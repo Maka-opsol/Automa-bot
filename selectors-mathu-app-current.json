@@ -1,0 +1,1 @@
+{"version":"1","created":"2024-01-15","selectors":{"signInWithMicrosoft":"button:has-text('Sign in with Microsoft'), a:has-text('Sign in with Microsoft')","watchButton":"button:has-text('Watch'), a:has-text('Watch')","startButton":"button:has-text('Start'), a:has-text('Start')","redoButton":"button:has-text('Redo'), a:has-text('Redo')"}}
