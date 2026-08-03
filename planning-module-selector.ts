@@ -25,7 +25,7 @@ class ModuleSelector {
 
   loadQValues() { 
     try {
-      const rows = getDb()?.prepare(`SELECT state, action, value FROM q_values`).all();
+      const rows = getDb()?.prepare(`SELECT state, action, value FROM q_values`).all() || [];
       for (const row of rows) {
         if (!this.qValues[row.state]) this.qValues[row.state] = {};
         this.qValues[row.state][row.action] = row.value;
