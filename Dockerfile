@@ -1,4 +1,4 @@
-use strict';
+'use strict';
 let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function getDb() { return _deps.database?.db; }
