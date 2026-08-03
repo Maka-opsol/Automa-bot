@@ -42,7 +42,21 @@ async function testModel(model: any) {
     if (!content) { log(`Model ${model.id} returned empty content`, 'WARN', 'evolution'); return false; }
     JSON.parse(content);
     return true;
-  } catch (err: any) { log(`Model ${model.id} failed test: ${err.message}`, 'WARN', 'evolution'); return false; }
+  } catch (err: any) {
+    // If the model doesn't support image input (404), retry as text-only.
+    if (err.message && err.message.includes('404') && err.message.includes('image')) {
+      log(`Model ${model.id} doesn't support vision — retrying as text-only`, 'DEBUG', 'evolution');
+      try {
+        const response = await getCallChatCompletion()(model.endpoint, apiKey, model.id, null, prompt, { maxTokens: 50 });
+        const content = response.choices?.[0]?.message?.content;
+        if (!content) return false;
+        JSON.parse(content);
+        return true;
+      } catch { return false; }
+    }
+    log(`Model ${model.id} failed test: ${err.message}`, 'WARN', 'evolution');
+    return false;
+  }
 }
 
 function getApiKey(provider: any) { 
