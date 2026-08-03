@@ -4,6 +4,7 @@ LABEL org.opencontainers.image.title="MathU Bot v6 — Render Free Plan"
 LABEL org.opencontainers.image.description="Autonomous MathU bot, all features, 512 MB, ephemeral disk"
 LABEL org.opencontainers.image.authors="U.S.J Sibiya"
 
+# System deps: Chromium shared libs + build tools for better-sqlite3
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
     libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
@@ -17,20 +18,30 @@ WORKDIR /app
 
 COPY package.json tsconfig.json ./
 
+# Main npm install — --ignore-scripts defers postinstall, --no-optional skips
+# ~140MB of native deps (onnxruntime-node, sharp, tesseract.js, @xenova/transformers)
 RUN NODE_OPTIONS=--max-old-space-size=256 \
     npm_config_jobs=1 \
     npm_config_build_from_source=false \
     npm install --ignore-scripts --no-optional
 
+# esbuild puts its platform binary in optionalDependencies — install it explicitly
 RUN npm install --ignore-scripts @esbuild/linux-x64
 
+# better-sqlite3 native addon — build tools from apt-get step above
 RUN npm rebuild better-sqlite3 \
     && node -e "require('better-sqlite3'); console.log('better-sqlite3 OK')"
 
+# Playwright Chromium — install to a world-readable path so the runtime
+# USER node can find it.  Default is ~/.cache/ms-playwright/ which would
+# be /root/.cache/ (unreadable by node user) if installed as root.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
 RUN npx playwright install chromium
 
+# App code last — layers above are cached when only .ts files change
 COPY . .
 
+# Runtime directories under /tmp (ephemeral disk)
 RUN mkdir -p /tmp/mathu-logs/screenshots \
     /tmp/.browser-data \
     /tmp/mathu-backups \
