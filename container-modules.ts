@@ -1,0 +1,949 @@
+'use strict';
+
+const { DIContainer } = require('./container-container');
+type DIContainerType = InstanceType<typeof DIContainer>;
+
+// Lazy logger with fallback for test environments
+let _logCache: { log: (msg: string, level?: string, mod?: string) => void; logError: (msg: string, err: Error) => void } | null = null;
+function _logger() {
+  if (_logCache) return _logCache;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    _logCache = require('./logger');
+  } catch {
+    _logCache = { log: () => {}, logError: () => {} };
+  }
+  return _logCache;
+}
+
+/** A [requirePath, containerName, deps] tuple for batch registration. */
+type ModuleTuple = [string, string, string[]];
+
+/**
+ * Build and return the fully-configured DI container.
+ *
+ * Every module that was previously directly required() in agent.js
+ * or cycle-manager.js is now declared here with its dependencies,
+ * lifecycle, and criticality.
+ *
+ * Modules are organized by subsystem for clarity.
+ */
+function createContainer(): DIContainerType {
+  const c = new DIContainer('mathu-bot');
+
+  // ═══════════════════════════════════════════════════════════
+  // CORE (critical — failure prevents startup)
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('config', {
+    factory: () => require('./config'),
+    critical: true,
+    tags: ['core'],
+  });
+
+  c.register('logger', {
+    factory: () => require('./logger'),
+    deps: ['config'],
+    critical: true,
+    tags: ['core'],
+  });
+
+  c.register('database', {
+    factory: (deps: any) => {
+      const mod = require('./database');
+      mod._injectDependencies(deps);
+      mod.initDatabase();
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: true,
+    tags: ['core'],
+  });
+
+  c.register('stateMachine', {
+    factory: (deps: any) => {
+      const mod = require('./state-machine');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['database', 'config', 'logger'],
+    critical: true,
+    tags: ['core'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // FOUNDATION UTILITIES (registered early — depended on by browser,
+  // providers, and many other modules)
+  // v5-fix: moved here from UTILITY section to fix registration-order
+  // fragility (browser depended on cache, but cache was 500 lines below).
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('cache', {
+    factory: (deps: any) => {
+      const mod = require('./cache');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  c.register('providersBase', {
+    factory: (deps: any) => {
+      const mod = require('./providers-base');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['providers'],
+  });
+
+  c.register('providersStats', {
+    factory: (deps: any) => {
+      const mod = require('./providers-stats');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: [],
+    critical: false,
+    tags: ['providers'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // BROWSER
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('browser', {
+    factory: (deps: any) => {
+      const mod = require('./browser');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'cache', 'database'],
+    critical: true,
+    tags: ['browser'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // ALERTING (critical — depended on by auth, providers, orchestrator, authGuard)
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('alerting', {
+    factory: (deps: any) => {
+      const mod = require('./alerting');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: true,
+    tags: ['alerting', 'core'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // AUTH
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('auth', {
+    factory: (deps: any) => {
+      const mod = require('./auth');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'alerting'],
+    critical: true,
+    tags: ['auth'],
+  });
+
+  c.register('jwt', {
+    factory: (deps: any) => {
+      const mod = require('./jwt');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'alerting'],
+    critical: false,
+    tags: ['auth', 'api'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // PROVIDERS
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('providers', {
+    factory: (deps: any) => {
+      const mod = require('./providers');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'browser', 'cache'],
+    critical: true,
+    tags: ['providers'],
+  });
+
+  c.register('providerRegistry', {
+    factory: (deps: any) => {
+      const mod = require('./providers-registry');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'alerting'],
+    critical: true,
+    tags: ['providers'],
+  });
+
+  c.register('visionPipeline', {
+    factory: (deps: any) => {
+      const mod = require('./providers-vision-pipeline');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'providerRegistry', 'providersBase', 'browser', 'cache'],
+    critical: true,
+    tags: ['providers'],
+  });
+
+  c.register('providerQuotaBargain', {
+    factory: (deps: any) => {
+      const mod = require('./provider-quota-bargain');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'alerting', 'providersBase'],
+    critical: false,
+    tags: ['providers'],
+  });
+
+  // providersBase and providersStats are registered in FOUNDATION UTILITIES above.
+  // v5-fix: moved up so dependents (providerQuotaBargain, dashboard) don't
+  // rely on late lazy-resolution.
+
+  c.register('providersConfigLoader', {
+    factory: (deps: any) => {
+      const mod = require('./providers-config-loader');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['providers'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // CYCLE
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('cycleManager', {
+    factory: (deps: any) => {
+      // Inject dependencies into cycle-manager via a setup function
+      const cycleManager = require('./cycle-cycle-manager');
+      cycleManager._injectDependencies(deps);
+      return cycleManager;
+    },
+    deps: [
+      // Core
+      'config', 'logger', 'database', 'browser', 'auth', 'providers',
+      'stateMachine', 'visionPipeline', 'cache', 'alerting',
+      // Cycle subsystems
+      'authGuard', 'actionExecutor', 'stagnation', 'moduleTracking',
+      // State & progress
+      'statePersist', 'moduleSelector', 'progressTracker',
+      // Self-heal
+      'selfHeal', 'selfHealGitops',
+      // Provider management
+      'providersBase', 'providerQuotaBargain',
+      // Utility modules
+      'dependencySurvivor', 'uiDriftDiscovery', 'captchaHumanFallback',
+      'bruteForceNavigator', 'blackbox', 'adaptivePerformanceEngine',
+      'explorationCartographer',
+      // Flutter subsystems
+      'flutterStability', 'flutterModalSlayer', 'flutterSemantics',
+      'flutterDpr', 'flutterNetwork', 'flutterInspector',
+      'flutterCanvas', 'flutterGestures',
+      // Experiments & policy
+      'strategyVariants', 'policyEngine', 'pluginAPI',
+    ],
+    critical: true,
+    tags: ['cycle'],
+  });
+
+  c.register('orchestrator', {
+    factory: (deps: any) => {
+      const mod = require('./cycle-orchestrator');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'cycleManager', 'shutdown', 'alerting'],
+    critical: true,
+    tags: ['cycle'],
+  });
+
+  c.register('shutdown', {
+    factory: (deps: any) => {
+      const mod = require('./cycle-shutdown');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['logger'],
+    critical: true,
+    tags: ['cycle'],
+  });
+
+  c.register('actionExecutor', {
+    factory: (deps: any) => {
+      const mod = require('./cycle-action-executor');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'browser', 'providers', 'providersBase', 'progressTracker', 'policyEngine', 'flutterGestures', 'adaptivePerformanceEngine'],
+    critical: true,
+    tags: ['cycle'],
+  });
+
+  c.register('authGuard', {
+    factory: (deps: any) => {
+      const mod = require('./cycle-auth-guard');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'auth', 'browser', 'alerting'],
+    critical: true,
+    tags: ['cycle', 'auth'],
+  });
+
+  c.register('stagnation', {
+    factory: (deps: any) => {
+      const mod = require('./cycle-stagnation');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'browser', 'alerting'],
+    critical: false,
+    tags: ['cycle'],
+  });
+
+  c.register('moduleTracking', {
+    factory: (deps: any) => {
+      const mod = require('./cycle-module-tracking');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'cache', 'providers'],
+    critical: false,
+    tags: ['cycle'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // SELF-HEAL
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('selfHeal', {
+    factory: (deps: any) => {
+      const mod = require('./self-heal');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    // Non-critical deps — self-heal gracefully falls back to lazy require()
+    // if any of these are unavailable (e.g. due to init failure).
+    deps: ['config', 'logger', 'database', 'selfHealAuditor', 'sandboxExecutor',
+           'providersStats', 'patchMemory', 'diffMinimizer', 'adversarialTester',
+           'canary', 'regressionBank', 'rewardTracker', 'healerCircuitBreaker',
+           'browser', 'auth', 'alerting'],
+    critical: false,
+    tags: ['self-heal'],
+  });
+
+  // v5-fix: removed 'providers' from deps — this module only uses providersBase
+  // (non-critical, already registered). If providersBase is unavailable, the
+  // module's getCallChatCompletion() falls back to require('./providers-base').
+  // This prevents cascading skip if the critical 'providers' module fails.
+  c.register('selfHealAuditor', {
+    factory: (deps: any) => {
+      const mod = require('./self-heal-auditor');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'sandboxExecutor'],
+    critical: false,
+    tags: ['self-heal'],
+  });
+
+  c.register('selfHealGitops', {
+    factory: (deps: any) => {
+      const mod = require('./self-heal-gitops');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'alerting'],
+    critical: false,
+    tags: ['self-heal'],
+  });
+
+  c.register('sandboxExecutor', {
+    factory: (deps: any) => {
+      const mod = require('./sandbox-executor');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'alerting'],
+    critical: false,
+    tags: ['self-heal'],
+  });
+
+  // v5-fix: removed 'providers' from deps — same rationale as selfHealAuditor.
+  // This module only uses providersBase (non-critical) with a lazy fallback.
+  c.register('criticalPatchConsensus', {
+    factory: (deps: any) => {
+      const mod = require('./critical-patch-consensus');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'sandboxExecutor'],
+    critical: false,
+    tags: ['self-heal'],
+  });
+
+  // Self-heal v2 subsystems — batch registered from typed tuples
+  const selfHealV2Modules: ModuleTuple[] = [
+    ['self-heal-predictive', 'predictiveHeal', ['config', 'logger', 'database', 'providers']],
+    ['self-heal-structural-drift-fingerprint', 'structuralDrift', ['config', 'logger', 'database']],
+    ['self-heal-provider-prediction', 'providerPrediction', ['config', 'logger', 'database', 'providers']],
+    ['self-heal-memory-prediction', 'memoryPrediction', ['config', 'logger', 'database']],
+    ['self-heal-db-healer', 'dbHealer', ['config', 'logger', 'database']],
+    ['self-heal-auth-healer', 'authHealer', ['config', 'logger', 'auth', 'database']],
+    ['self-heal-state-recovery', 'stateRecovery', ['config', 'logger', 'database', 'stateMachine']],
+    ['self-heal-dependency-healer', 'dependencyHealer', ['config', 'logger', 'database']],
+    ['self-heal-config-reconciler', 'configReconciler', ['config', 'logger', 'database']],
+    ['self-heal-reward-tracker', 'rewardTracker', ['config', 'logger', 'database']],
+    ['self-heal-timeline', 'healTimeline', ['config', 'logger', 'database']],
+    ['self-heal-meta-self-test', 'metaSelfTest', ['config', 'logger', 'database', 'selfHealAuditor', 'sandboxExecutor', 'alerting']],
+    ['self-heal-circuit-breaker', 'healerCircuitBreaker', ['config', 'logger', 'database']],
+    ['self-heal-canary', 'canary', ['config', 'logger', 'database']],
+    ['self-heal-diff-minimizer', 'diffMinimizer', ['config', 'logger']],
+    ['self-heal-adversarial-tester', 'adversarialTester', ['config', 'logger', 'database']],
+    ['self-heal-regression-bank', 'regressionBank', ['config', 'logger', 'database']],
+    ['self-heal-patch-memory', 'patchMemory', ['config', 'logger', 'database']],
+    ['self-heal-degradation-ladder', 'degradationLadder', ['config', 'logger', 'database', 'alerting']],
+    ['self-heal-clean-room-test', 'cleanRoomTest', ['config', 'logger', 'database', 'alerting']],
+    ['self-heal-self-deploy', 'selfDeploy', ['config', 'logger', 'database', 'alerting']],
+    ['self-heal-selector-drift', 'selectorDrift', ['config', 'logger', 'database']],
+    ['self-heal-blackbox-replay', 'blackboxReplay', ['config', 'logger', 'database']],
+    ['self-heal-critical-shadow-mode', 'criticalShadowMode', ['config', 'logger', 'database']],
+  ];
+
+  for (const [modPath, name, deps] of selfHealV2Modules) {
+    c.register(name, {
+      factory: (deps: any) => {
+        const mod = require(`./${modPath}`);
+        mod._injectDependencies(deps);
+        return mod;
+      },
+      deps,
+      critical: false,
+      tags: ['self-heal', 'self-heal-v2'],
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // MONITORING
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('healthCheck', {
+    factory: (deps: any) => {
+      const mod = require('./monitoring-health-check');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'alerting'],
+    critical: false,
+    tags: ['monitoring'],
+  });
+
+  c.register('anomalyDetector', {
+    factory: (deps: any) => {
+      const mod = require('./monitoring-anomaly-detector');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'alerting'],
+    critical: false,
+    tags: ['monitoring'],
+  });
+
+  c.register('subsystemCircuitBreakers', {
+    factory: (deps: any) => {
+      const mod = require('./monitoring-subsystem-circuit-breakers');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'alerting'],
+    critical: false,
+    tags: ['monitoring', 'self-heal'],
+  });
+
+  c.register('metrics', {
+    factory: (deps: any) => {
+      const mod = require('./metrics');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['monitoring', 'workerizable'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // LONGEVITY
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('playwrightGuardian', {
+    factory: (deps: any) => {
+      const mod = require('./longevity-playwright-guardian');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['longevity'],
+  });
+
+  c.register('dbJanitor', {
+    factory: (deps: any) => {
+      const mod = require('./longevity-db-janitor');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['longevity'],
+  });
+
+  c.register('nodeMonitor', {
+    factory: (deps: any) => {
+      const mod = require('./longevity-node-monitor');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['longevity'],
+  });
+
+  // (alerting moved to core section above — registered as critical before dependents)
+
+  // ═══════════════════════════════════════════════════════════
+  // PLANNING & EXPERIMENTS
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('moduleSelector', {
+    factory: (deps: any) => {
+      const mod = require('./planning-module-selector');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['planning'],
+  });
+
+  c.register('strategyVariants', {
+    factory: (deps: any) => {
+      const mod = require('./experiments-strategy-variants');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['experiments'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // META-LEARNING
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('reflection', {
+    factory: (deps: any) => {
+      const mod = require('./meta-learner-reflection');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'alerting', 'providersBase'],
+    critical: false,
+    tags: ['meta-learning'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // FLUTTER SPECIALIZATION
+  // ═══════════════════════════════════════════════════════════
+
+  const flutterModules: ModuleTuple[] = [
+    ['flutter-dpr-calibrator', 'flutterDpr', ['database']],
+    ['flutter-stability-waiter', 'flutterStability', []],
+    ['flutter-modal-slayer', 'flutterModalSlayer', ['browser']],
+    ['flutter-network-interceptor', 'flutterNetwork', ['database']],
+    ['flutter-engine-inspector', 'flutterInspector', []],
+    ['flutter-canvas-parser', 'flutterCanvas', []],
+    ['flutter-gesture-simulator', 'flutterGestures', []],
+    ['flutter-semantics-overlord', 'flutterSemantics', []],
+  ];
+
+  for (const [modPath, name, extraDeps] of flutterModules) {
+    c.register(name, {
+      factory: (deps: any) => {
+      const mod = require(`./${modPath}`);
+      mod._injectDependencies(deps);
+      return mod;
+    },
+      deps: ['config', 'logger', ...extraDeps],
+      critical: false,
+      tags: ['flutter'],
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // UTILITY
+  // ═══════════════════════════════════════════════════════════
+
+  // v5-fix M1: Register validationSuite — it was referenced in agent.ts:371
+  // via container.get('validationSuite') but never registered, so it always
+  // returned null and smoke tests never ran.
+  c.register('validationSuite', {
+    factory: (deps: any) => {
+      const mod = require('./test-validation-suite');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'browser', 'auth', 'providers', 'database'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  // cache is registered in FOUNDATION UTILITIES above.
+  // v5-fix: moved up because browser depends on it.
+
+  c.register('blackbox', {
+    factory: (deps: any) => {
+      const mod = require('./blackbox-recorder');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  c.register('progressTracker', {
+    factory: (deps: any) => {
+      const mod = require('./progress-tracker');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  c.register('statePersist', {
+    factory: (deps: any) => {
+      const mod = require('./state-persist');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'stateMachine', 'browser'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  c.register('dependencySurvivor', {
+    factory: (deps: any) => {
+      const mod = require('./dependency-survivor');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'providersBase'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  c.register('dependencyManager', {
+    factory: (deps: any) => {
+      const mod = require('./dependency-manager');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  c.register('failsafeCoordinator', {
+    factory: (deps: any) => {
+      const mod = require('./failsafe-coordinator');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'stateMachine', 'cache', 'browser', 'database'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  c.register('dbBackup', {
+    factory: (deps: any) => {
+      const mod = require('./db-backup');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  c.register('uiDriftDiscovery', {
+    factory: (deps: any) => {
+      const mod = require('./ui-drift-discovery');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  c.register('bruteForceNavigator', {
+    factory: (deps: any) => {
+      const mod = require('./brute-force-navigator');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  c.register('captchaHumanFallback', {
+    factory: (deps: any) => {
+      const mod = require('./captcha-human-fallback');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'browser', 'auth', 'providers', 'database'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  c.register('captchaSolverExternal', {
+    factory: (deps: any) => {
+      const mod = require('./captcha-solver-external');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  c.register('adaptivePerformanceEngine', {
+    factory: (deps: any) => {
+      const mod = require('./adaptive-performance-engine');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  c.register('explorationCartographer', {
+    factory: (deps: any) => {
+      const mod = require('./exploration-cartographer');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['utility', 'exploration'],
+  });
+
+  c.register('domainAdapter', {
+    factory: (deps: any) => {
+      const mod = require('./exploration-domain-adapter');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['utility', 'exploration'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // POLICY & PLUGINS
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('policyEngine', {
+    factory: (deps: any) => {
+      const mod = require('./policy-policy-engine');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['policy'],
+  });
+
+  c.register('pluginAPI', {
+    factory: (deps: any) => {
+      const mod = require('./plugins-plugin-interface');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['plugins'],
+  });
+
+  c.register('plugins', {
+    factory: (deps: any) => {
+      const mod = require('./plugins-loader');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['plugins'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // SERVICES
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('ipCheck', {
+    factory: (deps: any) => {
+      const mod = require('./services-ip-check');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['services'],
+  });
+
+  c.register('modelEvolution', {
+    factory: (deps: any) => {
+      const mod = require('./services-model-evolution');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'providersBase'],
+    critical: false,
+    tags: ['services'],
+  });
+
+  c.register('modelEvolutionAdvanced', {
+    factory: (deps: any) => {
+      const mod = require('./services-model-evolution-v2');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'providersBase'],
+    critical: false,
+    tags: ['services'],
+  });
+
+  c.register('remoteConfig', {
+    factory: (deps: any) => {
+      const mod = require('./config-remote-config');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['services'],
+  });
+
+  c.register('getActiveModel', {
+    factory: (deps: any) => {
+      const mod = require('./services-get-active-model');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'database'],
+    critical: false,
+    tags: ['services'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // DOCUMENTING
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('diary', {
+    factory: (deps: any) => {
+      const mod = require('./self-documenting-diary');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['documenting', 'workerizable'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // COORDINATION
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('coordinator', {
+    factory: (deps: any) => {
+      const mod = require('./coordinator-leader');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['coordination'],
+  });
+
+  c.register('resourceManager', {
+    factory: (deps: any) => {
+      const mod = require('./resource-manager');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['coordination'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // DASHBOARD
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('dashboard', {
+    factory: (deps: any) => {
+      const mod = require('./dashboard-server');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'stateMachine', 'cache', 'providers', 'browser', 'jwt', 'failsafeCoordinator', 'providersStats'],
+    critical: false,
+    tags: ['dashboard'],
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // REMOTE BRAIN
+  // ═══════════════════════════════════════════════════════════
+
+  c.register('remoteBrain', {
+    factory: (deps: any) => {
+      const mod = require('./remote-brain-injector');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['utility'],
+  });
+
+  return c;
+}
+
+module.exports = {  createContainer  };
