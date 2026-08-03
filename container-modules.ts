@@ -249,8 +249,6 @@ function createContainer(): DIContainerType {
       'authGuard', 'actionExecutor', 'stagnation', 'moduleTracking',
       // State & progress
       'statePersist', 'moduleSelector', 'progressTracker',
-      // Self-heal
-      'selfHeal', 'selfHealGitops',
       // Provider management
       'providersBase', 'providerQuotaBargain',
       // Utility modules
