@@ -49,7 +49,7 @@ async function executeAction(page: any, action: any) {
     case 'flutter_tap': {
       if (action.targetX == null || action.targetY == null) { log('❌ Click action missing coordinates.', 'ERROR', 'action'); break; }
       const { x, y } = toAbsolute(action.targetX, action.targetY);
-      const success = await (providersBase.retryWithBackoff || (fn: any => fn()))(() => browser.performClickWithRetry?.(page, x, y, 3), { maxRetries: 2, baseDelay: 1000 });
+      const success = await (providersBase.retryWithBackoff || ((fn: any) => fn()))(() => browser.performClickWithRetry?.(page, x, y, 3), { maxRetries: 2, baseDelay: 1000 });
       if (!success) { log('⚠️ Click failed to produce page change.', 'WARN', 'action'); await (browser.flutterTap?.(page, x, y)); }
       await sleep(CONFIG.POST_CLICK_MS * (CONFIG.WAIT_MULTIPLIER ?? 1.0));
       break;
