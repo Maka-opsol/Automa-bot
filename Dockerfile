@@ -36,21 +36,17 @@ COPY package.json tsconfig.json ./
 #                     and Playwright in isolated steps below so each gets
 #                     its own memory budget inside the 512 MB build env.
 # --no-optional     → skips onnxruntime-node (~50 MB), sharp, tesseract.js,
-#                     @xenova/transformers.  All are disabled or unnecessary
-#                     at runtime on 512 MB (ENABLE_LOCAL_VLM=false by
-#                     default; OCR falls back to vision APIs).
-# NODE_OPTIONS      → caps V8 heap at 256 MB so the OS + apt + gcc have
-#                     room to breathe during install.
-# npm_config_jobs=1 → serialises native compilations.  Two parallel g++
-#                     processes would each grab 100-200 MB and OOM.
-# npm_config_build_from_source=false → grabs prebuilt binaries when
-#                     available (better-sqlite3 ships them for glibc/Linux).
+#                     @xenova/transformers.
+# After the main install we explicitly grab @esbuild/linux-x64 which
+# --no-optional skipped — esbuild lists its platform binary as an
+# optionalDependency and crashes without it.
 # ═══════════════════════════════════════════════════════════════════════════
 
 RUN NODE_OPTIONS=--max-old-space-size=256 \
     npm_config_jobs=1 \
     npm_config_build_from_source=false \
-    npm install --ignore-scripts --no-optional
+    npm install --ignore-scripts --no-optional \
+    && npm install --ignore-scripts @esbuild/linux-x64
 
 # ═══════════════════════════════════════════════════════════════════════════
 # LAYER 3 — better-sqlite3 native addon
