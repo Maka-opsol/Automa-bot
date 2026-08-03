@@ -25,6 +25,9 @@ function getMailTransporter() {
       port: parseInt(process.env.SMTP_PORT || '587'),
       secure: process.env.SMTP_SECURE === 'true',
       auth: { user, pass },
+      connectionTimeout: 5000,   // 5s — fail fast on blocked ports (Render free tier)
+      greetingTimeout: 5000,
+      socketTimeout: 10000,
     });
   } catch (e: any) {
     logError('Failed to create mail transporter', e);
@@ -62,12 +65,14 @@ async function sendEmailAlert(message: any) {
     await transporter.sendMail({
       from: process.env.SMTP_FROM || process.env.SMTP_USER,
       to,
-      subject: '🚨 MathU Bot Alert',
+      subject: 'MathU Bot Alert',
       text: message,
     });
-    log(`📧 Sent email alert to ${to}`, 'DEBUG', 'alerting');
+    log(`Sent email alert to ${to}`, 'DEBUG', 'alerting');
   } catch (e: any) {
-    logError('Failed to send email alert', e);
+    // Render free tier blocks outbound SMTP (ports 25/587/465).
+    // Log at WARN, not ERROR, to avoid triggering alert cascades.
+    log(`Email alert skipped: ${e.code || e.message}`, 'WARN', 'alerting');
   }
 }
 
