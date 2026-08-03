@@ -59,10 +59,31 @@ if (!process.env.SELF_HEAL_BACKUP_DIR)  process.env.SELF_HEAL_BACKUP_DIR  = path
 if (!process.env.SELF_HEAL_STAGING_DIR) process.env.SELF_HEAL_STAGING_DIR = path.join(DATA_DIR, 'mathu-staging');
 if (!process.env.REGRESSION_BANK_DIR)   process.env.REGRESSION_BANK_DIR   = path.join(DATA_DIR, 'mathu-regression');
 
-// Memory — tight but workable for 512 MB (OS + Node + Chromium + subsystems)
-if (!process.env.MAX_MEMORY_MB)              process.env.MAX_MEMORY_MB = '448';
-if (!process.env.MEMORY_WARNING_THRESHOLD_MB) process.env.MEMORY_WARNING_THRESHOLD_MB = '350';
-if (!process.env.MEMORY_RESTART_THRESHOLD_MB) process.env.MEMORY_RESTART_THRESHOLD_MB = '400';
+// Memory — only set MAX_MEMORY_MB if not already set.
+// WARNING_THRESHOLD and RESTART_THRESHOLD are NOT set here.
+// They have correct defaults in config.ts (350 and 360 for Render).
+// Setting them here risks conflicting with a user-overridden MAX_MEMORY_MB
+// in the Render dashboard, causing validation failure (Bug #6).
+if (!process.env.MAX_MEMORY_MB) process.env.MAX_MEMORY_MB = '448';
+
+// Post-set consistency guard: ensure thresholds are always valid
+// relative to whatever MAX_MEMORY_MB ends up being (Dockerfile, dashboard,
+// or default).  This prevents the config.ts validation from killing the
+// container if the user sets MAX_MEMORY_MB lower in the Render dashboard.
+(function ensureMemoryThresholdConsistency() {
+  const maxMem = parseInt(process.env.MAX_MEMORY_MB || '448', 10);
+  const restartThr = parseInt(process.env.MEMORY_RESTART_THRESHOLD_MB || '0', 10);
+  const warnThr = parseInt(process.env.MEMORY_WARNING_THRESHOLD_MB || '0', 10);
+  // If thresholds aren't set, let config.ts defaults handle it.
+  // If they ARE set but violate the constraints, fix them here.
+  if (restartThr > 0 && restartThr >= maxMem) {
+    process.env.MEMORY_RESTART_THRESHOLD_MB = String(Math.floor(maxMem * 0.8));
+  }
+  const effectiveRestart = parseInt(process.env.MEMORY_RESTART_THRESHOLD_MB || String(Math.floor(maxMem * 0.8)), 10);
+  if (warnThr > 0 && warnThr >= effectiveRestart) {
+    process.env.MEMORY_WARNING_THRESHOLD_MB = String(Math.floor(maxMem * 0.7));
+  }
+})();
 
 // Timing
 if (!process.env.MAX_UPTIME_HOURS)           process.env.MAX_UPTIME_HOURS = '0';      // never force restart
