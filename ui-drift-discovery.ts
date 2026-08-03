@@ -1,4 +1,4 @@
-'use strict';
+'use'use strict';
 let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function getDb() { return _deps.database?.db; }
@@ -26,8 +26,12 @@ class UIDriftDetector {
 
   loadBaselines() { 
     try {
-      const rows = getDb()?.prepare('SELECT state, hash FROM ui_baselines').all();
-      for (const row of rows) this.baselines.set(row.state, row.hash);
+      const db = getDb();
+      if (!db) return;
+      const rows = db.prepare('SELECT state, hash FROM ui_baselines').all();
+      if (Array.isArray(rows)) {
+        for (const row of rows) this.baselines.set(row.state, row.hash);
+      }
     } catch (err: any) {
       logError('Failed to load UI baselines', err);
     }
