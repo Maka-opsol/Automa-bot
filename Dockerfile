@@ -1,104 +1,67 @@
-'use strict';
-let _deps: Record<string, any> = {};
-function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
-function getDb() { return _deps.database?.db; }
-function getUpsertUiBaseline() { return _deps.database?.upsertUiBaseline; }
+FROM node:20-bookworm-slim
 
-let sharp: any;
-try { sharp = require('sharp'); } catch (e: any) { sharp = null; }
-const crypto = require('crypto');
-const CONFIG = require('./get-config');
-const { log, logError } = require('./logger');
-let Tesseract: any;
-try { Tesseract = require('tesseract.js'); } catch (e: any) { Tesseract = null; }
+LABEL org.opencontainers.image.title="MathU Bot v6 — Render Free Plan"
+LABEL org.opencontainers.image.description="Autonomous MathU bot, all features, 512 MB, ephemeral disk"
+LABEL org.opencontainers.image.authors="U.S.J Sibiya"
 
-class UIDriftDetector {
-  baselines: any;
-  ocr: any;
-  aria: any;
-  dom: any;
-  actions: any;
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+    libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
+    libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 \
+    libcairo2 libasound2 libxshmfence1 libx11-xcb1 \
+    python3 make g++ \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-  constructor() {
-    this.baselines = new Map();
-    this.loadBaselines();
-  }
+WORKDIR /app
 
-  loadBaselines() { 
-    try {
-      const db = getDb();
-      if (!db) return;
-      const rows = db.prepare('SELECT state, hash FROM ui_baselines').all();
-      if (Array.isArray(rows)) {
-        for (const row of rows) this.baselines.set(row.state, row.hash);
-      }
-    } catch (err: any) {
-      logError('Failed to load UI baselines', err);
-    }
-  }
+COPY package.json tsconfig.json ./
 
-  async hashImage(base64: any) { 
-    if (!sharp) return '0';
-    const buffer = Buffer.from(base64, 'base64');
-    const { data } = await sharp(buffer).resize(9, 8).greyscale().raw().toBuffer({ resolveWithObject: true });
-    let hash = 0;
-    for (let i = 0; i < data.length; i++) {
-      const bit = data[i] > 128 ? 1 : 0;
-      hash = ((hash << 1) | bit) >>> 0;
-    }
-    return hash.toString(16);
-  }
+RUN NODE_OPTIONS=--max-old-space-size=256 \
+    npm_config_jobs=1 \
+    npm_config_build_from_source=false \
+    npm install --ignore-scripts --no-optional
 
-  hammingDistance(h1: any, h2: any) { 
-    const b1 = BigInt(`0x${h1}`), b2 = BigInt(`0x${h2}`);
-    let xor = b1 ^ b2;
-    let dist = 0;
-    while (xor > 0) { dist++; xor &= xor - 1n; }
-    return dist;
-  }
+RUN npm install --ignore-scripts @esbuild/linux-x64
 
-  async detectDrift(state: any, base64: any) { 
-    const baseline = this.baselines.get(state);
-    if (!baseline) return false;
-    const currentHash = await this.hashImage(base64);
-    const dist = this.hammingDistance(baseline, currentHash);
-    const threshold = CONFIG.UI_DRIFT_THRESHOLD || 10;
-    const drifted = dist > threshold;
-    if (drifted) log(`⚠️ UI Drift detected for ${state}! Hamming: ${dist}`, 'WARN', 'ui-drift');
-    return drifted;
-  }
+RUN npm rebuild better-sqlite3 \
+    && node -e "require('better-sqlite3'); console.log('better-sqlite3 OK')"
 
-  async discoverUI(page: any, state = 'assignments_page') { 
-    log('🔍 Entering UI Discovery Mode...', 'WARN', 'ui-drift');
-    const map = {};
-    const screenshot = await page.screenshot({ type: 'jpeg' });
-    const base64 = screenshot.toString('base64');
-    try {
-      if (!Tesseract) { log('Tesseract not available, skipping OCR', 'DEBUG', 'ui-drift'); return map; }
-      const { data: ocrResult } = await Tesseract.recognize(screenshot, 'eng');
-// @ts-expect-error
-      map.ocr = (ocrResult.words || []).map((w: any) => ({ text: w.text, x: w.bbox ? w.bbox.x0 : 0, y: w.bbox ? w.bbox.y0 : 0 }));
-    } catch (_e: any) { /* non-critical, suppressed */ }
-    try {
-      const snapshot = await require('./utils-a11y-snapshot').getA11ySnapshot(page);
-// @ts-expect-error
-      map.aria = snapshot;
-    } catch (_e: any) { /* non-critical, suppressed */ }
-    const elements = await page.evaluate(() => {
-      const all = document.querySelectorAll('button, a, input, [role="button"]');
-      return Array.from(all).map((el: any) => ({ tag: el.tagName, text: el.innerText || el.getAttribute('aria-label'), rect: el.getBoundingClientRect() }));
-    });
-// @ts-expect-error
-    map.dom = elements;
-    const watch = elements.filter((e: any) => e.text?.toLowerCase().includes('watch'));
-// @ts-expect-error
-    if (watch.length > 0) map.actions = { watch: watch[0].rect };
-    log('📦 UI Map generated. Transitions updated.', 'INFO', 'ui-drift');
-    const hash = await this.hashImage(base64);
-    getUpsertUiBaseline()?.run(state, hash, JSON.stringify(map), Date.now());
-    this.baselines.set(state, hash);
-    return map;
-  }
-}
+RUN npx playwright install chromium
 
-module.exports = Object.assign(new UIDriftDetector(), { _injectDependencies });
+COPY . .
+
+RUN mkdir -p /tmp/mathu-logs/screenshots \
+    /tmp/.browser-data \
+    /tmp/mathu-backups \
+    /tmp/mathu-staging \
+    /tmp/mathu-regression
+
+USER node
+
+EXPOSE 10000
+
+ENV NODE_ENV=production \
+    PORT=10000 \
+    HEADLESS=true \
+    MAX_MEMORY_MB=448 \
+    MEMORY_WARNING_THRESHOLD_MB=350 \
+    MEMORY_RESTART_THRESHOLD_MB=360 \
+    MAX_UPTIME_HOURS=0 \
+    MAX_CYCLES_BEFORE_RESTART=999999 \
+    LOG_LEVEL=info \
+    LOG_MAX_FILES=2 \
+    LOG_MAX_SIZE_MB=10 \
+    SAVE_SCREENSHOTS=false \
+    ENABLE_GAN_TELEMETRY=false \
+    ENABLE_LOCAL_VLM=false \
+    DB_PATH=/tmp/mathu-bot.db \
+    USER_DATA_DIR=/tmp/.browser-data \
+    LOG_DIR=/tmp/mathu-logs \
+    HEARTBEAT_FILE=/tmp/.heartbeat \
+    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion --js-flags=--max-old-space-size=128 --optimize-for-size --single-process"
+
+HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -sf http://localhost:10000/health || exit 1
+
+CMD ["node", "--expose-gc", "--max-old-space-size=384", "--import", "tsx", "render-free-plan.ts"]
