@@ -782,7 +782,7 @@ function createContainer(): DIContainerType {
     factory: (deps: any) => {
       const mod = require('./policy-policy-engine');
       mod._injectDependencies(deps);
-      return mod;
+      return mod.policyEngine;
     },
     deps: ['config', 'logger'],
     critical: false,
