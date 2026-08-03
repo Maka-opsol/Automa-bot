@@ -101,7 +101,7 @@ class ProtocolChameleon {
     try {
       const openapi = await fetchJSON(url, {}, 10000);
       const schema = this.extractChatCompletionSchema(openapi);
-      if (schema) { getDatabase().upsertProviderSchema.run(providerName, JSON.stringify(schema), openapi.info?.version || 'unknown', Date.now()); return schema; }}
+      if (schema) { getDatabase().upsertProviderSchema.run(providerName, JSON.stringify(schema), openapi.info?.version || 'unknown', Date.now()); return schema; }
     } catch (e: any) { logError(`Schema fetch failed for ${providerName}`, e); }
     return null;
   }
