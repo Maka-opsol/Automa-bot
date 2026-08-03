@@ -128,6 +128,10 @@ function runMigrations() {
   ];
 
   const transaction = db.transaction(() => {
+    // Ensure schema_version table exists before any migration runs.
+    // On ephemeral disks (Render /tmp), the DB is created fresh every
+    // cold start — the table would not exist yet, causing INSERT to fail.
+    db.exec('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER)');
     while (current < target) { current++; try { if (migrationSteps[current - 1]) { migrationSteps[current - 1](); log(`Applied migration ${current}`, 'DEBUG', 'database'); } } catch (err: any) { throw new Error(`Migration ${current} failed: ${err.message}`); } }
     db.prepare('INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)').run(target, Date.now());
   });
