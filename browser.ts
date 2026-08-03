@@ -1,4 +1,4 @@
-'use strict';
+' strict';
 
 import type { Deps } from './types/di-types';
 
@@ -275,6 +275,15 @@ class BrowserManager {
       new Promise((_, reject) => setTimeout(() => reject(new Error('Context creation timeout')), getCONFIG().BROWSER_CONTEXT_TIMEOUT_MS || 30000))
     ]);
     this.contextInstance.on('page', async (newPage: any) => {
+      // CRITICAL FIX: In --single-process mode (Render free plan), closing any
+      // page/popup kills the ENTIRE browser process because all pages share
+      // one OS process. We must NOT close popups — just ignore them.
+      const chromiumFlags = getCONFIG().CHROMIUM_FLAGS || process.env.CHROMIUM_FLAGS || '';
+      const isSingleProcess = chromiumFlags.includes('--single-process');
+      if (isSingleProcess) {
+        log('Popup opened in single-process mode — ignoring (close would kill browser)', 'DEBUG', 'browser');
+        return;
+      }
       log('Closing unexpected new page/popup', 'WARN', 'browser');
       try { await Promise.race([newPage.close(), new Promise((_, reject) => setTimeout(() => reject(new Error('Page close timeout')), getCONFIG().BROWSER_CLOSE_TIMEOUT_MS || 5000))]); } catch (err: any) { logError('Failed to close popup', err as Error); }
     });
