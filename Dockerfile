@@ -36,17 +36,21 @@ COPY package.json tsconfig.json ./
 #                     and Playwright in isolated steps below so each gets
 #                     its own memory budget inside the 512 MB build env.
 # --no-optional     → skips onnxruntime-node (~50 MB), sharp, tesseract.js,
-#                     @xenova/transformers.
-# After the main install we explicitly grab @esbuild/linux-x64 which
-# --no-optional skipped — esbuild lists its platform binary as an
-# optionalDependency and crashes without it.
+#                     @xenova/transformers.  All are disabled or unnecessary
+#                     at runtime on 512 MB (ENABLE_LOCAL_VLM=false by
+#                     default; OCR falls back to vision APIs).
+# NODE_OPTIONS      → caps V8 heap at 256 MB so the OS + apt + gcc have
+#                     room to breathe during install.
+# npm_config_jobs=1 → serialises native compilations.  Two parallel g++
+#                     processes would each grab 100-200 MB and OOM.
+# npm_config_build_from_source=false → grabs prebuilt binaries when
+#                     available (better-sqlite3 ships them for glibc/Linux).
 # ═══════════════════════════════════════════════════════════════════════════
 
 RUN NODE_OPTIONS=--max-old-space-size=256 \
     npm_config_jobs=1 \
     npm_config_build_from_source=false \
-    npm install --ignore-scripts --no-optional \
-    && npm install --ignore-scripts @esbuild/linux-x64
+    npm install --ignore-scripts --no-optional
 
 # ═══════════════════════════════════════════════════════════════════════════
 # LAYER 3 — better-sqlite3 native addon
@@ -102,16 +106,23 @@ EXPOSE 10000
 # ENVIRONMENT DEFAULTS
 # ═══════════════════════════════════════════════════════════════════════════
 # Sensible defaults for Render free plan (512 MB RAM, ephemeral disk).
-# Any key defined in render.yaml envVars takes precedence over these.
+# Any env var set in the Render dashboard takes precedence over these.
 # Feature flags are intentionally NOT set here — they default to true
 # in config.ts, so all features are enabled out of the box.
+#
+# IMPORTANT: MEMORY_RESTART_THRESHOLD_MB must be < MAX_MEMORY_MB.
+# config.ts validates this at startup and exits with code 1 if violated.
+# If the user sets MAX_MEMORY_MB in the Render dashboard to a lower value
+# (e.g. 384 to match the V8 heap cap), the threshold here (360) is still
+# below it.  Previously this was set to 400, which broke when the user
+# overrode MAX_MEMORY_MB to 384 in the dashboard.
 
 ENV NODE_ENV=production \
     PORT=10000 \
     HEADLESS=true \
     MAX_MEMORY_MB=448 \
     MEMORY_WARNING_THRESHOLD_MB=350 \
-    MEMORY_RESTART_THRESHOLD_MB=400 \
+    MEMORY_RESTART_THRESHOLD_MB=360 \
     MAX_UPTIME_HOURS=0 \
     MAX_CYCLES_BEFORE_RESTART=999999 \
     LOG_LEVEL=info \
