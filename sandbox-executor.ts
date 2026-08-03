@@ -36,17 +36,17 @@ const ALLOWED_MODULES = new Set([
 // Comment/string content is stripped before matching (see auditPatchContent).
 const BLOCKED_PATTERNS: readonly RegExp[] = [
   // Process access — match the global object, not the word "process" in identifiers
-  /(?<!\w)process(?=\s*(?:\.|\[|env|exit|kill|pid|cwd|argv|stdout|stderr|stdin|versions|memoryUsage|nextTick|on|once|emit|send))(?!\w)/,
+  /(?<!\w)process(?=\s*(?:\.|\[|env|exit|kill|pid|cwd|argv|stdout|stderr|stdin|versions|memoryUsage|nextTick|on|once|emit|send))\(?!\w)/,
   /(?<!\w)require\s*\(/,
-  /(?<!\w)global(?=\s*(?:\.|\[|this|__))(?!\w)/,
-  /(?<!\w)globalThis(?=\s*(?:\.|\[))(?!\w)/,
+  /(?<!\w)global(?=\s*(?:\.|\[|this|__))\(?!\w)/,
+  /(?<!\w)globalThis(?=\s*(?:\.|\[))\(?!\w)/,
   // Module/exports — match when used as the module object, not in strings like "module name"
   /(?<!\w)module\s*\./,
   /(?<!\w)module\.exports/,
   /(?<!\w)exports\s*[.=]/,
   /(?<!\w)__dirname(?=\s|[^a-zA-Z0-9_$])/,  
   /(?<!\w)__filename(?=\s|[^a-zA-Z0-9_$])/,  
-  /(?<!\w)Buffer(?=\s*(?:\.|\[|from|alloc|isBuffer|concat))(?!\w)/,
+  /(?<!\w)Buffer(?=\s*(?:\.|\[|from|alloc|isBuffer|concat))\(?!\w)/,
   // Timers (could be used for resource exhaustion)
   /(?<!\w)setTimeout\s*\(/,
   /(?<!\w)setInterval\s*\(/,
@@ -125,7 +125,10 @@ const ALLOWED_PREFIXES: readonly string[] = [
   'exploration-',
 ];
 
-// ─── Type Definitions ───
+// ─── Type Definitions (kept for TypeScript type checking only — NOT exported) ───
+// These interfaces are stripped by esbuild/tsx at runtime.
+// They were previously exported in module.exports, which caused
+// "AuditResult is not defined" ReferenceError at runtime.
 interface AuditResult {
   safe: boolean;
   violations: string[];
@@ -519,4 +522,4 @@ async function executePatchInSandbox(patchText: string, filePath: string): Promi
 }
 
 // @ts-expect-error
-module.exports = { vm, path, SOURCE_DIR, ALLOWED_MODULES, BLOCKED_PATTERNS, IMMUTABLE_FILES, RESTRICTED_FILES, ALLOWED_PREFIXES, AuditResult, PatchabilityResult, SandboxResult, auditPatchContent, isPatchableFile, createSandboxContext, runPatchInSandbox, executePatchInIsolatedProcess, executePatchInSandbox, _injectDependencies };
+module.exports = { vm, path, SOURCE_DIR, ALLOWED_MODULES, BLOCKED_PATTERNS, IMMUTABLE_FILES, RESTRICTED_FILES, ALLOWED_PREFIXES, auditPatchContent, isPatchableFile, createSandboxContext, runPatchInSandbox, executePatchInIsolatedProcess, executePatchInSandbox, _injectDependencies };
