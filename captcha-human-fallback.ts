@@ -8,7 +8,14 @@ const logError = (...args: any[]) => _deps.logger?.logError?.(...args) ?? consol
 const CONFIG = require('./get-config');
 
 const path = require('path');
+const os = require('os');
 const { PROJECT_ROOT } = require('./project-root');
+
+// Use USER_DATA_DIR (set by render-free-plan.ts to /tmp/.browser-data) instead
+// of PROJECT_ROOT (/app/) which is read-only in Docker.
+function getSessionDir() {
+  return process.env.USER_DATA_DIR || path.join(os.tmpdir(), '.browser-data');
+}
 let TelegramBot: any;
 try { TelegramBot = require('node-telegram-bot-api'); } catch (e: any) { TelegramBot = null; }
 const fs = require('fs');
@@ -59,7 +66,8 @@ class HumanFallbackCaptcha {
 
   getSessionPool() { 
     const pool = [];
-    const sessionDir = PROJECT_ROOT;
+    const sessionDir = getSessionDir();
+    try { fs.mkdirSync(sessionDir, { recursive: true }); } catch { /* best-effort */ }
     for (let i = 1; i <= 5; i++) {
       const file = path.join(sessionDir, `session-${i}.json`);
       if (fs.existsSync(file)) { try { pool.push(JSON.parse(fs.readFileSync(file, 'utf8'))); } catch (_e: any) { /* malformed data, skipping */ } }
@@ -68,14 +76,20 @@ class HumanFallbackCaptcha {
   }
 
   saveSessionToPool(storage: any) { 
-    const sessionDir = PROJECT_ROOT;
-    for (let i = 5; i > 1; i--) {
-      const src = path.join(sessionDir, `session-${i-1}.json`);
-      const dest = path.join(sessionDir, `session-${i}.json`);
-      if (fs.existsSync(src)) fs.renameSync(src, dest);
+    const sessionDir = getSessionDir();
+    try {
+      fs.mkdirSync(sessionDir, { recursive: true });
+      for (let i = 5; i > 1; i--) {
+        const src = path.join(sessionDir, `session-${i-1}.json`);
+        const dest = path.join(sessionDir, `session-${i}.json`);
+        if (fs.existsSync(src)) fs.renameSync(src, dest);
+      }
+      fs.writeFileSync(path.join(sessionDir, 'session-1.json'), JSON.stringify(storage, null, 2));
+      log('Saved session to pool.', 'INFO', 'session-pool');
+    } catch (e: any) {
+      // Non-critical — session pool is best-effort; fail silently in read-only envs.
+      log(`Session pool write failed: ${e.code || e.message}`, 'WARN', 'session-pool');
     }
-    fs.writeFileSync(path.join(sessionDir, 'session-1.json'), JSON.stringify(storage, null, 2));
-    log('💾 Saved session to pool.', 'INFO', 'session-pool');
   }
 
   async tryAllSessions(page: any) { 
