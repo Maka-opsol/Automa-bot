@@ -4,12 +4,17 @@ function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function getInsertProgress() { return _deps.database?.insertProgress; }
 
 const fs = require('fs');
+const path = require('path');
 const CONFIG = require('./get-config');
 const { log, logError } = require('./logger');
-const PROGRESS_LOG_PATH = CONFIG.PROGRESS_LOG_PATH;
-const LAST_STATE_PATH = CONFIG.LAST_STATE_PATH;
+
+// Lazy path resolution — ensures we pick up env vars set by render-free-plan.ts
+// before any module load, not the frozen default from config.ts.
+function getProgressLogPath() { return process.env.PROGRESS_LOG_PATH || CONFIG.PROGRESS_LOG_PATH; }
+function getLastStatePath() { return process.env.LAST_STATE_PATH || CONFIG.LAST_STATE_PATH; }
 
 function trackProgress(entry: any) { 
+  const PROGRESS_LOG_PATH = getProgressLogPath();
   if (!PROGRESS_LOG_PATH) return;
   try {
     // Validate entry fields before writing
@@ -26,6 +31,8 @@ function trackProgress(entry: any) {
       return;
     }
     const line = JSON.stringify({ ...entry, timestamp: new Date().toISOString() }) + '\n';
+    const dir = path.dirname(PROGRESS_LOG_PATH);
+    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* best-effort */ }
     fs.appendFileSync(PROGRESS_LOG_PATH, line);
 // @ts-expect-error
     getInsertProgress(entry.action, entry.state, entry.questions_completed);
@@ -33,13 +40,15 @@ function trackProgress(entry: any) {
 }
 
 function loadLastState() { 
+  const LAST_STATE_PATH = getLastStatePath();
   try { if (fs.existsSync(LAST_STATE_PATH)) { const data = fs.readFileSync(LAST_STATE_PATH, 'utf8'); return JSON.parse(data); } } catch (e: any) { logError('Failed to load last state', e); }
   return null;
 }
 
 function saveLastState(state: any) { 
+  const LAST_STATE_PATH = getLastStatePath();
   const tmp = LAST_STATE_PATH + '.tmp';
-  try { fs.writeFileSync(tmp, JSON.stringify(state, null, 2)); fs.renameSync(tmp, LAST_STATE_PATH); } catch (e: any) { logError('Failed to save last state', e); }
+  try { const dir = path.dirname(LAST_STATE_PATH); fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(tmp, JSON.stringify(state, null, 2)); fs.renameSync(tmp, LAST_STATE_PATH); } catch (e: any) { logError('Failed to save last state', e); }
 }
 
 module.exports = { trackProgress, loadLastState, saveLastState, _injectDependencies };
