@@ -13,6 +13,8 @@ const FLAG_GROUPS = {
     optional: ['--disable-accelerated-2d-canvas', '--disable-gpu', '--disable-extensions', '--disable-infobars', '--disable-background-timer-throttling', '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding']
   },
   compatibility: {
+    // These flags are only included when explicitly opted in via allowDeprecated: true.
+    // On Render free plan (single known domain), they are unnecessary.
     deprecated: ['--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
     optional: ['--disable-notifications', '--disable-popup-blocking', '--disable-prompt-on-repost', '--metrics-recording-only']
   },
@@ -21,43 +23,147 @@ const FLAG_GROUPS = {
   }
 };
 
-const DEPRECATED_FLAGS = new Set(['--enable-features=NetworkService,NetworkServiceInProcess']);
+// All flags that Chromium has removed or will remove.
+// These are ALWAYS stripped, regardless of allowDeprecated setting.
+const DEPRECATED_FLAGS = new Set([
+  '--enable-features=NetworkService,NetworkServiceInProcess',
+  // The following are also deprecated but were historically in compatibility.deprecated.
+  // They are now in DEPRECATED_FLAGS so they get properly filtered.
+  '--disable-web-security',
+  '--disable-features=IsolateOrigins,site-per-process',
+]);
 
+// Flags that CHROMIUM_FLAGS env var commonly duplicates from FLAG_GROUPS.
+// Used for deduplication — env flags matching these prefixes are skipped
+// when the corresponding group is already included.
+const COMMON_FLAG_PREFIXES = [
+  '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+  '--disable-gpu', '--disable-extensions', '--disable-background-networking',
+  '--disable-software-rasterizer', '--no-zygote', '--single-process',
+  '--disable-default-apps', '--disable-sync', '--disable-translate',
+  '--optimize-for-size', '--js-flags=',
+];
+
+/**
+ * Check if a flag matches any common prefix (exact match for --flag, or starts-with for --flag=value).
+ */
+function _matchesCommonPrefix(flag: string): boolean {
+  for (const prefix of COMMON_FLAG_PREFIXES) {
+    if (prefix.endsWith('=')) {
+      // Prefix with = means match --js-flags=*
+      if (flag.startsWith(prefix)) return true;
+    } else {
+      // Exact match
+      if (flag === prefix) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Detect if running on Render free plan.
+ */
+function _isRenderFreePlan(): boolean {
+  return !!(process.env.RENDER_SERVICE_ID) &&
+    (!process.env.RENDER_SERVICE_TYPE || process.env.RENDER_SERVICE_TYPE === 'free');
+}
+
+/**
+ * Build the Chrome/Chromium flag array for Playwright launch.
+ *
+ * @param options.isReplit - Include Replit-specific flags
+ * @param options.allowDeprecated - Include deprecated compatibility flags (default: false).
+ *        On Render free plan, always false regardless of this option.
+ * @param options.verbose - Log flag details
+ * @param options.dedupEnvFlags - Deduplicate flags from CHROMIUM_FLAGS env var against
+ *        FLAG_GROUPS output (default: true). Prevents ~8 duplicate flags on Render.
+ * @returns string[] of Chromium flags
+ */
 function getChromeFlags(options: any = {}) { 
-  const flags = [];
-  const warnings = [];
+  const flags: string[] = [];
+  const warnings: string[] = [];
+  const isRenderFree = _isRenderFreePlan();
+  const allowDeprecated = isRenderFree ? false : (options.allowDeprecated === true);
+  const dedupEnvFlags = options.dedupEnvFlags !== false;
+
+  // Track which common prefixes have been added from FLAG_GROUPS
+  // so we can skip duplicates from CHROMIUM_FLAGS env var.
+  const addedPrefixes = new Set<string>();
+
   for (const [group, groupFlags] of Object.entries(FLAG_GROUPS)) {
-    if (group === 'replit' && !(options as any).isReplit) continue;
-// @ts-expect-error
-    if (groupFlags.required) { for (const flag of groupFlags.required) { if (!DEPRECATED_FLAGS.has(flag)) flags.push(flag); } }
-    if (groupFlags.optional) { for (const flag of groupFlags.optional) { if (!DEPRECATED_FLAGS.has(flag)) flags.push(flag); } }
-// @ts-expect-error
-    if (groupFlags.deprecated && options.allowDeprecated !== false) {
-// @ts-expect-error
+    if (group === 'replit' && !options.isReplit) continue;
+    if (groupFlags.required) {
+      for (const flag of groupFlags.required) {
+        if (!DEPRECATED_FLAGS.has(flag)) {
+          flags.push(flag);
+          addedPrefixes.add(flag);
+        }
+      }
+    }
+    if (groupFlags.optional) {
+      for (const flag of groupFlags.optional) {
+        if (!DEPRECATED_FLAGS.has(flag)) {
+          flags.push(flag);
+          addedPrefixes.add(flag);
+        }
+      }
+    }
+    if (groupFlags.deprecated && allowDeprecated) {
       for (const flag of groupFlags.deprecated) {
-        if (!DEPRECATED_FLAGS.has(flag)) { flags.push(flag); warnings.push(`Using deprecated flag: ${flag}`); } else { warnings.push(`Skipped deprecated flag: ${flag}`); }
+        if (!DEPRECATED_FLAGS.has(flag)) {
+          flags.push(flag);
+          warnings.push(`Using deprecated flag: ${flag}`);
+        } else {
+          warnings.push(`Skipped deprecated flag: ${flag}`);
+        }
       }
     }
   }
-  // v5-fix: Allow extra Chromium flags via CHROMIUM_FLAGS env var (space-separated).
-  // Used on Render free plan to limit Chromium's V8 heap and disable heavy features.
+
+  // CHROMIUM_FLAGS env var — with deduplication on Render free plan.
+  // On Render, CHROMIUM_FLAGS contains ~12 flags, ~8 of which overlap
+  // with FLAG_GROUPS. Deduplication saves ~200 bytes of argv and reduces
+  // Chromium stderr noise from duplicate-flag warnings.
   const extraFlags = process.env.CHROMIUM_FLAGS;
+  let envSkipped = 0;
   if (extraFlags) {
-    for (const flag of extraFlags.split(/\s+/).filter(Boolean)) {
+    const envFlagList = extraFlags.split(/\s+/).filter(Boolean);
+    for (const flag of envFlagList) {
+      if (dedupEnvFlags && _matchesCommonPrefix(flag) && addedPrefixes.has(flag)) {
+        envSkipped++;
+        continue;
+      }
+      // Also skip env flags that are in DEPRECATED_FLAGS
+      if (DEPRECATED_FLAGS.has(flag)) {
+        envSkipped++;
+        continue;
+      }
       flags.push(flag);
     }
-    if (options.verbose) { _getLogger().log(`Added ${extraFlags.split(/\s+/).filter(Boolean).length} flags from CHROMIUM_FLAGS env var`, 'INFO', 'chrome-flags'); }
   }
-  if (warnings.length > 0 && options.verbose) { for (const warning of warnings) { _getLogger().log(`Using deprecated flag: ${warning}`, 'WARN', 'chrome-flags'); } }
+
+  if (options.verbose) {
+    const logFn = _getLogger().log;
+    logFn(`Chrome flags: ${flags.length} total (${envSkipped} env duplicates skipped, deprecated=${allowDeprecated})`, 'INFO', 'chrome-flags');
+    if (warnings.length > 0) {
+      for (const warning of warnings) {
+        logFn(warning, 'WARN', 'chrome-flags');
+      }
+    }
+    if (isRenderFree) {
+      logFn('Render free plan detected: deprecated flags disabled, env flag dedup enabled', 'DEBUG', 'chrome-flags');
+    }
+  }
+
   return flags;
 }
 
-function addProxyFlags(flags: any, proxyConfig: any) { 
+function addProxyFlags(flags: string[], proxyConfig: any): string[] { 
   if (proxyConfig.http) { flags.push(`--proxy-server=${proxyConfig.http}`); } else if (proxyConfig.https) { flags.push(`--proxy-server=https=${proxyConfig.https}`); }
   return flags;
 }
 
-function addWindowSizeFlags(flags: any, width: any, height: any) { 
+function addWindowSizeFlags(flags: string[], width: any, height: any): string[] { 
   flags.push(`--window-size=${width},${height}`);
   return flags;
 }
