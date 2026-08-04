@@ -2,13 +2,15 @@
 
 import type { Deps } from './types/di-types';
 
-// ─── Dependency Injection ───
+// ─── Dependency Injection ───────────────────────────────────────────────────
 let _deps: Deps = {};
 function _injectDependencies(deps: Deps) { _deps = deps; }
 
-// Lazy requires to avoid top-level circular dependency chain:
+// ─── Lazy Requires (avoid top-level circular dependency chains) ─────────────
 // providers-base → logger → config (cycle risk)
 // providers-base → utils-fetch → logger (cycle risk)
+// providers-base → providers-health (new, loaded on first use)
+// providers-base → providers-serializers (new, loaded on first use)
 let _utilsFetch: any = null;
 function _getUtilsFetch() { if (!_utilsFetch) _utilsFetch = require('./utils-fetch'); return _utilsFetch; }
 let _loggerMod: any = null;
@@ -16,19 +18,26 @@ function _getLogger() { if (!_loggerMod) _loggerMod = require('./logger'); retur
 function log(...args: any[]) { return _getLogger().log(...args); }
 function safeLog(...args: any[]) { return _getLogger().safeLog(...args); }
 function logError(...args: any[]) { return _getLogger().logError(...args); }
-// Lazy CONFIG accessor — DI when available, direct require as fallback.
 function getCONFIG(): Record<string, any> { return _deps.config || require('./get-config'); }
+
+// Lazy health module — loaded on first use to avoid circular deps
+let _healthMod: any = null;
+function _getHealth() { if (!_healthMod) _healthMod = require('./providers-health'); return _healthMod; }
+
+// Lazy serializers module — loaded on first use
+let _serializersMod: any = null;
+function _getSerializers() { if (!_serializersMod) _serializersMod = require('./providers-serializers'); return _serializersMod; }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UTILITY FUNCTIONS (preserved from original)
+// ═══════════════════════════════════════════════════════════════════════════════
 
 function sanitizeErrorText(text: any, maxLength = 100) {
   if (!text) return 'Unknown error';
-  // v5-fix L1: Previous regex /[a-zA-Z0-9_\\-]{20,}/g was far too aggressive —
-  // it redacted ANY alphanumeric string >= 20 chars (filenames, URLs, stack
-  // frames, model names like "gpt-4o-mini-chat"). Now only redact strings that
-  // look like actual API keys/secrets: hex strings (32+ chars) and base64-ish
-  // strings (40+ chars, containing +/=/).
+  // v5-fix L1: Only redact strings that look like actual API keys/secrets:
+  // hex strings (32+ chars) and base64-ish strings (40+ chars, containing +/=/).
   const sanitized = text
     .replace(/(?:^|[\s:="'])[a-fA-F0-9]{32,}(?:[\s"'])/g, (match) => {
-      // Redact hex-only strings 32+ chars (likely API keys / hashes)
       return match.slice(0, -1) + '[REDACTED]';
     })
     .replace(/[A-Za-z0-9+/=]{40,}/g, '[REDACTED_BASE64]');
@@ -79,33 +88,64 @@ function validateActionResponse(obj: any, modelName: any) {
 
 const { rollbackProvider, getProviderConfig } = require('./providers-config-loader');
 
-async function callChatCompletionWithRollback(endpoint: any, apiKey: any, model: any, base64Image: any, prompt: any, providerName: any, options: any = {}) { 
-  try { return await module.exports.callChatCompletion(endpoint, apiKey, model, base64Image, prompt, options); } catch (err: any) {
-    if (err.message && (err.message.includes('HTTP_ERROR_404') || err.message.includes('HTTP_ERROR_401') || err.message.includes('HTTP_ERROR_403'))) {
-      log(`⚠️ ${providerName} returned config error (${err.message}) -- attempting rollback...`, 'WARN', 'base');
-      const rolledBack = rollbackProvider(providerName);
-      if (rolledBack) {
-        log(`↩️ Rolled back ${providerName} to previous config.`, 'INFO', 'base');
-        const newConfig = getProviderConfig(providerName);
-        return await module.exports.callChatCompletion(newConfig.endpoint, apiKey, newConfig.model, base64Image, prompt, options);
-      }
-    }
-    throw err;
-  }
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+// CORE CHAT COMPLETION — P1: Provider-Specific Serialization
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// BREAKING CHANGE from original: providerName is now a REQUIRED 6th parameter.
+// Previous signature: (endpoint, apiKey, model, base64Image, prompt, options)
+// New signature:      (endpoint, apiKey, model, base64Image, prompt, providerName, options)
+//
+// This fixes two bugs:
+//   1. callChatCompletionWithRollback received providerName but never passed it through
+//   2. OpenRouter passed 7 args but the 6th ('OpenRouter') was silently eaten as 'options'
+//
+// The providerName drives serializer selection: OpenAI-compatible providers get
+// plain-string content when no image (fixes "content must be a string" errors),
+// and array content only when the provider supports vision AND multipart.
 
-async function callChatCompletion(endpoint: any, apiKey: any, model: any, base64Image = null, prompt: any, options: any = {}) { 
-  const { maxTokens = getCONFIG().MAX_TOKENS, temperature = getCONFIG().TEMPERATURE, responseFormat = null, signal } = options;
-  const content = [{ type: 'text', text: prompt }];
-  if (base64Image) { content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } } as any); }
-  const payload = { model, max_tokens: maxTokens, temperature, messages: [{ role: 'user', content }] };
-// @ts-expect-error
-  if (responseFormat) payload.response_format = responseFormat;
-  const response = await _getUtilsFetch().fetchWithTimeout(endpoint, { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal });
+async function callChatCompletion(endpoint: string, apiKey: string, model: string, base64Image: string | null, prompt: string, providerName: string, options: any = {}) { 
+  const config = getCONFIG();
+  const maxTokens = options.maxTokens || config.MAX_TOKENS || 4096;
+  const temperature = options.temperature !== undefined ? options.temperature : (config.TEMPERATURE !== undefined ? config.TEMPERATURE : 0.1);
+  const signal = options.signal;
+  const responseFormat = options.responseFormat || null;
+
+  // ─── Serializer-based payload construction (P1) ───
+  // Each provider gets the correct content format:
+  //   - OpenAI-compatible: string when no image, array when image + provider supports multipart
+  //   - Cloudflare: always plain string
+  //   - Gemini: not handled here (uses SDK)
+  const serializers = _getSerializers();
+  const caps = serializers.getProviderCapabilities(providerName);
+
+  // If provider has a custom serializer type (e.g. 'cloudflare'), use the router.
+  // For 'openai' type or unknown, we build the payload inline for maximum control.
+  let payload: any;
+  if (caps && caps.serializerType === 'cloudflare') {
+    // Cloudflare has a completely different URL structure — this function
+    // should not be called for Cloudflare. If it is, fall back to openai format.
+    payload = _buildOpenAIPayload(providerName, model, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
+  } else if (caps && caps.serializerType === 'gemini') {
+    // Gemini uses the Google SDK — this function should not be called.
+    // Build an OpenAI-format payload as fallback (may not work but won't crash).
+    payload = _buildOpenAIPayload(providerName, model, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
+  } else {
+    // OpenAI-compatible: use provider-aware serialization
+    payload = _buildOpenAIPayload(providerName, model, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
+  }
+
+  const response = await _getUtilsFetch().fetchWithTimeout(endpoint, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal,
+  });
+
+  // ─── 429 handling with retry-after extraction ───
   if (response.status === 429) {
-    // Extract retry-after header if available
     const retryAfter = response.headers.get('retry-after');
-    let retryMs = 60000;
+    let retryMs = 45000; // P7: reduced from 60s to 45s default
     if (retryAfter) {
       const asNum = parseInt(retryAfter, 10);
       if (!isNaN(asNum)) { retryMs = asNum * 1000; }
@@ -114,125 +154,380 @@ async function callChatCompletion(endpoint: any, apiKey: any, model: any, base64
         if (!isNaN(asDate.getTime())) { retryMs = Math.max(0, asDate.getTime() - Date.now()); }
       }
     }
-    const err = new Error('RATE_LIMIT');
-// @ts-expect-error
+    const err: any = new Error('RATE_LIMIT');
     err.retryAfterMs = retryMs;
-// @ts-expect-error
     err.rateLimitRemaining = response.headers.get('x-ratelimit-remaining');
     throw err;
   }
+
+  // ─── Non-429 error handling ───
   if (!response.ok) {
     const errorText = sanitizeErrorText(await response.text().catch(() => 'Unknown error'));
     throw new Error(`HTTP_ERROR_${response.status}: ${errorText}`);
   }
-  // v6-fix: Limit response body to prevent OOM from malicious/broken providers.
+
+  // ─── Response size guard (OOM prevention) ───
   const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
   const responseText = await response.text();
   if (responseText.length > MAX_RESPONSE_BYTES) {
     throw new Error(`RESPONSE_TOO_LARGE: ${responseText.length} bytes exceeds ${MAX_RESPONSE_BYTES} limit`);
   }
+
   const data = JSON.parse(responseText);
   const rawContent = data.choices?.[0]?.message?.content;
   if (!rawContent) throw new Error('EMPTY_RESPONSE');
   return rawContent;
 }
 
+/**
+ * Build an OpenAI-compatible payload with provider-aware content formatting.
+ *
+ * Key fix (P1): content is a PLAIN STRING when there is no image, or when
+ * the provider does not support multipart content. This prevents
+ * "messages[0].content must be a string" errors from Groq, z.ai, Agnes,
+ * OpenRouter, etc.
+ *
+ * Content is an ARRAY only when: image is present AND provider supports
+ * vision AND provider supports multipart content.
+ */
+function _buildOpenAIPayload(
+  providerName: string,
+  model: string,
+  prompt: string,
+  base64Image: string | null,
+  caps: any,
+  maxTokens: number,
+  temperature: number,
+  responseFormat: any
+): any {
+  const supportsVision = caps ? caps.supportsVision : false;
+  const supportsMultipart = caps ? caps.supportsMultipartContent : false;
+  const supportsResponseFmt = caps ? caps.supportsResponseFormat : false;
+  const useVision = !!(base64Image && supportsVision);
+  const useMultipart = useVision && supportsMultipart;
 
-async function retryWithBackoff(fn: () => Promise<unknown>, { maxRetries = getCONFIG().RETRY_ATTEMPTS, baseDelay = getCONFIG().RETRY_BASE_DELAY_MS, maxDelay = 30000} = {}) {
-  const safeMaxRetries = Math.max(1, Math.min(Math.floor(maxRetries) || 3, 10));
+  let userContent: string | Array<{type: string; text?: string; image_url?: {url: string}}>;
+  if (useMultipart) {
+    // Array format: text part + image part
+    userContent = [
+      { type: 'text', text: prompt },
+      { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
+    ];
+  } else {
+    // Plain string format (always safe for OpenAI-compatible APIs)
+    // If we have an image but provider doesn't support multipart,
+    // the image is silently dropped — the prompt text still guides the model.
+    userContent = prompt;
+  }
+
+  const payload: any = {
+    model,
+    max_tokens: maxTokens,
+    temperature,
+    messages: [{ role: 'user', content: userContent }],
+  };
+
+  // Only add response_format if provider supports it AND it was requested
+  // (P1 fix: some providers like Groq don't support this and return 400)
+  if (responseFormat && supportsResponseFmt) {
+    payload.response_format = responseFormat;
+  }
+
+  return payload;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROLLBACK WRAPPER — Updated to pass providerName through
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// On 404/401/403, attempts to roll back to the previous model config.
+// Now uses classifyError from providers-health for consistent error handling.
+
+async function callChatCompletionWithRollback(endpoint: string, apiKey: string, model: string, base64Image: string | null, prompt: string, providerName: string, options: any = {}) { 
+  try {
+    return await _callChatCompletionInternal(endpoint, apiKey, model, base64Image, prompt, providerName, options);
+  } catch (err: any) {
+    const health = _getHealth();
+    const classified = health.classifyError(err);
+    // Only attempt rollback for config-related errors
+    if (classified.category === 'model_removed' || classified.category === 'auth_failure') {
+      log(`\u26a0\ufe0f ${providerName} returned ${classified.category} (${err.message}) -- attempting rollback...`, 'WARN', 'base');
+      const rolledBack = rollbackProvider(providerName);
+      if (rolledBack) {
+        log(`\u21a9\ufe0f Rolled back ${providerName} to previous config.`, 'INFO', 'base');
+        const newConfig = getProviderConfig(providerName);
+        return await _callChatCompletionInternal(newConfig.endpoint, apiKey, newConfig.model, base64Image, prompt, providerName, options);
+      }
+      // If rollback not possible and model was removed, retire the provider
+      if (classified.category === 'model_removed') {
+        const registry = require('./providers-registry');
+        if (registry.retireProvider) {
+          registry.retireProvider(providerName, `Model ${model} not found (404)`);
+        }
+      }
+    }
+    throw err;
+  }
+}
+
+/**
+ * Internal call that wraps callChatCompletion with protocol chameleon support.
+ * Separated from the rollback wrapper so the chameleon only runs once per attempt.
+ */
+async function _callChatCompletionInternal(endpoint: string, apiKey: string, model: string, base64Image: string | null, prompt: string, providerName: string, options: any = {}) {
+  try {
+    return await callChatCompletion(endpoint, apiKey, model, base64Image, prompt, providerName, options);
+  } catch (err: any) {
+    // Protocol chameleon: attempt 422 recovery
+    const protocolChameleon = getProtocolChameleon();
+    if (err.message && err.message.includes('HTTP_ERROR_422') && protocolChameleon) {
+      log(`422 error, attempting protocol adaptation for ${providerName}`, 'WARN', 'base');
+      try {
+        const pUrls = getCONFIG().PROTOCOL_CHAMELEON_SCHEMA_URLS;
+        const schemaProvider = pUrls ? Object.keys(pUrls).find((p: string) => endpoint.includes(p)) || 'unknown' : 'unknown';
+        const adapted = await protocolChameleon.adapt(endpoint, apiKey, model, { base64Image, prompt, options }, schemaProvider);
+        if (adapted) { log('Protocol adaptation succeeded.', 'INFO', 'base'); return adapted; }
+      } catch (adaptErr: any) { logError('Protocol adaptation failed', adaptErr); }
+    }
+    throw err;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMART RETRY — P7: Error-Type-Aware Retry with Backoff
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Replaces the old retryWithBackoff() which retried ALL errors equally.
+// Now uses classifyError + getRetryDecision from providers-health to:
+//   - Never retry 400/404/422 (permanent errors)
+//   - One retry for 401 (credential refresh window)
+//   - Honors retry-after for 429
+//   - Exponential backoff for 5xx
+//   - One retry only for unknown errors
+
+async function retryWithBackoff(fn: () => Promise<unknown>, opts: any = {}) {
+  const config = getCONFIG();
+  const fallbackMax = Math.max(1, Math.min(Math.floor(config.RETRY_ATTEMPTS) || 3, 10));
+  const fallbackDelay = config.RETRY_BASE_DELAY_MS || 1000;
+  // Allow caller to specify providerName for health-aware retries
+  const providerName = opts.providerName || 'unknown';
+  const maxRetries = opts.maxRetries || fallbackMax;
+  const baseDelay = opts.baseDelay || fallbackDelay;
+  const maxDelay = opts.maxDelay || 30000;
+  const health = _getHealth();
+
   let attempt = 0;
   while (true) {
-    try { return await fn(); } catch (err: any) {
-      attempt++;
-      if (attempt >= safeMaxRetries) throw err;
-      let delay;
-      if (err.retryAfterMs && typeof err.retryAfterMs === 'number' && err.retryAfterMs > 0) {
-        delay = Math.min(err.retryAfterMs + Math.random() * 1000, maxDelay);
-      } else {
-        delay = Math.min(baseDelay * Math.pow(2, attempt - 1), maxDelay);
+    try {
+      const result = await fn();
+      // Record success for health tracking if providerName is known
+      if (providerName !== 'unknown') {
+        // Don't record here — the caller (safeCall or provider) records with latency
       }
-      log(`Retry ${attempt}/${maxRetries} after ${Math.round(delay)}ms due to: ${err.message}`, 'WARN', 'base');
+      return result;
+    } catch (err: any) {
+      attempt++;
+      const classified = health.classifyError(err);
+      const decision = health.getRetryDecision(classified, attempt - 1); // 0-indexed attempt
+
+      if (!decision.shouldRetry || attempt >= Math.min(maxRetries, decision.maxRetries) + 1) {
+        // Structured log (P20)
+        log(`Retry exhausted for ${providerName}: ${decision.reason} (attempt ${attempt}/${decision.maxRetries})`, 'WARN', 'base');
+        throw err;
+      }
+
+      const delay = Math.min(decision.delayMs + Math.random() * 300, maxDelay);
+      log(`Retry ${attempt}/${decision.maxRetries} for ${providerName} after ${Math.round(delay)}ms: ${decision.reason}`, 'WARN', 'base');
       await new Promise(r => setTimeout(r, delay));
     }
   }
 }
 
-const circuitBreakers = new Map();
+// ═══════════════════════════════════════════════════════════════════════════════
+// SAFE CALL — P22: Circuit Breaker Integration + P5: Health Recording
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The main entry point for the tribunal. Wraps provider calls with:
+//   1. Circuit breaker check (skip provider if open)
+//   2. Timeout with AbortController
+//   3. Smart retry with error-type awareness
+//   4. Health recording (success/failure → ProviderHealth + CircuitBreaker)
+//   5. Structured logging (P20)
 
-function getCircuitBreaker(url: any) { 
-  if (!circuitBreakers.has(url)) { circuitBreakers.set(url, { failures: 0, lastFailure: 0, state: 'closed' }); }
-  return circuitBreakers.get(url);
-}
+async function safeCall(fn: (signal: AbortSignal) => Promise<unknown>, context: string, opts: any = {}) {
+  const config = getCONFIG();
+  const timeoutMs = opts.timeoutMs || config.REQUEST_TIMEOUT_MS || 30000;
+  const maxRetries = opts.maxRetries || config.RETRY_ATTEMPTS || 3;
+  const baseDelay = opts.baseDelay || config.RETRY_BASE_DELAY_MS || 1000;
+  const providerName = opts.url || 'unknown';
+  const externalSignal = opts.signal || null;
+  const health = _getHealth();
 
-// v6-fix: Prune stale circuit breaker entries to prevent unbounded Map growth.
-// Over 5 years with dynamic provider discovery, dead entries accumulate.
-function _pruneStaleCircuitBreakers() {
-  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  for (const [url, entry] of circuitBreakers.entries()) {
-    if (entry.state === 'closed' && entry.failures === 0 && entry.lastFailure < cutoff) {
-      circuitBreakers.delete(url);
-    }
+  // ─── P22: Circuit breaker pre-check ───
+  if (!health.isProviderAvailable(providerName)) {
+    const snapshot = health.getHealthSnapshot(providerName);
+    const reason = snapshot.disabled ? 'disabled' :
+      snapshot.circuitState === 'open' ? `circuit open (${Math.round(snapshot.cooldownRemainingMs || 0)}ms remaining)` :
+      'on cooldown';
+    throw new Error(`Provider ${providerName} unavailable: ${reason}`);
   }
-}
-setInterval(_pruneStaleCircuitBreakers, 60 * 60 * 1000).unref();
 
-async function safeCall(fn: (signal: AbortSignal) => Promise<unknown>, context: string, { timeoutMs = getCONFIG().REQUEST_TIMEOUT_MS, maxRetries = getCONFIG().RETRY_ATTEMPTS, baseDelay = getCONFIG().RETRY_BASE_DELAY_MS, url = 'unknown', signal: externalSignal }: any = {}) {
-  const cb = getCircuitBreaker(url);
-  if (cb.state === 'open') {
-    const elapsed = Date.now() - cb.lastFailure;
-    if (elapsed < getCONFIG().CIRCUIT_BREAKER_TIMEOUT_MS) { throw new Error(`Circuit breaker open for ${url}`); } else { cb.state = 'half-open'; }
-  }
+  const cb = health.getCircuitBreaker(providerName);
   let attempt = 0;
   const safeMaxRetries = Math.max(1, Math.min(Math.floor(maxRetries) || 3, 10));
-  while (attempt <= safeMaxRetries) {
+  const startTime = Date.now();
+
+  while (attempt < safeMaxRetries) {
     attempt++;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-    let externalHandler;
+    let externalHandler: (() => void) | null = null;
+
     if (externalSignal) {
-      if (externalSignal.aborted) { clearTimeout(timeoutId); throw new Error('Aborted'); }
+      if (externalSignal.aborted) {
+        clearTimeout(timeoutId);
+        // Record as timeout since we never sent the request
+        health.recordCallResult(providerName, false, Date.now() - startTime, new Error('Aborted'));
+        throw new Error('Aborted');
+      }
       externalHandler = () => controller.abort();
       externalSignal.addEventListener('abort', externalHandler, { once: true });
     }
+
     try {
       const result = await fn(controller.signal);
-      cb.failures = 0; cb.state = 'closed'; clearTimeout(timeoutId);
+      const latency = Date.now() - startTime;
+      clearTimeout(timeoutId);
       if (externalSignal && externalHandler) externalSignal.removeEventListener('abort', externalHandler);
+
+      // ─── P5: Record success ───
+      health.recordCallResult(providerName, true, latency);
+      cb.recordSuccess();
+
+      // ─── P20: Structured success log ───
+      const healthScore = health.getProviderHealth(providerName).healthScore();
+      log(health.formatProviderLog(providerName, '', latency, true, null, attempt - 1, healthScore), 'INFO', 'base');
+
       return result;
     } catch (err: any) {
       clearTimeout(timeoutId);
       if (externalSignal && externalHandler) externalSignal.removeEventListener('abort', externalHandler);
-      cb.failures++; cb.lastFailure = Date.now();
-      if (externalSignal?.aborted) throw err;
-      if (cb.failures >= getCONFIG().CIRCUIT_BREAKER_FAILURE_THRESHOLD) { cb.state = 'open'; log(`🔴 Circuit opened for ${url} (${cb.failures} failures)`, 'ERROR', 'base'); }
-      if (attempt >= safeMaxRetries) throw err;
-      const base = baseDelay * Math.pow(2, attempt - 1);
-      const jitter = Math.random() * 200;
-      const delay = Math.min(base + jitter, 30000);
-      log(`🔄 Retry ${attempt}/${maxRetries} for ${context} after ${delay}ms`, 'WARN', 'base');
+
+      const latency = Date.now() - startTime;
+      if (externalSignal?.aborted) {
+        health.recordCallResult(providerName, false, latency, err);
+        throw err;
+      }
+
+      // ─── P6 + P7: Classify and decide retry ───
+      const classified = health.classifyError(err);
+      health.recordCallResult(providerName, false, latency, err);
+      cb.recordFailure(classified.category);
+
+      // ─── P20: Structured failure log ───
+      const healthScore = health.getProviderHealth(providerName).healthScore();
+      log(health.formatProviderLog(providerName, '', latency, false, classified.category, attempt - 1, healthScore), 'WARN', 'base');
+
+      // ─── Check if provider should be retired ───
+      if (classified.retireProvider) {
+        log(`\ud83d\uded1 Retiring ${providerName}: ${classified.description}`, 'ERROR', 'base');
+        try {
+          const registry = require('./providers-registry');
+          if (registry.retireProvider) registry.retireProvider(providerName, classified.description);
+        } catch {}
+        throw err;
+      }
+
+      // ─── Check if provider should be disabled ───
+      if (classified.disableProvider) {
+        log(`\u26d4 Disabling ${providerName}: ${classified.description}`, 'ERROR', 'base');
+        // Health module already disables via recordCallResult
+        throw err;
+      }
+
+      // ─── P7: Smart retry decision ───
+      const decision = health.getRetryDecision(classified, attempt - 1);
+      if (!decision.shouldRetry || attempt >= safeMaxRetries) {
+        throw err;
+      }
+
+      const delay = Math.min(decision.delayMs + Math.random() * 300, 30000);
+      log(`\ud83d\udd04 Retry ${attempt}/${safeMaxRetries} for ${context} after ${Math.round(delay)}ms: ${decision.reason}`, 'WARN', 'base');
       await new Promise(r => setTimeout(r, delay));
     }
   }
 }
 
-function classifyError(err: unknown) { 
-  const msg = (err && typeof err === 'object' && (err as any).message) || (typeof err === 'string' ? err : '');
-  if (msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT') || msg.includes('Timeout') || msg.includes('RATE_LIMIT')) return { code: 'transient', retryable: true, healable: false };
-  if (msg.includes('Invalid API key') || msg.includes('HTTP_ERROR_401') || msg.includes('HTTP_ERROR_403')) return { code: 'fatal', retryable: false, healable: false };
-  if (msg.includes('browser disconnected') || msg.includes('Browser disconnected')) return { code: 'transient', retryable: true, healable: false };
-  return { code: 'unknown', retryable: true, healable: true };
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR CLASSIFICATION — P6: Delegates to providers-health
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Kept for backward compatibility. Returns the same shape as before
+// { code, retryable, healable } but now backed by the 11-category classifier.
+// New code should use providers-health.classifyError() directly for the full
+// ClassifiedError with category, disableProvider, retireProvider, retryAfterMs.
+
+function classifyError(err: unknown) {
+  const health = _getHealth();
+  const classified = health.classifyError(err);
+  // Map new categories to old codes for backward compat
+  switch (classified.category) {
+    case 'malformed':
+    case 'bad_format':
+    case 'model_removed':
+      return { code: 'fatal', retryable: false, healable: false };
+    case 'auth_failure':
+      return { code: 'fatal', retryable: false, healable: true };
+    case 'rate_limited':
+    case 'server_error':
+    case 'timeout':
+    case 'connection':
+    case 'empty_response':
+      return { code: 'transient', retryable: true, healable: false };
+    case 'too_large':
+      return { code: 'fatal', retryable: false, healable: false };
+    default:
+      return { code: 'unknown', retryable: classified.retryable, healable: true };
+  }
 }
 
-class RequestCoalescer {
-  maxTokens: any;
-  temperature: any;
-  responseFormat: any;
-  signal: any;
-  response_format: any;
-  retryAfterMs: any;
-  rateLimitRemaining: any;
-  pending: any;
+// ═══════════════════════════════════════════════════════════════════════════════
+// CIRCUIT BREAKER — P22: Delegates to providers-health
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Kept for backward compatibility. Returns a plain object with the same shape
+// as the old inline circuit breaker (failures, lastFailure, state) but backed
+// by the full CircuitBreaker class from providers-health.
+//
+// NOTE: The old Map-based circuit breakers have been removed. All state is now
+// in providers-health.ts. This function provides a compatibility shim.
 
+const _compatCircuitBreakers = new Map<string, any>();
+
+function getCircuitBreaker(urlOrName: string) {
+  if (!_compatCircuitBreakers.has(urlOrName)) {
+    // Create a compatibility shim backed by the real CircuitBreaker
+    const health = _getHealth();
+    const realCb = health.getCircuitBreaker(urlOrName);
+    const shim: any = {
+      get state() { return realCb.getState(); },
+      set state(v: string) { /* no-op: state is managed by real CB */ },
+      get failures() { return health.getProviderHealth(urlOrName).getConsecutiveFailures(); },
+      set failures(v: number) { /* no-op: managed by real CB */ },
+      get lastFailure() { return 0; },
+      set lastFailure(v: number) { /* no-op */ },
+    };
+    _compatCircuitBreakers.set(urlOrName, shim);
+  }
+  return _compatCircuitBreakers.get(urlOrName);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REQUEST COALESCER (preserved from original)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class RequestCoalescer {
+  pending: any;
   constructor() { this.pending = new Map(); }
   async execute(key: any, factory: any, ttlMs = 5000) { 
     if (this.pending.has(key)) return this.pending.get(key);
@@ -244,9 +539,10 @@ class RequestCoalescer {
 
 const coalescer = new RequestCoalescer();
 
-// v5-fix H4: Lazy-load protocol chameleon on first use instead of at module
-// evaluation time. Previously `getCONFIG().ENABLE_PROTOCOL_CHAMELEON` ran
-// before DI injection, creating an implicit ordering dependency.
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROTOCOL CHAMELEON — Lazy loader (preserved from original)
+// ═══════════════════════════════════════════════════════════════════════════════
+
 let _protocolChameleon: any = null;
 let _protocolChameleonChecked = false;
 function getProtocolChameleon() {
@@ -259,35 +555,32 @@ function getProtocolChameleon() {
   return _protocolChameleon;
 }
 
-const _originalCallChatCompletion = callChatCompletion;
-// @ts-expect-error
-callChatCompletion = async function(endpoint: any, apiKey: any, model: any, base64Image: any, prompt: any, options: any = {}) {
-  try { return await _originalCallChatCompletion(endpoint, apiKey, model, base64Image, prompt, options); } catch (err: any) {
-    const protocolChameleon = getProtocolChameleon();
-    if (err.message && err.message.includes('HTTP_ERROR_422') && protocolChameleon) {
-      log(`422 error, attempting protocol adaptation for ${endpoint}`, 'WARN', 'base');
-      try {
-        const providerName = Object.keys(getCONFIG().PROTOCOL_CHAMELEON_SCHEMA_URLS).find(p => endpoint.includes(p)) || 'unknown';
-        const adapted = await protocolChameleon.adapt(endpoint, apiKey, model, { base64Image, prompt, options }, providerName);
-        if (adapted) { log('Protocol adaptation succeeded.', 'INFO', 'base'); return adapted; }
-      } catch (adaptErr: any) { logError('Protocol adaptation failed', adaptErr); }
-    }
-    throw err;
-  }
-};
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXPORTS
+// ═══════════════════════════════════════════════════════════════════════════════
 
 module.exports = {
+  // Fetch utility (lazy getter)
   get fetchWithTimeout() { return _getUtilsFetch().fetchWithTimeout; },
+  // Utilities (unchanged)
   sanitizeErrorText,
   extractJSON,
   validateActionResponse,
+  // Core completion (P1: now requires providerName as 6th arg)
   callChatCompletion,
   callChatCompletionWithRollback,
+  // Config access (unchanged)
   getProviderConfig,
+  // Retry (P7: now uses smart retry from providers-health)
   retryWithBackoff,
+  // Safe call (P22: now uses circuit breakers + health recording from providers-health)
   safeCall,
+  // Error classification (P6: delegates to providers-health, backward-compat shape)
   classifyError,
+  // Circuit breaker (P22: delegates to providers-health, backward-compat shim)
   getCircuitBreaker,
+  // Coalescer (unchanged)
   coalescer,
+  // DI
   _injectDependencies,
 };
