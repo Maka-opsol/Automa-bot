@@ -564,3 +564,184 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
       features: 'all-enabled',
       workers: 'in-process',
     };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(health));
+    return;
+  }
+
+  // \u2500\u2500 Status \u2500\u2500
+  if (pathname === '/api/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(getStats()));
+    return;
+  }
+
+  // \u2500\u2500 Metrics \u2500\u2500
+  if (pathname === '/api/metrics') {
+    const metricsMod = container.get('metrics', { required: false });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(metricsMod?.metrics?.getSummary?.() || {}));
+    return;
+  }
+
+  // \u2500\u2500 Container health \u2500\u2500
+  if (pathname === '/api/container') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(getContainerHealth()));
+    return;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.end('Not found');
+});
+
+// \u2500\u2500 Start HTTP server FIRST (Render requirement) \u2500\u2500
+const PORT = parseInt(process.env.PORT || '10000', 10);
+server.listen(PORT, '0.0.0.0', () => {
+  log(`MathU Bot v6 \u2014 Render Free Plan (all features) listening on port ${PORT}`, 'INFO', 'render-free-plan');
+  log(`Memory: warn=${CONFIG.MEMORY_WARNING_THRESHOLD_MB}MB, restart=${CONFIG.MEMORY_RESTART_THRESHOLD_MB}MB, rss_hard=${RSS_HARD_LIMIT_MB}MB, workers=in-process`, 'INFO', 'render-free-plan');
+});
+
+// \u2500\u2500 Heartbeat file \u2500\u2500
+setInterval(() => {
+  if (CONFIG.HEARTBEAT_FILE) {
+    try { fs.writeFileSync(CONFIG.HEARTBEAT_FILE, String(Date.now())); } catch { /* best-effort */ }
+  }
+}, CONFIG.HEARTBEAT_INTERVAL_MS).unref();
+
+// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// BACKGROUND TASKS (all enabled)
+// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+
+// IP check
+if (CONFIG.ENABLE_IP_CHECK) {
+  container.get('ipCheck', { required: false })?.checkIpLocation?.().catch(() => {});
+}
+
+// DB backup
+container.get('dbBackup', { required: false })?.startScheduledBackup?.();
+
+// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// MODEL EVOLUTION
+// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// BUG FIX (Response 18): Model evolution now has a dedicated timeout
+// and mutex guard. On Render's slow CPU, the evolution process
+// (which calls multiple provider APIs) can easily exceed 5 minutes.
+// Without a timeout, it blocks the next check cycle indefinitely.
+// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+
+const EVOLUTION_INTERVAL_DAYS = parseInt(process.env.EVOLUTION_INTERVAL_DAYS || '30', 10);
+// BUG FIX (Response 18): Cap evolution runtime to 4 minutes.
+// On Render's slow CPU, model discovery across multiple providers
+// can stall. This prevents the isEvolving mutex from being held forever.
+const EVOLUTION_TIMEOUT_MS = 4 * 60 * 1000;
+let isEvolving = false;
+let _evolutionStartTime = 0;
+
+async function checkAndRunEvolution() {
+  if (isEvolving) {
+    // BUG FIX (Response 18): If evolution has been running for too long,
+    // forcibly release the mutex. This handles the case where the
+    // evolution promise never resolves (stalled network, unhandled
+    // rejection swallowed by .catch()).
+    if (_evolutionStartTime > 0 && (Date.now() - _evolutionStartTime) > EVOLUTION_TIMEOUT_MS) {
+      log(
+        `Model evolution stuck for ${Math.round((Date.now() - _evolutionStartTime) / 1000)}s \u2014 releasing mutex`,
+        'ERROR',
+        'render-free-plan'
+      );
+      isEvolving = false;
+      _evolutionStartTime = 0;
+      if (CONFIG.ALERT_ON_ERROR) {
+        try { sendAlert('Model evolution timed out \u2014 mutex released'); } catch { /* non-critical */ }
+      }
+    } else {
+      return;
+    }
+  }
+  try {
+    const row = selectCalibration.get('last_evolution_timestamp');
+    const lastRun = row ? parseInt(row.value, 10) : 0;
+    const daysSince = (Date.now() - lastRun) / (1000 * 60 * 60 * 24);
+    if (daysSince >= EVOLUTION_INTERVAL_DAYS) {
+      log(`Running model evolution (${daysSince.toFixed(1)} days since last)...`, 'INFO', 'render-free-plan');
+      isEvolving = true;
+      _evolutionStartTime = Date.now();
+      try {
+        const modelEvolution = container.get('modelEvolutionAdvanced', { required: false });
+        if (modelEvolution) {
+          // BUG FIX (Response 18): Race evolution against timeout so it
+          // can't block forever even if evolveModelsAdvanced never resolves.
+          const evolutionPromise = modelEvolution.evolveModelsAdvanced();
+          const timeoutPromise = new Promise<null>(resolve =>
+            setTimeout(() => resolve(null), EVOLUTION_TIMEOUT_MS)
+          );
+          const result = await Promise.race([evolutionPromise, timeoutPromise]);
+          if (result === null) {
+            log('Model evolution timed out', 'WARN', 'render-free-plan');
+          } else {
+            log(`Model evolution: ${result.success ? 'success' : result.message}`, 'INFO', 'render-free-plan');
+          }
+        }
+        upsertCalibration.run('last_evolution_timestamp', String(Date.now()), Date.now());
+      } catch (err: any) {
+        logError('Model evolution failed', err);
+      } finally {
+        isEvolving = false;
+        _evolutionStartTime = 0;
+      }
+    }
+  } catch (err: any) { logError('Evolution check failed', err); }
+}
+
+// BUG FIX (Response 18): First evolution check delayed to 5 min to avoid
+// startup contention. Subsequent checks every 6 hours.
+// Both timers .unref()'d so they don't prevent clean shutdown.
+setTimeout(() => checkAndRunEvolution().catch(() => {}), 5 * 60 * 1000).unref();
+setInterval(() => checkAndRunEvolution().catch(() => {}), 6 * 60 * 60 * 1000).unref();
+
+// Template cache pruning
+// NOTE: 32-bit signed int max = 2_147_483_647 ms (~24.85 days).
+// 30 days = 2_592_000_000 ms which OVERFLOWS, causing the interval
+// to fire every 1ms (Node clamps the overflow to 1).  Cap at 7 days.
+const PRUNE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days (safe for 32-bit)
+if (typeof pruneTemplateCache === 'function') {
+  try {
+    setTimeout(() => { pruneTemplateCache(); }, 3600000).unref();
+    setInterval(() => { pruneTemplateCache(); }, PRUNE_INTERVAL_MS).unref();
+  } catch { /* best-effort */ }
+}
+
+// Autonomous features
+container.get('reflection', { required: false })?.startReflectionScheduler?.();
+container.get('strategyVariants', { required: false })?.runExperimentScheduler?.();
+container.get('anomalyDetector', { required: false })?.start?.();
+container.get('diary', { required: false })?.start?.();
+container.get('coordinator', { required: false })?.startCoordinator?.();
+container.get('resourceManager', { required: false })?.start?.();
+
+// Health checks
+container.get('failsafeCoordinator', { required: false })?.startHealthChecks?.(60000);
+
+// Remote config
+container.get('remoteConfig', { required: false })?.loadRemoteConfig?.().catch(() => {});
+
+// Startup smoke tests
+const smokeResult = runStartupSmokeTests();
+if (!smokeResult.passed && CONFIG.ALERT_ON_ERROR) {
+  const failed = smokeResult.checks.filter((c: any) => !c.passed).map((c: any) => `${c.id}(${c.detail || '?'})`).join('; ');
+  try { sendAlert(`Startup smoke tests failed: ${failed}`); } catch { /* non-critical */ }
+}
+
+// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// START THE DAEMON (non-blocking \u2014 runs in background)
+// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+
+log('Starting daemon loop (background, all features)...', 'INFO', 'render-free-plan');
+startDaemon().catch(err => {
+  logError('Fatal daemon error', err);
+  if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Fatal daemon error: ${err.message}`); } catch { /* non-critical */ }
+  log('Daemon crashed \u2014 will restart on next cycle iteration', 'ERROR', 'render-free-plan');
+});
+
+log('MathU Bot v6 \u2014 Render Free Plan fully started (all features, no workers)', 'INFO', 'render-free-plan');
