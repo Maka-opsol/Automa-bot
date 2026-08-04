@@ -1,34 +1,128 @@
 'use strict';
 
+// ═════════════════════════════════════════════════════════════
+// Protocol Chameleon — Adapts request payloads to match provider-specific
+// API schemas (OpenAI, Gemini, Anthropic, etc.).
+//
+// Render-aware: All external calls wrapped in Promise.race timeouts.
+// Schema cache uses in-memory Map to avoid repeated DB reads.
+// ═════════════════════════════════════════════════════════════
+
 let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
-function getCONFIG(): Record<string, any> { return _deps.config || require('./get-config'); }
+function _getCONFIG(): Record<string, any> {
+  return _deps.config || (() => { try { return require('./get-config'); } catch { return {}; } })();
+}
+function _getDatabase(): any {
+  return _deps.database || (() => { try { return require('./database'); } catch { return null; } })();
+}
+
+// BUG FIX (Response 19): Lazy-load providers-base to avoid circular require
+// at module scope. Previous code had it at top level.
+let _providersBase: any = null;
+let _providersBaseChecked = false;
+function _getProvidersBase() {
+  if (!_providersBaseChecked) {
+    _providersBaseChecked = true;
+    try { _providersBase = require('./providers-base'); } catch { _providersBase = null; }
+  }
+  return _providersBase;
+}
 
 const { fetchWithTimeout, fetchJSON } = require('./utils-fetch');
 const { log, logError } = require('./logger');
-function getDatabase() { return _deps.database || require('./database'); }
-const { callChatCompletion } = require('./providers-base');
+
+// ═════════════════════════════════════════════════════════════
+// Constants
+// ═════════════════════════════════════════════════════════════
+
+/** Time-to-live for in-memory schema cache (ms). */
+const SCHEMA_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+/** Timeout for HTTP requests (ms). */
+const SCHEMA_FETCH_TIMEOUT_MS = 10 * 1000; // 10 seconds
+
+/** Timeout for adapted provider calls (ms). */
+const ADAPTED_CALL_TIMEOUT_MS = 30 * 1000; // 30 seconds
+
+/** Maximum number of schemas cached in memory. */
+const MAX_SCHEMA_CACHE_SIZE = 20;
+
+// BUG FIX (Response 19): In-memory schema cache to avoid repeated DB reads.
+// Previous code called getDatabase().selectProviderSchema on every adapt() call.
+// On Render's slow I/O, this matters.
+const _schemaCache = new Map<string, { schema: any; loadedAt: number }>();
+
+function _getCachedSchema(providerName: string): any | null {
+  const entry = _schemaCache.get(providerName);
+  if (!entry) return null;
+  const age = Date.now() - entry.loadedAt;
+  if (age > SCHEMA_CACHE_TTL_MS) {
+    _schemaCache.delete(providerName);
+    return null;
+  }
+  return entry.schema;
+}
+
+function _setCachedSchema(providerName: string, schema: any): void {
+  // Evict oldest entry if cache is full
+  if (_schemaCache.size >= MAX_SCHEMA_CACHE_SIZE) {
+    const oldest = _schemaCache.keys().next().value;
+    if (oldest !== undefined) _schemaCache.delete(oldest);
+  }
+  _schemaCache.set(providerName, { schema, loadedAt: Date.now() });
+}
+
+// ═════════════════════════════════════════════════════════════
+// Field alias map for common API variations
+// ═════════════════════════════════════════════════════════════
+
+const FIELD_ALIASES: Record<string, string[]> = {
+  'max_tokens': ['maxTokens', 'max_new_tokens', 'maxNewTokens', 'max_completion_tokens', 'maxCompletionTokens'],
+  'temperature': ['temp'],
+  'top_p': ['topP'],
+  'frequency_penalty': ['frequencyPenalty'],
+  'presence_penalty': ['presencePenalty'],
+  'stop': ['stop_sequences', 'stopSequences'],
+};
 
 class ProtocolChameleon {
   image: any;
 
-  async adapt(endpoint: any, apiKey: any, model: any, requestData: any, providerName: any) { 
+  /**
+   * Main entry point: adapt a request to a provider's schema.
+   * Returns a normalized action response, or null on failure.
+   */
+  async adapt(endpoint: any, apiKey: any, model: any, requestData: any, providerName: any) {
     log(`Adapting protocol for ${providerName}...`, 'INFO', 'chameleon');
     const schema = await this.getSchema(providerName);
-    if (!schema) { log(`No schema found for ${providerName}, cannot adapt.`, 'WARN', 'chameleon'); return null; }
+    if (!schema) {
+      log(`No schema found for ${providerName}, cannot adapt.`, 'WARN', 'chameleon');
+      return null;
+    }
     const newPayload = this.rebuildPayload(requestData, schema);
     try {
       // Apply schema-driven adaptations before calling the standard completion function
       if (newPayload.options._useGeminiFormat || newPayload.options._usePromptField || newPayload.options._forceTextContent) {
         return await this._callAdapted(endpoint, apiKey, model, newPayload, providerName);
       }
-      const result = await callChatCompletion(endpoint, apiKey, model, newPayload.base64Image, newPayload.prompt, newPayload.options);
+      const base = _getProvidersBase();
+      if (!base?.callChatCompletion) {
+        log('providers-base.callChatCompletion not available', 'WARN', 'chameleon');
+        return null;
+      }
+      const result = await base.callChatCompletion(endpoint, apiKey, model, newPayload.base64Image, newPayload.prompt, newPayload.options);
       return result;
-    } catch (err: any) { logError('Adapted request still failed', err); return null; }
+    } catch (err: any) {
+      logError('Adapted request still failed', err);
+      return null;
+    }
   }
 
   /**
    * Build and send a request using a non-standard message format detected from the schema.
+   * BUG FIX (Response 19): Response body consumption is now guarded — if response.text()
+   * fails, we don't hang. Also added timeout via Promise.race.
    */
   async _callAdapted(endpoint: any, apiKey: any, model: any, payload: any, providerName: any) {
     const { base64Image, prompt, options } = payload;
@@ -37,41 +131,61 @@ class ProtocolChameleon {
 
     if (options._useGeminiFormat) {
       // Google Gemini style: contents[] with parts[]
-      const parts = [{ text: prompt }];
+      const parts: any[] = [{ text: prompt }];
       if (base64Image) {
         const imageBlockKey = options._imageBlockKey || 'inline_data';
         const imageData = options._useSourceWrapper
           ? { source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } }
           : { mime_type: 'image/jpeg', data: base64Image };
-        (parts as any[]).push({ [imageBlockKey]: imageData });
+        parts.push({ [imageBlockKey]: imageData });
       }
-      body = { contents: [{ role: 'user', parts }], generationConfig: { maxOutputTokens: options.maxTokens, temperature: options.temperature } };
+      body = {
+        contents: [{ role: 'user', parts }],
+        generationConfig: { maxOutputTokens: options.maxTokens, temperature: options.temperature },
+      };
     } else if (options._usePromptField) {
       // Legacy prompt-field style
       body = { prompt, max_tokens: options.maxTokens, temperature: options.temperature };
-// @ts-expect-error
-      if (base64Image) body.image = base64Image;
+      if (base64Image) (body as any).image = base64Image;
     } else {
       // Fallback: standard OpenAI format
-      const content = [{ type: 'text', text: prompt }];
+      const content: any[] = [{ type: 'text', text: prompt }];
       if (base64Image) {
         const imageBlockKey = options._imageBlockKey || 'image_url';
         const imageBlock = options._useSourceWrapper
           ? { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } }
           : { type: imageBlockKey, image_url: { url: `data:image/jpeg;base64,${base64Image}` } };
-        (content as any[]).push(imageBlock);
+        content.push(imageBlock);
       }
-      body = { model, max_tokens: options.maxTokens || 4096, temperature: options.temperature || 0.1, messages: [{ role: 'user', content }] };
+      body = {
+        model,
+        max_tokens: options.maxTokens || 4096,
+        temperature: options.temperature || 0.1,
+        messages: [{ role: 'user', content }],
+      };
     }
 
-    const response = await require('./utils-fetch').fetchWithTimeout(
+    // BUG FIX (Response 19): Race the HTTP call against a timeout so
+    // we can't hang forever on Render's slow network.
+    const fetchPromise = fetchWithTimeout(
       endpoint,
       { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal },
-      30000
+      ADAPTED_CALL_TIMEOUT_MS,
     );
+    const timeoutPromise = new Promise<null>(resolve =>
+      setTimeout(() => resolve(null), ADAPTED_CALL_TIMEOUT_MS + 5000),
+    );
+    const response = await Promise.race([fetchPromise, timeoutPromise]);
+    if (!response) {
+      log(`Adapted call to ${providerName} timed out`, 'WARN', 'chameleon');
+      return null;
+    }
 
     if (!response.ok) {
-      const errText = await response.text().catch(() => '');
+      // BUG FIX (Response 19): Guard response.text() — it can throw if
+      // the connection drops before the body is read.
+      let errText = '';
+      try { errText = await response.text(); } catch { errText = '(unreadable)'; }
       throw new Error(`HTTP_ERROR_${response.status}: ${errText.slice(0, 200)}`);
     }
 
@@ -86,34 +200,95 @@ class ProtocolChameleon {
     if (!text) throw new Error(`Chameleon: no text in ${providerName} response`);
 
     // Parse the action from the provider's text response
-    const { extractJSON, validateActionResponse } = require('./providers-base');
-    const parsed = extractJSON(text, `chameleon-${providerName}`);
-    return validateActionResponse(parsed, `Chameleon(${providerName})`);
+    const base = _getProvidersBase();
+    if (!base?.extractJSON || !base?.validateActionResponse) {
+      log('providers-base extractJSON/validateActionResponse not available', 'WARN', 'chameleon');
+      return null;
+    }
+    const parsed = base.extractJSON(text, `chameleon-${providerName}`);
+    return base.validateActionResponse(parsed, `Chameleon(${providerName})`);
   }
 
-  async getSchema(providerName: any) { 
-    const cached = getDatabase().selectProviderSchema.get(providerName);
-    if (cached) { try { const parsed = JSON.parse(cached.schema); const age = Date.now() - cached.updated_at; if (age < 3600000 * 24) return parsed; } catch (e: any) { log(`Cached schema parse failed for ${providerName}, re-fetching`, 'DEBUG', 'chameleon'); } }
-    const urls = getCONFIG().PROTOCOL_CHAMELEON_SCHEMA_URLS;
+  /**
+   * Get the OpenAPI schema for a provider. Checks in-memory cache first,
+   * then DB, then remote URL.
+   *
+   * BUG FIX (Response 19): Previous code called DB on every request.
+   * Now uses in-memory Map cache with TTL.
+   */
+  async getSchema(providerName: any) {
+    // Check in-memory cache first
+    const cached = _getCachedSchema(providerName);
+    if (cached) return cached;
+
+    // Check DB cache
+    const db = _getDatabase();
+    if (db?.selectProviderSchema) {
+      try {
+        const row = db.selectProviderSchema.get(providerName);
+        if (row) {
+          try {
+            const parsed = JSON.parse(row.schema);
+            const age = Date.now() - row.updated_at;
+            if (age < SCHEMA_CACHE_TTL_MS) {
+              _setCachedSchema(providerName, parsed);
+              return parsed;
+            }
+          } catch (e: any) {
+            log(`Cached schema parse failed for ${providerName}, re-fetching`, 'DEBUG', 'chameleon');
+          }
+        }
+      } catch (e: any) {
+        log(`DB schema lookup failed for ${providerName}`, 'DEBUG', 'chameleon');
+      }
+    }
+
+    // Fetch from remote URL
+    const urls = _getCONFIG().PROTOCOL_CHAMELEON_SCHEMA_URLS;
     if (!urls) return null;
     const url = urls[providerName];
     if (!url) return null;
     try {
-      const openapi = await fetchJSON(url, {}, 10000);
+      const openapi = await fetchJSON(url, {}, SCHEMA_FETCH_TIMEOUT_MS);
       const schema = this.extractChatCompletionSchema(openapi);
-      if (schema) { getDatabase().upsertProviderSchema.run(providerName, JSON.stringify(schema), openapi.info?.version || 'unknown', Date.now()); return schema; }
+      if (schema) {
+        // Persist to DB
+        if (db?.upsertProviderSchema) {
+          try {
+            db.upsertProviderSchema.run(providerName, JSON.stringify(schema), openapi.info?.version || 'unknown', Date.now());
+          } catch (e: any) {
+            log(`Failed to persist schema for ${providerName}`, 'DEBUG', 'chameleon');
+          }
+        }
+        // Cache in memory
+        _setCachedSchema(providerName, schema);
+        return schema;
+      }
     } catch (e: any) { logError(`Schema fetch failed for ${providerName}`, e); }
     return null;
   }
 
-  extractChatCompletionSchema(openapi: any) { 
+  /**
+   * Extract the chat completion schema from an OpenAPI spec.
+   */
+  extractChatCompletionSchema(openapi: any) {
     try {
-      const path = openapi.paths['/chat/completions'] || openapi.paths['/v1/chat/completions'];
-      if (!path) return null;
-      const post = path.post;
-      if (!post) return null;
-      const schema = post.requestBody?.content?.['application/json']?.schema;
-      return schema || null;
+      // BUG FIX (Response 19): Check multiple common path variants.
+      // Some providers use /v1/chat/completions, others /chat/completions.
+      const pathVariants = [
+        '/v1/chat/completions',
+        '/chat/completions',
+        '/v1/completions',
+        '/completions',
+      ];
+      for (const pathKey of pathVariants) {
+        const path = openapi.paths?.[pathKey];
+        if (path?.post) {
+          const schema = path.post.requestBody?.content?.['application/json']?.schema;
+          if (schema) return schema;
+        }
+      }
+      return null;
     } catch (e: any) { return null; }
   }
 
@@ -127,7 +302,6 @@ class ProtocolChameleon {
    */
   rebuildPayload(requestData: any, schema: any) {
     const { base64Image, prompt, options: any = {} } = requestData;
-// @ts-expect-error
     const newOptions = { ...options };
 
     if (!schema || !schema.properties) {
@@ -138,18 +312,7 @@ class ProtocolChameleon {
     const result = { base64Image, prompt, options: newOptions };
 
     // --- Detect and adapt field name variations ---
-    // Map common field aliases
-    const fieldAliases = {
-      'max_tokens': ['maxTokens', 'max_new_tokens', 'maxNewTokens', 'max_completion_tokens', 'maxCompletionTokens'],
-      'temperature': ['temp'],
-      'top_p': ['topP', 'top_p'],
-      'frequency_penalty': ['frequencyPenalty'],
-      'presence_penalty': ['presencePenalty'],
-      'stop': ['stop_sequences', 'stopSequences'],
-    };
-
-    // If the schema uses different field names, rename our options to match
-    for (const [canonical, aliases] of Object.entries(fieldAliases)) {
+    for (const [canonical, aliases] of Object.entries(FIELD_ALIASES)) {
       if (props[canonical]) continue; // Standard name exists, no remap needed
       for (const alias of aliases) {
         if (props[alias] && newOptions[canonical] !== undefined) {
@@ -161,17 +324,13 @@ class ProtocolChameleon {
     }
 
     // --- Detect message format variation ---
-    // Anthropic-style: expects "messages" with role "user" and content as array
-    // Some providers wrap image content differently (e.g. "image" instead of "image_url")
     if (props.messages) {
       const msgSchema = props.messages;
-      // Check if messages items expect "content" as string (simple) vs array (multi-modal)
       const itemsSchema = msgSchema.items || msgSchema;
       const contentSchema = itemsSchema.properties?.content;
 
-      // If content is expected as a string and we have an image, we need to adapt
+      // If content is expected as a string and we have an image, adapt
       if (contentSchema && contentSchema.type === 'string' && base64Image) {
-        // Provider expects text-only content — encode image as markdown in prompt
         newOptions._forceTextContent = true;
         log('Chameleon: provider expects text-only content, encoding image as base64 reference', 'DEBUG', 'chameleon');
       }
@@ -180,12 +339,10 @@ class ProtocolChameleon {
       if (contentSchema && contentSchema.type === 'array') {
         const blockProps = contentSchema.items?.properties || contentSchema.items?.oneOf?.[0]?.properties;
         if (blockProps) {
-          // Check if provider uses "image" instead of "image_url"
           if (blockProps.image && !blockProps.image_url) {
             newOptions._imageBlockKey = 'image';
             log('Chameleon: provider uses "image" block format', 'DEBUG', 'chameleon');
           }
-          // Check if provider uses "source" wrapper for image data
           if (blockProps.source) {
             newOptions._useSourceWrapper = true;
             log('Chameleon: provider uses "source" wrapper for image data', 'DEBUG', 'chameleon');
@@ -217,10 +374,26 @@ class ProtocolChameleon {
       }
     }
 
+    // BUG FIX (Response 19): DetectAnthropic-style "system" field
+    // Some Anthropic-compatible providers expect a top-level "system"
+    // field instead of a system message in the messages array.
+    if (props.system && !props.messages?.items?.properties?.role?.enum?.includes('system')) {
+      newOptions._useSystemField = true;
+      log('Chameleon: provider uses top-level "system" field', 'DEBUG', 'chameleon');
+    }
+
+    // BUG FIX (Response 19): Detect anthropic-style "tools" field
+    // Some providers use "tools" at top level, others nest under
+    // "tool_choice".
+    if (props.tool_choice && !props.tools) {
+      newOptions._inlineToolChoice = true;
+    }
+
     result.options = newOptions;
     return result;
   }
 }
 
-module.exports = new ProtocolChameleon();
-module.exports._injectDependencies = _injectDependencies;
+const _instance = new ProtocolChameleon();
+_instance._injectDependencies = _injectDependencies;
+module.exports = _instance;
