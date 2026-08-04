@@ -376,7 +376,8 @@ function providerSupportsVision(providerName: string, model?: string): boolean {
     // Known text-only model patterns
     const textOnlyPatterns = [
       'qwen3-0.6b',
-      'llama-4-scout',  // llama-4-scout is text-only
+      'llama-4-scout',         // llama-4-scout is text-only
+      'deepseek-r1-distill',  // deepseek-r1-distill-llama-70b is text-only
     ];
     for (const pattern of textOnlyPatterns) {
       if (model.toLowerCase().includes(pattern.toLowerCase())) return false;
