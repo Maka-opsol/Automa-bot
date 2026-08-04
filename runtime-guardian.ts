@@ -226,4 +226,5 @@ class RuntimeGuardian {
 
 const _runtimeGuardianInstance = new RuntimeGuardian();
 _runtimeGuardianInstance._injectDependencies = _injectDependencies;
+
 module.exports = _runtimeGuardianInstance;
