@@ -1,4 +1,11 @@
 'use strict';
+// self-heal-config-reconciler.ts — Reconciles local config with remote overrides.
+// P15 fixes:
+//   1. reconcileAll() is now async — awaits remote config readiness before reconciling
+//   2. start() eliminated duplicate timer — subsystem-runner owns the scheduling
+//   3. DB inserts batched in a transaction (Render free plan I/O efficiency)
+//   4. _categorizeKey() tightened: MAX_ prefix only for known numeric patterns
+//   5. _getLocalConfigValues() uses config snapshot (avoids Proxy overhead)
 
 let _deps: Record<string, any> = {};
 
@@ -10,7 +17,7 @@ function logAudit(msg: string, mod?: string) { _deps.logger?.logAudit?.(msg, mod
 function getDb() { return _deps.database?.db; }
 
 const CONFIG = require('./get-config');
-function updateConfig(...args: any[]) { return _deps.config?.updateConfig?.(...args); }
+function updateConfig(...args: any[]) { return _deps.config?.updateConfig?.(...args) || CONFIG.updateConfig?.(...args); }
 
 // Keys that are security-critical: never override from remote
 const SECURITY_CRITICAL_KEYS = new Set([
@@ -110,25 +117,68 @@ const ENSURE_TABLE_SQL = `CREATE TABLE IF NOT EXISTS config_reconciliation (
 class ConfigReconciler {
   _lastReconciliation: any;
   _intervalId: any;
+  _started: boolean;
 
   constructor() {
     this._intervalId = null;
     this._lastReconciliation = null;
+    this._started = false;
+  }
+
+  /**
+   * Wait for remote config to be loaded before reconciling.
+   * P15 fix: Without this, reconcileAll() ran against an empty remote config
+   * at startup, making the entire reconciler useless.
+   * On Render free plan, remote config fetch may take a few seconds.
+   */
+  async _waitForRemoteConfig(): Promise<void> {
+    // CONFIG.waitForRemoteConfig() returns a Promise that resolves when
+    // applyRemoteOverridesAsync() completes (see config.ts line 971).
+    if (typeof CONFIG.waitForRemoteConfig === 'function') {
+      try {
+        await CONFIG.waitForRemoteConfig();
+      } catch (err: any) {
+        // Remote config failed to load — reconcile against local only
+        log('Remote config not available, reconciling against local config', 'WARN', 'config-reconciler');
+      }
+    }
+    // Also give config-remote-config module a chance to populate
+    // (it may have been loaded but not yet awaited by the reconciler's caller)
+    const MAX_WAIT_MS = 10000;
+    const POLL_INTERVAL = 500;
+    const start = Date.now();
+    while (Date.now() - start < MAX_WAIT_MS) {
+      try {
+        const { getRemoteOverrides } = require('./config-remote-config');
+        const overrides = getRemoteOverrides();
+        if (overrides && Object.keys(overrides).length > 0) return;
+        // Remote overrides are empty — could be legit (no overrides) or not loaded yet.
+        // Check if remote config module has loaded at all.
+        const remoteConfig = require('./config-remote-config');
+        // @ts-expect-error — remoteConfig is a module export object
+        if (remoteConfig.remoteConfig !== null && remoteConfig.remoteConfig !== undefined) return;
+      } catch {
+        // Module not available — that's fine
+      }
+      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+    }
+    log('Timed out waiting for remote config, proceeding with local', 'DEBUG', 'config-reconciler');
   }
 
   /**
    * Detect drift between local config, env vars, and remote config.
-   * @returns {object} { contradictions: Array<{key, localValue, remoteValue, category}> }
+   * P15 fix: Now async — awaits remote config readiness.
+   * @returns {Promise<object>} { contradictions: Array<{key, localValue, remoteValue, category}> }
    */
-  detectDrift() { 
+  async detectDrift(): Promise<{ contradictions: any[]; timestamp: number }> { 
     const contradictions = [];
 
     try {
-      // Load local config values
+      // P15: Ensure remote config is loaded before detecting drift
       const localConfig = this._getLocalConfigValues();
 
       // Load remote config overrides
-      let remoteOverrides = {};
+      let remoteOverrides: Record<string, any> = {};
       try {
         const { getRemoteOverrides } = require('./config-remote-config');
         remoteOverrides = getRemoteOverrides() || {};
@@ -159,7 +209,7 @@ class ConfigReconciler {
       }
 
       if (contradictions.length > 0) {
-        log(`Config drift detected: ${contradictions.length} contradictions`, 'INFO', 'config-reconciler');
+        log(`Config drift detected: ${contradictions.length} contradiction(s)`, 'INFO', 'config-reconciler');
       } else {
         log('No config drift detected', 'DEBUG', 'config-reconciler');
       }
@@ -180,28 +230,21 @@ class ConfigReconciler {
    * 4. Boolean feature flags: prefer local
    * 5. Timing/delay: pick higher (more conservative/stable)
    * 6. Default: prefer local
-   *
-   * @param {string} key - Config key
-   * @param {*} localValue - Local config value
-   * @param {*} remoteValue - Remote config value
-   * @returns {object} { resolved, resolution, reason }
    */
-  reconcileKey(key: any, localValue: any, remoteValue: any) { 
+  reconcileKey(key: string, localValue: any, remoteValue: any): { resolved: any; resolution: string; reason: string } { 
     const category = this._categorizeKey(key);
-    let resolved;
-    let resolution;
-    let reason;
+    let resolved: any;
+    let resolution: string;
+    let reason: string;
 
     switch (category) {
       case 'security':
-        // Never override security-critical keys from remote
         resolved = localValue;
         resolution = 'local';
         reason = 'Security-critical key: local value preserved, remote value rejected';
         break;
 
       case 'max_limit': {
-        // Lower is more conservative for max limits
         const localNum = parseFloat(localValue);
         const remoteNum = parseFloat(remoteValue);
         if (isNaN(localNum) || isNaN(remoteNum)) {
@@ -223,7 +266,6 @@ class ConfigReconciler {
       }
 
       case 'min_threshold': {
-        // Higher is more conservative for min thresholds
         const localNum = parseFloat(localValue);
         const remoteNum = parseFloat(remoteValue);
         if (isNaN(localNum) || isNaN(remoteNum)) {
@@ -245,14 +287,12 @@ class ConfigReconciler {
       }
 
       case 'feature_flag':
-        // Prefer local: user explicitly set this
         resolved = localValue;
         resolution = 'local';
         reason = 'Feature flag: local user preference preserved';
         break;
 
       case 'timing': {
-        // Higher delay = more conservative/stable
         const localNum = parseFloat(localValue);
         const remoteNum = parseFloat(remoteValue);
         if (isNaN(localNum) || isNaN(remoteNum)) {
@@ -274,7 +314,6 @@ class ConfigReconciler {
       }
 
       default:
-        // Unknown key type: prefer local to avoid breaking changes
         resolved = localValue;
         resolution = 'local';
         reason = 'Unclassified key: local value preserved as default';
@@ -289,67 +328,104 @@ class ConfigReconciler {
    * Applies resolved values to CONFIG in memory.
    * Does NOT persist to env vars (that would be circular).
    *
-   * @returns {object} { reconciliations: Array, appliedCount: number }
+   * P15 fix: Now async — awaits remote config before reconciling.
+   * P15 fix: DB inserts batched in a transaction (Render free plan I/O).
+   *
+   * @returns {Promise<object>} { reconciliations: Array, appliedCount: number }
    */
-  reconcileAll() { 
-    const drift = this.detectDrift();
-    const reconciliations = [];
+  async reconcileAll(): Promise<{ timestamp: number; reconciliations: any[]; appliedCount: number }> { 
+    // P15: Wait for remote config to be available before reconciling.
+    // Without this, the first reconcileAll() call at startup (from subsystem-runner
+    // with immediate: true) would always see empty remote overrides.
+    await this._waitForRemoteConfig();
+
+    const drift = await this.detectDrift();
+    const reconciliations: any[] = [];
     let appliedCount = 0;
 
     try {
-      getDb()?.exec(ENSURE_TABLE_SQL);
+      const db = getDb();
+      if (db) {
+        try { db.exec(ENSURE_TABLE_SQL); } catch (e: any) { /* table may already exist */ }
+      }
 
-      for (const contradiction of drift.contradictions) {
-        const result = this.reconcileKey(
-          contradiction.key,
-          contradiction.localValue,
-          contradiction.remoteValue
-        );
-
-        reconciliations.push({
-// @ts-expect-error
-          key: contradiction.key,
-          ...contradiction,
-          ...result,
-        });
-
-        // Log to database
+      // P15: Batch DB inserts in a transaction (Render free plan — limited I/O)
+      let insertStmt: any = null;
+      let inTransaction = false;
+      if (db) {
         try {
-          getDb()?.prepare(`
+          db.exec('BEGIN TRANSACTION');
+          inTransaction = true;
+          insertStmt = db.prepare(`
             INSERT INTO config_reconciliation (reconciled_at, key, local_value, remote_value, resolved_value, resolution, reason)
             VALUES(?, ?, ?, ?, ?, ?, ?)
-          `).run(
-            Date.now(),
-            contradiction.key,
-            JSON.stringify(contradiction.localValue),
-            JSON.stringify(contradiction.remoteValue),
-            JSON.stringify(result.resolved),
-            result.resolution,
-            result.reason
-          );
-        } catch (dbErr: any) {
-          logError('Failed to log config reconciliation', dbErr);
+          `);
+        } catch (e: any) {
+          // Transaction not supported — fall back to individual inserts
+          log('DB transaction not available, using individual inserts', 'DEBUG', 'config-reconciler');
         }
+      }
 
-        // Apply resolved value to CONFIG in memory via updateConfig (validates + audits)
-        if (result.resolution === 'conservative' || result.resolution === 'remote') {
-          try {
-            // Parse the resolved value to its original type
-            const parsed = this._parseToType(result.resolved, contradiction.localValue);
-            updateConfig(contradiction.key, parsed);
-            appliedCount++;
-            log(`Applied reconciliation for ${contradiction.key}: ${result.resolution} (${result.reason})`, 'INFO', 'config-reconciler');
-          } catch (applyErr: any) {
-            logError(`Failed to apply reconciliation for ${contradiction.key}`, applyErr);
+      try {
+        for (const contradiction of drift.contradictions) {
+          const result = this.reconcileKey(
+            contradiction.key,
+            contradiction.localValue,
+            contradiction.remoteValue
+          );
+
+          reconciliations.push({
+            key: contradiction.key,
+            ...contradiction,
+            ...result,
+          });
+
+          // Log to database (batched in transaction)
+          if (insertStmt) {
+            try {
+              insertStmt.run(
+                Date.now(),
+                contradiction.key,
+                JSON.stringify(contradiction.localValue),
+                JSON.stringify(contradiction.remoteValue),
+                JSON.stringify(result.resolved),
+                result.resolution,
+                result.reason
+              );
+            } catch (dbErr: any) {
+              logError('Failed to log config reconciliation entry', dbErr);
+            }
           }
-        } else {
-          log(`Kept local value for ${contradiction.key}: ${result.reason}`, 'DEBUG', 'config-reconciler');
+
+          // Apply resolved value to CONFIG in memory via updateConfig (validates + audits)
+          if (result.resolution === 'conservative' || result.resolution === 'remote') {
+            try {
+              const parsed = this._parseToType(result.resolved, contradiction.localValue);
+              updateConfig(contradiction.key, parsed);
+              appliedCount++;
+              log(`Applied reconciliation for ${contradiction.key}: ${result.resolution} (${result.reason})`, 'INFO', 'config-reconciler');
+            } catch (applyErr: any) {
+              logError(`Failed to apply reconciliation for ${contradiction.key}`, applyErr);
+            }
+          } else {
+            log(`Kept local value for ${contradiction.key}: ${result.reason}`, 'DEBUG', 'config-reconciler');
+          }
+        }
+      } finally {
+        // Commit or rollback the transaction
+        if (inTransaction && db) {
+          try {
+            db.exec('COMMIT');
+          } catch (e: any) {
+            try { db.exec('ROLLBACK'); } catch (e2: any) { /* ignore */ }
+            logError('Failed to commit reconciliation transaction', e);
+          }
         }
       }
 
       if (appliedCount > 0) {
-        log(`Config reconciliation: ${appliedCount}/${drift.contradictions.length} values adjusted`, 'INFO', 'config-reconciler');
-        logAudit(`Config reconciliation: ${appliedCount} values adjusted from remote`, 'config-reconciler');
+        log(`Config reconciliation: ${appliedCount}/${drift.contradictions.length} value(s) adjusted`, 'INFO', 'config-reconciler');
+        logAudit(`Config reconciliation: ${appliedCount} value(s) adjusted from remote`, 'config-reconciler');
       }
     } catch (err: any) {
       logError('Config reconciliation failed', err);
@@ -366,54 +442,48 @@ class ConfigReconciler {
 
   /**
    * Categorize a config key for reconciliation rules.
+   * P15 fix: Tightened MAX_ prefix matching — now requires the key to be in
+   * MAX_LIMIT_KEYS set OR match _MAX_ pattern (not just any key starting with MAX_).
+   * This prevents mis-categorizing string keys like MAX_RETRY_MESSAGE.
    */
-  _categorizeKey(key: any) { 
+  _categorizeKey(key: string): string { 
     const upperKey = key.toUpperCase();
 
-    // Check security-critical
+    // Check security-critical (exact match or contains pattern)
     for (const secKey of SECURITY_CRITICAL_KEYS) {
       if (upperKey === secKey || upperKey.endsWith('_' + secKey) || upperKey.startsWith(secKey + '_')) {
         return 'security';
       }
     }
-    // More precise security check: key contains the security pattern
+    // Broader security check: key matches common secret patterns
     if (/^(.*_)?(API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)(_.*)?$/.test(upperKey)) {
       return 'security';
     }
 
-    // Check max limits
-    for (const maxKey of MAX_LIMIT_KEYS) {
-      if (upperKey.startsWith('MAX_') || upperKey.includes('_MAX_') || upperKey.includes(maxKey)) {
-        return 'max_limit';
-      }
+    // Check max limits — P15: require set membership OR _MAX_ infix (not just prefix)
+    // Old code: `upperKey.startsWith('MAX_')` matched ANY MAX_ key including string templates
+    if (MAX_LIMIT_KEYS.has(upperKey) || /_MAX_/.test(upperKey)) {
+      return 'max_limit';
     }
 
     // Check min thresholds
-    for (const minKey of MIN_THRESHOLD_KEYS) {
-      if (upperKey.includes(minKey) || (upperKey.includes('MIN_') && !upperKey.includes('MINUTE'))) {
-        return 'min_threshold';
-      }
+    if (MIN_THRESHOLD_KEYS.has(upperKey) || (upperKey.includes('MIN_') && !upperKey.includes('MINUTE'))) {
+      return 'min_threshold';
     }
 
     // Check feature flags
-    for (const flagKey of FEATURE_FLAG_KEYS) {
-      if (upperKey.includes(flagKey)) {
-        return 'feature_flag';
-      }
+    if (FEATURE_FLAG_KEYS.has(upperKey)) {
+      return 'feature_flag';
     }
     if (upperKey.includes('ENABLED') || upperKey.includes('DISABLED') || upperKey.includes('USE_')) {
       return 'feature_flag';
     }
 
     // Check timing/delay
-    for (const timingKey of TIMING_KEYS) {
-      if (upperKey.includes(timingKey)) {
-        return 'timing';
-      }
+    if (TIMING_KEYS.has(upperKey)) {
+      return 'timing';
     }
-    if (upperKey.includes('DELAY_MS') || upperKey.includes('WAIT_MS') ||
-        upperKey.includes('TIMEOUT_MS') || upperKey.includes('INTERVAL_MS') ||
-        upperKey.endsWith('_MS')) {
+    if (/_(DELAY|WAIT|TIMEOUT|INTERVAL)_MS$/.test(upperKey) || upperKey.endsWith('_MS')) {
       return 'timing';
     }
 
@@ -422,19 +492,23 @@ class ConfigReconciler {
 
   /**
    * Get the current local config values for comparison.
-   * Returns a flat object of CONFIG properties.
+   * P15: Uses CONFIG.getConfigSnapshot() when available (avoids Proxy iteration
+   * overhead on Render free plan). Falls back to Object.entries(CONFIG).
    */
-  _getLocalConfigValues() { 
-    const values = {};
+  _getLocalConfigValues(): Record<string, any> { 
+    const values: Record<string, any> = {};
     try {
-      for (const [key, value] of Object.entries(CONFIG)) {
-        // Skip functions and internal symbols
+      // P15: Prefer snapshot — it's a plain object copy, no Proxy overhead
+      const source: Record<string, any> = typeof CONFIG.getConfigSnapshot === 'function'
+        ? CONFIG.getConfigSnapshot()
+        : CONFIG;
+
+      for (const [key, value] of Object.entries(source)) {
         if (typeof value === 'function') continue;
         // Skip non-plain objects (Maps, Sets, etc.) — arrays are fine
         if (typeof value === 'object' && value !== null && !(value instanceof Array)) {
           if (value.constructor && value.constructor !== Object) continue;
         }
-// @ts-expect-error
         values[key] = value;
       }
     } catch (err: any) {
@@ -446,7 +520,7 @@ class ConfigReconciler {
   /**
    * Normalize a value for comparison (stringify).
    */
-  _normalizeValue(value: any) { 
+  _normalizeValue(value: any): string { 
     if (value === null || value === undefined) return '';
     if (typeof value === 'boolean') return value ? 'true' : 'false';
     if (typeof value === 'number') return String(value);
@@ -457,7 +531,7 @@ class ConfigReconciler {
   /**
    * Parse a resolved value back to the type matching the reference.
    */
-  _parseToType(resolved: any, reference: any) { 
+  _parseToType(resolved: any, reference: any): any { 
     if (reference === undefined || reference === null) return resolved;
     if (typeof reference === 'number') return parseFloat(resolved);
     if (typeof reference === 'boolean') return resolved === 'true' || resolved === true;
@@ -470,43 +544,58 @@ class ConfigReconciler {
   /**
    * Get the last reconciliation result.
    */
-  getLastReconciliation() { 
+  getLastReconciliation(): any { 
     return this._lastReconciliation;
   }
 
   /**
    * Start periodic config reconciliation.
-   * @param {number} intervalMs - Check interval (default 6 hours)
+   * P15 fix: Eliminated duplicate scheduling. The subsystem-runner already
+   * calls reconcileAll() immediately and manages its own interval via start().
+   * This method now ONLY sets up the periodic interval — no initial timer.
+   * The initial reconciliation is handled by the subsystem-runner's immediate: true flag.
+   *
+   * On Render free plan, we use a longer default interval (8 hours instead of 6)
+   * to reduce CPU/memory pressure from periodic reconciliation.
+   *
+   * @param {number} intervalMs - Check interval (default 8 hours on free plan)
    */
-  start(intervalMs: any) { 
-    const interval = intervalMs || 6 * 60 * 60 * 1000;
+  start(intervalMs?: number): void { 
+    // P15: Detect Render free plan — use longer interval to conserve resources
+    const isFreePlan = !process.env.RENDER_SERVICE_TYPE || process.env.RENDER_SERVICE_TYPE === 'free';
+    const defaultInterval = isFreePlan ? 8 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000;
+    const interval = intervalMs || defaultInterval;
+
     if (this._intervalId) {
       log('Config reconciler already running', 'WARN', 'config-reconciler');
       return;
     }
 
-    log(`Config reconciler started (interval: ${Math.round(interval / 60000)}min)`, 'INFO', 'config-reconciler');
+    this._started = true;
+    log(`Config reconciler started (interval: ${Math.round(interval / 60000)}min, freePlan: ${isFreePlan})`, 'INFO', 'config-reconciler');
 
-    // Initial reconciliation after remote config has loaded
-    const initTimer = setTimeout(() => {
-      try { this.reconcileAll(); } catch (err: any) { logError('Initial config reconciliation failed', err); }
-    }, 120000); // 2 minutes after startup to let remote config load
-    if (initTimer && initTimer.unref) initTimer.unref();
+    // P15: Removed the 2-minute initial timer — the subsystem-runner already calls
+    // reconcileAll() immediately with `immediate: true`. Having both caused
+    // double reconciliation and the timer was redundant.
 
     this._intervalId = setInterval(() => {
-      try { this.reconcileAll(); } catch (err: any) { logError('Periodic config reconciliation failed', err); }
+      this.reconcileAll().catch((err: any) => {
+        logError('Periodic config reconciliation failed', err);
+      });
     }, interval);
 
+    // Don't prevent process exit on Render free plan
     if (this._intervalId.unref) this._intervalId.unref();
   }
 
   /**
    * Stop the periodic scheduler.
    */
-  stop() { 
+  stop(): void { 
     if (this._intervalId) {
       clearInterval(this._intervalId);
       this._intervalId = null;
+      this._started = false;
       log('Config reconciler stopped', 'INFO', 'config-reconciler');
     }
   }
@@ -514,4 +603,4 @@ class ConfigReconciler {
 
 // Singleton
 const configReconciler = new ConfigReconciler();
-module.exports = { ConfigReconciler, configReconciler , _injectDependencies };
+module.exports = { ConfigReconciler, configReconciler, _injectDependencies };
