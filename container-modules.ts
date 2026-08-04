@@ -16,8 +16,10 @@ function _logger() {
   return _logCache;
 }
 
-/** A [requirePath, containerName, deps] tuple for batch registration. */
-type ModuleTuple = [string, string, string[]];
+/** A [requirePath, containerName, deps, optionalDeps?] tuple for batch registration.
+ *  P13: optionalDeps allows batch-registered modules to declare optional deps
+ *  that inject null on failure instead of skipping the parent module. */
+type ModuleTuple = [string, string, string[], string[]?];
 
 /**
  * Build and return the fully-configured DI container.
@@ -336,33 +338,40 @@ function createContainer(): DIContainerType {
   // SELF-HEAL
   // ═══════════════════════════════════════════════════════════
 
+  // P13: Removed 'sandboxExecutor' and 'selfHealAuditor' from deps.
+  // selfHeal internally lazy-requires both when needed, so if they fail
+  // to initialize (e.g. sandboxExecutor on Render's constrained env),
+  // selfHeal still works. Previously, sandboxExecutor failure cascaded:
+  //   sandboxExecutor fails → selfHealAuditor skipped → selfHeal skipped
+  // Now: sandboxExecutor failure = sandboxExecutor only.
   c.register('selfHeal', {
     factory: (deps: any) => {
       const mod = require('./self-heal');
       mod._injectDependencies(deps);
       return mod;
     },
-    // Non-critical deps — self-heal gracefully falls back to lazy require()
-    // if any of these are unavailable (e.g. due to init failure).
-    deps: ['config', 'logger', 'database', 'selfHealAuditor', 'sandboxExecutor',
+    deps: ['config', 'logger', 'database',
            'providersStats', 'patchMemory', 'diffMinimizer', 'adversarialTester',
            'canary', 'regressionBank', 'rewardTracker', 'healerCircuitBreaker',
            'browser', 'auth', 'alerting'],
+    // P13: sandboxExecutor and selfHealAuditor are lazy-required internally
+    optionalDeps: ['sandboxExecutor', 'selfHealAuditor'],
     critical: false,
     tags: ['self-heal'],
   });
 
-  // v5-fix: removed 'providers' from deps — this module only uses providersBase
-  // (non-critical, already registered). If providersBase is unavailable, the
-  // module's getCallChatCompletion() falls back to require('./providers-base').
-  // This prevents cascading skip if the critical 'providers' module fails.
+  // P13: Removed 'sandboxExecutor' from deps — selfHealAuditor lazy-requires
+  // it internally. This breaks the cascade:
+  //   sandboxExecutor fails → selfHealAuditor skipped → selfHeal skipped
+  // Now: sandboxExecutor failure = sandboxExecutor only.
   c.register('selfHealAuditor', {
     factory: (deps: any) => {
       const mod = require('./self-heal-auditor');
       mod._injectDependencies(deps);
       return mod;
     },
-    deps: ['config', 'logger', 'database', 'sandboxExecutor'],
+    deps: ['config', 'logger', 'database'],
+    optionalDeps: ['sandboxExecutor'],
     critical: false,
     tags: ['self-heal'],
   });
@@ -415,7 +424,9 @@ function createContainer(): DIContainerType {
     ['self-heal-config-reconciler', 'configReconciler', ['config', 'logger', 'database']],
     ['self-heal-reward-tracker', 'rewardTracker', ['config', 'logger', 'database']],
     ['self-heal-timeline', 'healTimeline', ['config', 'logger', 'database']],
-    ['self-heal-meta-self-test', 'metaSelfTest', ['config', 'logger', 'database', 'selfHealAuditor', 'sandboxExecutor', 'alerting']],
+    // P13: Removed 'sandboxExecutor' from metaSelfTest deps — it lazy-requires
+    // internally. Kept 'selfHealAuditor' as optional (has lazy fallback).
+    ['self-heal-meta-self-test', 'metaSelfTest', ['config', 'logger', 'database', 'alerting'], ['selfHealAuditor', 'sandboxExecutor']],
     ['self-heal-circuit-breaker', 'healerCircuitBreaker', ['config', 'logger', 'database']],
     ['self-heal-canary', 'canary', ['config', 'logger', 'database']],
     ['self-heal-diff-minimizer', 'diffMinimizer', ['config', 'logger']],
@@ -430,7 +441,9 @@ function createContainer(): DIContainerType {
     ['self-heal-critical-shadow-mode', 'criticalShadowMode', ['config', 'logger', 'database']],
   ];
 
-  for (const [modPath, name, deps] of selfHealV2Modules) {
+  // ModuleTuple is now [requirePath, containerName, deps, optionalDeps?]
+  for (const tuple of selfHealV2Modules) {
+    const [modPath, name, deps, optionalDeps] = tuple;
     c.register(name, {
       factory: (deps: any) => {
         const mod = require(`./${modPath}`);
@@ -438,6 +451,7 @@ function createContainer(): DIContainerType {
         return mod;
       },
       deps,
+      optionalDeps: optionalDeps || [],
       critical: false,
       tags: ['self-heal', 'self-heal-v2'],
     });
