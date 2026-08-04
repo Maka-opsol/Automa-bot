@@ -53,7 +53,7 @@ async function autoDiscoverModels() {
 
 const DEFAULTS = {
   'GitHub GPT': { endpoint: 'https://models.inference.ai.azure.com/chat/completions', model: 'gpt-4o-mini' },
-  Groq: { endpoint: 'https://api.groq.com/openai/v1/chat/completions', model: 'llama-4-scout-17b-16e-instruct' },
+  Groq: { endpoint: 'https://api.groq.com/openai/v1/chat/completions', model: 'llama-3.1-8b-instant' },
   'z.ai': { endpoint: 'https://api.z.ai/api/paas/v4/chat/completions', model: 'GLM-4.6V-Flash' },
   Agnes: { endpoint: 'https://apihub.agnes-ai.com/v1/chat/completions', model: 'agnes-2.0-flash' },
   NVIDIA: { endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions', model: 'meta/llama-3.2-11b-vision-instruct' },
