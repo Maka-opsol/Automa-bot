@@ -50,6 +50,10 @@ const STATUS: Readonly<Record<string, string>> = Object.freeze({
 interface ModuleRegistration {
   factory: (deps: Record<string, unknown>, container: DIContainer) => unknown;
   deps: string[];
+  /** Dependencies that are allowed to fail. If an optional dep fails
+   *  to initialize, null is injected instead of skipping the parent module.
+   *  P13: Prevents cascading failures from non-critical deps. */
+  optionalDeps: string[];
   lifecycle: string;
   critical: boolean;
   tags: Set<string>;
@@ -107,6 +111,8 @@ class DIContainer {
   register(name: string, opts: {
     factory: (deps: Record<string, unknown>, container: DIContainer) => unknown;
     deps?: string[];
+    /** P13: Optional deps — inject null on failure instead of skipping parent */
+    optionalDeps?: string[];
     lifecycle?: string;
     critical?: boolean;
     tags?: string[];
@@ -118,6 +124,7 @@ class DIContainer {
     const registration: ModuleRegistration = {
       factory: opts.factory,
       deps: opts.deps || [],
+      optionalDeps: opts.optionalDeps || [],
       lifecycle: opts.lifecycle || LIFECYCLE.SINGLETON,
       critical: opts.critical !== undefined ? opts.critical : true,
       tags: new Set(opts.tags || []),
@@ -131,12 +138,14 @@ class DIContainer {
    */
   registerInstance(name: string, instance: unknown, opts: {
     deps?: string[];
+    optionalDeps?: string[];
     critical?: boolean;
     tags?: string[];
   } = {}): void {
     this._registry.set(name, {
       factory: () => instance,
       deps: opts.deps || [],
+      optionalDeps: opts.optionalDeps || [],
       lifecycle: LIFECYCLE.SINGLETON,
       critical: opts.critical !== undefined ? opts.critical : true,
       tags: new Set(opts.tags || []),
@@ -208,12 +217,21 @@ class DIContainer {
     this._statuses.set(name, STATUS.INITIALIZING);
 
     // Resolve dependencies
+    // Build the set of optional dep names for fast lookup (P13)
+    const optionalSet = new Set(reg.optionalDeps);
     const resolvedDeps: Record<string, unknown> = {};
     try {
       for (const depName of reg.deps) {
-        const depResult = this.get(depName, { required: true });
+        const isOptional = optionalSet.has(depName);
+        const depResult = this.get(depName, { required: !isOptional });
         // A registered dep that returns null means it failed to initialize
         if (depResult === null && this._registry.has(depName)) {
+          if (isOptional) {
+            // P13: Optional dep failed — inject null and continue
+            _log(`[DI] Optional dep "${depName}" failed for "${name}", injecting null`, 'WARN', 'container');
+            resolvedDeps[depName] = null;
+            continue;
+          }
           throw new Error(`[DI] Dependency "${depName}" failed to initialize`);
         }
         resolvedDeps[depName] = depResult;
