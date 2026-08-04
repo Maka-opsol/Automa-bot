@@ -1,3 +1,4 @@
+
 'use strict';
 
 let _deps: Record<string, any> = {};
@@ -12,6 +13,7 @@ const fs = require('fs');
 const path = require('path');
 
 const CHECKPOINT_FILE = CONFIG.CHECKPOINT_FILE || './checkpoint.json';
+const CHECKPOINT_FILE = process.env.CHECKPOINT_FILE || CONFIG.CHECKPOINT_FILE || path.join(require('os').tmpdir(), 'checkpoint.json');
 
 function saveCheckpoint(data: any) { 
   const tmp = CHECKPOINT_FILE + '.tmp';
