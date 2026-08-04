@@ -9,6 +9,7 @@ const { NvidiaProvider } = require('./providers-nvidia');
 const { CloudflareProvider } = require('./providers-cloudflare');
 const { CerebrasProvider } = require('./providers-cerebras');
 const { GeminiProvider } = require('./providers-gemini');
+const { OpenRouterTribunalProvider } = require('./providers-openrouter-tribunal');
 
 // ─── Dependency Injection ───
 let _deps: Record<string, any> = {};
@@ -125,6 +126,7 @@ async function getAvailableProviders() {
   const cloudflare = CloudflareProvider(); if (cloudflare && !isProviderBlacklisted('Cloudflare') && !isProviderRetired('Cloudflare')) providers.push({ name: 'Cloudflare', fn: cloudflare });
   const cerebras = CerebrasProvider(); if (cerebras && !isProviderBlacklisted('Cerebras') && !isProviderRetired('Cerebras')) providers.push({ name: 'Cerebras', fn: cerebras });
   const gemini = GeminiProvider(); if (gemini && !isProviderBlacklisted('Gemini') && !isProviderRetired('Gemini')) providers.push({ name: 'Gemini', fn: gemini });
+  const openrouter = OpenRouterTribunalProvider(); if (openrouter && !isProviderBlacklisted('OpenRouter') && !isProviderRetired('OpenRouter')) providers.push({ name: 'OpenRouter', fn: openrouter });
   const hasZai = providers.some(p => p.name === 'z.ai');
   if (!hasZai) { const zai = ZAIProvider(); if (zai && !isProviderBlacklisted('z.ai') && !isProviderRetired('z.ai')) providers.push({ name: 'z.ai', fn: zai }); }
   for (const dp of dynamicProviders) { if (!isProviderBlacklisted(dp.name) && !isProviderRetired(dp.name)) { providers.push(dp); } }
