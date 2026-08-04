@@ -53,13 +53,13 @@ async function autoDiscoverModels() {
 
 const DEFAULTS = {
   'GitHub GPT': { endpoint: 'https://models.inference.ai.azure.com/chat/completions', model: 'gpt-4o-mini' },
-  Groq: { endpoint: 'https://api.groq.com/openai/v1/chat/completions', model: 'llama-3.2-11b-vision-preview' },
+  Groq: { endpoint: 'https://api.groq.com/openai/v1/chat/completions', model: 'llama-4-scout-17b-16e-instruct' },
   'z.ai': { endpoint: 'https://api.z.ai/api/paas/v4/chat/completions', model: 'GLM-4.6V-Flash' },
   Agnes: { endpoint: 'https://apihub.agnes-ai.com/v1/chat/completions', model: 'agnes-2.0-flash' },
   NVIDIA: { endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions', model: 'meta/llama-3.2-11b-vision-instruct' },
-  Cloudflare: { endpoint: null, model: '@cf/meta/llama-3.2-11b-vision' },
+  Cloudflare: { endpoint: null, model: '@cf/meta/llama-4-scout-17b-16e-instruct' },
   Cerebras: { endpoint: 'https://api.cerebras.ai/v1/chat/completions', model: 'gemma-4-31b' },
-  Gemini: { endpoint: null, model: 'gemini-1.5-flash' },
+  Gemini: { endpoint: null, model: 'gemini-2.0-flash' },
 };
 
 /** Lazy accessor for database selectProvider — resolves at call time, not at require() time. */
