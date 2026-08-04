@@ -1,6 +1,15 @@
 'use strict';
 
+// ═════════════════════════════════════════════════════════════
+// Work Detector — Scans the MathU assignments page to check
+// if there are actionable items (Watch/Start/Redo buttons).
+// ═════════════════════════════════════════════════════════════
+
 const { runVisionPipeline } = require('./providers-vision-pipeline');
+const { log } = require('./logger');
+
+// BUG FIX (Response 19): Timeout for vision pipeline
+const VISION_TIMEOUT_MS = 15000;
 
 const DETECTION_PROMPT = `
 You are a scanner for an educational platform assignments page.
@@ -11,14 +20,45 @@ Return ONLY raw JSON formatting data:
 { "hasActionableItems": boolean, "reason": "Brief explanation of what you see" }
 `;
 
-async function detectNewWork(base64Image: any, signal: any) { 
-  const res = await runVisionPipeline(base64Image, DETECTION_PROMPT, {
-    validator: (parsed: any) => { if (typeof parsed.hasActionableItems !== 'boolean') throw new Error('Invalid response'); return { hasActionableItems: parsed.hasActionableItems, reason: parsed.reason || '' }; },
-    timeoutMs: 15000,
-    signal,
-  });
-  if (!res) return { hasActionableItems: true, reason: 'Detection failed, assuming true' };
-  return res.result;
+/**
+ * Detect whether the assignments page has actionable work items.
+ *
+ * @param base64Image - Base64-encoded screenshot
+ * @param signal - Optional AbortSignal
+ * @returns Object with hasActionableItems and reason
+ */
+async function detectNewWork(base64Image: any, signal: any) {
+  if (!base64Image) {
+    log('detectNewWork: missing image, assuming true', 'WARN', 'detection-work');
+    return { hasActionableItems: true, reason: 'No image provided, assuming true' };
+  }
+
+  try {
+    const res = await runVisionPipeline(base64Image, DETECTION_PROMPT, {
+      validator: (parsed: any) => {
+        // BUG FIX (Response 19): Strict validation
+        if (!parsed || typeof parsed !== 'object') {
+          throw new Error('Response is not an object');
+        }
+        if (typeof parsed.hasActionableItems !== 'boolean') {
+          throw new Error('Missing boolean hasActionableItems');
+        }
+        return {
+          hasActionableItems: parsed.hasActionableItems,
+          reason: parsed.reason || '',
+        };
+      },
+      timeoutMs: VISION_TIMEOUT_MS,
+      signal,
+    });
+    if (!res) {
+      return { hasActionableItems: true, reason: 'Detection failed, assuming true' };
+    }
+    return res.result;
+  } catch (e: any) {
+    log(`Work detection failed: ${e.message}`, 'WARN', 'detection-work');
+    return { hasActionableItems: true, reason: 'Detection error, assuming true' };
+  }
 }
 
 module.exports = { detectNewWork };
