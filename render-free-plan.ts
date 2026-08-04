@@ -527,10 +527,14 @@ setTimeout(() => checkAndRunEvolution().catch(() => {}), 5 * 60 * 1000);
 setInterval(() => checkAndRunEvolution().catch(() => {}), 6 * 60 * 60 * 1000).unref();
 
 // Template cache pruning
+// NOTE: 32-bit signed int max = 2_147_483_647 ms (~24.85 days).
+// 30 days = 2_592_000_000 ms which OVERFLOWS, causing the interval
+// to fire every 1ms (Node clamps the overflow to 1).  Cap at 7 days.
+const PRUNE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days (safe for 32-bit)
 try {
   const { pruneTemplateCache } = container.get('database');
   setTimeout(() => { pruneTemplateCache(); }, 3600000);
-  setInterval(() => { pruneTemplateCache(); }, 30 * 24 * 60 * 60 * 1000).unref();
+  setInterval(() => { pruneTemplateCache(); }, PRUNE_INTERVAL_MS).unref();
 } catch { /* best-effort */ }
 
 // Autonomous features
