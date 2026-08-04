@@ -1,4 +1,14 @@
 'use strict';
+// sandbox-executor.ts — Security-critical module for validating self-heal patches.
+// P14 fixes:
+//   1. isPatchableFile() now handles absolute paths correctly (callers pass fullPath)
+//   2. Worker script no longer requires ./project-root (was crashing from /tmp/)
+//   3. Path traversal check uses path.resolve() correctly for absolute filePath inputs
+//   4. Worker script uses 0o600 (no execute needed — fork() handles that)
+//   5. tsc command injection via filePath closed (execFileSync with args array)
+//   6. auditPatchContent resets regex lastIndex (defensive for stateful patterns)
+//   7. extractRelativeName() exported for external path normalization
+
 const vm = require('vm');
 const path = require('path');
 const { PROJECT_ROOT } = require('./project-root');
@@ -36,17 +46,17 @@ const ALLOWED_MODULES = new Set([
 // Comment/string content is stripped before matching (see auditPatchContent).
 const BLOCKED_PATTERNS: readonly RegExp[] = [
   // Process access — match the global object, not the word "process" in identifiers
-  /(?<!\w)process(?=\s*(?:\.|\[|env|exit|kill|pid|cwd|argv|stdout|stderr|stdin|versions|memoryUsage|nextTick|on|once|emit|send))\(?!\w)/,
+  /(?<!\w)process(?=\s*(?:\.|\[|env|exit|kill|pid|cwd|argv|stdout|stderr|stdin|versions|memoryUsage|nextTick|on|once|emit|send))(?!\w)/,
   /(?<!\w)require\s*\(/,
-  /(?<!\w)global(?=\s*(?:\.|\[|this|__))\(?!\w)/,
-  /(?<!\w)globalThis(?=\s*(?:\.|\[))\(?!\w)/,
+  /(?<!\w)global(?=\s*(?:\.|\[|this|__))(?!\w)/,
+  /(?<!\w)globalThis(?=\s*(?:\.|\[))(?!\w)/,
   // Module/exports — match when used as the module object, not in strings like "module name"
   /(?<!\w)module\s*\./,
   /(?<!\w)module\.exports/,
   /(?<!\w)exports\s*[.=]/,
   /(?<!\w)__dirname(?=\s|[^a-zA-Z0-9_$])/,  
   /(?<!\w)__filename(?=\s|[^a-zA-Z0-9_$])/,  
-  /(?<!\w)Buffer(?=\s*(?:\.|\[|from|alloc|isBuffer|concat))\(?!\w)/,
+  /(?<!\w)Buffer(?=\s*(?:\.|\[|from|alloc|isBuffer|concat))(?!\w)/,
   // Timers (could be used for resource exhaustion)
   /(?<!\w)setTimeout\s*\(/,
   /(?<!\w)setInterval\s*\(/,
@@ -77,7 +87,7 @@ const BLOCKED_PATTERNS: readonly RegExp[] = [
   /(?<!\w)MICROSOFT_PASSWORD/,
   /(?<!\w)API_KEY/,
   // Anti-bypass: catch require indirection patterns
-  /\[\s*['"](?:re|req|require)['"]\s*\]/,
+   /\[\s*['"](?:re|req|require)['"]\s*\]/,
   /(?:atob|btoa)\s*\(/,
   /String\.fromCharCode/,
   /\\u[0-9a-fA-F]{4}/,
@@ -125,10 +135,7 @@ const ALLOWED_PREFIXES: readonly string[] = [
   'exploration-',
 ];
 
-// ─── Type Definitions (kept for TypeScript type checking only — NOT exported) ───
-// These interfaces are stripped by esbuild/tsx at runtime.
-// They were previously exported in module.exports, which caused
-// "AuditResult is not defined" ReferenceError at runtime.
+// ─── Type Definitions ───
 interface AuditResult {
   safe: boolean;
   violations: string[];
@@ -148,16 +155,45 @@ interface SandboxResult {
 }
 
 /**
+ * Extract the relative filename from either an absolute or relative path.
+ * Callers pass both forms:
+ *   - self-heal.ts: path.join(SOURCE_DIR, file) → absolute e.g. '/app/cycle-ui-prompt-updater.ts'
+ *   - critical-patch-consensus.ts: path.join(SOURCE_DIR, targetFile) → absolute
+ *   - meta-learner-suggestion-applier.ts: path.join(SOURCE_DIR, file) → absolute
+ *   - test-validation-suite.js: '/tmp/test.js' → absolute (outside SOURCE_DIR, basename only)
+ *   - self-heal-meta-self-test.ts: '/tmp/self-heal-test-dummy.js' → absolute (dummy, for testing)
+ *
+ * P14 fix: Previously isPatchableFile only stripped './' prefix, so absolute paths
+ * like '/app/cycle-ui-prompt-updater.ts' never matched ALLOWED_PREFIXES —
+ * silently rejecting all valid patches to cycle-*, utils-*, etc.
+ */
+function extractRelativeName(filePath: string): string {
+  // If absolute and under SOURCE_DIR, strip the prefix to get relative name
+  if (path.isAbsolute(filePath)) {
+    const normalized = path.normalize(filePath).replace(/\\/g, '/');
+    const root = SOURCE_DIR.replace(/\\/g, '/');
+    if (normalized === root) return '';
+    if (normalized.startsWith(root + '/')) return normalized.slice(root.length + 1);
+    // Absolute path outside SOURCE_DIR — return basename for IMMUTABLE/RESTRICTED checks
+    return path.basename(filePath);
+  }
+  // Relative path — just normalize
+  return filePath.replace(/\\/g, '/').replace(/^\.\/?/, '');
+}
+
+/**
  * Check whether a patch string contains dangerous patterns.
+ * P14: Resets regex lastIndex for safety with stateful patterns.
  */
 function auditPatchContent(patchCode: string): AuditResult {
   const violations: string[] = [];
+  // Strip comments before pattern matching
+  const codeWithoutComments = patchCode
+    .replace(/\/\/.*$/gm, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/<!--[\s\S]*?-->/g, '');
   for (const pattern of BLOCKED_PATTERNS) {
-    // Strip comments properly before pattern matching
-    const codeWithoutComments = patchCode
-      .replace(/\/\/.*$/gm, '')
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/<!--[\s\S]*?-->/g, '');
+    pattern.lastIndex = 0; // Reset for stateful regexes (defensive)
     if (pattern.test(codeWithoutComments)) {
       violations.push(`Blocked pattern: ${pattern.source}`);
     }
@@ -167,33 +203,33 @@ function auditPatchContent(patchCode: string): AuditResult {
 
 /**
  * Determine if a file is allowed to be patched.
+ * Accepts both absolute and relative paths (P14 fix).
  */
 function isPatchableFile(filePath: string, opts: { requireApproval?: boolean } = {}): PatchabilityResult {
-  // Normalize the path
-  const normalized = filePath.replace(/\\/g, '/').replace(/^\.\/?/, '');
+  const relativeName = extractRelativeName(filePath);
 
   // Absolute immutables — never patchable
-  if (IMMUTABLE_FILES.has(normalized) || IMMUTABLE_FILES.has(path.basename(normalized))) {
-    return { allowed: false, reason: `File ${normalized} is in the immutable list and can never be patched`, requiresApproval: false };
+  if (IMMUTABLE_FILES.has(relativeName) || IMMUTABLE_FILES.has(path.basename(relativeName))) {
+    return { allowed: false, reason: `File ${relativeName} is in the immutable list and can never be patched`, requiresApproval: false };
   }
 
-  // Check if restricted (BEFORE prefix)
-  const isRestricted = RESTRICTED_FILES.has(normalized) || RESTRICTED_FILES.has(path.basename(normalized));
+  // Check if restricted (BEFORE prefix — restricted takes priority)
+  const isRestricted = RESTRICTED_FILES.has(relativeName) || RESTRICTED_FILES.has(path.basename(relativeName));
   if (isRestricted) {
     if (opts.requireApproval) {
-      return { allowed: true, requiresApproval: true, reason: `File ${normalized} requires explicit approval for patching` };
+      return { allowed: true, requiresApproval: true, reason: `File ${relativeName} requires explicit approval for patching` };
     }
-    return { allowed: false, reason: `File ${normalized} is restricted and requires explicit approval`, requiresApproval: true };
+    return { allowed: false, reason: `File ${relativeName} is restricted and requires explicit approval`, requiresApproval: true };
   }
 
   // Check if it matches an allowed prefix (unrestricted)
-  const prefixAllowed = ALLOWED_PREFIXES.some(p => normalized.startsWith(p));
+  const prefixAllowed = ALLOWED_PREFIXES.some(p => relativeName.startsWith(p));
   if (prefixAllowed) {
     return { allowed: true, requiresApproval: false };
   }
 
   // Default: not allowed
-  return { allowed: false, reason: `File ${normalized} is not in any allowed patching scope`, requiresApproval: false };
+  return { allowed: false, reason: `File ${relativeName} is not in any allowed patching scope`, requiresApproval: false };
 }
 
 /**
@@ -254,16 +290,31 @@ function getWorkerScriptPath(): string {
 
   // Generate a minimal worker script that receives patch code via IPC,
   // validates it, and reports back — all in a separate process.
+  //
+  // P14 fix: The worker is written to os.tmpdir() and forked from there.
+  // It MUST NOT require('./project-root') because that would look for
+  // /tmp/project-root.js which doesn't exist, crashing the worker on startup
+  // before it can send the READY message or process any VALIDATE_PATCH messages.
+  // This was a critical bug — the isolated process sandbox was completely broken
+  // on every deployment where the worker ran from /tmp/.
+  //
+  // P14 fix: tsc now uses execFileSync with args array instead of execSync with
+  // a concatenated command string. This closes a shell injection vector where
+  // filePath containing quotes or semicolons could execute arbitrary commands.
+
   const workerCode = `
 'use strict';
 // sandbox-isolation-worker.js
 // This script runs in a FORKED child process with true process isolation.
 // It has NO access to the parent's require cache, globals, or state.
+// P14: Does NOT require('./project-root') — worker lives in /tmp/ where that module
+// doesn't exist. Only uses Node.js built-in modules.
 
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const vm = require('vm');
 const path = require('path');
-const { PROJECT_ROOT } = require('./project-root');
+const os = require('os');
+const fs = require('fs');
 
 process.on('message', (msg) => {
   if (!msg || msg.type !== 'VALIDATE_PATCH') {
@@ -279,24 +330,33 @@ process.on('message', (msg) => {
     new vm.Script(patchCode, { filename: filePath || 'patch.js', timeout: 3000 });
 
     // Step 2: For TypeScript files, also try tsc --noEmit if available
+    // P14 fix: Uses execFileSync instead of execSync to avoid shell interpretation,
+    // and passes tmpPath as a separate argument (not concatenated into command string).
     if (filePath && (filePath.endsWith('.ts') || filePath.endsWith('.tsx'))) {
       try {
-        const tmpPath = path.join(require('os').tmpdir(), \`sandbox-verify-\${Date.now()}.ts\`);
-        require('fs').writeFileSync(tmpPath, patchCode, 'utf8');
+        const tmpPath = path.join(os.tmpdir(), 'sandbox-verify-' + Date.now() + '.ts');
+        fs.writeFileSync(tmpPath, patchCode, 'utf8');
         try {
-          execSync('npx tsc --noEmit --allowJs --skipLibCheck --esModuleInterop --target ES2020 --moduleResolution node "' + tmpPath + '"', {
+          // execFileSync with args array — no shell, no injection possible
+          execFileSync('npx', [
+            'tsc', '--noEmit', '--allowJs', '--skipLibCheck',
+            '--esModuleInterop', '--target', 'ES2020',
+            '--moduleResolution', 'node', tmpPath
+          ], {
             timeout: 15000,
             stdio: 'pipe',
             env: { ...process.env, NODE_ENV: 'sandbox-verify' }
           });
         } finally {
-          try { require('fs').unlinkSync(tmpPath); } catch (e: any) { /* ignore */ }
+          try { fs.unlinkSync(tmpPath); } catch (e) { /* ignore */ }
         }
-      } catch (tscErr: any) {
+      } catch (tscErr) {
+        const errMsg = ((tscErr.stderr && tscErr.stderr.toString()) ||
+                       (tscErr.message || '')).slice(0, 500);
         process.send({
           type: 'RESULT',
           success: false,
-          error: 'TypeScript compilation check failed: ' + (tscErr.stderr || tscErr.message || '').slice(0, 500),
+          error: 'TypeScript compilation check failed: ' + errMsg,
           durationMs: Date.now() - startTime
         });
         return;
@@ -307,21 +367,21 @@ process.on('message', (msg) => {
     // with NO access to require, process, fs, etc.
     const isolatedContext = vm.createContext({
       console: { log: () => {}, warn: () => {}, error: () => {}, info: () => {}, debug: () => {} },
-      Math,
-      JSON,
-      Date,
-      Array,
-      Object,
-      String,
-      Number,
-      Boolean,
-      RegExp,
-      Map,
-      Set,
-      Error,
-      TypeError,
-      RangeError,
-      SyntaxError,
+      Math: Math,
+      JSON: JSON,
+      Date: Date,
+      Array: Array,
+      Object: Object,
+      String: String,
+      Number: Number,
+      Boolean: Boolean,
+      RegExp: RegExp,
+      Map: Map,
+      Set: Set,
+      Error: Error,
+      TypeError: TypeError,
+      RangeError: RangeError,
+      SyntaxError: SyntaxError,
     });
 
     const script = new vm.Script(patchCode, {
@@ -341,11 +401,11 @@ process.on('message', (msg) => {
       success: true,
       durationMs: Date.now() - startTime
     });
-  } catch (err: any) {
+  } catch (err) {
     process.send({
       type: 'RESULT',
       success: false,
-      error: err.message || String(err),
+      error: (err && err.message) || String(err),
       durationMs: Date.now() - startTime
     });
   }
@@ -356,9 +416,10 @@ process.send({ type: 'READY' });
 `;
 
   // Write the worker script to a secure temp location
-  const workerPath = path.join(os.tmpdir(), `mathu-sandbox-worker-${process.pid}.js`);
+  // P14: Use 0o600 (rw-------) — no execute bit needed since fork() uses Node.js directly
+  const workerPath = path.join(os.tmpdir(), 'mathu-sandbox-worker-' + process.pid + '.js');
   fs.writeFileSync(workerPath, workerCode, 'utf8');
-  fs.chmodSync(workerPath, 0o700); // owner read/write/execute only
+  fs.chmodSync(workerPath, 0o600);
   _workerScriptPath = workerPath;
   return workerPath;
 }
@@ -458,16 +519,16 @@ function executePatchInIsolatedProcess(patchCode: string, filePath: string, time
  * Execute a patch in the sandbox with full security checks.
  *
  * Security layers:
- *  1. File-level check (isPatchableFile)
+ *  1. File-level check (isPatchableFile) — P14: now handles absolute paths
  *  2. Content-level check (auditPatchContent)
- *  3. Path traversal check
+ *  3. Path traversal check — P14: handles both absolute and relative filePath
  *  4. Syntax validation via vm.Script (does NOT execute)
- *  5. Runtime validation in isolated child process (true process isolation)
- *  6. Size limit check
+ *  5. Size limit check
+ *  6. Runtime validation in isolated child process (true process isolation)
  *  7. No file writes — caller is responsible for writing after all checks pass
  */
 async function executePatchInSandbox(patchText: string, filePath: string): Promise<SandboxResult> {
-  // Layer 1: File-level check
+  // Layer 1: File-level check (P14: works with absolute paths now)
   const fileCheck = isPatchableFile(filePath);
   if (!fileCheck.allowed) {
     _log(`Sandbox: File not patchable: ${filePath} — ${fileCheck.reason}`, 'ERROR', 'sandbox-executor');
@@ -482,15 +543,22 @@ async function executePatchInSandbox(patchText: string, filePath: string): Promi
   }
 
   // Layer 3: Path traversal check
-  const resolvedTarget = path.resolve(SOURCE_DIR, filePath);
-  if (!resolvedTarget.startsWith(SOURCE_DIR + path.sep) && resolvedTarget !== SOURCE_DIR) {
-    _log(`Sandbox: Path traversal blocked for ${filePath}`, 'ERROR', 'sandbox-executor');
+  // P14 fix: Handle both absolute and relative filePath inputs.
+  // - If filePath is already absolute: use it directly (callers pass path.join(SOURCE_DIR, file))
+  // - If filePath is relative: resolve against SOURCE_DIR
+  // Either way, the result must stay within SOURCE_DIR.
+  const resolvedTarget = path.isAbsolute(filePath)
+    ? path.normalize(filePath)
+    : path.resolve(SOURCE_DIR, filePath);
+  const normalizedRoot = path.normalize(SOURCE_DIR);
+  if (!resolvedTarget.startsWith(normalizedRoot + path.sep) && resolvedTarget !== normalizedRoot) {
+    _log(`Sandbox: Path traversal blocked for ${filePath} (resolved: ${resolvedTarget}, root: ${normalizedRoot})`, 'ERROR', 'sandbox-executor');
     return { safe: false, error: `Path traversal blocked: ${filePath}` };
   }
 
   // Layer 4: Syntax validation using vm.Script (does NOT execute)
   try {
-    new vm.Script(patchText, { filename: filePath, timeout: 3000 });
+    new vm.Script(patchText, { filename: path.basename(filePath), timeout: 3000 });
   } catch (e: any) {
     _log(`Sandbox: Syntax validation failed for ${filePath}: ${e.message}`, 'ERROR', 'sandbox-executor');
     return { safe: false, error: `Patch syntax validation failed: ${e.message}` };
@@ -522,4 +590,13 @@ async function executePatchInSandbox(patchText: string, filePath: string): Promi
 }
 
 // @ts-expect-error
-module.exports = { vm, path, SOURCE_DIR, ALLOWED_MODULES, BLOCKED_PATTERNS, IMMUTABLE_FILES, RESTRICTED_FILES, ALLOWED_PREFIXES, auditPatchContent, isPatchableFile, createSandboxContext, runPatchInSandbox, executePatchInIsolatedProcess, executePatchInSandbox, _injectDependencies };
+module.exports = {
+  vm, path, SOURCE_DIR,
+  ALLOWED_MODULES, BLOCKED_PATTERNS, IMMUTABLE_FILES, RESTRICTED_FILES, ALLOWED_PREFIXES,
+  AuditResult, PatchabilityResult, SandboxResult,
+  auditPatchContent, isPatchableFile, extractRelativeName,
+  createSandboxContext, runPatchInSandbox,
+  executePatchInIsolatedProcess, executePatchInSandbox,
+  _injectDependencies,
+};
+
