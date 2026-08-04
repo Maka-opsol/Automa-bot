@@ -1,4 +1,3 @@
-
 'use strict';
 
 let _deps: Record<string, any> = {};
@@ -12,29 +11,28 @@ const CONFIG = require('./get-config');
 const fs = require('fs');
 const path = require('path');
 
-const CHECKPOINT_FILE = CONFIG.CHECKPOINT_FILE || './checkpoint.json';
-const CHECKPOINT_FILE = process.env.CHECKPOINT_FILE || CONFIG.CHECKPOINT_FILE || path.join(require('os').tmpdir(), 'checkpoint.json');
+const _CHECKPOINT_PATH = process.env.CHECKPOINT_FILE || (CONFIG && CONFIG.CHECKPOINT_FILE) || path.join(require('os').tmpdir(), 'checkpoint.json');
 
 function saveCheckpoint(data: any) { 
-  const tmp = CHECKPOINT_FILE + '.tmp';
+  const tmp = _CHECKPOINT_PATH + '.tmp';
   try {
     const json = JSON.stringify({ ...data, savedAt: Date.now() }, null, 2);
     if (json.length > 5 * 1024 * 1024) { log('Checkpoint data too large, skipping', 'WARN', 'state-persist'); return; }
-    fs.writeFileSync(tmp, json); fs.renameSync(tmp, CHECKPOINT_FILE);
+    fs.writeFileSync(tmp, json); fs.renameSync(tmp, _CHECKPOINT_PATH);
   } catch (e: any) { logError('Checkpoint save failed', e); }
 }
 
 function loadCheckpoint() {
   try {
-    if (fs.existsSync(CHECKPOINT_FILE)) {
-      const stats = fs.statSync(CHECKPOINT_FILE);
+    if (fs.existsSync(_CHECKPOINT_PATH)) {
+      const stats = fs.statSync(_CHECKPOINT_PATH);
       if (stats.size > 5 * 1024 * 1024) {
         log('Checkpoint file too large, skipping load', 'WARN', 'state-persist');
         return null;
       }
-      return JSON.parse(fs.readFileSync(CHECKPOINT_FILE, 'utf8'));
+      return JSON.parse(fs.readFileSync(_CHECKPOINT_PATH, 'utf8'));
     }
-  } catch (e: any) { if (fs.existsSync(CHECKPOINT_FILE)) { console.warn('Checkpoint file exists but could not be parsed:', e.message); } }
+  } catch (e: any) { if (fs.existsSync(_CHECKPOINT_PATH)) { console.warn('Checkpoint file exists but could not be parsed:', e.message); } }
   return null;
 }
 
