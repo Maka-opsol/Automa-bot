@@ -3,7 +3,12 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { PROJECT_ROOT } = require('./project-root');
+
+// Use USER_DATA_DIR (set by render-free-plan.ts to /tmp/.browser-data) instead
+// of PROJECT_ROOT (/app/) which is read-only in Docker.
+function getDataDir() { return process.env.USER_DATA_DIR || path.join(os.tmpdir(), '.browser-data'); }
 
 let _deps: Record<string, any> = {};
 let screenshotCache: any = null;
@@ -91,7 +96,7 @@ function clearCache() {  try { const oldSize = screenshotCache.size; screenshotC
 
 function getCacheStats() {  if (!screenshotCache || !visionResponseCache) return { size: 0, maxSize: 0, calculatedSize: 0, visionSize: 0 }; return { size: screenshotCache.size, maxSize: screenshotCache.max, calculatedSize: screenshotCache.calculatedSize, visionSize: visionResponseCache.size }; }
 
-const SESSION_FILE = path.join(PROJECT_ROOT, 'session.json');
+const SESSION_FILE = path.join(getDataDir(), 'session.json');
 const SESSION_LOCK_FILE = SESSION_FILE + '.lock';
 
 async function acquireLock(lockPath: any, timeoutMs = 5000) { 
