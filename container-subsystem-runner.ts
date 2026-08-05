@@ -176,6 +176,38 @@ function startSelfHealV2Subsystems(
 }
 
 /**
+ * Start resilience subsystems — modules tagged 'resilience' that have
+ * a start() method. Includes survival, runtime, progress, economy,
+ * policy, auth, and network modules from the worst-case resilience plan.
+ */
+function startResilienceSubsystems(
+  container: any,
+): SubsystemStartResult {
+  const result = startSubsystemGroup(container, 'resilience', 'start');
+
+  // Additional one-time init for modules that need startup calls beyond start()
+  try {
+    const configDriftDetector = container.get('configDriftDetector', { required: false }) as Record<string, unknown> | null;
+    if (configDriftDetector && typeof configDriftDetector.checkAndAlert === 'function') {
+      (configDriftDetector.checkAndAlert as () => void)();
+    }
+  } catch (e: any) {
+    _logger()?.log(`configDriftDetector.checkAndAlert failed: ${(e as Error).message}`, 'WARN', 'subsystem-runner');
+  }
+
+  try {
+    const networkIpRotator = container.get('networkIpRotator', { required: false }) as Record<string, unknown> | null;
+    if (networkIpRotator && typeof networkIpRotator.checkIp === 'function') {
+      (networkIpRotator.checkIp as () => Promise<unknown>)().catch(() => {});
+    }
+  } catch (e: any) {
+    _logger()?.log(`networkIpRotator.checkIp failed: ${(e as Error).message}`, 'WARN', 'subsystem-runner');
+  }
+
+  return result;
+}
+
+/**
  * Run startup smoke tests to catch common failure modes early.
  * Called after container initialization but before the daemon loop starts.
  * Non-critical — failures are logged and alerted but don't prevent startup.
@@ -309,6 +341,7 @@ async function spawnWorkers(
 module.exports = { 
   startSubsystemGroup,
   startSelfHealV2Subsystems,
+  startResilienceSubsystems,
   getContainerHealth,
   runStartupSmokeTests,
   spawnWorkers,
