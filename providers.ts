@@ -1,6 +1,6 @@
 'use strict';
 
-// Internal sub-modules — not container-registered, loaded via require()
+// Last modified: 2026-08-05 — Response 20: Updated compression to 768px quality 30
 const { getAvailableProviders, resetCycleProviderState, addProviderFailure, getProviderCycleState, registerDynamicProvider } = require('./providers-registry');
 const { runTribunal } = require('./providers-tribunal');
 const { getStats, updateStats } = require('./providers-stats');
@@ -39,7 +39,7 @@ async function determineNextAction(base64Image: string, pageUrl: string | null =
   const logError = getLogError();
   const { compressScreenshot } = getBrowser();
   const { getCachedAction, setCachedAction } = getCache();
-  const compressed = await compressScreenshot(base64Image, 640, 15);
+  const compressed = await compressScreenshot(base64Image, 768, 30);
   const cached = getCachedAction(base64Image);
   if (cached) return cached;
   const key = `action:${crypto.createHash('sha256').update(compressed).digest('hex')}`;
