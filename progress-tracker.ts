@@ -32,7 +32,13 @@ function trackProgress(entry: any) {
     }
     const line = JSON.stringify({ ...entry, timestamp: new Date().toISOString() }) + '\n';
     const dir = path.dirname(PROGRESS_LOG_PATH);
-    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* best-effort */ }
+    // Ensure directory exists BEFORE writing — ENOENT fix for ./logs/progress.jsonl
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (mkdirErr: any) {
+      log(`trackProgress: failed to create directory ${dir}: ${mkdirErr.message}`, 'WARN', 'progress-tracker');
+      return; // Don't try to write if we can't create the directory
+    }
     fs.appendFileSync(PROGRESS_LOG_PATH, line);
 // @ts-expect-error
     getInsertProgress(entry.action, entry.state, entry.questions_completed);
