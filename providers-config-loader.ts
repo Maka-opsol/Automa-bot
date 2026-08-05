@@ -463,6 +463,21 @@ function getKnownProviders(): string[] {
 }
 
 /**
+ * Synchronous provider availability check.
+ * Returns names of providers that have all required env keys present and are not disabled.
+ * Used by smoke tests (sync context) to verify at least one provider is configured.
+ */
+function getAvailableProviderNamesSync(): string[] {
+  const names: string[] = [];
+  for (const name of Object.keys(DEFAULTS)) {
+    if (isProviderDisabledByDefault(name)) continue;
+    if (!hasRequiredEnvKeys(name)) continue;
+    names.push(name);
+  }
+  return names;
+}
+
+/**
  * Get the full default config for a provider (including metadata).
  */
 function getProviderDefault(providerName: string): ProviderDefault | null {
@@ -547,6 +562,7 @@ module.exports = {
   isProviderDisabledByDefault,
   getFallbackModels,
   getKnownProviders,
+  getAvailableProviderNamesSync,
   getProviderDefault,
   // Dynamic models
   DYNAMIC_MODELS: () => ({ ...DYNAMIC_MODELS }),
