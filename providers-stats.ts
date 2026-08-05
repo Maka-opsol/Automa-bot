@@ -39,7 +39,13 @@ const NUMERIC_FIELDS = new Set([
 ]);
 
 function getStats() {
-  return { ...stats };
+  // Populate availableProviders from config-loader (sync check for smoke tests)
+  let availableProviders: string[] = [];
+  try {
+    const cl = _deps.providersConfigLoader ?? require('./providers-config-loader');
+    availableProviders = cl.getAvailableProviderNamesSync?.() ?? [];
+  } catch {}
+  return { ...stats, availableProviders };
 }
 
 /**
