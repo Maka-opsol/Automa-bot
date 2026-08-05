@@ -31,8 +31,8 @@ function _getLogger() { if (!_logger) _logger = require('./logger'); return _log
  */
 const VISION_FALLBACK_MODELS = [
   'google/gemma-3-27b-it:free',           // (V) Best free vision model on OpenRouter
+  'nvidia/nemotron-nano-12b-2-vl:free',   // (V) NVIDIA Nemotron vision — OCR-optimized
   'google/gemma-3-12b-it:free',           // (V) Smaller Gemma, still good vision
-  'meta-llama/llama-4-maverick-17b-128e-instruct:free', // (V) Vision capable
   'qwen/qwen2.5-vl-72b-instruct:free',   // (V) Qwen vision — excellent at math OCR
 ];
 
@@ -43,8 +43,9 @@ const VISION_FALLBACK_MODELS = [
  * These are cheap, fast, but CANNOT process images.
  */
 const TEXT_FALLBACK_MODELS = [
-  'meta-llama/llama-4-scout-17b-16e-instruct:free', // (T) Fast text-only
-  'deepseek/deepseek-r1-distill-llama-70b:free',    // (T) Reasoning
+  'google/gemma-4-31b-it:free',                     // (T) Updated Aug 2026
+  'nvidia/nemotron-3-super-120b:free',               // (T) Efficient MoE, strong reasoning
+  'deepseek/deepseek-r1-distill-llama-70b:free',      // (T) Reasoning (if still available)
 ];
 
 function OpenRouterTribunalProvider() {
