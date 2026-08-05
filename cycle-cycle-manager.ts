@@ -1,4 +1,6 @@
 'use strict';
+// Last modified: 2026-08-05 — Integrated cycle-watchdog.ts (per-question 10-min timeout,
+//   self-heal, provider re-discovery). See "// WD:" comments for watchdog integration points.
 
 const fs = require('fs');
 const crypto = require('crypto');
@@ -138,6 +140,21 @@ async function runCycle() {
   log(`Starting cycle #${getStats().cycleCount}`, 'INFO', 'cycle');
   resetCycleProviderState();
 
+  // WD: Resolve cycle-watchdog and arm it for the cycle
+  const cycleWatchdog = getDep('cycleWatchdog');
+  const wdOnCycleStarted = cycleWatchdog?.onCycleStarted;
+  const wdOnCycleEnded = cycleWatchdog?.onCycleEnded;
+  const wdOnQuestionStarted = cycleWatchdog?.onQuestionStarted;
+  const wdOnQuestionCompleted = cycleWatchdog?.onQuestionCompleted;
+  const wdOnActionCompleted = cycleWatchdog?.onActionCompleted;
+  const wdCheckTimeout = cycleWatchdog?.checkQuestionTimeout;
+  const watchdogArmed = !!(wdOnCycleStarted && wdCheckTimeout);
+  if (watchdogArmed) {
+    wdOnCycleStarted();
+  } else {
+    log('Cycle watchdog not available — question timeout protection disabled', 'DEBUG', 'cycle');
+  }
+
   let page: any;
   let clickAttempts = 0;
   let clickSuccesses = 0;
@@ -170,6 +187,12 @@ async function runCycle() {
     let currentModule = getNextModule?.();
     if (currentModule) { log(`Selected module: ${currentModule}`, 'INFO', 'cycle'); }
 
+    // WD: Track whether we're currently working on a question.
+    // A "question" starts the first time we enter the loop or after a
+    // question completes, and ends when we hit score_screen/pathway_feedback.
+    let questionInProgress = false;
+    let currentQuestionNumber = questionsCompleted + 1;
+
     while (questionsCompleted < CONFIG.MAX_QUESTIONS && !stopRequested) {
       try { fs.writeFileSync(CONFIG.HEARTBEAT_FILE, String(Date.now())); } catch (_e: any) { /* best-effort heartbeat write */ }
       if (checkMemoryAndRecover(CONFIG, log, clearCache)) {
@@ -191,6 +214,31 @@ async function runCycle() {
       if (Date.now() - cycleStart > CONFIG.MAX_RUNTIME_PER_CYCLE_MS) {
         log('Cycle timeout', 'INFO', 'cycle');
         break;
+      }
+
+      // WD: Start tracking a new question if we're not already
+      if (!questionInProgress && watchdogArmed) {
+        currentQuestionNumber = questionsCompleted + 1;
+        wdOnQuestionStarted!(currentQuestionNumber);
+        questionInProgress = true;
+      }
+
+      // WD: Check if the current question has timed out (before doing anything else)
+      if (watchdogArmed) {
+        try {
+          const wdResult = await wdCheckTimeout!(page.url(), clickAttempts + clickSuccesses);
+          if (wdResult.shouldBreak && wdResult.shouldContinue) {
+            // Watchdog says: abandon this question, skip to next
+            questionInProgress = false;
+            questionsCompleted++; // Count as "processed" (even if failed) to advance
+            updateStats({ questionsCompleted });
+            saveCheckpoint?.({ url: page.url(), state: currentState || 'timeout_skip', questionsCompleted });
+            log(`Watchdog: Skipping question #${currentQuestionNumber} after timeout+self-heal`, 'WARN', 'cycle');
+            continue;
+          }
+        } catch (wdErr: any) {
+          logError('Watchdog check failed (non-fatal)', wdErr);
+        }
       }
 
       if (ensureAuthenticated) {
@@ -363,6 +411,11 @@ async function runCycle() {
         consecutiveFailures = 0;
       }
 
+      // WD: Notify watchdog that an action completed (resets stuck detection)
+      if (watchdogArmed) {
+        wdOnActionCompleted!(action.actionType);
+      }
+
       // Record experiment result
       const latency = Date.now() - startTime;
       if (strategyVariants?.getActiveExperiment?.()) {
@@ -413,6 +466,11 @@ async function runCycle() {
           log(`Module ${currentModule} completed in ${timeTaken / 1000}s`, 'INFO', 'cycle');
           currentModule = getNextModule?.();
           if (currentModule) { log(`Next module: ${currentModule}`, 'INFO', 'cycle'); }
+        }
+        // WD: Notify watchdog that this question completed successfully
+        if (watchdogArmed) {
+          wdOnQuestionCompleted!(currentQuestionNumber, true);
+          questionInProgress = false;
         }
       }
 
@@ -509,6 +567,10 @@ async function runCycle() {
       }
     }
   } finally {
+    // WD: Notify watchdog that the cycle is ending
+    if (watchdogArmed && wdOnCycleEnded) {
+      wdOnCycleEnded();
+    }
     if (closeBrowser) await closeBrowser();
     if (clearCache) clearCache();
     _networkSetup = false;
