@@ -149,7 +149,7 @@ for (const dir of [
 // LOAD MODULES
 // \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
 
-const { container, startSubsystemGroup, startSelfHealV2Subsystems, getContainerHealth, runStartupSmokeTests } = require('./container');
+const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilienceSubsystems, getContainerHealth, runStartupSmokeTests } = require('./container');
 
 let CONFIG: any, log: any, logError: any;
 let closeDatabase: any, upsertCalibration: any, selectCalibration: any, pruneTemplateCache: any;
@@ -199,6 +199,9 @@ if (!active) {
 
 // Self-Heal v2 subsystems (all enabled)
 startSelfHealV2Subsystems(CONFIG);
+
+// Resilience subsystems (survival, runtime, progress, economy, policy, auth, network)
+startResilienceSubsystems();
 
 // \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
 // WORKER FALLBACK: Start rewardTracker in-process
