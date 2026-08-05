@@ -133,7 +133,8 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
   const cached = getCachedVisionResponse(prompt, base64Image);
   if (cached) { log('Using cached vision response', 'DEBUG', 'vision'); return cached; }
 
-  const compressedBase64 = await compressScreenshot(base64Image, 640, 15);
+  // Improved compression: 768px wide, JPEG quality 30 (better OCR for math)
+  const compressedBase64 = await compressScreenshot(base64Image, 768, 30);
 
   // ─── Optional: Local ONNX pre-processing ───
   // This runs ONNX inference but doesn't use the result directly —
@@ -173,15 +174,21 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
     }
   }
 
-  // ─── Cloud provider execution ───
-  let providers = await getAvailableProviders();
+  // ─── Cloud provider execution (vision-only) ───
+  // Only query providers that actually support vision — text-only providers
+  // would silently strip the image and produce blind analyses.
+  let providers = await getAvailableProviders({ visionOnly: true });
 
-  // Groq priority: move Groq to front for speed (LPU inference is fastest).
-  // This is intentional — Groq's llama-3.2-11b-vision is both fast and good at OCR.
-  // The registry returns health-sorted providers, but we override for vision-specific speed.
-  const groqProvider = providers.find((p: any) => p.name === 'Groq');
-  const otherProviders = providers.filter((p: any) => p.name !== 'Groq');
-  const orderedProviders = groqProvider ? [groqProvider, ...otherProviders] : providers;
+  // z.ai GLM-4.6V priority: move z.ai to front for reliability (confirmed alive, free vision).
+  // DeepInfra priority: move DeepInfra after z.ai (free Qwen2.5-VL vision models).
+  const zaiProvider = providers.find((p: any) => p.name === 'z.ai');
+  const deepinfraProvider = providers.find((p: any) => p.name === 'DeepInfra');
+  const rest = providers.filter((p: any) => p.name !== 'z.ai' && p.name !== 'DeepInfra');
+  const orderedProviders = [
+    ...(zaiProvider ? [zaiProvider] : []),
+    ...(deepinfraProvider ? [deepinfraProvider] : []),
+    ...rest,
+  ];
 
   if (orderedProviders.length === 0) {
     log('No cloud providers available, falling back to local VLM...', 'WARN', 'vision');
@@ -249,7 +256,8 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
   }
 
   // ─── All cloud providers failed → local VLM fallback ───
-  log(`All ${results.length} cloud providers failed for vision, attempting local VLM fallback`, 'WARN', 'vision');
+  log(`All ${results.length} cloud vision providers failed, attempting local VLM fallback`, 'WARN', 'vision');
+  log(`Local VLM is ${getCONFIG().ENABLE_LOCAL_VLM ? 'enabled' : 'DISABLED (Render free plan limitation)'}`, 'INFO', 'vision');
   return await tryLocalVLM(compressedBase64, prompt, validator, setCachedVisionResponse, base64Image);
 }
 
