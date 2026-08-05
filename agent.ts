@@ -14,7 +14,7 @@ const { PROJECT_ROOT } = require('./project-root');
 // ─── DI Container — single point of access for all modules ───
 // NOTE: agent.ts IS the bootstrap entrypoint; direct require() here is intentional
 // (the container itself is being imported here to bootstrap everything else).
-const { container, startSubsystemGroup, startSelfHealV2Subsystems, getContainerHealth } = require('./container');
+const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilienceSubsystems, getContainerHealth } = require('./container');
 
 // ─── Core modules (critical, initialized eagerly) ───
 let CONFIG: any,       log: any,       setLogLevel: any,       logError: any,       logMetric: any,       logAudit: any;
@@ -374,6 +374,9 @@ resourceManager?.start?.();
 // ─── Self-Heal v2: All subsystems via container ───
 // A: Predictive & Proactive Healing
 startSelfHealV2Subsystems(CONFIG);
+
+// ─── Resilience subsystems ───
+startResilienceSubsystems();
 
 // B6: Prompt evolution
 if (CONFIG.PROMPT_EVOLUTION_ENABLED) {
