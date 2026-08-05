@@ -4,6 +4,7 @@ const { createContainer } = require('./container-modules');
 const {
   startSubsystemGroup,
   startSelfHealV2Subsystems,
+  startResilienceSubsystems,
   getContainerHealth,
   runStartupSmokeTests,
   spawnWorkers,
@@ -21,6 +22,8 @@ module.exports = {
     startSubsystemGroup(container, tag, method),
   startSelfHealV2Subsystems: (CONFIG: any) =>
     startSelfHealV2Subsystems(container, CONFIG),
+  startResilienceSubsystems: () =>
+    startResilienceSubsystems(container),
   getContainerHealth: () =>
     getContainerHealth(container),
   runStartupSmokeTests: () =>
