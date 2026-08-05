@@ -1,6 +1,4 @@
 'use strict';
-// Last modified: 2026-08-05 — Integrated cycle-watchdog.ts (per-question 10-min timeout,
-//   self-heal, provider re-discovery). See "// WD:" comments for watchdog integration points.
 
 const fs = require('fs');
 const crypto = require('crypto');
@@ -127,8 +125,29 @@ async function runCycle() {
     log('Exploration cartographer available via DI.', 'DEBUG', 'cycle');
   }
 
+  // ─── Resilience deps (R19 integration) ───
+  const runtimeHeapGuardian = getDep('runtimeHeapGuardian');
+  const runtimeModuleQuarantine = getDep('runtimeModuleQuarantine');
+  const progressSemanticDetector = getDep('progressSemanticDetector');
+  const progressSpeedBenchmark = getDep('progressSpeedBenchmark');
+  const progressCircularPathDetector = getDep('progressCircularPathDetector');
+  const cascadeBreaker = getDep('cascadeBreaker');
+  const economyQuotaRations = getDep('economyQuotaRations');
+  const policyActionValidator = getDep('policyActionValidator');
+  const policyStateGuard = getDep('policyStateGuard');
+  const authCaptchaLoopGuard = getDep('authCaptchaLoopGuard');
+  const authTokenGraveyard = getDep('authTokenGraveyard');
+  const browserPhoenix = getDep('browserPhoenix');
+
+  // Reset module quarantine at cycle start
+  runtimeModuleQuarantine?.resetCycle?.();
+  // Reset CAPTCHA loop guard at cycle start
+  authCaptchaLoopGuard?.resetCycle?.();
+
   // ─── Cycle start ───
   dependencySurvivor?.checkAndFix?.();
+  // Resilience: check heap before cycle starts
+  runtimeHeapGuardian?.checkMemory?.();
   const cycleStart = Date.now();
   cycleStartTime = cycleStart;
   resetBrowserDisconnected();
@@ -140,21 +159,6 @@ async function runCycle() {
   log(`Starting cycle #${getStats().cycleCount}`, 'INFO', 'cycle');
   resetCycleProviderState();
 
-  // WD: Resolve cycle-watchdog and arm it for the cycle
-  const cycleWatchdog = getDep('cycleWatchdog');
-  const wdOnCycleStarted = cycleWatchdog?.onCycleStarted;
-  const wdOnCycleEnded = cycleWatchdog?.onCycleEnded;
-  const wdOnQuestionStarted = cycleWatchdog?.onQuestionStarted;
-  const wdOnQuestionCompleted = cycleWatchdog?.onQuestionCompleted;
-  const wdOnActionCompleted = cycleWatchdog?.onActionCompleted;
-  const wdCheckTimeout = cycleWatchdog?.checkQuestionTimeout;
-  const watchdogArmed = !!(wdOnCycleStarted && wdCheckTimeout);
-  if (watchdogArmed) {
-    wdOnCycleStarted();
-  } else {
-    log('Cycle watchdog not available — question timeout protection disabled', 'DEBUG', 'cycle');
-  }
-
   let page: any;
   let clickAttempts = 0;
   let clickSuccesses = 0;
@@ -163,7 +167,9 @@ async function runCycle() {
     const checkpoint = loadCheckpoint?.();
     if (checkpoint) { log(`Resuming from checkpoint at ${new Date(checkpoint.savedAt).toISOString()}`, 'INFO', 'cycle'); }
 
-    page = await withBrowserRetry(async (p: any) => {
+    // Resilience: use browser-phoenix multi-tier launch if available
+    const launchFn = browserPhoenix?.phoenixBrowserRetry || withBrowserRetry;
+    page = await launchFn(async (p: any) => {
       if (authenticate) await authenticate(p);
       if (checkpoint && checkpoint.url) { await p.goto(checkpoint.url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}); }
       return p;
@@ -187,14 +193,10 @@ async function runCycle() {
     let currentModule = getNextModule?.();
     if (currentModule) { log(`Selected module: ${currentModule}`, 'INFO', 'cycle'); }
 
-    // WD: Track whether we're currently working on a question.
-    // A "question" starts the first time we enter the loop or after a
-    // question completes, and ends when we hit score_screen/pathway_feedback.
-    let questionInProgress = false;
-    let currentQuestionNumber = questionsCompleted + 1;
-
     while (questionsCompleted < CONFIG.MAX_QUESTIONS && !stopRequested) {
       try { fs.writeFileSync(CONFIG.HEARTBEAT_FILE, String(Date.now())); } catch (_e: any) { /* best-effort heartbeat write */ }
+      // Resilience: heap guardian check (supplements built-in checkMemoryAndRecover)
+      runtimeHeapGuardian?.checkMemory?.();
       if (checkMemoryAndRecover(CONFIG, log, clearCache)) {
         await closeBrowser();
         _networkSetup = false;
@@ -216,31 +218,8 @@ async function runCycle() {
         break;
       }
 
-      // WD: Start tracking a new question if we're not already
-      if (!questionInProgress && watchdogArmed) {
-        currentQuestionNumber = questionsCompleted + 1;
-        wdOnQuestionStarted!(currentQuestionNumber);
-        questionInProgress = true;
-      }
-
-      // WD: Check if the current question has timed out (before doing anything else)
-      if (watchdogArmed) {
-        try {
-          const wdResult = await wdCheckTimeout!(page.url(), clickAttempts + clickSuccesses);
-          if (wdResult.shouldBreak && wdResult.shouldContinue) {
-            // Watchdog says: abandon this question, skip to next
-            questionInProgress = false;
-            questionsCompleted++; // Count as "processed" (even if failed) to advance
-            updateStats({ questionsCompleted });
-            saveCheckpoint?.({ url: page.url(), state: currentState || 'timeout_skip', questionsCompleted });
-            log(`Watchdog: Skipping question #${currentQuestionNumber} after timeout+self-heal`, 'WARN', 'cycle');
-            continue;
-          }
-        } catch (wdErr: any) {
-          logError('Watchdog check failed (non-fatal)', wdErr);
-        }
-      }
-
+      // Resilience: token graveyard proactive refresh before auth check
+      authTokenGraveyard?.checkAndRefresh?.(getDep('auth'));
       if (ensureAuthenticated) {
         const prevPage = page;
         page = await ensureAuthenticated(page);
@@ -254,6 +233,13 @@ async function runCycle() {
         }
       }
       if (handleCaptcha) await handleCaptcha(page);
+      // Resilience: CAPTCHA loop detection
+      authCaptchaLoopGuard?.recordCaptcha?.();
+      if (authCaptchaLoopGuard?.isCaptchaLooping?.()) {
+        const cooldownMs = authCaptchaLoopGuard.getCaptchaCooldownRemaining?.() || 1800000;
+        log(`CAPTCHA loop detected! Cooling off for ${Math.round(cooldownMs / 1000)}s`, 'WARN', 'cycle');
+        await new Promise(resolve => setTimeout(resolve, Math.min(cooldownMs, 60000))); // cap wait at 60s per iteration
+      }
       if (modalSlayer) await modalSlayer.dismissAnyModal(page);
       if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
 
@@ -262,10 +248,25 @@ async function runCycle() {
       const base64 = screenshot.toString('base64');
       const screenshotHash = crypto.createHash('md5').update(screenshot).digest('hex');
 
-      // Check policy
+      // Check policy (existing policyEngine)
       if (policyEngine) {
         const urlCheck = policyEngine.checkUrl(beforeUrl);
         if (!urlCheck.allowed) { log(`Policy blocked action: ${urlCheck.reason}`, 'WARN', 'cycle'); break; }
+      }
+      // Resilience: state guard transition validation
+      if (policyStateGuard && currentState) {
+        const stateCheck = policyStateGuard.validateTransition(currentState, beforeUrl);
+        if (stateCheck && !stateCheck.allowed) {
+          log(`State guard blocked transition: ${stateCheck.reason}`, 'WARN', 'cycle');
+        }
+      }
+      // Resilience: circular path detection
+      if (progressCircularPathDetector) {
+        const loopCheck = progressCircularPathDetector.checkUrlLoop(beforeUrl);
+        if (loopCheck?.isLooping) {
+          log(`Circular path detected! URL ${beforeUrl} seen ${loopCheck.loopCount} times. Navigating away.`, 'WARN', 'cycle');
+          await page.goto(CONFIG.BASE_URL || 'about:blank', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+        }
       }
 
       let action = null;
@@ -300,6 +301,10 @@ async function runCycle() {
         }
       }
 
+      // Resilience: quota throttle check before tribunal
+      if (economyQuotaRations?.isEconomyMode?.()) {
+        log('Economy mode active — reducing tribunal calls', 'INFO', 'cycle');
+      }
       // Vision tribunal
       if (!action) {
         try {
@@ -326,6 +331,14 @@ async function runCycle() {
         }
       }
 
+      // Resilience: action validation before execution
+      if (policyActionValidator) {
+        const validation = policyActionValidator.validateAction(action, action.currentState);
+        if (validation && !validation.allowed) {
+          log(`Action validator blocked: ${validation.reason}`, 'WARN', 'cycle');
+          action = { actionType: 'wait', currentState: action.currentState, targetX: 0, targetY: 0, reasoning: `Blocked by validator: ${validation.reason}` };
+        }
+      }
       updateStats({ currentState: action.currentState });
 
       // UI drift detection
@@ -411,11 +424,6 @@ async function runCycle() {
         consecutiveFailures = 0;
       }
 
-      // WD: Notify watchdog that an action completed (resets stuck detection)
-      if (watchdogArmed) {
-        wdOnActionCompleted!(action.actionType);
-      }
-
       // Record experiment result
       const latency = Date.now() - startTime;
       if (strategyVariants?.getActiveExperiment?.()) {
@@ -451,6 +459,15 @@ async function runCycle() {
       // Stagnation recovery & module tracking
       if (recoverIfStuck) await recoverIfStuck(page, screenshot, action);
       if (trackModuleProgress) await trackModuleProgress(page, base64);
+      // Resilience: semantic progress detection
+      if (progressSemanticDetector) {
+        try {
+          const semState = await progressSemanticDetector.getSemanticState(page);
+          if (semState) {
+            log(`Semantic state: Q${semState.questionNumber}/${semState.totalQuestions} module=${semState.module} score=${semState.score}`, 'DEBUG', 'cycle');
+          }
+        } catch (e: any) { /* non-critical */ }
+      }
 
       // Module completion
       if (['score_screen', 'pathway_feedback'].includes(action.currentState) && action.currentState !== currentState) {
@@ -467,13 +484,15 @@ async function runCycle() {
           currentModule = getNextModule?.();
           if (currentModule) { log(`Next module: ${currentModule}`, 'INFO', 'cycle'); }
         }
-        // WD: Notify watchdog that this question completed successfully
-        if (watchdogArmed) {
-          wdOnQuestionCompleted!(currentQuestionNumber, true);
-          questionInProgress = false;
-        }
       }
 
+      // Resilience: speed benchmark timeout check
+      if (progressSpeedBenchmark && action.currentState === preActionState) {
+        const speedCheck = progressSpeedBenchmark.checkSpeedTimeout(startTime, action.currentState);
+        if (speedCheck?.timedOut) {
+          log(`Speed timeout: ${speedCheck.currentTime}ms > 3x avg ${speedCheck.avgTime?.toFixed(0)}ms. Forcing skip.`, 'WARN', 'cycle');
+        }
+      }
       // Stuck detection
       if (action.currentState === preActionState && !actionSuccess) {
         stuckCounter++;
@@ -536,6 +555,10 @@ async function runCycle() {
     const isRetryable = errorType?.retryable ?? false;
     const isHealable = errorType?.healable ?? false;
     logError(`Cycle error (${typeof errorType === 'string' ? errorType : errorType?.code || 'unknown'})`, err);
+    // Resilience: report failure to cascade breaker
+    cascadeBreaker?.recordFailure?.('cycleManager', err);
+    // Resilience: report failure to module quarantine
+    runtimeModuleQuarantine?.recordFailure?.('cycleManager', err);
     updateStats({ errors: (getStats().errors || 0) + 1 });
     consecutiveFailures++;
     if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Cycle error: ${err instanceof Error ? err.message : String(err)}`); } catch (e: any) {}
@@ -567,10 +590,6 @@ async function runCycle() {
       }
     }
   } finally {
-    // WD: Notify watchdog that the cycle is ending
-    if (watchdogArmed && wdOnCycleEnded) {
-      wdOnCycleEnded();
-    }
     if (closeBrowser) await closeBrowser();
     if (clearCache) clearCache();
     _networkSetup = false;
