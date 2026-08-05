@@ -1,4 +1,5 @@
 'use strict';
+// Last modified: 2026-08-05 — Response 20: Added DeepInfra, generalized emergency discovery, vision-only filter
 
 // Provider implementations — internal sub-modules, not container-registered
 const { GitHubGPTProvider } = require('./providers-github-gpt');
@@ -10,6 +11,7 @@ const { CloudflareProvider } = require('./providers-cloudflare');
 const { CerebrasProvider } = require('./providers-cerebras');
 const { GeminiProvider } = require('./providers-gemini');
 const { OpenRouterTribunalProvider } = require('./providers-openrouter-tribunal');
+const { DeepInfraProvider } = require('./providers-deepinfra');
 
 // ─── Dependency Injection ───────────────────────────────────────────────────
 let _deps: Record<string, any> = {};
@@ -54,6 +56,7 @@ const PROVIDER_TABLE: ProviderEntry[] = [
   { name: 'NVIDIA', factory: NvidiaProvider },
   { name: 'Cloudflare', factory: CloudflareProvider },
   { name: 'Cerebras', factory: CerebrasProvider },
+  { name: 'DeepInfra', factory: DeepInfraProvider },
   { name: 'Gemini', factory: GeminiProvider },
   { name: 'OpenRouter', factory: OpenRouterTribunalProvider },
   // GitHub GPT is in the table but filtered by P9 (disabled by default)
@@ -298,12 +301,13 @@ function isProviderRetired(name: string): boolean {
 //   4. Not retired
 //   5. Not disabled/cooldown/circuit-open (from providers-health)
 //   6. Not Gemini on 429 cooldown (P10)
-//   7. Sort by health score descending
+//   7. Vision-only filter if requested (Phase 2.5)
+//   8. Sort by health score descending
 
-async function getAvailableProviders() { 
+async function getAvailableProviders(options?: { visionOnly?: boolean }) { 
   const log = getLog();
   const configLoader = _getConfigLoader();
-  const candidates: Array<{ name: string; fn: any; healthScore: number }> = [];
+  let candidates: Array<{ name: string; fn: any; healthScore: number }> = [];
 
   // ─── Phase 1: Collect candidates from PROVIDER_TABLE ───
   for (const entry of PROVIDER_TABLE) {
@@ -346,6 +350,19 @@ async function getAvailableProviders() {
     candidates.push({ name: dp.name, fn: dp.fn, healthScore });
   }
 
+  // ─── Phase 2.5: Vision-only filtering ───
+  if (options?.visionOnly) {
+    const serializers = _getSerializers();
+    const beforeCount = candidates.length;
+    candidates = candidates.filter(candidate => {
+      const caps = serializers.getProviderCapabilities?.(candidate.name);
+      const isVisionCapable = caps ? caps.supportsVision : true;
+      return isVisionCapable;
+    });
+    const filtered = beforeCount - candidates.length;
+    log(`Vision filter: ${filtered} text-only providers excluded`, 'DEBUG', 'registry');
+  }
+
   // ─── Phase 3: Sort by health score (highest first) ───
   candidates.sort((a, b) => b.healthScore - a.healthScore);
 
@@ -357,12 +374,19 @@ async function getAvailableProviders() {
       if (discovered.length > 0) {
         log(`Emergency discovery found ${discovered.length} model(s). Attempting to register as dynamic providers.`, 'WARN', 'registry');
         // Try to create callable providers from discovered models
+        const PROVIDER_ENDPOINT_MAP: Record<string, {endpoint: string; envKey: string}> = {
+          openrouter: { endpoint: 'https://openrouter.ai/api/v1/chat/completions', envKey: 'OPENROUTER_API_KEY' },
+          groq: { endpoint: 'https://api.groq.com/openai/v1/chat/completions', envKey: 'GROQ_API_KEY' },
+          nvidia: { endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions', envKey: 'NVIDIA_API_KEY' },
+          deepinfra: { endpoint: 'https://api.deepinfra.com/v1/openai/chat/completions', envKey: 'DEEPINFRA_API_KEY' },
+        };
         for (const disc of discovered.slice(0, 2)) {
-          if (disc.provider === 'openrouter' && process.env.OPENROUTER_API_KEY) {
+          const providerConfig = PROVIDER_ENDPOINT_MAP[disc.provider];
+          if (providerConfig && process.env[providerConfig.envKey]) {
             const { callChatCompletionWithRollback, extractJSON, validateActionResponse, retryWithBackoff } = require('./providers-base');
             const modelId = disc.model;
-            const endpoint = 'https://openrouter.ai/api/v1/chat/completions';
-            const apiKey = process.env.OPENROUTER_API_KEY;
+            const endpoint = providerConfig.endpoint;
+            const apiKey = process.env[providerConfig.envKey];
             const dynName = `discovered-${modelId.replace(/[^a-z0-9]/gi, '-').slice(0, 30)}`;
             const dynFn = async (base64Image: any, prompt: any, signal: any, options: any = {}) => {
               const rawContent = await retryWithBackoff(() =>
