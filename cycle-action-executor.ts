@@ -40,9 +40,13 @@ const PRE_TYPE_DELAY_MS = 500;
 /** Delay between keypad taps (ms). */
 const KEYPAD_TAP_DELAY_MS = 200;
 
-/** BUG FIX (Response 19): Maximum time for a single action execution (ms).
- * Prevents a single action from blocking the cycle indefinitely. */
+/** Maximum time for a single non-wait action execution (ms).
+ * Prevents a non-wait action from blocking the cycle indefinitely.
+ * Wait actions use their own dynamic timeout (waitTime + buffer). */
 const ACTION_TIMEOUT_MS = 30 * 1000; // 30 seconds
+
+/** Extra buffer added to wait action time for timeout (ms). */
+const WAIT_TIMEOUT_BUFFER_MS = 5000;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Helpers
@@ -79,14 +83,28 @@ async function _typeText(page: any, text: string, config: any): Promise<void> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function executeAction(page: any, action: any) {
-  // BUG FIX (Response 19): Race the entire action against a timeout
+  // Race the entire action against a timeout.
+  // Wait actions use a dynamic timeout (waitTime + buffer) since they may
+  // legitimately need > 30s (e.g., BETWEEN_STEPS_MS * WAIT_MULTIPLIER = 75s).
+  const isWaitAction = action.actionType === 'wait';
+  const CONFIG = getCONFIG();
+  const wm = _waitMultiplier(CONFIG);
+  const estimatedWaitTime = isWaitAction
+    ? ((CONFIG.ENABLE_ADAPTIVE_PERFORMANCE && _deps.adaptivePerformanceEngine?.getAdjustedWait)
+        ? (_deps.adaptivePerformanceEngine.getAdjustedWait(CONFIG.BETWEEN_STEPS_MS) || CONFIG.BETWEEN_STEPS_MS * wm)
+        : CONFIG.BETWEEN_STEPS_MS * wm)
+    : 0;
+  const timeoutMs = isWaitAction
+    ? Math.max(estimatedWaitTime + WAIT_TIMEOUT_BUFFER_MS, ACTION_TIMEOUT_MS)
+    : ACTION_TIMEOUT_MS;
+
   const actionPromise = _executeActionInner(page, action);
   const timeoutPromise = new Promise<null>(resolve =>
-    setTimeout(() => resolve(null), ACTION_TIMEOUT_MS)
+    setTimeout(() => resolve(null), timeoutMs)
   );
   const result = await Promise.race([actionPromise, timeoutPromise]);
   if (result === null) {
-    log(`Action ${action.actionType} timed out after ${ACTION_TIMEOUT_MS / 1000}s`, 'WARN', 'action');
+    log(`Action ${action.actionType} timed out after ${timeoutMs / 1000}s`, 'WARN', 'action');
   }
 }
 
