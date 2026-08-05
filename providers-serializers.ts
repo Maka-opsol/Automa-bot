@@ -1,4 +1,5 @@
 'use strict';
+// Last modified: 2026-08-05 — Response 20: Fixed Groq/NVIDIA vision flags, added DeepInfra, updated text-only patterns
 
 // ─── Provider-Specific Request Serializers (P1) ───
 //
@@ -47,8 +48,8 @@ export interface ProviderCapabilities {
 export const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
   'Groq': {
     name: 'Groq',
-    supportsVision: true,
-    supportsMultipartContent: true,
+    supportsVision: false,  // Default model llama-3.3-70b-versatile is text-only; vision models available but not default
+    supportsMultipartContent: false,  // Default model llama-3.3-70b-versatile is text-only; vision models available but not default
     supportsSystemRole: true,
     supportsResponseFormat: false,  // Groq does NOT reliably support response_format
     requiresPaidPlan: false,
@@ -80,7 +81,7 @@ export const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
   },
   'NVIDIA': {
     name: 'NVIDIA',
-    supportsVision: true,  // llama-3.2-11b-vision-instruct supports vision
+    supportsVision: false,  // Default model is text-only; vision fallback available (llama-3.2-11b-vision-instruct)
     supportsMultipartContent: true,
     supportsSystemRole: true,
     supportsResponseFormat: false,  // NVIDIA's free tier doesn't reliably support it
@@ -111,6 +112,17 @@ export const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
     enabled: true,
     serializerType: 'openai',
   },
+  'DeepInfra': {
+    name: 'DeepInfra',
+    supportsVision: true,  // Qwen2.5-VL is vision-capable
+    supportsMultipartContent: true,
+    supportsSystemRole: true,
+    supportsResponseFormat: false,
+    requiresPaidPlan: false,
+    freeTier: true,
+    enabled: true,
+    serializerType: 'openai',
+  },
   'Gemini': {
     name: 'Gemini',
     supportsVision: true,
@@ -133,6 +145,7 @@ export const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
     enabled: true,
     serializerType: 'openai',
   },
+  // Retired July 30, 2026
   'GitHub GPT': {
     name: 'GitHub GPT',
     supportsVision: true,  // gpt-4o-mini supports vision
@@ -375,9 +388,12 @@ function providerSupportsVision(providerName: string, model?: string): boolean {
   if (model) {
     // Known text-only model patterns
     const textOnlyPatterns = [
-      'qwen3-0.6b',
-      'llama-4-scout',         // llama-4-scout is text-only
-      'deepseek-r1-distill',  // deepseek-r1-distill-llama-70b is text-only
+      'llama-3.3-70b',         // text-only
+      'llama-4-scout',         // text-only
+      'deepseek-r1-distill',  // text-only
+      'qwen3-0.6b',           // text-only
+      'gemma2-9b-it',         // text-only
+      'qwen3-coder',          // inference-focused, not vision
     ];
     for (const pattern of textOnlyPatterns) {
       if (model.toLowerCase().includes(pattern.toLowerCase())) return false;
