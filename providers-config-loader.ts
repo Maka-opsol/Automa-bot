@@ -102,20 +102,20 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'Cerebras': {
     endpoint: 'https://api.cerebras.ai/v1/chat/completions',
-    model: 'llama-4-scout-17b-16e-instruct',
+    model: 'llama-4-scout-17b-16e',
     envKeys: ['CEREBRAS_API_KEY'],
     visionCapable: false,  // Cerebras is inference-only, text
     fallbackModels: [
       'llama3.3-70b',
-      'deepseek-r1-distill-llama-70b',
+      'qwen-3-32b',
     ],
   },
   'DeepInfra': {
     endpoint: 'https://api.deepinfra.com/v1/openai/chat/completions',
-    model: 'Qwen/Qwen2.5-VL-7B-Instruct',
+    model: 'Qwen/Qwen2.5-VL-32B-Instruct',
     envKeys: ['DEEPINFRA_API_KEY'],
     visionCapable: true,
-    fallbackModels: ['Qwen/Qwen2.5-VL-32B-Instruct', 'meta-llama/Llama-3.2-11B-Vision-Instruct'],
+    fallbackModels: ['meta-llama/Llama-4-Scout-17B-16E-Instruct', 'Qwen/Qwen3-0.6B'],
   },
   'Gemini': {
     endpoint: null,  // uses Google SDK, not HTTP endpoint
