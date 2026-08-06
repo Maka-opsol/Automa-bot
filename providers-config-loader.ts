@@ -1,4 +1,4 @@
-'use strict';
+ strict';
 // Last modified: 2026-08-05 — Response 20: Updated model IDs, added DeepInfra, fixed Groq vision filter
 
 // ─── Dependency Injection ───────────────────────────────────────────────────
@@ -102,7 +102,7 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'Cerebras': {
     endpoint: 'https://api.cerebras.ai/v1/chat/completions',
-    model: 'llama-4-scout-17b-16e',
+    model: 'gemma-4-31b',
     envKeys: ['CEREBRAS_API_KEY'],
     visionCapable: false,  // Cerebras is inference-only, text
     fallbackModels: [
