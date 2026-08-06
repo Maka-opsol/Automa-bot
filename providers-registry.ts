@@ -318,7 +318,17 @@ async function getAvailableProviders(options?: { visionOnly?: boolean }) {
 
     // Instantiate the provider (checks for API key)
     const fn = entry.factory();
-    if (!fn) continue;
+    if (!fn) {
+      // Log why each provider was skipped for diagnostics
+      const envKeys = configLoader.getEnvKeys?.(entry.name) || [];
+      const missingKeys = envKeys.filter((k: string) => !process.env[k]);
+      if (missingKeys.length > 0) {
+        getLog()(`Provider ${entry.name} skipped — missing env keys: ${missingKeys.join(', ')}`, 'DEBUG', 'registry');
+      } else {
+        getLog()(`Provider ${entry.name} factory returned null (unknown reason)`, 'DEBUG', 'registry');
+      }
+      continue;
+    }
 
     // Check all exclusion filters
     if (isProviderBlacklisted(entry.name)) continue;
