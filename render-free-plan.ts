@@ -937,6 +937,12 @@ try {
   });
 } catch { /* module not found — skip */ }
 
+// BetterStack Logtail (graceful no-op if not configured)
+try {
+  const betterstack = require('./logging-betterstack');
+  betterstack.startBetterStackLogging();
+} catch { /* module not found — skip */ }
+
 // Startup smoke tests
 const smokeResult = runStartupSmokeTests();
 if (!smokeResult.passed && CONFIG.ALERT_ON_ERROR) {
