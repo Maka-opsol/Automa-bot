@@ -1,305 +1,132 @@
 'use strict';
+// Last modified: 2026-08-05 — Response 20: Updated vision/text fallback model lists for Aug 2026
 
-// Lazy requires to avoid top-level circular dependency chain
-const { getAvailableProviders, addProviderFailure, recordProviderResult } = require('./providers-registry');
+// ─── OpenRouter Tribunal Provider ───────────────────────────────────────────
+//
+// Uses OpenRouter's API to access multiple free vision models.
+// This is the most flexible provider — it can route to any OpenRouter model.
+//
+// Key behaviors:
+//   - Uses callChatCompletionWithRollback (not bare callChatCompletion)
+//     for protocol chameleon 422 recovery and config rollback support
+//   - Falls back through a chain of known free vision models
+//   - Model-level vision capability check via providers-serializers
+//     (e.g., llama-4-scout is text-only and will be skipped for vision tasks)
+//   - P7: providerName passed to retryWithBackoff for health-aware retries
+//   - P19: Fallback chain includes multiple free vision models for resilience
 
-// Lazy logger — loaded on first use
+const { extractJSON, validateActionResponse, callChatCompletionWithRollback, retryWithBackoff } = require('./providers-base');
+const { providerSupportsVision } = require('./providers-serializers');
+
+// Lazy logger
 let _logger: any = null;
 function _getLogger() { if (!_logger) _logger = require('./logger'); return _logger; }
 
-// Lazy providers-base — loaded on first use
-let _providersBase: any = null;
-function _getProvidersBase() { if (!_providersBase) _providersBase = require('./providers-base'); return _providersBase; }
-
-// Lazy providers-prompts — loaded on first use
-let _prompts: any = null;
-function _getPrompts() { if (!_prompts) _prompts = require('./providers-prompts'); return _prompts; }
-
-// Lazy health module — loaded on first use
-let _healthMod: any = null;
-function _getHealth() { if (!_healthMod) _healthMod = require('./providers-health'); return _healthMod; }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// WEIGHTED CONSENSUS ALGORITHM (P12)
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Each provider vote is weighted by three factors:
-//   1. Health score (0.0-1.0) — from providers-health, reflects success rate,
-//      latency, error diversity, recency
-//   2. Confidence (0.0-1.0) — extracted from the provider's response if it
-//      includes a 'confidence' field, otherwise estimated from reasoning length
-//   3. Latency inverse (normalized) — faster responses get slightly higher
-//      weight (1 / normalizedLatency), capped to prevent extreme values
-//
-// Final weight = healthScore * confidence * latencyInverse
-//
-// Consensus: the action with the highest TOTAL weight wins, provided it has
-// at least 30% of the total weight (prevents a single high-weight outlier
-// from dominating). If no action reaches 30%, the highest-weight action
-// still wins (fail-open — better than returning 'wait' and idling).
-
-interface WeightedVote {
-  action: any;
-  providerName: string;
-  healthScore: number;
-  confidence: number;
-  latencyMs: number;
-  weight: number;
-}
-
-interface WeightedConsensus {
-  winningAction: any;
-  totalWeight: number;
-  winnerWeight: number;
-  agreementPct: number;
-  clusterSize: number;
-  totalVoters: number;
-  details: Array<{ providerName: string; actionType: string; weight: number }>;
-}
+/**
+ * Known free vision models on OpenRouter, ordered by quality.
+ * Text-only models are filtered out at runtime via providerSupportsVision().
+ *
+ * Models marked with (V) are confirmed vision-capable.
+ * Models marked with (T) are text-only — included as last-resort fallbacks
+ * when no image is present, or when vision providers all fail.
+ */
+const VISION_FALLBACK_MODELS = [
+  'google/gemma-3-27b-it',           // (V) Best free vision model on OpenRouter
+  'nvidia/nemotron-nano-12b-2-vl',   // (V) NVIDIA Nemotron vision — OCR-optimized
+  'google/gemma-3-12b-it',           // (V) Smaller Gemma, still good vision
+  'qwen/qwen2.5-vl-72b-instruct',   // (V) Qwen vision — excellent at math OCR
+];
 
 /**
- * Estimate confidence from a provider response.
- * If the response includes a numeric 'confidence' field, use it.
- * Otherwise, estimate from reasoning length: longer reasoning = higher confidence.
- * Range: 0.0 – 1.0
+ * Text-only fallback models. Used only when:
+ *   1. No image is provided (text-only request), OR
+ *   2. All vision models failed and we have no other option
+ * These are cheap, fast, but CANNOT process images.
  */
-function extractConfidence(action: any): number {
-  if (!action) return 0.5;
-  // Explicit confidence from LLM response
-  if (typeof action.confidence === 'number' && action.confidence >= 0 && action.confidence <= 1) {
-    return action.confidence;
-  }
-  // Estimate from reasoning length
-  const reasoning = action.reasoning || '';
-  if (reasoning.length > 200) return 0.8;
-  if (reasoning.length > 100) return 0.7;
-  if (reasoning.length > 50) return 0.6;
-  if (reasoning.length > 20) return 0.5;
-  return 0.4;  // very short or no reasoning
-}
+const TEXT_FALLBACK_MODELS = [
+  'google/gemma-4-31b-it',                     // (T) Updated Aug 2026
+  'nvidia/nemotron-3-super-120b',               // (T) Efficient MoE, strong reasoning
+  'deepseek/deepseek-r1-distill-llama-70b',      // (T) Reasoning (if still available)
+];
 
-/**
- * Compute latency inverse weight.
- * Faster responses get higher weight, but capped to prevent
- * a 100ms response from completely dominating a 5000ms one.
- * Uses reciprocal with floor: 1 / max(latency, 500)
- * Then normalized across all votes.
- */
-function computeLatencyInverse(latencyMs: number, minLatency: number, maxLatency: number): number {
-  if (maxLatency <= minLatency) return 1.0;
-  // Normalize to 0.0-1.0 range (inverse: lower latency = higher value)
-  const normalized = 1.0 - ((latencyMs - minLatency) / (maxLatency - minLatency));
-  // Apply floor at 0.5 so even the slowest provider retains some influence
-  return Math.max(0.5, Math.min(1.0, normalized + 0.5));
-}
-
-/**
- * Run the weighted consensus algorithm.
- * Returns the consensus result or null if no valid votes.
- */
-function findWeightedConsensus(votes: WeightedVote[]): WeightedConsensus | null {
-  if (votes.length === 0) return null;
-
-  // Single voter — accept directly
-  if (votes.length === 1) {
-    return {
-      winningAction: votes[0].action,
-      totalWeight: votes[0].weight,
-      winnerWeight: votes[0].weight,
-      agreementPct: 1.0,
-      clusterSize: 1,
-      totalVoters: 1,
-      details: [{ providerName: votes[0].providerName, actionType: votes[0].action.actionType, weight: votes[0].weight }],
-    };
+function OpenRouterTribunalProvider() {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    return null;
   }
 
-  // Group votes by action key (currentState::actionType)
-  const clusters = new Map<string, WeightedVote[]>();
-  for (const vote of votes) {
-    const key = `${vote.action.currentState || 'unknown'}::${vote.action.actionType}`;
-    if (!clusters.has(key)) clusters.set(key, []);
-    clusters.get(key)!.push(vote);
-  }
+  // The primary model can be overridden via env var
+  const primaryModel = process.env.OPENROUTER_TRIBUNAL_MODEL || 'google/gemma-3-27b-it';
+  const endpoint = 'https://openrouter.ai/api/v1/chat/completions';
 
-  // Sum weights per cluster
-  const clusterWeights = new Map<string, number>();
-  for (const [key, clusterVotes] of clusters) {
-    const totalWeight = clusterVotes.reduce((sum, v) => sum + v.weight, 0);
-    clusterWeights.set(key, totalWeight);
-  }
+  return async (base64Image: any, prompt: any, signal: any, options: any = {}) => {
+    const log = _getLogger().log;
+    const hasImage = !!base64Image;
 
-  // Total weight across all votes
-  const totalWeight = votes.reduce((sum, v) => sum + v.weight, 0);
+    // Build fallback chain based on whether we have an image
+    // If image present: try vision models first, then text fallbacks
+    // If no image: try primary model, then text fallbacks
+    const candidates = [primaryModel];
+    const fallbackPool = hasImage
+      ? [...VISION_FALLBACK_MODELS, ...TEXT_FALLBACK_MODELS]
+      : [...TEXT_FALLBACK_MODELS];
 
-  // Find the cluster with highest total weight
-  let bestKey = '';
-  let bestWeight = -1;
-  for (const [key, weight] of clusterWeights) {
-    if (weight > bestWeight) { bestWeight = weight; bestKey = key; }
-  }
+    // Deduplicate (primary model might be in the fallback pool)
+    const seen = new Set<string>();
+    for (const m of candidates) {
+      if (!seen.has(m)) seen.add(m);
+    }
+    for (const m of fallbackPool) {
+      if (!seen.has(m)) seen.add(m);
+    }
+    const models = Array.from(seen);
 
-  const bestCluster = clusters.get(bestKey)!;
-  const rep = bestCluster[0].action;
-  const agreementPct = totalWeight > 0 ? bestWeight / totalWeight : 0;
-
-  // Build details for logging
-  const details = votes.map(v => ({
-    providerName: v.providerName,
-    actionType: v.action.actionType,
-    weight: Math.round(v.weight * 1000) / 1000,
-  }));
-
-  return {
-    winningAction: rep,
-    totalWeight: Math.round(totalWeight * 1000) / 1000,
-    winnerWeight: Math.round(bestWeight * 1000) / 1000,
-    agreementPct: Math.round(agreementPct * 100) / 100,
-    clusterSize: bestCluster.length,
-    totalVoters: votes.length,
-    details,
-  };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// TRIBUNAL EXECUTION
-// ═══════════════════════════════════════════════════════════════════════════════
-
-async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = null, signal: any = null) {
-  const { log } = _getLogger();
-  const { safeCall } = _getProvidersBase();
-  const { getSystemPrompt, getUserInstruction } = _getPrompts();
-
-  // ─── Get health-weighted providers from registry ───
-  const providers = await getAvailableProviders();
-  if (providers.length === 0) {
-    log('No providers available after health filtering.', 'ERROR', 'tribunal');
-    return { actionType: 'wait', currentState: 'error', reasoning: 'No providers', targetX: 0, targetY: 0 };
-  }
-
-  // ─── Build prompt ───
-  let mapHint = '';
-  if (uiMap) { mapHint = `\nUI MAP (from exploration): ${JSON.stringify(uiMap).substring(0, 500)}\nUse this map to guide actions.\n`; }
-  const urlHint = pageUrl ? `\nCURRENT PAGE URL: ${pageUrl}\nUse this URL as an additional hint for state detection.\n` : '';
-  const fullPrompt = `${getSystemPrompt()}${urlHint}${mapHint}\n${getUserInstruction()}`;
-
-  const providerNames = providers.map((p: any) => `${p.name}(${(p.healthScore || 0).toFixed(2)})`).join(', ');
-  log(`Tribunal: consulting ${providers.length} provider(s) [${providerNames}]`, 'INFO', 'tribunal');
-
-  // ─── Consult all providers in parallel ───
-  const results: PromiseSettledResult<any>[] = await Promise.allSettled(
-    providers.map(async (provider: any) => {
-      const start = Date.now();
-      try {
-        const res = await safeCall(
-          (sig: any) => provider.fn(base64Image, fullPrompt, sig || signal, { validate: true }),
-          `Tribunal ${provider.name}`,
-          { url: provider.name, maxRetries: 2, baseDelay: 1000, signal }
-        );
-        const latency = Date.now() - start;
-        // Note: safeCall already records to providers-health via recordCallResult internally.
-        // We also record to the registry for DB persistence.
-        recordProviderResult(provider.name, true, latency);
-        return { ...res, _model: provider.name, _healthScore: provider.healthScore || 0.5, _latency: latency };
-      } catch (err: any) {
-        const latency = Date.now() - start;
-        recordProviderResult(provider.name, false, latency);
-        addProviderFailure(provider.name);
-        const errMsg = err && err.message ? String(err.message) : String(err);
-        log(`Tribunal: ${provider.name} failed: ${errMsg}`, 'WARN', 'tribunal');
-        return null;
+    let lastErr: any = null;
+    for (const m of models) {
+      // P1: Skip text-only models when we have an image
+      // (the serializer would strip the image, resulting in a blind analysis)
+      if (hasImage && !providerSupportsVision('OpenRouter', m)) {
+        log(`OpenRouter: skipping text-only model ${m} for vision request`, 'DEBUG', 'openrouter');
+        continue;
       }
-    })
-  );
 
-  // ─── Filter valid results ───
-  const fulfilled = results
-    .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value !== null)
-    .map(r => r.value);
+      try {
+        // Use callChatCompletionWithRollback for:
+        //   - Protocol chameleon 422 recovery
+        //   - Config rollback on 404/401
+        // P7: providerName for health-aware retries
+        const rawContent = await retryWithBackoff(
+          () => callChatCompletionWithRollback(
+            endpoint, apiKey, m, base64Image, prompt, 'OpenRouter',
+            { signal }
+          ),
+          { providerName: 'OpenRouter', maxRetries: 2, baseDelay: 1000 }
+        );
 
-  const valid = fulfilled.filter(r => {
-    if (!r) return false;
-    const hasAction = r.actionType && typeof r.actionType === 'string' && r.actionType.trim().length > 0;
-    if (!hasAction) {
-      log(`Tribunal: filtered malformed result from ${r._model || 'unknown'} (no actionType)`, 'WARN', 'tribunal');
-      return false;
+        if (options.validate === false) return rawContent;
+        return validateActionResponse(extractJSON(rawContent, 'OpenRouter'), 'OpenRouter');
+      } catch (err: any) {
+        lastErr = err;
+        const errMsg = err?.message || String(err);
+
+        // On 404 or model-not-found, try next model in chain
+        // On other errors, also try next (the fallback chain IS the retry strategy)
+        if (errMsg.includes('HTTP_ERROR_404') || errMsg.includes('does not exist')) {
+          log(`OpenRouter: model ${m} not found, trying next fallback`, 'WARN', 'openrouter');
+          continue;
+        }
+        // For transient errors (429, 5xx), try next model rather than failing immediately
+        if (errMsg.includes('HTTP_ERROR_429') || errMsg.includes('HTTP_ERROR_5') || errMsg.includes('timeout') || errMsg.includes('ECONNREFUSED')) {
+          log(`OpenRouter: model ${m} transient error, trying next fallback`, 'WARN', 'openrouter');
+          continue;
+        }
+        // Permanent errors (400, 401, 403) — no point trying other models with same key
+        throw err;
+      }
     }
-    // currentState is desirable but not required — validateActionResponse only
-    // mandates actionType. Default to 'unknown' so the vote still counts.
-    if (!r.currentState || typeof r.currentState !== 'string' || r.currentState.trim().length === 0) {
-      log(`Tribunal: ${r._model || 'unknown'} returned valid action but no currentState — defaulting to 'unknown'`, 'DEBUG', 'tribunal');
-      r.currentState = 'unknown';
-    }
-    return true;
-  });
 
-  if (valid.length === 0) {
-    log('No valid model responses -- falling back to wait.', 'WARN', 'tribunal');
-    return { actionType: 'wait', currentState: 'error', reasoning: 'No valid responses from any provider', targetX: 0, targetY: 0 };
-  }
-
-  // ─── Compute vote weights (P12) ───
-  const latencies = valid.map(r => r._latency || 1000);
-  const minLatency = Math.min(...latencies);
-  const maxLatency = Math.max(...latencies);
-
-  const votes: WeightedVote[] = valid.map(r => {
-    const healthScore = r._healthScore || 0.5;
-    const confidence = extractConfidence(r);
-    const latencyInv = computeLatencyInverse(r._latency || 1000, minLatency, maxLatency);
-    const weight = healthScore * confidence * latencyInv;
-    return {
-      action: r,
-      providerName: r._model,
-      healthScore,
-      confidence,
-      latencyMs: r._latency || 0,
-      weight,
-    };
-  });
-
-  // ─── Run weighted consensus ───
-  const consensus = findWeightedConsensus(votes);
-  if (!consensus) {
-    // Should never happen since we checked valid.length > 0
-    const { _model, ...action } = valid[0];
-    return { ...action, reasoning: `Tribunal (fallback): ${action.reasoning}` };
-  }
-
-  const rep = consensus.winningAction;
-
-  // ─── Log consensus details (P20) ───
-  if (valid.length === 1) {
-    log(`Tribunal (1 provider - ${valid[0]._model}, weight=${consensus.winnerWeight.toFixed(3)}): ${rep.currentState} / ${rep.actionType}`, 'INFO', 'tribunal');
-  } else {
-    // Log the weight distribution for transparency
-    const weightLog = consensus.details
-      .sort((a, b) => b.weight - a.weight)
-      .map(d => `${d.providerName}:${d.weight.toFixed(3)}(${d.actionType})`)
-      .join(', ');
-    log(`Tribunal consensus (${consensus.clusterSize}/${consensus.totalVoters} providers, ${consensus.agreementPct}% weight agreement): ${rep.currentState} / ${rep.actionType} | weights: [${weightLog}]`, 'INFO', 'tribunal');
-
-    // Warn on low agreement
-    if (consensus.agreementPct < 0.4 && consensus.totalVoters >= 3) {
-      log(`Low tribunal agreement (${consensus.agreementPct}%) -- providers disagree on action`, 'WARN', 'tribunal');
-    }
-  }
-
-  // ─── Build and return the winning action ───
-  const reasoningPrefix = valid.length === 1
-    ? `Tribunal (1 model - ${valid[0]._model}, w=${consensus.winnerWeight.toFixed(2)})`
-    : `Tribunal (${consensus.clusterSize}/${consensus.totalVoters} models, ${consensus.agreementPct}% agreement)`;
-
-  return {
-    currentState: rep.currentState,
-    reasoning: `${reasoningPrefix}: ${rep.reasoning}`,
-    actionType: rep.actionType,
-    targetX: rep.targetX ?? 0,
-    targetY: rep.targetY ?? 0,
-    value: rep.value ?? '',
-    keypadSequence: rep.keypadSequence,
-    submitX: rep.submitX ?? 0,
-    submitY: rep.submitY ?? 0,
+    throw lastErr || new Error('OpenRouter: all models exhausted');
   };
 }
 
-module.exports = { runTribunal };
+module.exports = { OpenRouterTribunalProvider };
