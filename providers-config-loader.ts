@@ -451,6 +451,14 @@ function isProviderDisabledByDefault(providerName: string): boolean {
 }
 
 /**
+ * Get the env keys required for a provider (for diagnostics).
+ */
+function getEnvKeys(providerName: string): string[] {
+  const def = DEFAULTS[providerName];
+  return def ? (def.envKeys || []) : [];
+}
+
+/**
  * Get the fallback models chain for a provider.
  */
 function getFallbackModels(providerName: string): string[] {
@@ -563,6 +571,7 @@ module.exports = {
   // Provider metadata (P4)
   hasRequiredEnvKeys,
   isProviderDisabledByDefault,
+  getEnvKeys,
   getFallbackModels,
   getKnownProviders,
   getAvailableProviderNamesSync,
