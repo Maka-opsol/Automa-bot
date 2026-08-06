@@ -1,4 +1,5 @@
 'use strict';
+// Last modified: 2026-08-05 — Response 20: Updated vision/text fallback model lists for Aug 2026
 
 // ─── OpenRouter Tribunal Provider ───────────────────────────────────────────
 //
@@ -30,10 +31,10 @@ function _getLogger() { if (!_logger) _logger = require('./logger'); return _log
  * when no image is present, or when vision providers all fail.
  */
 const VISION_FALLBACK_MODELS = [
-  'google/gemma-3-27b-it:free',           // (V) Best free vision model on OpenRouter
-  'nvidia/nemotron-nano-12b-2-vl:free',   // (V) NVIDIA Nemotron vision — OCR-optimized
-  'google/gemma-3-12b-it:free',           // (V) Smaller Gemma, still good vision
-  'qwen/qwen2.5-vl-72b-instruct:free',   // (V) Qwen vision — excellent at math OCR
+  'google/gemma-3-27b-it',           // (V) Best free vision model on OpenRouter
+  'nvidia/nemotron-nano-12b-2-vl',   // (V) NVIDIA Nemotron vision — OCR-optimized
+  'google/gemma-3-12b-it',           // (V) Smaller Gemma, still good vision
+  'qwen/qwen2.5-vl-72b-instruct',   // (V) Qwen vision — excellent at math OCR
 ];
 
 /**
@@ -43,9 +44,9 @@ const VISION_FALLBACK_MODELS = [
  * These are cheap, fast, but CANNOT process images.
  */
 const TEXT_FALLBACK_MODELS = [
-  'google/gemma-4-31b-it:free',                     // (T) Updated Aug 2026
-  'nvidia/nemotron-3-super-120b:free',               // (T) Efficient MoE, strong reasoning
-  'deepseek/deepseek-r1-distill-llama-70b:free',      // (T) Reasoning (if still available)
+  'google/gemma-4-31b-it',                     // (T) Updated Aug 2026
+  'nvidia/nemotron-3-super-120b',               // (T) Efficient MoE, strong reasoning
+  'deepseek/deepseek-r1-distill-llama-70b',      // (T) Reasoning (if still available)
 ];
 
 function OpenRouterTribunalProvider() {
@@ -55,7 +56,7 @@ function OpenRouterTribunalProvider() {
   }
 
   // The primary model can be overridden via env var
-  const primaryModel = process.env.OPENROUTER_TRIBUNAL_MODEL || 'google/gemma-3-27b-it:free';
+  const primaryModel = process.env.OPENROUTER_TRIBUNAL_MODEL || 'google/gemma-3-27b-it';
   const endpoint = 'https://openrouter.ai/api/v1/chat/completions';
 
   return async (base64Image: any, prompt: any, signal: any, options: any = {}) => {
