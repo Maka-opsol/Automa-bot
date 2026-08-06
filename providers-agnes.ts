@@ -2,15 +2,11 @@
 
 // ─── Agnes Provider ─────────────────────────────────────────────────────────
 //
-// Agnes is a text-only API. Does NOT support vision or multipart content.
+// Agnes supports vision (all providers are now vision-capable).
 // The serializer (providers-serializers.ts) marks Agnes with
-// supportsVision=false, supportsMultipartContent=false.
-// When an image is provided, it is silently dropped and only the text prompt
-// is sent. Vision analysis for this provider comes from the tribunal's
-// other vision-capable providers (Groq, z.ai, Gemini, OpenRouter).
+// supportsVision=true, supportsMultipartContent=true.
 //
 // P1: Content serialization handled by providers-base/serializers.
-//     The serializer sends plain string content (never array format).
 // P20: Structured logging.
 
 const { extractJSON, validateActionResponse, callChatCompletionWithRollback, getProviderConfig, retryWithBackoff } = require('./providers-base');
@@ -35,8 +31,7 @@ function AgnesProvider() {
 
     if (options.validate === false) return rawContent;
     const parsed = extractJSON(rawContent, 'Agnes');
-    // Agnes frequently returns nearly-correct JSON missing required fields.
-    // Tolerate missing actionType/currentState rather than discarding the response.
+    // Tolerate missing fields rather than discarding the response.
     if (!parsed || typeof parsed !== 'object') {
       return { actionType: 'wait', currentState: 'unknown', reasoning: 'Agnes returned non-object response' };
     }
