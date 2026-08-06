@@ -188,6 +188,8 @@ async function runCycle() {
     let stuckCounter = 0;
     const MAX_STUCK = 10;
     let consecutiveTribunalFailures = 0;
+    let unknownStateCounter = 0; // Counts consecutive 'unknown' currentState results
+    const MAX_UNKNOWN_STATE = 3; // After this many unknowns, force recovery
 
     // Select module using dynamic planning
     let currentModule = getNextModule?.();
@@ -502,6 +504,33 @@ async function runCycle() {
         consecutiveTribunalFailures = 0;
         explorationFailures = 0;
         explorationMode = false;
+      }
+
+      // Unknown state escape hatch — prevents 75s × N death spiral
+      // When providers can't determine the page state, they return 'unknown'
+      // and default to 'wait', creating an infinite idle loop. After
+      // MAX_UNKNOWN_STATE consecutive unknowns, force a page reload to
+      // break the cycle and potentially land on a recognizable page.
+      if (action.currentState === 'unknown' || !action.currentState) {
+        unknownStateCounter++;
+        if (unknownStateCounter >= MAX_UNKNOWN_STATE) {
+          log(`Unknown state ${unknownStateCounter} times in a row. Forcing page reload to break loop.`, 'WARN', 'cycle');
+          unknownStateCounter = 0;
+          try {
+            const currentUrl = page.url();
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+            // If still on same page after reload, try navigating to BASE_URL
+            if (page.url() === currentUrl && CONFIG.BASE_URL) {
+              log('Reload didn\'t change page, navigating to BASE_URL.', 'WARN', 'cycle');
+              await page.goto(CONFIG.BASE_URL, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+            }
+          } catch (reloadErr: any) {
+            log(`Page reload failed: ${reloadErr.message || reloadErr}`, 'WARN', 'cycle');
+          }
+          continue; // Skip the wait action and re-evaluate on next iteration
+        }
+      } else {
+        unknownStateCounter = 0;
       }
 
       // Exploration mode
