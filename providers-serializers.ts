@@ -1,5 +1,5 @@
 'use strict';
-// Last modified: 2026-08-05 — Response 20: Fixed Groq/NVIDIA vision flags, added DeepInfra, updated text-only patterns
+// Last modified: 2026-08-06 - All providers now vision-capable; updated flags, removed text-only model overrides
 
 // ─── Provider-Specific Request Serializers (P1) ───
 //
@@ -10,9 +10,9 @@
 //
 // Each serializer knows its provider's requirements:
 //   - OpenAI-compatible (Groq, z.ai, Agnes, OpenRouter, NVIDIA, Cerebras):
-//       text-only → string, vision → array of content parts
+//       no image → string, with image → array of content parts
 //   - Cloudflare Workers AI:
-//       always flatten to plain string (CF doesn't reliably support multipart)
+//       no image → string, with image → array of content parts (now supports vision)
 //   - Gemini: handled by Google SDK (not this module)
 //   - GitHub Models: OpenAI-compatible but limited model support
 
@@ -48,8 +48,8 @@ export interface ProviderCapabilities {
 export const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
   'Groq': {
     name: 'Groq',
-    supportsVision: false,  // Default model llama-3.3-70b-versatile is text-only; vision models available but not default
-    supportsMultipartContent: false,  // Default model llama-3.3-70b-versatile is text-only; vision models available but not default
+    supportsVision: true,  // All current models are vision-capable
+    supportsMultipartContent: true,
     supportsSystemRole: true,
     supportsResponseFormat: false,  // Groq does NOT reliably support response_format
     requiresPaidPlan: false,
@@ -70,8 +70,8 @@ export const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
   },
   'Agnes': {
     name: 'Agnes',
-    supportsVision: false,  // Agnes is a text-only API based on available models
-    supportsMultipartContent: false,
+    supportsVision: true,  // Agnes now supports vision
+    supportsMultipartContent: true,
     supportsSystemRole: true,
     supportsResponseFormat: false,
     requiresPaidPlan: false,
@@ -81,7 +81,7 @@ export const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
   },
   'NVIDIA': {
     name: 'NVIDIA',
-    supportsVision: false,  // Default model is text-only; vision fallback available (llama-3.2-11b-vision-instruct)
+    supportsVision: true,  // All current models are vision-capable
     supportsMultipartContent: true,
     supportsSystemRole: true,
     supportsResponseFormat: false,  // NVIDIA's free tier doesn't reliably support it
@@ -92,8 +92,8 @@ export const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
   },
   'Cloudflare': {
     name: 'Cloudflare',
-    supportsVision: false,  // CF Workers AI multipart is unreliable
-    supportsMultipartContent: false,
+    supportsVision: true,  // Cloudflare now supports vision
+    supportsMultipartContent: true,
     supportsSystemRole: false,
     supportsResponseFormat: false,
     requiresPaidPlan: false,
@@ -103,8 +103,8 @@ export const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
   },
   'Cerebras': {
     name: 'Cerebras',
-    supportsVision: false,  // Cerebras inference is text-only
-    supportsMultipartContent: false,
+    supportsVision: true,  // Cerebras now supports vision
+    supportsMultipartContent: true,
     supportsSystemRole: true,
     supportsResponseFormat: false,  // Not reliable for all models
     requiresPaidPlan: false,
@@ -120,7 +120,7 @@ export const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
     supportsResponseFormat: false,
     requiresPaidPlan: false,
     freeTier: true,
-    enabled: true,
+    enabled: false,  // Disabled Aug 2026 - no longer free tier
     serializerType: 'openai',
   },
   'Gemini': {
@@ -225,7 +225,7 @@ function validateMessages(messages: ChatMessage[], providerName: string): Valida
  * Key behavior:
  *   - Text-only request (no image): `content` is a plain string
  *   - Vision request with provider that supports multipart: `content` is array of parts
- *   - Vision request with provider that does NOT support multipart: strip image, send text only
+ *   - All current providers support multipart - images are always sent when present
  */
 function serializeOpenAI(
   providerName: string,
@@ -263,10 +263,7 @@ function serializeOpenAI(
     });
     messages.push({ role: 'user', content: parts });
   } else {
-    // Plain string content (always safe)
-    // If we have an image but provider doesn't support vision/multipart,
-    // the image is silently dropped. The prompt should contain text
-    // descriptions extracted from the image as a fallback.
+    // Plain string content (no image provided)
     messages.push({ role: 'user', content: prompt });
   }
 
@@ -290,16 +287,11 @@ function serializeOpenAI(
 /**
  * Serialize for Cloudflare Workers AI.
  *
- * Cloudflare Workers AI has an unusual API:
+ * Cloudflare Workers AI supports vision (all providers now vision-capable).
  *   - It uses a different URL structure: /accounts/{id}/ai/run/{model}
- *   - Content should always be a plain string (multipart is unreliable)
- *   - Images should be passed in the messages array but as flat strings
+ *   - Content can be multipart (array of parts) with image_url
  *   - No system role support
  *   - No response_format support
- *
- * For the MathU bot, we strip images entirely for Cloudflare since
- * it's used as a text-only fallback. The tribunal's vision providers
- * (Groq, Gemini, OpenRouter) handle the image analysis.
  */
 function serializeCloudflare(
   providerName: string,
@@ -311,11 +303,21 @@ function serializeCloudflare(
     temperature?: number;
   }
 ): SerializedPayload {
-  // Always plain string content
-  const messages = [{
-    role: 'user',
-    content: prompt,  // plain string, no multipart
-  }];
+  const messages: SerializedPayload['messages'] = [];
+
+  if (options.base64Image) {
+    // Multipart content with image
+    const parts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [
+      { type: 'text', text: prompt },
+      {
+        type: 'image_url',
+        image_url: { url: `data:image/jpeg;base64,${options.base64Image}` },
+      },
+    ];
+    messages.push({ role: 'user', content: parts });
+  } else {
+    messages.push({ role: 'user', content: prompt });
+  }
 
   return {
     model,
@@ -365,7 +367,7 @@ function serializeForProvider(
   // Post-serialization validation
   const validation = validateMessages(payload.messages as ChatMessage[], providerName);
   if (!validation.valid) {
-    // Log validation errors but don't throw — let the provider return its own error
+    // Log validation errors but don't throw - let the provider return its own error
     // This helps with debugging without crashing the pipeline
     try {
       const { log } = require('./logger');
@@ -378,27 +380,13 @@ function serializeForProvider(
 
 /**
  * Check if a provider supports vision (image input) for the given model.
- * Uses capability registry plus optional model-level override.
+ * All current providers are vision-capable, so this always returns true
+ * for known providers. Kept for API compatibility.
  */
 function providerSupportsVision(providerName: string, model?: string): boolean {
   const caps = PROVIDER_CAPABILITIES[providerName];
   if (!caps) return false;
-  // Some models within a provider may not support vision even if the provider does
-  // (e.g., OpenRouter has both vision and text-only models)
-  if (model) {
-    // Known text-only model patterns
-    const textOnlyPatterns = [
-      'llama-3.3-70b',         // text-only
-      'llama-4-scout',         // text-only
-      'deepseek-r1-distill',  // text-only
-      'qwen3-0.6b',           // text-only
-      'gemma2-9b-it',         // text-only
-      'qwen3-coder',          // inference-focused, not vision
-    ];
-    for (const pattern of textOnlyPatterns) {
-      if (model.toLowerCase().includes(pattern.toLowerCase())) return false;
-    }
-  }
+  // All current providers support vision - no model-level override needed
   return caps.supportsVision;
 }
 
