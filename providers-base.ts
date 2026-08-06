@@ -105,6 +105,9 @@ const { rollbackProvider, getProviderConfig } = require('./providers-config-load
 // and array content only when the provider supports vision AND multipart.
 
 async function callChatCompletion(endpoint: string, apiKey: string, model: string, base64Image: string | null, prompt: string, providerName: string, options: any = {}) { 
+  // Safety net: strip ':free' suffix that OpenRouter uses for pricing tier —
+  // most provider APIs reject it as an unknown model variant.
+  const cleanModel = model.replace(/:free$/, '');
   const config = getCONFIG();
   const maxTokens = options.maxTokens || config.MAX_TOKENS || 4096;
   const temperature = options.temperature !== undefined ? options.temperature : (config.TEMPERATURE !== undefined ? config.TEMPERATURE : 0.1);
@@ -125,14 +128,14 @@ async function callChatCompletion(endpoint: string, apiKey: string, model: strin
   if (caps && caps.serializerType === 'cloudflare') {
     // Cloudflare has a completely different URL structure — this function
     // should not be called for Cloudflare. If it is, fall back to openai format.
-    payload = _buildOpenAIPayload(providerName, model, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
+    payload = _buildOpenAIPayload(providerName, cleanModel, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
   } else if (caps && caps.serializerType === 'gemini') {
     // Gemini uses the Google SDK — this function should not be called.
     // Build an OpenAI-format payload as fallback (may not work but won't crash).
-    payload = _buildOpenAIPayload(providerName, model, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
+    payload = _buildOpenAIPayload(providerName, cleanModel, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
   } else {
     // OpenAI-compatible: use provider-aware serialization
-    payload = _buildOpenAIPayload(providerName, model, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
+    payload = _buildOpenAIPayload(providerName, cleanModel, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
   }
 
   const response = await _getUtilsFetch().fetchWithTimeout(endpoint, {
