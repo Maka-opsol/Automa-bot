@@ -42,9 +42,11 @@ function logError(msg: string, err: Error) {
 const TRACKED_VARS = [
   'MICROSOFT_EMAIL',
   'GROQ_API_KEY', 'ZAI_API_KEY',
-  'AGNES_API_KEY', 'NVIDIA_API_KEY', 'CEREBRAS_API_KEY',
+  'AGNES_API_KEY', 'NVIDIA_API_KEY',
   'CLOUDFLARE_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY',
-  'DEEPINFRA_API_KEY',
+  // Cerebras retired 2026-08-07 — excluded to avoid false drift alerts
+  // DeepInfra retired 2026-08-06 — excluded to avoid false drift alerts
+  // GitHub GPT retired 2026-07-30 — excluded to avoid false drift alerts
   'ENCRYPTION_KEY',
   'RENDER', 'NODE_ENV',
 ];
