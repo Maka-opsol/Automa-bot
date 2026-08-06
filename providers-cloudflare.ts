@@ -36,6 +36,11 @@ function CloudflareProvider() {
     const config = getProviderConfig('Cloudflare');
     const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${config.model}`;
 
+    // Guard: reject empty or whitespace-only prompts before hitting the API
+    if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
+      throw new Error('Cloudflare: Empty or invalid input (prompt is empty/whitespace)');
+    }
+
     // P1 FIX: Content is always a PLAIN STRING for Cloudflare.
     // The original code used `content: [{type:'text',...}, ...]` (array format)
     // which Cloudflare's API does not support. Images are stripped entirely.
