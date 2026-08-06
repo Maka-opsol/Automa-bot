@@ -56,7 +56,7 @@ const PROVIDER_TABLE: ProviderEntry[] = [
   { name: 'NVIDIA', factory: NvidiaProvider },
   { name: 'Cloudflare', factory: CloudflareProvider },
   { name: 'Cerebras', factory: CerebrasProvider },
-  { name: 'DeepInfra', factory: DeepInfraProvider },
+  // DeepInfra removed — no longer free tier (2026-08-06)
   { name: 'Gemini', factory: GeminiProvider },
   { name: 'OpenRouter', factory: OpenRouterTribunalProvider },
   // GitHub GPT is in the table but filtered by P9 (disabled by default)
