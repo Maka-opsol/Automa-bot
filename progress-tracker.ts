@@ -1,17 +1,21 @@
 'use strict';
+// Last modified: 2026-08-05 — Response 20: Fixed ENOENT — mkdir error now logged with early return
 let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function getInsertProgress() { return _deps.database?.insertProgress; }
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const CONFIG = require('./get-config');
 const { log, logError } = require('./logger');
 
 // Lazy path resolution — ensures we pick up env vars set by render-free-plan.ts
 // before any module load, not the frozen default from config.ts.
-function getProgressLogPath() { return process.env.PROGRESS_LOG_PATH || CONFIG.PROGRESS_LOG_PATH; }
-function getLastStatePath() { return process.env.LAST_STATE_PATH || CONFIG.LAST_STATE_PATH; }
+// On Render free tier, env vars from render-free-plan.ts point to /tmp which is
+// always writable. The fallback also uses /tmp to avoid EACCES on read-only CWD.
+function getProgressLogPath() { return process.env.PROGRESS_LOG_PATH || CONFIG.PROGRESS_LOG_PATH || path.join(os.tmpdir(), 'mathu-logs', 'progress.jsonl'); }
+function getLastStatePath() { return process.env.LAST_STATE_PATH || CONFIG.LAST_STATE_PATH || path.join(os.tmpdir(), 'last-state.json'); }
 
 function trackProgress(entry: any) { 
   const PROGRESS_LOG_PATH = getProgressLogPath();
