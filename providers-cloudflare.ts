@@ -3,17 +3,12 @@
 // ─── Cloudflare Workers AI Provider ──────────────────────────────────────────
 //
 // Uses Cloudflare Workers AI API (/accounts/{id}/ai/run/{model}).
-// This is NOT an OpenAI-compatible API — it has its own URL structure
+// This is NOT an OpenAI-compatible API - it has its own URL structure
 // and response format, so it cannot use callChatCompletionWithRollback.
 //
-// CRITICAL: Cloudflare is TEXT-ONLY. Does NOT support vision or multipart.
-// P1 FIX: Content is sent as a plain string, NOT an array of parts.
-//     The original code sent `content: [{type:'text',...}, {type:'image',...}]`
-//     which is NOT supported by Cloudflare's API and caused silent failures.
-//     Images are now completely stripped. Vision analysis comes from the
-//     tribunal's other vision-capable providers.
+// Cloudflare now supports vision (multipart content with image_url).
 //
-// Rollback logic: Uses callChatCompletionWithRollback's approach —
+// Rollback logic: Uses callChatCompletionWithRollback's approach -
 // on 401/403/404, attempts config rollback via providers-config-loader.
 //
 // P7: providerName passed to retryWithBackoff for health-aware retries.
@@ -41,11 +36,16 @@ function CloudflareProvider() {
       throw new Error('Cloudflare: Empty or invalid input (prompt is empty/whitespace)');
     }
 
-    // P1 FIX: Content is always a PLAIN STRING for Cloudflare.
-    // The original code used `content: [{type:'text',...}, ...]` (array format)
-    // which Cloudflare's API does not support. Images are stripped entirely.
+    // Build content - multipart with image if available, plain string otherwise
+    const userContent = base64Image
+      ? [
+          { type: 'text', text: prompt },
+          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
+        ]
+      : prompt;
+
     const payload = {
-      messages: [{ role: 'user', content: prompt }],  // plain string, no multipart
+      messages: [{ role: 'user', content: userContent }],
       max_tokens: CONFIG.MAX_TOKENS || 4096,
       temperature: 0.0,
       stream: false,
