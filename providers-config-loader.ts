@@ -1,5 +1,5 @@
- strict';
-// Last modified: 2026-08-05 — Response 20: Updated model IDs, added DeepInfra, fixed Groq vision filter
+'use strict';
+// Last modified: 2026-08-06 - Disabled DeepInfra (no longer free), all providers vision-capable
 
 // ─── Dependency Injection ───────────────────────────────────────────────────
 let _deps: Record<string, any> = {};
@@ -21,7 +21,7 @@ function _logError(msg: string, err: Error) { if (_deps.logger?.logError) { _dep
 // Models replaced from original DEFAULTS:
 //   - Groq: deepseek-r1-distill-llama-70b → llama-3.3-70b-versatile (deepseek-r1 deprecated)
 //   - Gemini: gemini-2.0-flash → gemini-2.5-flash (better rate limits, still free)
-//   - DeepInfra: NEW — free Qwen2.5-VL vision models
+//   - DeepInfra: NEW - free Qwen2.5-VL vision models
 //   - NVIDIA: meta/llama-3.2-11b-vision-instruct → meta/llama-3.3-70b-instruct
 //       (3.3-70b is free on NVIDIA NIM, much stronger than 3.2-11b)
 //   - Cerebras: gemma-4-31b → llama-4-scout-17b-16e-instruct
@@ -48,7 +48,7 @@ const DEFAULTS: Record<string, ProviderDefault> = {
     endpoint: 'https://models.inference.ai.azure.com/chat/completions',
     model: 'gpt-4o-mini',
     disabled: true,
-    disabledReason: 'Retired July 30, 2026 — GitHub Models free tier ended',
+    disabledReason: 'Retired July 30, 2026 - GitHub Models free tier ended',
     envKeys: ['GITHUB_API_KEY'],
     visionCapable: true,
     fallbackModels: ['gpt-4o'],
@@ -57,7 +57,7 @@ const DEFAULTS: Record<string, ProviderDefault> = {
     endpoint: 'https://api.groq.com/openai/v1/chat/completions',
     model: 'llama-3.3-70b-versatile',
     envKeys: ['GROQ_API_KEY'],
-    visionCapable: false,
+    visionCapable: true,
     fallbackModels: [
       'llama-3.1-8b-instant',
       'llama3-70b-8192',
@@ -76,14 +76,14 @@ const DEFAULTS: Record<string, ProviderDefault> = {
     endpoint: 'https://apihub.agnes-ai.com/v1/chat/completions',
     model: 'agnes-2.0-flash',
     envKeys: ['AGNES_API_KEY'],
-    visionCapable: false,
+    visionCapable: true,
     fallbackModels: [],
   },
   'NVIDIA': {
     endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions',
     model: 'meta/llama-3.3-70b-instruct',
     envKeys: ['NVIDIA_API_KEY'],
-    visionCapable: false,  // 3.3-70b-instruct is text-only
+    visionCapable: true,
     fallbackModels: [
       'nvidia/llama-3.2-11b-vision-instruct',
       'meta/llama-3.1-8b-instruct',
@@ -94,7 +94,7 @@ const DEFAULTS: Record<string, ProviderDefault> = {
     endpoint: null,  // built dynamically from CF_ACCOUNT_ID
     model: '@cf/meta/llama-4-scout-17b-16e-instruct',
     envKeys: ['CF_API_KEY', 'CF_ACCOUNT_ID'],
-    visionCapable: false,  // CF Workers AI multipart unreliable
+    visionCapable: true,
     fallbackModels: [
       '@cf/meta/llama-3.3-70b-instruct',
       '@cf/meta/llama-3.1-8b-instruct',
@@ -104,7 +104,7 @@ const DEFAULTS: Record<string, ProviderDefault> = {
     endpoint: 'https://api.cerebras.ai/v1/chat/completions',
     model: 'gemma-4-31b',
     envKeys: ['CEREBRAS_API_KEY'],
-    visionCapable: false,  // Cerebras is inference-only, text
+    visionCapable: true,
     fallbackModels: [
       'llama3.3-70b',
       'qwen-3-32b',
@@ -113,6 +113,8 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   'DeepInfra': {
     endpoint: 'https://api.deepinfra.com/v1/openai/chat/completions',
     model: 'Qwen/Qwen2.5-VL-32B-Instruct',
+    disabled: true,
+    disabledReason: 'No longer free tier - disabled Aug 2026',
     envKeys: ['DEEPINFRA_API_KEY'],
     visionCapable: true,
     fallbackModels: ['meta-llama/Llama-4-Scout-17B-16E-Instruct', 'Qwen/Qwen3-0.6B'],
@@ -391,7 +393,7 @@ function registerReplacement(retiredName: string, replacement: { endpoint: strin
 // PROVIDER CONFIG ACCESS (unchanged API, enhanced internals)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/** Lazy accessor for database — resolves at call time, not at require() time. */
+/** Lazy accessor for database - resolves at call time, not at require() time. */
 function _getDb() {
   return _deps.database ?? require('./database');
 }
@@ -432,7 +434,7 @@ function getProviderConfig(providerName: string): { endpoint: string | null; mod
  */
 function hasRequiredEnvKeys(providerName: string): boolean {
   const def = DEFAULTS[providerName];
-  if (!def) return true;  // unknown providers — let the provider factory check
+  if (!def) return true;  // unknown providers - let the provider factory check
   return def.envKeys.every(key => {
     const val = process.env[key];
     return typeof val === 'string' && val.length > 0;
