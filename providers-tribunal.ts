@@ -237,6 +237,13 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
     return { actionType: 'wait', currentState: 'error', reasoning: 'No valid responses from any provider', targetX: 0, targetY: 0 };
   }
 
+  // Log success rate for observability — don't abort unless literally nobody responded
+  const successRate = valid.length / providers.length;
+  log(`Tribunal success: ${valid.length}/${providers.length} (${Math.round(successRate * 100)}%)`, 'INFO', 'tribunal');
+  if (successRate < 0.25 && providers.length >= 3) {
+    log('Majority of providers unavailable — proceeding with surviving votes', 'WARN', 'tribunal');
+  }
+
   // ─── Compute vote weights (P12) ───
   const latencies = valid.map(r => r._latency || 1000);
   const minLatency = Math.min(...latencies);
