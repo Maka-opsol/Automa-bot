@@ -48,7 +48,7 @@ export interface ProviderCapabilities {
 export const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
   'Groq': {
     name: 'Groq',
-    supportsVision: true,  // All current models are vision-capable
+    supportsVision: true,  // qwen/qwen3.6-27b supports vision via groq-sdk
     supportsMultipartContent: true,
     supportsSystemRole: true,
     supportsResponseFormat: false,  // Groq does NOT reliably support response_format
@@ -103,7 +103,7 @@ export const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
   },
   'Cerebras': {
     name: 'Cerebras',
-    supportsVision: true,  // Cerebras now supports vision
+    supportsVision: true,  // gemma-4-31b supports vision via SDK
     supportsMultipartContent: true,
     supportsSystemRole: true,
     supportsResponseFormat: false,  // Not reliable for all models
