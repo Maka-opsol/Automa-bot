@@ -1,10 +1,3 @@
-'use strict';
-// Last modified: 2026-08-05 — Response 20: Updated model IDs, added DeepInfra, fixed Groq vision filter
-
-// ─── Dependency Injection ───────────────────────────────────────────────────
-let _deps: Record<string, any> = {};
-function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
-
 // Lazy logger fallback for before DI init
 function _log(msg: string, level?: string, mod?: string) { if (_deps.logger?.log) { _deps.logger.log(msg, level, mod); } else { try { const l = require('./logger'); l.log(msg, level, mod); } catch {} } }
 function _logError(msg: string, err: Error) { if (_deps.logger?.logError) { _deps.logger.logError(msg, err); } else { try { const l = require('./logger'); l.logError(msg, err); } catch {} } }
@@ -126,13 +119,13 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'OpenRouter': {
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
-    model: 'google/gemma-3-27b-it:free',
+    model: 'google/gemma-3-27b-it',
     envKeys: ['OPENROUTER_API_KEY'],
     visionCapable: true,
     fallbackModels: [
-      'google/gemma-4-31b-it:free',
-      'nvidia/nemotron-nano-12b-2-vl:free',
-      'qwen/qwen3-0.6b:free',
+      'google/gemma-4-31b-it',
+      'nvidia/nemotron-nano-12b-2-vl',
+      'qwen/qwen3-0.6b',
     ],
   },
 };
