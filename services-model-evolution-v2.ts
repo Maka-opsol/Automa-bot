@@ -140,7 +140,7 @@ Which ${TRIBUNAL_VOTE_COUNT} are most capable at BOTH vision (screenshot analysi
     }
 
     const response = await Promise.race([
-      callChatCompletion(endpoint, apiKey, active.model_id, null, prompt, {
+      callChatCompletion(endpoint, apiKey, active.model_id, null, prompt, provider, {
         maxTokens: 200,
         temperature: 0.0,
       }),
@@ -217,7 +217,7 @@ async function testModel(model: { id: string; provider: string; endpoint: string
   // Try vision test first
   try {
     const response = await Promise.race([
-      callChatCompletion(model.endpoint, apiKey, model.id, DUMMY_IMAGE_1X1_JPEG, TEST_PROMPT, {
+      callChatCompletion(model.endpoint, apiKey, model.id, DUMMY_IMAGE_1X1_JPEG, TEST_PROMPT, model.provider, {
         maxTokens: 50,
       }),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Model test timeout')), MODEL_TEST_TIMEOUT_MS)),
@@ -245,7 +245,7 @@ async function testModel(model: { id: string; provider: string; endpoint: string
       _log(`Model ${model.id} doesn't support vision - retrying as text-only`, 'DEBUG', 'evolution');
       try {
         const response = await Promise.race([
-          callChatCompletion(model.endpoint, apiKey, model.id, null, TEST_PROMPT, {
+          callChatCompletion(model.endpoint, apiKey, model.id, null, TEST_PROMPT, model.provider, {
             maxTokens: 50,
           }),
           new Promise((_, reject) => setTimeout(() => reject(new Error('Model text test timeout')), MODEL_TEST_TIMEOUT_MS)),
