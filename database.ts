@@ -121,17 +121,13 @@ function runMigrations() {
     () => { db.exec(`CREATE TABLE IF NOT EXISTS critical_patch_audit ( id INTEGER PRIMARY KEY AUTOINCREMENT, requested_at INTEGER, target_file TEXT, description TEXT, status TEXT DEFAULT 'pending', phases_completed TEXT, provider_votes TEXT, resolution TEXT, resolved_at INTEGER ); CREATE INDEX IF NOT EXISTS idx_critical_audit_time ON critical_patch_audit(requested_at); CREATE INDEX IF NOT EXISTS idx_critical_audit_status ON critical_patch_audit(status);`); },
     () => { db.exec(`CREATE TABLE IF NOT EXISTS self_heal_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, feature_id TEXT NOT NULL, phase TEXT NOT NULL, trigger_reason TEXT, investigation_result TEXT, patches_generated INTEGER DEFAULT 0, patches_safe INTEGER DEFAULT 0, patches_applied INTEGER DEFAULT 0, outcome TEXT, duration_ms INTEGER, error TEXT ); CREATE INDEX IF NOT EXISTS idx_self_heal_events_time ON self_heal_events(timestamp); CREATE INDEX IF NOT EXISTS idx_self_heal_events_feature ON self_heal_events(feature_id); CREATE TABLE IF NOT EXISTS selector_versions ( id INTEGER PRIMARY KEY AUTOINCREMENT, selector_file TEXT NOT NULL, version INTEGER DEFAULT 1, content TEXT NOT NULL, previous_content TEXT, created_at INTEGER NOT NULL, source TEXT DEFAULT 'auto', validated INTEGER DEFAULT 0 ); CREATE TABLE IF NOT EXISTS patch_canary ( id INTEGER PRIMARY KEY AUTOINCREMENT, patch_id INTEGER NOT NULL, mode TEXT NOT NULL DEFAULT 'canary', started_at INTEGER NOT NULL, observation_hours REAL DEFAULT 6, error_rate_baseline REAL DEFAULT 0, error_rate_observed REAL DEFAULT 0, cycles_run INTEGER DEFAULT 0, status TEXT DEFAULT 'canary', promoted_at INTEGER, rolled_back_at INTEGER, FOREIGN KEY (patch_id) REFERENCES patch_history(id) ); CREATE TABLE IF NOT EXISTS adversarial_test_results ( id INTEGER PRIMARY KEY AUTOINCREMENT, patch_id INTEGER NOT NULL, test_type TEXT NOT NULL, passed INTEGER DEFAULT 0, details TEXT, tested_at INTEGER NOT NULL, FOREIGN KEY (patch_id) REFERENCES patch_history(id) ); CREATE TABLE IF NOT EXISTS db_quarantine ( id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL, row_id INTEGER, original_data TEXT, reason TEXT, quarantined_at INTEGER NOT NULL, repair_attempted INTEGER DEFAULT 0, repaired INTEGER DEFAULT 0 ); CREATE TABLE IF NOT EXISTS discovered_states ( state TEXT PRIMARY KEY, added_at INTEGER NOT NULL, traverse_count INTEGER DEFAULT 0, last_traversed INTEGER, ttl_days INTEGER DEFAULT 7, promoted INTEGER DEFAULT 0, source_screenshot_hash TEXT, tribunal_reasoning TEXT ); CREATE TABLE IF NOT EXISTS dependency_health ( id INTEGER PRIMARY KEY AUTOINCREMENT, package TEXT NOT NULL, expected_hash TEXT, actual_hash TEXT, healthy INTEGER DEFAULT 1, last_checked INTEGER, repair_attempted INTEGER DEFAULT 0, repair_result TEXT ); CREATE TABLE IF NOT EXISTS config_reconciliation ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, source TEXT NOT NULL, key TEXT NOT NULL, local_value TEXT, remote_value TEXT, resolved_value TEXT, resolution TEXT ); CREATE TABLE IF NOT EXISTS blackbox_full ( id INTEGER PRIMARY KEY AUTOINCREMENT, blackbox_id INTEGER NOT NULL, screenshot BLOB, dom_html TEXT, network_log TEXT, tribunal_responses TEXT, captured_at INTEGER NOT NULL, FOREIGN KEY (blackbox_id) REFERENCES blackbox(id) ); CREATE INDEX IF NOT EXISTS idx_blackbox_full_bb ON blackbox_full(blackbox_id); CREATE TABLE IF NOT EXISTS patch_embeddings ( id INTEGER PRIMARY KEY AUTOINCREMENT, patch_id INTEGER NOT NULL, embedding TEXT, investigation_context TEXT, file TEXT, patch_text TEXT, status TEXT, created_at INTEGER NOT NULL, FOREIGN KEY (patch_id) REFERENCES patch_history(id) ); CREATE INDEX IF NOT EXISTS idx_patch_embeddings_time ON patch_embeddings(created_at); CREATE TABLE IF NOT EXISTS heal_model_metrics ( id INTEGER PRIMARY KEY AUTOINCREMENT, model_name TEXT NOT NULL, patch_id INTEGER, staging_passed INTEGER DEFAULT 0, prod_survived_24h INTEGER DEFAULT 0, prod_checked_at INTEGER, created_at INTEGER NOT NULL ); CREATE TABLE IF NOT EXISTS healer_circuit_state ( id INTEGER PRIMARY KEY CHECK (id = 1), state TEXT DEFAULT 'closed', failure_count INTEGER DEFAULT 0, success_count INTEGER DEFAULT 0, last_failure_time INTEGER, consecutive_opens INTEGER DEFAULT 0, updated_at INTEGER ); CREATE TABLE IF NOT EXISTS degradation_log ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, from_mode TEXT NOT NULL, to_mode TEXT NOT NULL, reason TEXT, resource_snapshot TEXT );`); },
     () => { db.exec(`CREATE TABLE IF NOT EXISTS critical_consensus ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, phase TEXT NOT NULL, target_file TEXT, provider TEXT, approved INTEGER DEFAULT 0, confidence REAL DEFAULT 0, reasoning TEXT, patch_hash TEXT, details TEXT ); CREATE INDEX IF NOT EXISTS idx_critical_consensus_timestamp ON critical_consensus(timestamp); CREATE INDEX IF NOT EXISTS idx_critical_consensus_phase ON critical_consensus(phase); CREATE INDEX IF NOT EXISTS idx_critical_consensus_file ON critical_consensus(target_file); CREATE INDEX IF NOT EXISTS idx_critical_consensus_hash ON critical_consensus(patch_hash);`); },
-    () => {},
+    () => { db.exec(`CREATE TABLE IF NOT EXISTS banned_actions ( action_type TEXT PRIMARY KEY, banned_by TEXT, banned_at INTEGER, reason TEXT );`); },
     () => {},
     () => {},
     () => {},
   ];
 
   const transaction = db.transaction(() => {
-    // Ensure schema_version table exists before any migration runs.
-    // On ephemeral disks (Render /tmp), the DB is created fresh every
-    // cold start — the table would not exist yet, causing INSERT to fail.
-    db.exec('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER)');
     while (current < target) { current++; try { if (migrationSteps[current - 1]) { migrationSteps[current - 1](); log(`Applied migration ${current}`, 'DEBUG', 'database'); } } catch (err: any) { throw new Error(`Migration ${current} failed: ${err.message}`); } }
     db.prepare('INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)').run(target, Date.now());
   });
@@ -234,6 +230,7 @@ let insertPatchEmbedding: any, searchPatchEmbeddings: any;
 let insertHealModelMetric: any, getHealModelMetrics: any;
 let getOrCreateHealerCircuitState: any, updateHealerCircuitState: any, getHealerCircuitState: any;
 let insertDegradationLog: any, getDegradationLog: any;
+let insertBannedAction: any, deleteBannedAction: any, listBannedActions: any, selectBannedAction: any;
 
 function createPreparedStatements() {
   insertModule = createSafeStatement('INSERT OR IGNORE INTO completed_modules (name, completed_at) VALUES (?, ?)', nonEmptyString);
@@ -307,6 +304,11 @@ function createPreparedStatements() {
   getHealerCircuitState = db.prepare("SELECT * FROM healer_circuit_state WHERE id = 1");
   insertDegradationLog = db.prepare(`INSERT INTO degradation_log (timestamp, from_mode, to_mode, reason, resource_snapshot) VALUES (?, ?, ?, ?, ?)`);
   getDegradationLog = db.prepare('SELECT * FROM degradation_log ORDER BY timestamp DESC LIMIT ?');
+  // Dashboard control: banned actions
+  insertBannedAction = db.prepare(`INSERT OR REPLACE INTO banned_actions (action_type, banned_by, banned_at, reason) VALUES (?, ?, ?, ?)`);
+  deleteBannedAction = db.prepare('DELETE FROM banned_actions WHERE action_type = ?');
+  listBannedActions = db.prepare('SELECT * FROM banned_actions ORDER BY banned_at DESC');
+  selectBannedAction = db.prepare('SELECT 1 FROM banned_actions WHERE action_type = ?');
 }
 
 function safeInsertModule(name: string) {  if (!name || typeof name !== 'string' || name.length > 500) { getLog()(`Invalid module name: ${typeof name}`, 'WARN', 'database'); return; } try { insertModule.run(name, Date.now()); } catch (err: any) { getLogError()('Failed to insert module', err, { moduleName: name.substring(0, 50) }); } }
@@ -411,6 +413,11 @@ module.exports = {
   get getHealerCircuitState() { return getHealerCircuitState; },
   get insertDegradationLog() { return insertDegradationLog; },
   get getDegradationLog() { return getDegradationLog; },
+  // Dashboard control
+  get insertBannedAction() { return insertBannedAction; },
+  get deleteBannedAction() { return deleteBannedAction; },
+  get listBannedActions() { return listBannedActions; },
+  get selectBannedAction() { return selectBannedAction; },
   // DI support
   _injectDependencies,
   initDatabase,
