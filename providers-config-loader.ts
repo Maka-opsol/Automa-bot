@@ -102,6 +102,8 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   'Cerebras': {
     endpoint: null,  // Uses @cerebras/cerebras_cloud_sdk (not raw HTTP)
     model: 'gemma-4-31b',
+    disabled: true,
+    disabledReason: 'Free tier removed - disabled Aug 2026',
     envKeys: ['CEREBRAS_API_KEY'],
     visionCapable: true,
     fallbackModels: [
