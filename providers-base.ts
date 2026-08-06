@@ -65,7 +65,26 @@ function extractJSON(raw: any, context: any) {
     return str;
   }
   const jsonStr = extractFirstJSON(cleaned);
-  try { return JSON.parse(jsonStr); } catch (e: any) { logError(`JSON parse error in ${context}`, e); throw new Error(`${context}: JSON parse failed`); }
+  try { return JSON.parse(jsonStr); } catch {
+    // Common LLM JSON fixes: trailing commas, unescaped newlines, control chars
+    let repaired = jsonStr
+      .replace(/,\s*}/g, '}')
+      .replace(/,\s*]/g, ']')
+      .replace(/[\x00-\x09\x0b\x0c\x0e-\x1f]/g, '')
+      .replace(/\n/g, '\\n')
+      .replace(/\r/g, '\\r')
+      .replace(/\t/g, '\\t');
+    try { return JSON.parse(repaired); } catch (e2: any) {
+      // Last resort: try extracting actionType with regex from raw content
+      const actionMatch = cleaned.match(/"actionType"\s*:\s*"([^"]+)"/);
+      if (actionMatch) {
+        log(`${context}: JSON parse failed, extracted actionType="${actionMatch[1]}" from raw content`, 'WARN', 'base');
+        return { actionType: actionMatch[1], currentState: 'unknown', reasoning: 'Extracted from malformed JSON' };
+      }
+      logError(`JSON parse error in ${context} (repaired also failed)`, e2);
+      throw new Error(`${context}: JSON parse failed`);
+    }
+  }
 }
 
 function validateActionResponse(obj: any, modelName: any) { 
