@@ -17,6 +17,8 @@
 //   - Tables synced: calibration, completed_modules, last_state, banned_actions,
 //     provider_registry, model_registry
 //   - Sync interval: every 60 seconds (configurable)
+//   - Dirty-check: hashes all local data before sync — skips the round-trip
+//     entirely if nothing has changed since the last successful sync
 //   - On startup: pull from Turso if local DB is empty (cold start recovery)
 //   - One-directional: local → Turso (local is source of truth)
 //   - Conflict resolution: last-write-wins (local always wins)
@@ -35,6 +37,7 @@ let _syncEnabled = false;
 let _syncInterval: any = null;
 let _lastSyncTime = 0;
 let _syncErrors = 0;
+let _lastDataHash: string | null = null; // Dirty-check: skip sync if data hasn't changed
 
 function _log(msg: string, level: string = 'INFO') {
   try { console.log(`[${new Date().toISOString()}] [turbo-sync:${level}] ${msg}`); }
@@ -106,12 +109,51 @@ async function initTursoSchema(): Promise<void> {
 }
 
 /**
+ * Compute a deterministic hash of all local DB data for dirty-checking.
+ * Returns an MD5 hex string, or null if the DB is not available.
+ */
+function _computeLocalDataHash(db: any): string | null {
+  try {
+    const crypto = require('crypto');
+    const parts: string[] = [];
+    parts.push(`cal:${JSON.stringify(db.db?.prepare('SELECT * FROM calibration ORDER BY key')?.all() || [])}`);
+    parts.push(`mod:${JSON.stringify(db.db?.prepare('SELECT * FROM completed_modules ORDER BY name')?.all() || [])}`);
+    const ls = db.db?.prepare('SELECT * FROM last_state ORDER BY timestamp DESC LIMIT 1')?.get();
+    parts.push(`ls:${JSON.stringify(ls || {})}`);
+    parts.push(`ba:${JSON.stringify(db.db?.prepare('SELECT * FROM banned_actions ORDER BY action_type')?.all() || [])}`);
+    parts.push(`pr:${JSON.stringify(db.db?.prepare('SELECT * FROM provider_registry ORDER BY provider_name')?.all() || [])}`);
+    parts.push(`mr:${JSON.stringify(db.db?.prepare('SELECT * FROM model_registry ORDER BY provider, model_id')?.all() || [])}`);
+    return crypto.createHash('md5').update(parts.join('\n')).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Push local data to Turso. Called periodically by the sync timer.
  * Reads from the local SQLite DB and upserts into Turso.
+ * Includes a dirty-check: computes a hash of all local data and skips
+ * the sync entirely if nothing has changed since the last sync.
  */
 async function syncToTurso(): Promise<{ synced: number; errors: number }> {
   const client = _getClient();
   if (!client) return { synced: 0, errors: 0 };
+
+  try {
+    const db = require('./database');
+
+    // ─── Dirty-check: skip sync if data hasn't changed ───
+    const currentHash = _computeLocalDataHash(db);
+    if (currentHash !== null && _lastDataHash !== null && currentHash === _lastDataHash) {
+      _lastSyncTime = Date.now();
+      return { synced: 0, errors: 0 }; // Nothing changed — skip the round-trip
+    }
+    if (currentHash !== null) {
+      _lastDataHash = currentHash;
+    }
+  } catch {
+    // If dirty-check fails, proceed with sync anyway
+  }
 
   let synced = 0;
   let errors = 0;
