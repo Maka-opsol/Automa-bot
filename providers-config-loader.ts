@@ -1,3 +1,10 @@
+'use strict';
+// Last modified: 2026-08-05 — Response 20: Updated model IDs, added DeepInfra, fixed Groq vision filter
+
+// ─── Dependency Injection ───────────────────────────────────────────────────
+let _deps: Record<string, any> = {};
+function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
+
 // Lazy logger fallback for before DI init
 function _log(msg: string, level?: string, mod?: string) { if (_deps.logger?.log) { _deps.logger.log(msg, level, mod); } else { try { const l = require('./logger'); l.log(msg, level, mod); } catch {} } }
 function _logError(msg: string, err: Error) { if (_deps.logger?.logError) { _deps.logger.logError(msg, err); } else { try { const l = require('./logger'); l.logError(msg, err); } catch {} } }
