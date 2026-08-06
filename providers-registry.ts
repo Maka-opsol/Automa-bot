@@ -1,5 +1,5 @@
 'use strict';
-// Last modified: 2026-08-05 - Response 20: Added DeepInfra, generalized emergency discovery, vision-only filter
+// Last modified: 2026-08-07 - Disabled Cerebras (free tier removed)
 
 // Provider implementations - internal sub-modules, not container-registered
 const { GitHubGPTProvider } = require('./providers-github-gpt');
@@ -55,7 +55,7 @@ const PROVIDER_TABLE: ProviderEntry[] = [
   { name: 'Agnes', factory: AgnesProvider },
   { name: 'NVIDIA', factory: NvidiaProvider },
   { name: 'Cloudflare', factory: CloudflareProvider },
-  { name: 'Cerebras', factory: CerebrasProvider },
+  // Cerebras removed - free tier removed (2026-08-07)
   // DeepInfra removed - no longer free tier (2026-08-06)
   { name: 'Gemini', factory: GeminiProvider },
   { name: 'OpenRouter', factory: OpenRouterTribunalProvider },
