@@ -469,6 +469,27 @@ const DASHBOARD_ALLOWED_ORIGINS = process.env.DASHBOARD_ALLOWED_ORIGINS
   ? process.env.DASHBOARD_ALLOWED_ORIGINS.split(',')
   : ['*'];
 
+// ── Screenshot cache (for /api/screenshot endpoint) ──
+let _latestScreenshot: { screenshot: string; timestamp: number; action?: any } | null = null;
+
+function setLatestScreenshot(base64Jpeg: string, action?: any) {
+  // Cap at ~500KB to avoid memory bloat on 512MB instance
+  if (base64Jpeg.length > 500_000) return;
+  _latestScreenshot = { screenshot: base64Jpeg, timestamp: Date.now(), action };
+}
+
+function getLatestScreenshot() {
+  // Expire after 120 seconds
+  if (_latestScreenshot && Date.now() - _latestScreenshot.timestamp > 120_000) {
+    _latestScreenshot = null;
+  }
+  return _latestScreenshot;
+}
+
+// Expose globally so cycle manager can call it
+(globalThis as any).__setLatestScreenshot = setLatestScreenshot;
+(globalThis as any).__getLatestScreenshot = getLatestScreenshot;
+
 function getStats() {
   try {
     const stateMachine = container.get('stateMachine');
@@ -597,6 +618,179 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
   if (pathname === '/api/container') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(getContainerHealth()));
+    return;
+  }
+
+  // ── Screenshot (live view for dashboard) ──
+  if (pathname === '/api/screenshot') {
+    const shot = getLatestScreenshot();
+    if (!shot) {
+      res.writeHead(204, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ available: false }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ available: true, timestamp: shot.timestamp, action: { actionType: shot.action?.actionType, currentState: shot.action?.currentState, reasoning: shot.action?.reasoning?.substring(0, 200) }, screenshot: shot.screenshot }));
+    return;
+  }
+
+  // ── Provider health details ──
+  if (pathname === '/api/providers') {
+    try {
+      const healthMod = require('./providers-health');
+      const registryMod = require('./providers-registry');
+      const providers = registryMod.getAvailableProviders ? await registryMod.getAvailableProviders() : [];
+      const healthDetails = providers.map((p: any) => {
+        const snapshot = healthMod.getHealthSnapshot?.(p.name) || {};
+        return {
+          name: p.name,
+          healthScore: p.healthScore,
+          totalCalls: snapshot.totalCalls || 0,
+          successRate: snapshot.successRate || 0,
+          avgLatencyMs: snapshot.avgLatencyMs || 0,
+          isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
+          circuitBreaker: snapshot.circuitBreakerState || 'closed',
+        };
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ providers: healthDetails, timestamp: Date.now() }));
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // ── Banned actions management ──
+  if (pathname === '/api/banned-actions' && req.method === 'GET') {
+    try {
+      const { listBannedActions } = require('./database');
+      const rows = listBannedActions();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(rows));
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  if (pathname === '/api/banned-actions' && req.method === 'POST') {
+    try {
+      let body = '';
+      req.on('data', (chunk: any) => { body += chunk; });
+      req.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.action_type) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'action_type is required' }));
+            return;
+          }
+          const { insertBannedAction } = require('./database');
+          insertBannedAction(data.action_type, 'dashboard', Date.now(), data.reason || 'Manual ban via dashboard');
+          log(`Action banned via dashboard: ${data.action_type} (${data.reason || 'no reason'})`, 'WARN', 'dashboard');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, banned: data.action_type }));
+        } catch (parseErr: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid JSON' }));
+        }
+      });
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  if (pathname === '/api/banned-actions' && req.method === 'DELETE') {
+    try {
+      let body = '';
+      req.on('data', (chunk: any) => { body += chunk; });
+      req.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.action_type) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'action_type is required' }));
+            return;
+          }
+          const { deleteBannedAction } = require('./database');
+          deleteBannedAction(data.action_type);
+          log(`Action unbanned via dashboard: ${data.action_type}`, 'INFO', 'dashboard');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, unbanned: data.action_type }));
+        } catch (parseErr: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid JSON' }));
+        }
+      });
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // ── Set state manually ──
+  if (pathname === '/api/set-state' && req.method === 'POST') {
+    try {
+      let body = '';
+      req.on('data', (chunk: any) => { body += chunk; });
+      req.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.state || typeof data.state !== 'string') {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'state is required' }));
+            return;
+          }
+          const { upsertLastState } = require('./database');
+          upsertLastState('manual://dashboard', data.state.substring(0, 100), Date.now());
+          log(`State set via dashboard: ${data.state}`, 'INFO', 'dashboard');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, state: data.state }));
+        } catch (parseErr: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid JSON' }));
+        }
+      });
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // ── Full status (for dashboard) ──
+  if (pathname === '/api/full-status') {
+    const stats = getStats();
+    const memInfo = getMemoryInfo();
+    const shot = getLatestScreenshot();
+    try {
+      const healthMod = require('./providers-health');
+      const registryMod = require('./providers-registry');
+      const providers = registryMod.getAvailableProviders ? await registryMod.getAvailableProviders() : [];
+      const providerSummary = providers.map((p: any) => ({
+        name: p.name,
+        healthScore: p.healthScore,
+        isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
+      }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ...stats,
+        memory: memInfo,
+        uptime: process.uptime(),
+        platform: 'render-free-plan',
+        screenshotAvailable: !!shot,
+        providers: providerSummary,
+        timestamp: Date.now(),
+      }));
+    } catch (e: any) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ...stats, memory: memInfo, uptime: process.uptime(), timestamp: Date.now() }));
+    }
     return;
   }
 
@@ -734,6 +928,14 @@ container.get('failsafeCoordinator', { required: false })?.startHealthChecks?.(6
 
 // Remote config
 container.get('remoteConfig', { required: false })?.loadRemoteConfig?.().catch(() => {});
+
+// Turso cloud sync (graceful no-op if not configured)
+try {
+  const tursoSync = require('./database-turso');
+  tursoSync.startTursoSync().catch((err: any) => {
+    log(`Turso sync failed to start: ${err.message}`, 'WARN', 'render-free-plan');
+  });
+} catch { /* module not found — skip */ }
 
 // Startup smoke tests
 const smokeResult = runStartupSmokeTests();
