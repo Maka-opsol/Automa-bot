@@ -1,7 +1,7 @@
 'use strict';
-// Last modified: 2026-08-05 — Response 20: Added DeepInfra, generalized emergency discovery, vision-only filter
+// Last modified: 2026-08-05 - Response 20: Added DeepInfra, generalized emergency discovery, vision-only filter
 
-// Provider implementations — internal sub-modules, not container-registered
+// Provider implementations - internal sub-modules, not container-registered
 const { GitHubGPTProvider } = require('./providers-github-gpt');
 const { GroqProvider } = require('./providers-groq');
 const { ZAIProvider } = require('./providers-zai');
@@ -13,7 +13,7 @@ const { GeminiProvider } = require('./providers-gemini');
 const { OpenRouterTribunalProvider } = require('./providers-openrouter-tribunal');
 const { DeepInfraProvider } = require('./providers-deepinfra');
 
-// ─── Dependency Injection ───────────────────────────────────────────────────
+// --- Dependency Injection ---------------------------------------------------
 let _deps: Record<string, any> = {};
 
 function _injectDependencies(deps: Record<string, any>) {
@@ -24,21 +24,21 @@ function getLog(): (msg: string, level?: string, _module?: string) => void {
   return _deps.logger?.log || console.log;
 }
 
-// Lazy health module — loaded on first use
+// Lazy health module - loaded on first use
 let _healthMod: any = null;
 function _getHealth() { if (!_healthMod) _healthMod = require('./providers-health'); return _healthMod; }
 
-// Lazy config loader — loaded on first use
+// Lazy config loader - loaded on first use
 let _configLoaderMod: any = null;
 function _getConfigLoader() { if (!_configLoaderMod) _configLoaderMod = require('./providers-config-loader'); return _configLoaderMod; }
 
-// Lazy serializers — loaded on first use
+// Lazy serializers - loaded on first use
 let _serializersMod: any = null;
 function _getSerializers() { if (!_serializersMod) _serializersMod = require('./providers-serializers'); return _serializersMod; }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // PROVIDER REGISTRATION TABLE
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 //
 // Each entry maps a provider name to its factory function.
 // The registry iterates this table in getAvailableProviders(),
@@ -56,31 +56,31 @@ const PROVIDER_TABLE: ProviderEntry[] = [
   { name: 'NVIDIA', factory: NvidiaProvider },
   { name: 'Cloudflare', factory: CloudflareProvider },
   { name: 'Cerebras', factory: CerebrasProvider },
-  // DeepInfra removed — no longer free tier (2026-08-06)
+  // DeepInfra removed - no longer free tier (2026-08-06)
   { name: 'Gemini', factory: GeminiProvider },
   { name: 'OpenRouter', factory: OpenRouterTribunalProvider },
   // GitHub GPT is in the table but filtered by P9 (disabled by default)
   { name: 'GitHub GPT', factory: GitHubGPTProvider },
 ];
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // CYCLE-LEVEL STATE (reset per question cycle)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 const providerCycleState = { githubRateLimitCount: 0, githubSwappedOut: false };
 let cycleBlacklist = new Set<string>();
 let cycleFailCounts: Record<string, number> = {};
 let dynamicProviders: Array<{ name: string; fn: any }> = [];
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // RETIRED PROVIDERS (permanent until restart or manual intervention)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 const retiredProviders = new Map<string, { reason: string; retiredAt: number }>();
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // GEMINI 429 ESCALATING COOLDOWN (P10)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 //
 // Gemini free tier is aggressively rate-limited. Instead of letting the
 // generic circuit breaker handle it (which would block Gemini entirely
@@ -124,18 +124,18 @@ function isGeminiOnCooldown(): boolean {
   return Date.now() < gemini429State.cooldownUntil;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // DYNAMIC PROVIDERS
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 function registerDynamicProvider(name: string, providerFn: any) { 
   dynamicProviders.push({ name, fn: providerFn });
   getLog()(`Registered dynamic provider: ${name}`, 'DEBUG', 'registry');
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RESULT RECORDING (P5 — delegates to providers-health)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
+// RESULT RECORDING (P5 - delegates to providers-health)
+// ===============================================================================
 //
 // recordProviderResult is the main entry point called by the tribunal.
 // It now delegates to providers-health.recordCallResult for health scoring,
@@ -181,9 +181,9 @@ function recordProviderResult(name: string, success: boolean, latency: number) {
   } catch (e: any) { log(`DB error in recordProviderResult: ${e.message || e}`, 'DEBUG', 'registry'); }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// HEALTH CHECK (P5 — delegates to providers-health)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
+// HEALTH CHECK (P5 - delegates to providers-health)
+// ===============================================================================
 
 function isProviderHealthy(name: string): boolean { 
   try {
@@ -197,9 +197,9 @@ function isProviderHealthy(name: string): boolean {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // CYCLE-LEVEL BLACKLIST (per-question-cycle, not persistent)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 function resetCycleProviderState() {
   const log = getLog();
@@ -244,7 +244,7 @@ function isProviderBlacklisted(name: string): boolean {
   try {
     const health = _getHealth();
     if (!health.isProviderAvailable(name)) return true;
-    // Also check health score — below 0.2 is effectively dead
+    // Also check health score - below 0.2 is effectively dead
     const snapshot = health.getHealthSnapshot(name);
     if (snapshot.healthScore < 0.2 && snapshot.totalCalls >= 3) return true;
   } catch {}
@@ -252,9 +252,9 @@ function isProviderBlacklisted(name: string): boolean {
   return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // PROVIDER RETIREMENT + AUTO-REPLACEMENT (P8)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 function retireProvider(name: string, reason: string) { 
   const log = getLog();
@@ -286,9 +286,9 @@ function isProviderRetired(name: string): boolean {
   return retiredProviders.has(name);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // HEALTH-WEIGHTED PROVIDER SELECTION (P5, P12, P16)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 //
 // getAvailableProviders() returns providers sorted by health score (descending).
 // This means the tribunal will consult the healthiest providers first,
@@ -309,7 +309,7 @@ async function getAvailableProviders(options?: { visionOnly?: boolean }) {
   const configLoader = _getConfigLoader();
   let candidates: Array<{ name: string; fn: any; healthScore: number }> = [];
 
-  // ─── Phase 1: Collect candidates from PROVIDER_TABLE ───
+  // --- Phase 1: Collect candidates from PROVIDER_TABLE ---
   for (const entry of PROVIDER_TABLE) {
     // P9: Skip disabled-by-default providers (GitHub GPT)
     if (configLoader.isProviderDisabledByDefault(entry.name)) {
@@ -338,7 +338,7 @@ async function getAvailableProviders(options?: { visionOnly?: boolean }) {
     candidates.push({ name: entry.name, fn, healthScore });
   }
 
-  // ─── Phase 2: Add dynamic providers ───
+  // --- Phase 2: Add dynamic providers ---
   for (const dp of dynamicProviders) {
     if (isProviderBlacklisted(dp.name) || isProviderRetired(dp.name)) continue;
     let healthScore = 0.5;
@@ -350,7 +350,7 @@ async function getAvailableProviders(options?: { visionOnly?: boolean }) {
     candidates.push({ name: dp.name, fn: dp.fn, healthScore });
   }
 
-  // ─── Phase 2.5: Vision-only filtering ───
+  // --- Phase 2.5: Vision-only filtering ---
   if (options?.visionOnly) {
     const serializers = _getSerializers();
     const beforeCount = candidates.length;
@@ -363,10 +363,10 @@ async function getAvailableProviders(options?: { visionOnly?: boolean }) {
     log(`Vision filter: ${filtered} text-only providers excluded`, 'DEBUG', 'registry');
   }
 
-  // ─── Phase 3: Sort by health score (highest first) ───
+  // --- Phase 3: Sort by health score (highest first) ---
   candidates.sort((a, b) => b.healthScore - a.healthScore);
 
-  // ─── Phase 4: Fail-fast on empty (P16) ───
+  // --- Phase 4: Fail-fast on empty (P16) ---
   if (candidates.length === 0) {
     log('CRITICAL: No providers available after all filters. Attempting emergency discovery + registration.', 'ERROR', 'registry');
     try {
@@ -415,9 +415,9 @@ async function getAvailableProviders(options?: { visionOnly?: boolean }) {
   return candidates;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // LEGACY COMPATIBILITY
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 function getProviderCycleState() { return providerCycleState; }
 
