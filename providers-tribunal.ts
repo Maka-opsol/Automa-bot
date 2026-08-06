@@ -219,10 +219,15 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   const valid = fulfilled.filter(r => {
     if (!r) return false;
     const hasAction = r.actionType && typeof r.actionType === 'string' && r.actionType.trim().length > 0;
-    const hasState = r.currentState && typeof r.currentState === 'string' && r.currentState.trim().length > 0;
-    if (!hasAction || !hasState) {
-      log(`Tribunal: filtered malformed result from ${r._model || 'unknown'}`, 'WARN', 'tribunal');
+    if (!hasAction) {
+      log(`Tribunal: filtered malformed result from ${r._model || 'unknown'} (no actionType)`, 'WARN', 'tribunal');
       return false;
+    }
+    // currentState is desirable but not required — validateActionResponse only
+    // mandates actionType. Default to 'unknown' so the vote still counts.
+    if (!r.currentState || typeof r.currentState !== 'string' || r.currentState.trim().length === 0) {
+      log(`Tribunal: ${r._model || 'unknown'} returned valid action but no currentState — defaulting to 'unknown'`, 'DEBUG', 'tribunal');
+      r.currentState = 'unknown';
     }
     return true;
   });
