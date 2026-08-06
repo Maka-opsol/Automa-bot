@@ -163,8 +163,10 @@ function _loadUsage(): void {
     if (savedDate === _getToday()) {
       // Same day — restore usage counts
       const knownProviders = [
-        'groq', 'zai', 'agnes', 'nvidia', 'cerebras',
-        'cloudflare', 'gemini', 'openrouter', 'deepinfra',
+        'groq', 'zai', 'agnes', 'nvidia',
+        'cloudflare', 'gemini', 'openrouter',
+        // Cerebras removed 2026-08-07 — free tier removed
+        // DeepInfra removed 2026-08-06 — free tier removed
       ];
 
       for (const provider of knownProviders) {
