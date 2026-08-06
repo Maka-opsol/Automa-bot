@@ -190,6 +190,11 @@ async function runCycle() {
     let consecutiveTribunalFailures = 0;
     let unknownStateCounter = 0; // Counts consecutive 'unknown' currentState results
     const MAX_UNKNOWN_STATE = 3; // After this many unknowns, force recovery
+    let lastScreenshotChangeTime = Date.now(); // Track last time screenshot actually changed
+    let lastQuestionCompletionTime = Date.now(); // Track last time a question was completed
+    const STAGNATION_AUTO_BAN_MS = 20 * 60 * 1000; // 20 minutes — auto-ban wait & unknown if no progress
+    let stagnationAutoBanTriggered = false; // Prevent repeated bans
+    let previousScreenshotHash: string | null = null; // Compare screenshots across iterations
 
     // Select module using dynamic planning
     let currentModule = getNextModule?.();
@@ -256,6 +261,11 @@ async function runCycle() {
         }
       } catch { /* non-critical */ }
       const screenshotHash = crypto.createHash('md5').update(screenshot).digest('hex');
+      // Track screenshot changes for stagnation auto-ban
+      if (previousScreenshotHash && screenshotHash !== previousScreenshotHash) {
+        lastScreenshotChangeTime = Date.now();
+      }
+      previousScreenshotHash = screenshotHash;
 
       // Check policy (existing policyEngine)
       if (policyEngine) {
@@ -333,8 +343,15 @@ async function runCycle() {
         const dbMod = require('./database');
         const isBanned = dbMod.selectBannedAction?.(action.actionType);
         if (isBanned) {
-          log(`Action ${action.actionType} is banned via dashboard. Forcing wait.`, 'WARN', 'cycle');
-          action = { actionType: 'wait', currentState: action.currentState, targetX: 0, targetY: 0, reasoning: `Action ${action.actionType} banned by admin` };
+          const isWaitAlsoBanned = dbMod.selectBannedAction?.('wait');
+          if (!isWaitAlsoBanned) {
+            log(`Action ${action.actionType} is banned via dashboard. Forcing wait.`, 'WARN', 'cycle');
+            action = { actionType: 'wait', currentState: action.currentState, targetX: 0, targetY: 0, reasoning: `Action ${action.actionType} banned by admin` };
+          } else {
+            // Both the action and wait are banned — force a reload to break the deadlock
+            log(`Action ${action.actionType} AND 'wait' are both banned. Forcing page reload instead.`, 'WARN', 'cycle');
+            action = { actionType: 'reload', currentState: action.currentState, targetX: 0, targetY: 0, reasoning: `Both ${action.actionType} and wait are banned — forcing reload` };
+          }
         }
       } catch { /* non-critical: DB unavailable */ }
 
@@ -444,6 +461,21 @@ async function runCycle() {
           if (bruteSuccess) actionSuccess = true;
         }
         if (actionSuccess) consecutiveFailures = 0;
+      } else if (action.actionType === 'reload') {
+        // Forced reload — used when wait is banned to break death spirals
+        log('Executing forced page reload (wait-banned escape).', 'WARN', 'cycle');
+        try {
+          const curUrl = page.url();
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+          if (page.url() === curUrl && CONFIG.BASE_URL) {
+            await page.goto(CONFIG.BASE_URL, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+          }
+          lastScreenshotChangeTime = Date.now(); // Reset since page changed
+          actionSuccess = true;
+          consecutiveFailures = 0;
+        } catch (reloadErr: any) {
+          log(`Forced reload failed: ${reloadErr.message || reloadErr}`, 'ERROR', 'cycle');
+        }
       } else {
         if (executeAction) await executeAction(page, action);
         actionSuccess = true;
@@ -498,6 +530,8 @@ async function runCycle() {
       // Module completion
       if (['score_screen', 'pathway_feedback'].includes(action.currentState) && action.currentState !== currentState) {
         questionsCompleted++;
+        lastQuestionCompletionTime = Date.now(); // Reset stagnation timer on progress
+        lastScreenshotChangeTime = Date.now(); // Screenshot definitely changed
         updateStats({ questionsCompleted });
         trackProgress?.({ action: action.actionType, state: action.currentState, timestamp: new Date().toISOString(), questionsCompleted });
         if (upsertLastState) upsertLastState.run(page.url(), action.currentState, Date.now());
@@ -555,6 +589,51 @@ async function runCycle() {
         }
       } else {
         unknownStateCounter = 0;
+      }
+
+      // ─── 20-min stagnation auto-ban ───
+      // If no screenshot change AND no question completed for 20+ minutes,
+      // auto-ban 'wait' and force the bot out of the unknown/wait death spiral.
+      // The banned actions are persisted in SQLite so they survive restarts.
+      if (!stagnationAutoBanTriggered) {
+        const timeSinceScreenChange = Date.now() - lastScreenshotChangeTime;
+        const timeSinceQuestion = Date.now() - lastQuestionCompletionTime;
+        const isInWaitUnknownLoop = action.actionType === 'wait' && (action.currentState === 'unknown' || !action.currentState);
+
+        if (isInWaitUnknownLoop && timeSinceScreenChange > STAGNATION_AUTO_BAN_MS && timeSinceQuestion > STAGNATION_AUTO_BAN_MS) {
+          log(`⚠️ STAGNATION AUTO-BAN: No progress for ${Math.round(timeSinceScreenChange / 60000)} min. Auto-banning 'wait' action to break death spiral.`, 'ERROR', 'cycle');
+          try {
+            const dbMod = require('./database');
+            if (dbMod.insertBannedAction) {
+              dbMod.insertBannedAction('wait', 'stagnation-guard', Date.now(), `Auto-banned: no progress for ${Math.round(timeSinceScreenChange / 60000)} min (20 min threshold). Screenshot unchanged, no questions completed.`);
+              log('Action "wait" auto-banned via stagnation guard.', 'WARN', 'cycle');
+            }
+          } catch (banErr: any) {
+            log(`Failed to auto-ban wait: ${banErr.message || banErr}`, 'ERROR', 'cycle');
+          }
+          stagnationAutoBanTriggered = true;
+          // Force a hard reset — reload page to break the loop
+          try {
+            const currentUrl = page.url();
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+            if (page.url() === currentUrl && CONFIG.BASE_URL) {
+              log('Auto-ban recovery: navigating to BASE_URL.', 'WARN', 'cycle');
+              await page.goto(CONFIG.BASE_URL, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+            }
+          } catch (reloadErr: any) {
+            log(`Auto-ban recovery reload failed: ${reloadErr.message || reloadErr}`, 'WARN', 'cycle');
+          }
+          // Alert
+          try { sendAlert(`STAGNATION AUTO-BAN: "wait" banned after ${Math.round(timeSinceScreenChange / 60000)} min of no progress. Manual unban may be needed.`); } catch (_e: any) {}
+          continue; // Skip the wait action and re-evaluate
+        }
+      } else {
+        // Once auto-ban has triggered, check if progress has resumed to allow future auto-bans
+        const timeSinceScreenChange = Date.now() - lastScreenshotChangeTime;
+        if (timeSinceScreenChange < 60000) { // Screenshot changed in the last minute
+          stagnationAutoBanTriggered = false;
+          log('Progress resumed after stagnation auto-ban. Auto-ban re-armed.', 'INFO', 'cycle');
+        }
       }
 
       // Exploration mode
