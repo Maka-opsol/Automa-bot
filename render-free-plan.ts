@@ -241,7 +241,7 @@ if (CONFIG.MAX_UPTIME_HOURS && CONFIG.MAX_UPTIME_HOURS > 0) {
 // This allows pinging HTTP-based cron monitors too.
 // \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
 
-const KEEPALIVE_INTERVAL_MS = 4 * 60 * 1000;
+const KEEPALIVE_INTERVAL_MS = 3.5 * 60 * 1000;  // 3.5 min (was 4 min) — tighter margin against 15-min spin-down
 const EXTERNAL_PING_URL = process.env.KEEPALIVE_PING_URL || '';
 // Maximum consecutive keepalive failures before logging at ERROR level
 // instead of WARN. Prevents log spam during network blips.
@@ -334,7 +334,7 @@ setTimeout(() => {
     _selfPingWrapped();
     externalPing();
   }, KEEPALIVE_INTERVAL_MS).unref();
-}, 30000);
+}, 15000);  // 15s initial delay (was 30s) — health server is ready faster now
 
 log(
   `Keepalive system started (interval: ${KEEPALIVE_INTERVAL_MS / 1000}s, external: ${EXTERNAL_PING_URL ? 'enabled' : 'disabled'})`,
@@ -380,7 +380,13 @@ registerShutdownHook(async () => {
   log('Closing browser...', 'INFO', 'render-free-plan');
   try {
     const browserMod = container.get('browser', { required: false });
-    if (browserMod?.closeBrowser) await browserMod.closeBrowser();
+    if (browserMod?.closeBrowser) {
+      // Timeout browser close to prevent shutdown hanging on disconnected process
+      await Promise.race([
+        browserMod.closeBrowser(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Browser close timed out')), 8000))
+      ]).catch((err: any) => { log(`Browser close error (non-fatal): ${err.message}`, 'WARN', 'render-free-plan'); });
+    }
   } catch { /* best effort */ }
 }, 1);
 registerShutdownHook(async () => {
