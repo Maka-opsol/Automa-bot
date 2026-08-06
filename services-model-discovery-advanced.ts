@@ -96,8 +96,10 @@ async function discoverModels(providerName: string): Promise<any[]> {
     const fetchJSON = _getFetchJSON();
     const headers = endpoint.getHeaders(cfg);
     const data = await fetchJSON(endpoint.url, { headers }, 15000);
+    // Strip ':free' suffix — OpenRouter uses it for pricing tier but
+    // most provider APIs reject it as an unknown model variant.
     const models: any[] = (data.data || []).filter(_isFreeModel).map((m: any) => ({
-      id: m.id,
+      id: m.id.replace(/:free$/, ''),
       provider: providerName,
       endpoint: providerName === 'openrouter'
         ? 'https://openrouter.ai/api/v1/chat/completions'
