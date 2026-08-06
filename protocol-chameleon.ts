@@ -111,7 +111,7 @@ class ProtocolChameleon {
         log('providers-base.callChatCompletion not available', 'WARN', 'chameleon');
         return null;
       }
-      const result = await base.callChatCompletion(endpoint, apiKey, model, newPayload.base64Image, newPayload.prompt, newPayload.options);
+      const result = await base.callChatCompletion(endpoint, apiKey, model, newPayload.base64Image, newPayload.prompt, providerName, newPayload.options);
       return result;
     } catch (err: any) {
       logError('Adapted request still failed', err);
