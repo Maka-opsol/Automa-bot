@@ -99,7 +99,7 @@ class QuotaBargainManager {
             if (!apiKey) {
               return { actionType: 'wait', currentState: 'error', reasoning: 'No OPENROUTER_API_KEY configured', targetX: 0, targetY: 0 };
             }
-            const result = await providersBase.callChatCompletion(endpoint, apiKey, modelId, base64Image, prompt, {
+            const result = await providersBase.callChatCompletion(endpoint, apiKey, modelId, base64Image, prompt, 'openrouter', {
               ...options,
               maxTokens: options.maxTokens || 4096,
               temperature: options.temperature || 0.1,
