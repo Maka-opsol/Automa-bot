@@ -1,4 +1,5 @@
 'use strict';
+// Last modified: 2026-08-06 - All providers vision-capable; removed DeepInfra priority (disabled), relaxed vision-only filter comment
 
 // ─── Vision Pipeline ─────────────────────────────────────────────────────────
 //
@@ -137,7 +138,7 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
   const compressedBase64 = await compressScreenshot(base64Image, 768, 30);
 
   // ─── Optional: Local ONNX pre-processing ───
-  // This runs ONNX inference but doesn't use the result directly —
+  // This runs ONNX inference but doesn't use the result directly -
   // it's a pre-processing step that may inform future analysis.
   const session = await loadONNX();
   if (session) {
@@ -175,18 +176,15 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
   }
 
   // ─── Cloud provider execution (vision-only) ───
-  // Only query providers that actually support vision — text-only providers
-  // would silently strip the image and produce blind analyses.
+  // All current providers support vision - the vision-only filter now
+  // passes through all available providers.
   let providers = await getAvailableProviders({ visionOnly: true });
 
   // z.ai GLM-4.6V priority: move z.ai to front for reliability (confirmed alive, free vision).
-  // DeepInfra priority: move DeepInfra after z.ai (free Qwen2.5-VL vision models).
   const zaiProvider = providers.find((p: any) => p.name === 'z.ai');
-  const deepinfraProvider = providers.find((p: any) => p.name === 'DeepInfra');
-  const rest = providers.filter((p: any) => p.name !== 'z.ai' && p.name !== 'DeepInfra');
+  const rest = providers.filter((p: any) => p.name !== 'z.ai');
   const orderedProviders = [
     ...(zaiProvider ? [zaiProvider] : []),
-    ...(deepinfraProvider ? [deepinfraProvider] : []),
     ...rest,
   ];
 
@@ -234,7 +232,7 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
       return { result, provider: provider.name };
     } catch (err: any) {
       const latency = Date.now() - start;
-      // Only log at DEBUG — the safeCall already logged at WARN with structured details
+      // Only log at DEBUG - the safeCall already logged at WARN with structured details
       log(`Provider ${provider.name} vision failed: ${err.message || err}`, 'DEBUG', 'vision');
       recordProviderResult(provider.name, false, latency);
       return null;
