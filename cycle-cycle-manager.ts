@@ -248,6 +248,13 @@ async function runCycle() {
       const beforeUrl = page.url();
       const screenshot = await page.screenshot({ type: 'jpeg', quality: 30 });
       const base64 = screenshot.toString('base64');
+      // Feed screenshot to dashboard cache (non-blocking)
+      try {
+        const setShot = (globalThis as any).__setLatestScreenshot;
+        if (setShot) {
+          setShot(base64, null); // action set after tribunal
+        }
+      } catch { /* non-critical */ }
       const screenshotHash = crypto.createHash('md5').update(screenshot).digest('hex');
 
       // Check policy (existing policyEngine)
@@ -321,6 +328,16 @@ async function runCycle() {
         action = { actionType: 'wait', currentState: 'error', targetX: 0, targetY: 0 };
       }
 
+      // Dashboard: check if action is banned
+      try {
+        const dbMod = require('./database');
+        const isBanned = dbMod.selectBannedAction?.(action.actionType);
+        if (isBanned) {
+          log(`Action ${action.actionType} is banned via dashboard. Forcing wait.`, 'WARN', 'cycle');
+          action = { actionType: 'wait', currentState: action.currentState, targetX: 0, targetY: 0, reasoning: `Action ${action.actionType} banned by admin` };
+        }
+      } catch { /* non-critical: DB unavailable */ }
+
       // Experiment context
       if (strategyVariants) {
         const experiment = strategyVariants.getActiveExperiment?.();
@@ -342,6 +359,13 @@ async function runCycle() {
         }
       }
       updateStats({ currentState: action.currentState });
+      // Update dashboard cache with action info
+      try {
+        const setShot = (globalThis as any).__setLatestScreenshot;
+        if (setShot) {
+          setShot(base64, action);
+        }
+      } catch { /* non-critical */ }
 
       // UI drift detection
       if (uiDrift) {
