@@ -1,7 +1,7 @@
 'use strict';
 // Last modified: 2026-08-06 - Disabled DeepInfra (no longer free), all providers vision-capable
 
-// ─── Dependency Injection ───────────────────────────────────────────────────
+// --- Dependency Injection ---------------------------------------------------
 let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 
@@ -9,9 +9,9 @@ function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function _log(msg: string, level?: string, mod?: string) { if (_deps.logger?.log) { _deps.logger.log(msg, level, mod); } else { try { const l = require('./logger'); l.log(msg, level, mod); } catch {} } }
 function _logError(msg: string, err: Error) { if (_deps.logger?.logError) { _deps.logger.logError(msg, err); } else { try { const l = require('./logger'); l.logError(msg, err); } catch {} } }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // FREE-ONLY MODEL DEFAULTS (P2, P3)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 //
 // Every model here MUST be:
 //   1. Available on a free tier (no credit card required)
@@ -19,12 +19,12 @@ function _logError(msg: string, err: Error) { if (_deps.logger?.logError) { _dep
 //   3. Reasonably fast (<10s typical response on free tier)
 //
 // Models replaced from original DEFAULTS:
-//   - Groq: deepseek-r1-distill-llama-70b → llama-3.3-70b-versatile (deepseek-r1 deprecated)
-//   - Gemini: gemini-2.0-flash → gemini-2.5-flash (better rate limits, still free)
+//   - Groq: deepseek-r1-distill-llama-70b ??? llama-3.3-70b-versatile (deepseek-r1 deprecated)
+//   - Gemini: gemini-2.0-flash ??? gemini-2.5-flash (better rate limits, still free)
 //   - DeepInfra: NEW - free Qwen2.5-VL vision models
-//   - NVIDIA: meta/llama-3.2-11b-vision-instruct → meta/llama-3.3-70b-instruct
+//   - NVIDIA: meta/llama-3.2-11b-vision-instruct ??? meta/llama-3.3-70b-instruct
 //       (3.3-70b is free on NVIDIA NIM, much stronger than 3.2-11b)
-//   - Cerebras: gemma-4-31b → llama-4-scout-17b-16e-instruct
+//   - Cerebras: gemma-4-31b ??? llama-4-scout-17b-16e-instruct
 //       (Cerebras may not host gemma-4; llama-4-scout is confirmed available)
 //   - GitHub GPT: DISABLED (free tier ended)
 //
@@ -138,9 +138,9 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // DYNAMIC MODEL REGISTRY (P4, P19)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 //
 // Discovered and verified models live here. Persisted to DB so they survive
 // restarts. Entries have metadata for capability-based filtering.
@@ -180,9 +180,9 @@ function saveDynamicModels() {
   } catch (e: any) { _logError('Failed to save dynamic models', e); }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // AUTO-DISCOVERY WITH VERIFICATION (P19)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 //
 // Queries provider model list APIs for free models, then verifies each
 // with a minimal test request before registering. This prevents registering
@@ -191,7 +191,7 @@ function saveDynamicModels() {
 async function autoDiscoverModels() { 
   const discoveries: Array<{provider: string; model: string; visionCapable: boolean}> = [];
 
-  // ─── OpenRouter: query /models for free vision models ───
+  // --- OpenRouter: query /models for free vision models ---
   try {
     const { fetchJSON } = require('./utils-fetch');
     const data = await fetchJSON('https://openrouter.ai/api/v1/models', {}, 15000);
@@ -229,7 +229,7 @@ async function autoDiscoverModels() {
     }
   } catch (e: any) { _log(`Auto-discover OpenRouter failed: ${e.message}`, 'WARN', 'config-loader'); }
 
-  // ─── Groq: query /models for available models ───
+  // --- Groq: query /models for available models ---
   try {
     const { fetchJSON } = require('./utils-fetch');
     const groqKey = process.env.GROQ_API_KEY;
@@ -263,7 +263,7 @@ async function autoDiscoverModels() {
     }
   } catch (e: any) { _log(`Auto-discover Groq failed: ${e.message}`, 'WARN', 'config-loader'); }
 
-  // ─── Verify discovered models with minimal test requests ───
+  // --- Verify discovered models with minimal test requests ---
   // Only verify the first discovery from each provider to save time
   const toVerify = discoveries.filter((d, i, arr) => arr.findIndex(x => x.provider === d.provider) === i);
   for (const disc of toVerify.slice(0, 2)) {  // max 2 verifications to limit API usage
@@ -289,3 +289,284 @@ async function autoDiscoverModels() {
   }
   return discoveries;
 }
+
+/**
+ * Verify a model with a minimal test request.
+ * Sends a short prompt and checks for a valid response.
+ */
+async function _verifyModel(dm: DynamicModel): Promise<boolean> {
+  if (!dm.endpoint) return false;
+  let apiKey = '';
+  if (dm.providerName === 'OpenRouter') apiKey = process.env.OPENROUTER_API_KEY || '';
+  else if (dm.providerName === 'Groq') apiKey = process.env.GROQ_API_KEY || '';
+  if (!apiKey) return false;
+
+  try {
+    const { fetchWithTimeout } = require('./utils-fetch');
+    const payload = {
+      model: dm.model,
+      max_tokens: 10,
+      temperature: 0,
+      messages: [{ role: 'user', content: 'Reply with just the word OK.' }],
+    };
+    const resp = await fetchWithTimeout(dm.endpoint, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, 10000);
+    if (!resp.ok) return false;
+    const data = await resp.json();
+    return !!(data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content);
+  } catch {
+    return false;
+  }
+}
+
+// ===============================================================================
+// AUTO-REPLACEMENT (P8)
+// ===============================================================================
+//
+// When a provider is retired (model 404), find a replacement from:
+//   1. The provider's fallbackModels list in DEFAULTS
+//   2. Verified dynamic models for the same provider
+//   3. Verified dynamic models from any provider
+
+function findReplacement(providerName: string): { endpoint: string | null; model: string } | null {
+  const def = DEFAULTS[providerName];
+  if (!def) {
+    // Try dynamic models
+    for (const [key, dm] of Object.entries(DYNAMIC_MODELS)) {
+      if (dm.verified && dm.providerName === providerName && dm.endpoint) {
+        return { endpoint: dm.endpoint, model: dm.model };
+      }
+    }
+    return null;
+  }
+
+  // 1. Try fallback models from DEFAULTS
+  if (def.fallbackModels && def.fallbackModels.length > 0) {
+    for (const fbModel of def.fallbackModels) {
+      return { endpoint: def.endpoint, model: fbModel };
+    }
+  }
+
+  // 2. Try verified dynamic models for the same provider
+  for (const [key, dm] of Object.entries(DYNAMIC_MODELS)) {
+    if (dm.verified && dm.providerName === providerName && dm.endpoint) {
+      return { endpoint: dm.endpoint, model: dm.model };
+    }
+  }
+
+  // 3. Try any verified dynamic model (cross-provider replacement)
+  for (const [key, dm] of Object.entries(DYNAMIC_MODELS)) {
+    if (dm.verified && dm.endpoint) {
+      return { endpoint: dm.endpoint, model: dm.model };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Register a replacement provider after a retirement.
+ * The replacement is registered as a dynamic provider in the registry.
+ */
+function registerReplacement(retiredName: string, replacement: { endpoint: string | null; model: string }): string {
+  const dynName = `replacement-for-${retiredName}`;
+  DYNAMIC_MODELS[dynName] = {
+    endpoint: replacement.endpoint,
+    model: replacement.model,
+    discoveredAt: Date.now(),
+    source: `auto-replacement-for-${retiredName}`,
+    verified: false,
+    verifiedAt: null,
+    visionCapable: false,  // will be determined by first call
+    providerName: retiredName,
+  };
+  saveDynamicModels();
+  _log(`Registered replacement ${dynName}: ${replacement.model}`, 'INFO', 'config-loader');
+  return dynName;
+}
+
+// ===============================================================================
+// PROVIDER CONFIG ACCESS (unchanged API, enhanced internals)
+// ===============================================================================
+
+/** Lazy accessor for database - resolves at call time, not at require() time. */
+function _getDb() {
+  return _deps.database ?? require('./database');
+}
+
+function getProviderConfig(providerName: string): { endpoint: string | null; model: string; disabled?: boolean; disabledReason?: string } {
+  try {
+    loadDynamicModels();
+    const db = _getDb();
+    const row = db.selectProvider?.get(providerName);
+    if (row && row.model) {
+      return { endpoint: row.endpoint || null, model: row.model };
+    }
+  } catch (e: any) { _logError(`getProviderConfig DB error for ${providerName}`, e); }
+
+  // Check dynamic models
+  if (DYNAMIC_MODELS[providerName]) {
+    const d = DYNAMIC_MODELS[providerName];
+    return { endpoint: d.endpoint || null, model: d.model };
+  }
+
+  // Fall back to DEFAULTS
+  const def = DEFAULTS[providerName];
+  if (def) {
+    return {
+      endpoint: def.endpoint || null,
+      model: def.model,
+      disabled: def.disabled || false,
+      disabledReason: def.disabledReason,
+    };
+  }
+
+  return { endpoint: null, model: null };
+}
+
+/**
+ * Check if a provider's required env keys are present.
+ * Used by the registry to skip providers without API keys.
+ */
+function hasRequiredEnvKeys(providerName: string): boolean {
+  const def = DEFAULTS[providerName];
+  if (!def) return true;  // unknown providers - let the provider factory check
+  return def.envKeys.every(key => {
+    const val = process.env[key];
+    return typeof val === 'string' && val.length > 0;
+  });
+}
+
+/**
+ * Check if a provider is disabled by default.
+ */
+function isProviderDisabledByDefault(providerName: string): boolean {
+  const def = DEFAULTS[providerName];
+  return def ? (def.disabled || false) : false;
+}
+
+/**
+ * Get the fallback models chain for a provider.
+ */
+function getFallbackModels(providerName: string): string[] {
+  const def = DEFAULTS[providerName];
+  return def ? (def.fallbackModels || []) : [];
+}
+
+/**
+ * Get all provider names from DEFAULTS.
+ */
+function getKnownProviders(): string[] {
+  return Object.keys(DEFAULTS);
+}
+
+/**
+ * Synchronous provider availability check.
+ * Returns names of providers that have all required env keys present and are not disabled.
+ * Used by smoke tests (sync context) to verify at least one provider is configured.
+ */
+function getAvailableProviderNamesSync(): string[] {
+  const names: string[] = [];
+  for (const name of Object.keys(DEFAULTS)) {
+    if (isProviderDisabledByDefault(name)) continue;
+    if (!hasRequiredEnvKeys(name)) continue;
+    names.push(name);
+  }
+  return names;
+}
+
+/**
+ * Get the full default config for a provider (including metadata).
+ */
+function getProviderDefault(providerName: string): ProviderDefault | null {
+  return DEFAULTS[providerName] || null;
+}
+
+function updateProviderConfig(providerName: string, newConfig: any, verified = true) { 
+  try {
+    const db = _getDb();
+    const old = db.selectProvider?.get(providerName);
+    let history = [];
+    if (old && old.history) { try { history = JSON.parse(old.history); } catch (_e: any) { /* malformed data, skipping */ } }
+    if (old) {
+      history.push({
+        endpoint: old.endpoint,
+        model: old.model,
+        verifiedAt: old.last_verified ? new Date(old.last_verified).toISOString() : new Date().toISOString(),
+      });
+      if (history.length > 5) history.shift();
+    }
+    db.upsertProvider?.run(
+      providerName,
+      newConfig.endpoint || null,
+      newConfig.model,
+      verified ? Date.now() : (old ? old.last_verified : Date.now()),
+      JSON.stringify(history),
+      old ? (old.success_count ?? 0) : 0,
+      old ? (old.failure_count ?? 0) : 0,
+      old ? (old.total_latency ?? 0) : 0,
+      Date.now()
+    );
+  } catch (e: any) { _logError(`Failed to update provider config for ${providerName}`, e); }
+}
+
+function rollbackProvider(providerName: string): boolean { 
+  try {
+    const db = _getDb();
+    const row = db.selectProvider?.get(providerName);
+    if (!row || !row.history) return false;
+    let history = [];
+    try { history = JSON.parse(row.history); } catch (e: any) { return false; }
+    if (history.length === 0) return false;
+    const previous = history.pop();
+    db.upsertProvider?.run(
+      providerName,
+      previous.endpoint || null,
+      previous.model,
+      Date.now(),
+      JSON.stringify(history),
+      row ? (row.success_count ?? 0) : 0,
+      row ? (row.failure_count ?? 0) : 0,
+      row ? (row.total_latency ?? 0) : 0,
+      Date.now()
+    );
+    _log(`Rolled back ${providerName} to ${previous.model}`, 'INFO', 'config-loader');
+    return true;
+  } catch (e: any) { return false; }
+}
+
+function getProviderHistory(providerName: string): Array<{endpoint: string | null; model: string; verifiedAt: string}> { 
+  try {
+    const db = _getDb();
+    const row = db.selectProvider?.get(providerName);
+    if (row && row.history) return JSON.parse(row.history);
+  } catch (_e: any) { /* malformed data, skipping */ }
+  return [];
+}
+
+module.exports = {
+  // Core config access
+  getProviderConfig,
+  updateProviderConfig,
+  rollbackProvider,
+  getProviderHistory,
+  // Discovery
+  autoDiscoverModels,
+  // Replacement (P8)
+  findReplacement,
+  registerReplacement,
+  // Provider metadata (P4)
+  hasRequiredEnvKeys,
+  isProviderDisabledByDefault,
+  getFallbackModels,
+  getKnownProviders,
+  getAvailableProviderNamesSync,
+  getProviderDefault,
+  // Dynamic models
+  DYNAMIC_MODELS: () => ({ ...DYNAMIC_MODELS }),
+  // DI
+  _injectDependencies,
+};
