@@ -86,7 +86,7 @@ const PROVIDER_ENDPOINTS: Record<string, { endpoint: string; apiKeyFn: (cfg: any
 /**
  * Get endpoint + API key for the currently active model's provider.
  */
-function getActiveProviderDetails(): { endpoint: string; apiKey: string | null; model: string } | null {
+function getActiveProviderDetails(): { endpoint: string; apiKey: string | null; model: string; provider: string } | null {
   const activeModel = getGetActiveModel()?.get();
   if (!activeModel) return null;
   const provider = activeModel.provider || 'openrouter';
@@ -95,7 +95,7 @@ function getActiveProviderDetails(): { endpoint: string; apiKey: string | null; 
   if (!entry) return null;
   const apiKey = entry.apiKeyFn(cfg);
   if (!apiKey) return null;
-  return { endpoint: entry.endpoint, apiKey, model: activeModel.model_id };
+  return { endpoint: entry.endpoint, apiKey, model: activeModel.model_id, provider };
 }
 
 // ─── Discovery ───
@@ -173,7 +173,7 @@ Reply ONLY with a JSON array of strings, e.g., ["model/id/1", "model/id/2", "mod
   try {
     const callChatCompletion = _getCallChatCompletion();
     const response = await Promise.race([
-      callChatCompletion(details.endpoint, details.apiKey, details.model, null, prompt, {
+      callChatCompletion(details.endpoint, details.apiKey, details.model, null, prompt, details.provider, {
         maxTokens: 200,
         temperature: 0.0,
       }),
@@ -245,7 +245,7 @@ async function safeTestModel(modelId: string, provider = 'openrouter'): Promise<
   // Try vision test first
   try {
     const response = await Promise.race([
-      callChatCompletion(entry.endpoint, apiKey, modelId, DUMMY_IMAGE_1X1_JPEG, TEST_PROMPT, {
+      callChatCompletion(entry.endpoint, apiKey, modelId, DUMMY_IMAGE_1X1_JPEG, TEST_PROMPT, provider, {
         maxTokens: 50,
         temperature: 0.0,
       }),
@@ -266,7 +266,7 @@ async function safeTestModel(modelId: string, provider = 'openrouter'): Promise<
       _log(`Model ${modelId} vision failed (404), retrying text-only...`, 'DEBUG', 'evolution');
       try {
         const response = await Promise.race([
-          callChatCompletion(entry.endpoint, apiKey, modelId, null, TEST_PROMPT, {
+          callChatCompletion(entry.endpoint, apiKey, modelId, null, TEST_PROMPT, provider, {
             maxTokens: 50,
             temperature: 0.0,
           }),
