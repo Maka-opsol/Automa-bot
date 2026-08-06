@@ -590,7 +590,10 @@ const _configStore: Record<string, any> = {
   // v5-fix: safeMkdir can throw during module evaluation if LOG_DIR is unwritable
   // (e.g. permission denied, invalid path). Previously this crashed config.ts
   // with no clear message. Now falls back to ./logs with a warning.
-  LOG_DIR: (() => { try { return safeMkdir(sanitizePathString(env.LOG_DIR), 'LOG_DIR'); } catch (mkdirErr: unknown) { console.warn(`\u26A0\uFE0F LOG_DIR creation failed (${(mkdirErr as Error).message}), falling back to ./logs`); try { return safeMkdir(path.join(PROJECT_ROOT, 'logs'), 'LOG_DIR (fallback)'); } catch { return path.join(PROJECT_ROOT, 'logs'); } } })(),
+  LOG_DIR: (() => { try { return safeMkdir(sanitizePathString(env.LOG_DIR), 'LOG_DIR'); } catch (mkdirErr: unknown) {
+    console.warn(`\u26A0\uFE0F LOG_DIR creation failed (${(mkdirErr as Error).message}), falling back to os.tmpdir()`);
+    try { return safeMkdir(path.join(require('os').tmpdir(), 'mathu-logs'), 'LOG_DIR (fallback)'); } catch { return path.join(require('os').tmpdir(), 'mathu-logs'); }
+  } })(),
   AUTH_STATE_PATH: (env.AUTH_STATE_PATH || '').replace(/[^a-zA-Z0-9_\-\/\.]/g, ''),
   HEADLESS: env.HEADLESS,
   CHROMIUM_EXECUTABLE_PATH: env.CHROMIUM_EXECUTABLE_PATH || null,
@@ -849,7 +852,7 @@ function validateConfig(): void {
       console.warn('\u26A0\uFE0F   Set MICROSOFT_EMAIL and MICROSOFT_PASSWORD in .env to enable full operation.');
       credsOk = false;
     }
-    const visionKeys: string[] = ['GITHUB_API_KEY', 'GROQ_API_KEY', 'ZAI_API_KEY', 'AGNES_API_KEY', 'NVIDIA_API_KEY', 'CF_API_KEY', 'CEREBRAS_API_KEY', 'GEMINI_API_KEY'];
+    const visionKeys: string[] = ['GITHUB_API_KEY', 'GROQ_API_KEY', 'ZAI_API_KEY', 'AGNES_API_KEY', 'NVIDIA_API_KEY', 'CF_API_KEY', 'GEMINI_API_KEY'];
     const hasVisionKey: boolean = visionKeys.some(k => process.env[k] && process.env[k].length > 10);
     if (!hasVisionKey) {
       console.warn('\u26A0\uFE0F DEGRADED: No vision API keys found. Vision-dependent features disabled.');
