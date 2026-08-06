@@ -65,9 +65,10 @@ function checkEnvVars(): CheckResult {
   // Also check for at least one provider API key
   const providerKeys = [
     'GROQ_API_KEY', 'ZAI_API_KEY',
-    'AGNES_API_KEY', 'NVIDIA_API_KEY', 'CEREBRAS_API_KEY',
+    'AGNES_API_KEY', 'NVIDIA_API_KEY',
     'CLOUDFLARE_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY',
-    'DEEPINFRA_API_KEY',
+    // Cerebras retired 2026-08-07 — free tier removed
+    // DeepInfra retired 2026-08-06 — free tier removed
     // GitHub GPT retired 2026-07-30 — excluded
   ];
 
@@ -95,9 +96,10 @@ function checkApiKeyFormats(): CheckResult {
   const CONFIG = getCONFIG();
   const keys = [
     'GROQ_API_KEY', 'ZAI_API_KEY',
-    'AGNES_API_KEY', 'NVIDIA_API_KEY', 'CEREBRAS_API_KEY',
+    'AGNES_API_KEY', 'NVIDIA_API_KEY',
     'CLOUDFLARE_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY',
-    'DEEPINFRA_API_KEY',
+    // Cerebras retired 2026-08-07 — free tier removed
+    // DeepInfra retired 2026-08-06 — free tier removed
     // GitHub GPT retired 2026-07-30 — excluded
   ];
 
