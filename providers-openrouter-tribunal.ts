@@ -1,52 +1,43 @@
 'use strict';
-// Last modified: 2026-08-05 — Response 20: Updated vision/text fallback model lists for Aug 2026
+// Last modified: 2026-08-06 - All providers vision-capable; updated comments, removed text-only skip logic
 
 // ─── OpenRouter Tribunal Provider ───────────────────────────────────────────
 //
-// Uses OpenRouter's API to access multiple free vision models.
-// This is the most flexible provider — it can route to any OpenRouter model.
+// Uses OpenRouter's API to access multiple free models.
+// This is the most flexible provider - it can route to any OpenRouter model.
+// All current models are vision-capable.
 //
 // Key behaviors:
 //   - Uses callChatCompletionWithRollback (not bare callChatCompletion)
 //     for protocol chameleon 422 recovery and config rollback support
-//   - Falls back through a chain of known free vision models
-//   - Model-level vision capability check via providers-serializers
-//     (e.g., llama-4-scout is text-only and will be skipped for vision tasks)
+//   - Falls back through a chain of known free models
 //   - P7: providerName passed to retryWithBackoff for health-aware retries
-//   - P19: Fallback chain includes multiple free vision models for resilience
+//   - P19: Fallback chain includes multiple free models for resilience
 
 const { extractJSON, validateActionResponse, callChatCompletionWithRollback, retryWithBackoff } = require('./providers-base');
-const { providerSupportsVision } = require('./providers-serializers');
 
 // Lazy logger
 let _logger: any = null;
 function _getLogger() { if (!_logger) _logger = require('./logger'); return _logger; }
 
 /**
- * Known free vision models on OpenRouter, ordered by quality.
- * Text-only models are filtered out at runtime via providerSupportsVision().
- *
- * Models marked with (V) are confirmed vision-capable.
- * Models marked with (T) are text-only — included as last-resort fallbacks
- * when no image is present, or when vision providers all fail.
+ * Primary vision models on OpenRouter, ordered by quality.
+ * All models are now vision-capable.
  */
 const VISION_FALLBACK_MODELS = [
-  'google/gemma-3-27b-it',           // (V) Best free vision model on OpenRouter
-  'nvidia/nemotron-nano-12b-2-vl',   // (V) NVIDIA Nemotron vision — OCR-optimized
-  'google/gemma-3-12b-it',           // (V) Smaller Gemma, still good vision
-  'qwen/qwen2.5-vl-72b-instruct',   // (V) Qwen vision — excellent at math OCR
+  'google/gemma-3-27b-it',           // Best free vision model on OpenRouter
+  'nvidia/nemotron-nano-12b-2-vl',   // NVIDIA Nemotron vision - OCR-optimized
+  'google/gemma-3-12b-it',           // Smaller Gemma, still good vision
+  'qwen/qwen2.5-vl-72b-instruct',   // Qwen vision - excellent at math OCR
 ];
 
 /**
- * Text-only fallback models. Used only when:
- *   1. No image is provided (text-only request), OR
- *   2. All vision models failed and we have no other option
- * These are cheap, fast, but CANNOT process images.
+ * Additional fallback models for resilience when primary models fail.
  */
 const TEXT_FALLBACK_MODELS = [
-  'google/gemma-4-31b-it',                     // (T) Updated Aug 2026
-  'nvidia/nemotron-3-super-120b',               // (T) Efficient MoE, strong reasoning
-  'deepseek/deepseek-r1-distill-llama-70b',      // (T) Reasoning (if still available)
+  'google/gemma-4-31b-it',                     // Updated Aug 2026
+  'nvidia/nemotron-3-super-120b',               // Efficient MoE, strong reasoning
+  'deepseek/deepseek-r1-distill-llama-70b',      // Reasoning (if still available)
 ];
 
 function OpenRouterTribunalProvider() {
@@ -61,15 +52,10 @@ function OpenRouterTribunalProvider() {
 
   return async (base64Image: any, prompt: any, signal: any, options: any = {}) => {
     const log = _getLogger().log;
-    const hasImage = !!base64Image;
 
-    // Build fallback chain based on whether we have an image
-    // If image present: try vision models first, then text fallbacks
-    // If no image: try primary model, then text fallbacks
+    // Build fallback chain: primary model first, then all fallback models
     const candidates = [primaryModel];
-    const fallbackPool = hasImage
-      ? [...VISION_FALLBACK_MODELS, ...TEXT_FALLBACK_MODELS]
-      : [...TEXT_FALLBACK_MODELS];
+    const fallbackPool = [...VISION_FALLBACK_MODELS, ...TEXT_FALLBACK_MODELS];
 
     // Deduplicate (primary model might be in the fallback pool)
     const seen = new Set<string>();
@@ -83,12 +69,7 @@ function OpenRouterTribunalProvider() {
 
     let lastErr: any = null;
     for (const m of models) {
-      // P1: Skip text-only models when we have an image
-      // (the serializer would strip the image, resulting in a blind analysis)
-      if (hasImage && !providerSupportsVision('OpenRouter', m)) {
-        log(`OpenRouter: skipping text-only model ${m} for vision request`, 'DEBUG', 'openrouter');
-        continue;
-      }
+      // All models are vision-capable - no need to skip for missing vision support
 
       try {
         // Use callChatCompletionWithRollback for:
@@ -120,7 +101,7 @@ function OpenRouterTribunalProvider() {
           log(`OpenRouter: model ${m} transient error, trying next fallback`, 'WARN', 'openrouter');
           continue;
         }
-        // Permanent errors (400, 401, 403) — no point trying other models with same key
+        // Permanent errors (400, 401, 403) - no point trying other models with same key
         throw err;
       }
     }
