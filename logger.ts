@@ -22,6 +22,17 @@ const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW_MS = 1000;
 const RATE_LIMIT_MAX_PER_WINDOW = 100;
 
+// BetterStack integration flag — checked after each log write
+let _betterStackStarted = false;
+function _ensureBetterStack() {
+  if (_betterStackStarted) return;
+  _betterStackStarted = true;
+  try {
+    const bs = require('./logging-betterstack');
+    bs.startBetterStackLogging();
+  } catch { /* not available */ }
+}
+
 // v5-fix: Lazy-load CONFIG to avoid circular dependency.
 // DO NOT convert this to a top-level require — see guard above.
 let _CONFIG: any = null;
@@ -171,6 +182,18 @@ function log(message: any, level = 'INFO', module = 'main') {
     let child = _childLoggerCache.get(safeModule);
     if (!child) { child = logger.child({ module: safeModule }); _childLoggerCache.set(safeModule, child); }
     child[lvl](safeMessage);
+
+    // Ship to BetterStack Logtail (non-blocking, lazy-init on first log)
+    _ensureBetterStack();
+    try {
+      const bs = require('./logging-betterstack');
+      bs.send({
+        level: lvl,
+        message: safeMessage,
+        module: safeModule,
+        timestamp: new Date().toISOString(),
+      });
+    } catch { /* betterstack not available */ }
   } catch (err: any) {
     console.error(`Log failure: ${err.message}`, { originalMessage: String(message)?.substring(0, 100) });
   }
