@@ -1,4 +1,4 @@
-' strict';
+'use strict';
 
 import type { Deps } from './types/di-types';
 
@@ -327,7 +327,8 @@ class BrowserManager {
     log('Closing browser gracefully...', 'INFO', 'browser');
     if (this._healthCheckInterval) { clearInterval(this._healthCheckInterval); this._healthCheckInterval = null; }
     if (this._memoryMonitorInterval) { clearInterval(this._memoryMonitorInterval); this._memoryMonitorInterval = null; }
-    if (this.contextInstance && !this.browserDisconnected) {
+    // Skip session save if browser already disconnected (avoids Protocol error)
+    if (this.contextInstance && !this.browserDisconnected && this.browserInstance?.isConnected()) {
       try { const storage = await this.contextInstance.storageState(); if (storage) { saveSession(storage); } } catch (err: any) { log(`Failed to save session on close: ${(err as Error).message}`, 'WARN', 'browser'); }
     }
     const closeOperations = [
