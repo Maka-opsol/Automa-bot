@@ -34,7 +34,19 @@ function AgnesProvider() {
     );
 
     if (options.validate === false) return rawContent;
-    return validateActionResponse(extractJSON(rawContent, 'Agnes'), 'Agnes');
+    const parsed = extractJSON(rawContent, 'Agnes');
+    // Agnes frequently returns nearly-correct JSON missing required fields.
+    // Tolerate missing actionType/currentState rather than discarding the response.
+    if (!parsed || typeof parsed !== 'object') {
+      return { actionType: 'wait', currentState: 'unknown', reasoning: 'Agnes returned non-object response' };
+    }
+    if (!parsed.actionType || typeof parsed.actionType !== 'string') {
+      parsed.actionType = 'wait';
+    }
+    if (!parsed.currentState || typeof parsed.currentState !== 'string') {
+      parsed.currentState = 'unknown';
+    }
+    return validateActionResponse(parsed, 'Agnes');
   };
 }
 
