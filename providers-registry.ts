@@ -1,460 +1,471 @@
 'use strict';
-// Last modified: 2026-08-05 — Response 20: Fixed Groq/NVIDIA vision flags, added DeepInfra, updated text-only patterns
+// Last modified: 2026-08-07 - Disabled Cerebras (free tier removed)
 
-// ─── Provider-Specific Request Serializers (P1) ───
-//
-// This module handles the critical formatting differences between
-// LLM API providers. The core problem: providers-base.ts was sending
-// `content: [{type:'text',...}]` (array format) to ALL providers,
-// but many expect `content: "plain string"` (string format).
-//
-// Each serializer knows its provider's requirements:
-//   - OpenAI-compatible (Groq, z.ai, Agnes, OpenRouter, NVIDIA, Cerebras):
-//       text-only → string, vision → array of content parts
-//   - Cloudflare Workers AI:
-//       always flatten to plain string (CF doesn't reliably support multipart)
-//   - Gemini: handled by Google SDK (not this module)
-//   - GitHub Models: OpenAI-compatible but limited model support
+// Provider implementations - internal sub-modules, not container-registered
+// Each require is wrapped in try/catch so one broken provider doesn't kill the entire registry.
+let GitHubGPTProvider: any = null; try { ({ GitHubGPTProvider } = require('./providers-github-gpt')); } catch (e: any) { console.error(`[registry] Failed to load providers-github-gpt: ${e.message}`); }
+let GroqProvider: any = null; try { ({ GroqProvider } = require('./providers-groq')); } catch (e: any) { console.error(`[registry] Failed to load providers-groq: ${e.message}`); }
+let ZAIProvider: any = null; try { ({ ZAIProvider } = require('./providers-zai')); } catch (e: any) { console.error(`[registry] Failed to load providers-zai: ${e.message}`); }
+let AgnesProvider: any = null; try { ({ AgnesProvider } = require('./providers-agnes')); } catch (e: any) { console.error(`[registry] Failed to load providers-agnes: ${e.message}`); }
+let NvidiaProvider: any = null; try { ({ NvidiaProvider } = require('./providers-nvidia')); } catch (e: any) { console.error(`[registry] Failed to load providers-nvidia: ${e.message}`); }
+let CloudflareProvider: any = null; try { ({ CloudflareProvider } = require('./providers-cloudflare')); } catch (e: any) { console.error(`[registry] Failed to load providers-cloudflare: ${e.message}`); }
+let CerebrasProvider: any = null; try { ({ CerebrasProvider } = require('./providers-cerebras')); } catch (e: any) { console.error(`[registry] Failed to load providers-cerebras: ${e.message}`); }
+let GeminiProvider: any = null; try { ({ GeminiProvider } = require('./providers-gemini')); } catch (e: any) { console.error(`[registry] Failed to load providers-gemini: ${e.message}`); }
+let OpenRouterTribunalProvider: any = null; try { ({ OpenRouterTribunalProvider } = require('./providers-openrouter-tribunal')); } catch (e: any) { console.error(`[registry] Failed to load providers-openrouter-tribunal: ${e.message}`); }
+let DeepInfraProvider: any = null; try { ({ DeepInfraProvider } = require('./providers-deepinfra')); } catch (e: any) { console.error(`[registry] Failed to load providers-deepinfra: ${e.message}`); }
 
-// ─── Provider Capability Metadata (P4, P11) ───
+// --- Dependency Injection ---------------------------------------------------
+let _deps: Record<string, any> = {};
 
-export interface ProviderCapabilities {
-  /** Provider name (matches registry key) */
-  name: string;
-  /** Whether this provider can process images */
-  supportsVision: boolean;
-  /** Whether the API accepts content as array of parts (vs plain string) */
-  supportsMultipartContent: boolean;
-  /** Whether the API accepts a 'system' role in messages */
-  supportsSystemRole: boolean;
-  /** Whether the API accepts response_format parameter */
-  supportsResponseFormat: boolean;
-  /** Whether this provider requires a paid plan */
-  requiresPaidPlan: boolean;
-  /** Whether this is a free-tier provider */
-  freeTier: boolean;
-  /** Whether this provider is currently enabled */
-  enabled: boolean;
-  /** The serialization strategy to use */
-  serializerType: 'openai' | 'cloudflare' | 'gemini' | 'custom';
+function _injectDependencies(deps: Record<string, any>) {
+  _deps = deps;
 }
 
-/**
- * Provider capability registry. Each entry describes what a provider
- * can and cannot do. Used by the registry to filter providers for
- * specific tasks (e.g., vision-required vs text-only) and by the
- * serializers to choose the correct format.
- */
-export const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
-  'Groq': {
-    name: 'Groq',
-    supportsVision: false,  // Default model llama-3.3-70b-versatile is text-only; vision models available but not default
-    supportsMultipartContent: false,  // Default model llama-3.3-70b-versatile is text-only; vision models available but not default
-    supportsSystemRole: true,
-    supportsResponseFormat: false,  // Groq does NOT reliably support response_format
-    requiresPaidPlan: false,
-    freeTier: true,
-    enabled: true,
-    serializerType: 'openai',
-  },
-  'z.ai': {
-    name: 'z.ai',
-    supportsVision: true,  // GLM-4.6V-Flash is a vision model
-    supportsMultipartContent: true,
-    supportsSystemRole: true,
-    supportsResponseFormat: false,
-    requiresPaidPlan: false,
-    freeTier: true,
-    enabled: true,
-    serializerType: 'openai',
-  },
-  'Agnes': {
-    name: 'Agnes',
-    supportsVision: false,  // Agnes is a text-only API based on available models
-    supportsMultipartContent: false,
-    supportsSystemRole: true,
-    supportsResponseFormat: false,
-    requiresPaidPlan: false,
-    freeTier: true,
-    enabled: true,
-    serializerType: 'openai',
-  },
-  'NVIDIA': {
-    name: 'NVIDIA',
-    supportsVision: false,  // Default model is text-only; vision fallback available (llama-3.2-11b-vision-instruct)
-    supportsMultipartContent: true,
-    supportsSystemRole: true,
-    supportsResponseFormat: false,  // NVIDIA's free tier doesn't reliably support it
-    requiresPaidPlan: false,
-    freeTier: true,
-    enabled: true,
-    serializerType: 'openai',
-  },
-  'Cloudflare': {
-    name: 'Cloudflare',
-    supportsVision: true,   // All current models are vision-capable (moondream3.1, kimi-k2.7, kimi-k2.6, gemma-4, llama-4-scout, llama-3.2-11b-vision)
-    supportsMultipartContent: true,
-    supportsSystemRole: true,
-    supportsResponseFormat: false,
-    requiresPaidPlan: false,
-    freeTier: true,
-    enabled: true,
-    serializerType: 'cloudflare',
-  },
-  'Cerebras': {
-    name: 'Cerebras',
-    supportsVision: false,  // Cerebras inference is text-only
-    supportsMultipartContent: false,
-    supportsSystemRole: true,
-    supportsResponseFormat: false,  // Not reliable for all models
-    requiresPaidPlan: false,
-    freeTier: true,
-    enabled: true,
-    serializerType: 'openai',
-  },
-  'DeepInfra': {
-    name: 'DeepInfra',
-    supportsVision: true,  // Qwen2.5-VL is vision-capable
-    supportsMultipartContent: true,
-    supportsSystemRole: true,
-    supportsResponseFormat: false,
-    requiresPaidPlan: false,
-    freeTier: true,
-    enabled: true,
-    serializerType: 'openai',
-  },
-  'Gemini': {
-    name: 'Gemini',
-    supportsVision: true,
-    supportsMultipartContent: true,
-    supportsSystemRole: true,
-    supportsResponseFormat: false,
-    requiresPaidPlan: false,
-    freeTier: true,
-    enabled: true,
-    serializerType: 'gemini',
-  },
-  'OpenRouter': {
-    name: 'OpenRouter',
-    supportsVision: true,  // depends on model, but tribunal uses vision models
-    supportsMultipartContent: true,
-    supportsSystemRole: true,
-    supportsResponseFormat: false,
-    requiresPaidPlan: false,
-    freeTier: true,
-    enabled: true,
-    serializerType: 'openai',
-  },
-  // Retired July 30, 2026
-  'GitHub GPT': {
-    name: 'GitHub GPT',
-    supportsVision: true,  // gpt-4o-mini supports vision
-    supportsMultipartContent: true,
-    supportsSystemRole: true,
-    supportsResponseFormat: true,  // GitHub Models supports JSON mode
-    requiresPaidPlan: false,
-    freeTier: true,
-    enabled: false,  // P9: DISABLED until health check passes
-    serializerType: 'openai',
-  },
+function getLog(): (msg: string, level?: string, _module?: string) => void {
+  return _deps.logger?.log || console.log;
+}
+
+// Lazy health module - loaded on first use
+let _healthMod: any = null;
+function _getHealth() { if (!_healthMod) _healthMod = require('./providers-health'); return _healthMod; }
+
+// Lazy config loader - loaded on first use
+let _configLoaderMod: any = null;
+function _getConfigLoader() { if (!_configLoaderMod) _configLoaderMod = require('./providers-config-loader'); return _configLoaderMod; }
+
+// Lazy serializers - loaded on first use
+let _serializersMod: any = null;
+function _getSerializers() { if (!_serializersMod) _serializersMod = require('./providers-serializers'); return _serializersMod; }
+
+// ===============================================================================
+// PROVIDER REGISTRATION TABLE
+// ===============================================================================
+//
+// Each entry maps a provider name to its factory function.
+// The registry iterates this table in getAvailableProviders(),
+// applying health/capability/blacklist/retirement filters.
+
+interface ProviderEntry {
+  name: string;
+  factory: () => any;  // returns null if API key missing
+}
+
+const PROVIDER_TABLE: ProviderEntry[] = [
+  { name: 'Groq', factory: GroqProvider },
+  { name: 'z.ai', factory: ZAIProvider },
+  { name: 'Agnes', factory: AgnesProvider },
+  { name: 'NVIDIA', factory: NvidiaProvider },
+  { name: 'Cloudflare', factory: CloudflareProvider },
+  // Cerebras removed - free tier removed (2026-08-07)
+  // DeepInfra removed - no longer free tier (2026-08-06)
+  { name: 'Gemini', factory: GeminiProvider },
+  { name: 'OpenRouter', factory: OpenRouterTribunalProvider },
+  // GitHub GPT is in the table but filtered by P9 (disabled by default)
+  { name: 'GitHub GPT', factory: GitHubGPTProvider },
+];
+
+// ===============================================================================
+// CYCLE-LEVEL STATE (reset per question cycle)
+// ===============================================================================
+
+const providerCycleState = { githubRateLimitCount: 0, githubSwappedOut: false };
+let _lastEmptyProviderLogTime = 0;
+const EMPTY_PROVIDER_LOG_COOLDOWN_MS = 10 * 60 * 1000; // 10 min between CRITICAL logs
+let _lastEmergencyDiscoveryTime = 0;
+const EMERGENCY_DISCOVERY_COOLDOWN_MS = 10 * 60 * 1000; // 10 min between emergency discoveries
+let cycleBlacklist = new Set<string>();
+let cycleFailCounts: Record<string, number> = {};
+let dynamicProviders: Array<{ name: string; fn: any }> = [];
+
+// ===============================================================================
+// RETIRED PROVIDERS (permanent until restart or manual intervention)
+// ===============================================================================
+
+const retiredProviders = new Map<string, { reason: string; retiredAt: number }>();
+
+// ===============================================================================
+// GEMINI 429 ESCALATING COOLDOWN (P10)
+// ===============================================================================
+//
+// Gemini free tier is aggressively rate-limited. Instead of letting the
+// generic circuit breaker handle it (which would block Gemini entirely
+// for 45s), we use an escalating cooldown that adapts:
+//   - 1st consecutive 429: 30s cooldown
+//   - 2nd consecutive 429: 60s cooldown
+//   - 3rd+ consecutive 429: 120s cooldown
+// After cooldown, allow 1 probe request (half-open). If it succeeds, reset.
+// If it 429s again, double the cooldown.
+
+const gemini429State = {
+  consecutive429s: 0,
+  cooldownUntil: 0,
+  currentCooldownMs: 30000,
 };
 
-// ─── Message Types ───
-
-export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string | ContentPart[];
+function getGeminiCooldownRemainingMs(): number {
+  const remaining = gemini429State.cooldownUntil - Date.now();
+  return Math.max(0, remaining);
 }
 
-export interface ContentPart {
-  type: 'text' | 'image_url';
-  text?: string;
-  image_url?: { url: string };
+function recordGemini429(): void {
+  gemini429State.consecutive429s++;
+  if (gemini429State.consecutive429s === 1) gemini429State.currentCooldownMs = 30000;
+  else if (gemini429State.consecutive429s === 2) gemini429State.currentCooldownMs = 60000;
+  else gemini429State.currentCooldownMs = 120000;
+  gemini429State.cooldownUntil = Date.now() + gemini429State.currentCooldownMs;
+  getLog()(`Gemini 429 cooldown: ${gemini429State.consecutive429s} consecutive, ${gemini429State.currentCooldownMs / 1000}s cooldown`, 'WARN', 'registry');
 }
 
-export interface SerializedPayload {
-  model: string;
-  messages: Array<{ role: string; content: string | Array<{ type: string; text?: string; image_url?: { url: string } }> }>;
-  max_tokens: number;
-  temperature: number;
-  response_format?: { type: string };
-  [key: string]: any;  // allow provider-specific extensions
-}
-
-// ─── Validation ───
-
-export interface ValidationResult {
-  valid: boolean;
-  errors: string[];
-}
-
-/**
- * Validate messages array before sending to a provider.
- * Catches common issues that would result in 400 errors.
- */
-function validateMessages(messages: ChatMessage[], providerName: string): ValidationResult {
-  const errors: string[] = [];
-  if (!Array.isArray(messages) || messages.length === 0) {
-    errors.push(`${providerName}: messages must be a non-empty array`);
-    return { valid: false, errors };
+function recordGeminiSuccess(): void {
+  if (gemini429State.consecutive429s > 0) {
+    getLog()(`Gemini recovered after ${gemini429State.consecutive429s} consecutive 429s`, 'INFO', 'registry');
   }
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (!msg.role || typeof msg.role !== 'string') {
-      errors.push(`${providerName}: message[${i}] missing or invalid role`);
+  gemini429State.consecutive429s = 0;
+  gemini429State.cooldownUntil = 0;
+  gemini429State.currentCooldownMs = 30000;
+}
+
+function isGeminiOnCooldown(): boolean {
+  return Date.now() < gemini429State.cooldownUntil;
+}
+
+// ===============================================================================
+// DYNAMIC PROVIDERS
+// ===============================================================================
+
+function registerDynamicProvider(name: string, providerFn: any) { 
+  dynamicProviders.push({ name, fn: providerFn });
+  getLog()(`Registered dynamic provider: ${name}`, 'DEBUG', 'registry');
+}
+
+// ===============================================================================
+// RESULT RECORDING (P5 - delegates to providers-health)
+// ===============================================================================
+//
+// recordProviderResult is the main entry point called by the tribunal.
+// It now delegates to providers-health.recordCallResult for health scoring,
+// circuit breakers, and cooldowns. The DB write is kept here for persistence.
+
+function recordProviderResult(name: string, success: boolean, latency: number) { 
+  const log = getLog();
+
+  // Delegate to health module for scoring + circuit breakers + cooldowns
+  try {
+    const health = _getHealth();
+    health.recordCallResult(name, success, latency);
+  } catch (e: any) { /* non-critical: health module failure shouldn't break recording */ }
+
+  // Gemini-specific 429 tracking (P10)
+  if (name === 'Gemini') {
+    if (success) recordGeminiSuccess();
+    // Note: 429 recording happens in addProviderFailure below
+  }
+
+  // Persist to DB for long-term stats
+  try {
+    const db = _deps.database;
+    if (!db) return;
+    const selectProvider = db.selectProvider;
+    const upsertProvider = db.upsertProvider;
+    const updateProviderStats = db.updateProviderStats;
+    if (!selectProvider || !upsertProvider || !updateProviderStats) return;
+    let row = selectProvider.get(name);
+    if (!row) {
+      upsertProvider.run(name, null, null, Date.now(), '[]', 0, 0, 0, Date.now());
+      row = selectProvider.get(name);
     }
-    if (msg.content === undefined || msg.content === null) {
-      errors.push(`${providerName}: message[${i}] missing content`);
+    if (row) {
+      updateProviderStats.run(
+        (row.success_count ?? 0) + (success ? 1 : 0),
+        (row.failure_count ?? 0) + (success ? 0 : 1),
+        (row.total_latency ?? 0) + latency,
+        Date.now(),
+        name
+      );
     }
-    if (typeof msg.content === 'string' && msg.content.trim().length === 0) {
-      errors.push(`${providerName}: message[${i}] has empty string content`);
-    }
-    if (Array.isArray(msg.content) && msg.content.length === 0) {
-      errors.push(`${providerName}: message[${i}] has empty content parts array`);
-    }
-  }
-  return { valid: errors.length === 0, errors };
+  } catch (e: any) { log(`DB error in recordProviderResult: ${e.message || e}`, 'DEBUG', 'registry'); }
 }
 
-// ─── OpenAI-Compatible Serializer ───
+// ===============================================================================
+// HEALTH CHECK (P5 - delegates to providers-health)
+// ===============================================================================
 
-/**
- * Serialize for OpenAI-compatible providers (Groq, z.ai, Agnes, OpenRouter,
- * NVIDIA, Cerebras, GitHub GPT).
- *
- * Key behavior:
- *   - Text-only request (no image): `content` is a plain string
- *   - Vision request with provider that supports multipart: `content` is array of parts
- *   - Vision request with provider that does NOT support multipart: strip image, send text only
- */
-function serializeOpenAI(
-  providerName: string,
-  model: string,
-  prompt: string,
-  options: {
-    base64Image?: string | null;
-    maxTokens?: number;
-    temperature?: number;
-    responseFormat?: { type: string } | null;
-    systemPrompt?: string | null;
+function isProviderHealthy(name: string): boolean { 
+  try {
+    const health = _getHealth();
+    const snapshot = health.getHealthSnapshot(name);
+    // Health score >= 0.3 is considered healthy (tolerant for low-sample providers)
+    return snapshot.healthScore >= 0.3;
+  } catch {
+    // If health module fails, assume healthy (fail-open)
+    return true;
   }
-): SerializedPayload {
-  const caps = PROVIDER_CAPABILITIES[providerName];
-  const useVision = options.base64Image && caps?.supportsVision;
-  const useMultipart = useVision && caps?.supportsMultipartContent;
-  const useSystem = caps?.supportsSystemRole && options.systemPrompt;
-
-  const messages: SerializedPayload['messages'] = [];
-
-  // System message
-  if (useSystem) {
-    messages.push({ role: 'system', content: options.systemPrompt! });
-  }
-
-  // User message
-  if (useMultipart) {
-    // Array content with text + optional image
-    const parts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [
-      { type: 'text', text: prompt },
-    ];
-    parts.push({
-      type: 'image_url',
-      image_url: { url: `data:image/jpeg;base64,${options.base64Image}` },
-    });
-    messages.push({ role: 'user', content: parts });
-  } else {
-    // Plain string content (always safe)
-    // If we have an image but provider doesn't support vision/multipart,
-    // the image is silently dropped. The prompt should contain text
-    // descriptions extracted from the image as a fallback.
-    messages.push({ role: 'user', content: prompt });
-  }
-
-  const payload: SerializedPayload = {
-    model,
-    messages,
-    max_tokens: options.maxTokens || 4096,
-    temperature: options.temperature ?? 0.1,
-  };
-
-  // Only add response_format if provider supports it AND it was requested
-  if (options.responseFormat && caps?.supportsResponseFormat) {
-    payload.response_format = options.responseFormat;
-  }
-
-  return payload;
 }
 
-// ─── Cloudflare Workers AI Serializer ───
+// ===============================================================================
+// CYCLE-LEVEL BLACKLIST (per-question-cycle, not persistent)
+// ===============================================================================
 
-/**
- * Serialize for Cloudflare Workers AI.
- *
- * Cloudflare Workers AI has an unusual API:
- *   - It uses a different URL structure: /accounts/{id}/ai/run/{model}
- *   - Content should always be a plain string (multipart is unreliable)
- *   - Images should be passed in the messages array but as flat strings
- *   - System role supported by Kimi and newer models
- *   - No response_format support
- *
- * For the MathU bot, we strip images entirely for Cloudflare since
- * it's used as a text-only fallback. The tribunal's vision providers
- * (Groq, Gemini, OpenRouter) handle the image analysis.
- */
-function serializeCloudflare(
-  providerName: string,
-  model: string,
-  prompt: string,
-  options: {
-    base64Image?: string | null;
-    maxTokens?: number;
-    temperature?: number;
-  }
-): SerializedPayload {
-  const messages: Array<{ role: string; content: string }> = [];
-
-  // System message (supported by Kimi and newer CF models)
-  if (options.systemPrompt) {
-    messages.push({ role: 'system', content: options.systemPrompt });
-  }
-
-  // User message — always plain string, no multipart
-  messages.push({
-    role: 'user',
-    content: prompt,
-  });
-
-  return {
-    model,
-    messages,
-    max_tokens: options.maxTokens || 4096,
-    temperature: 0.0,  // Cloudflare works best at temp 0
-  };
+function resetCycleProviderState() {
+  const log = getLog();
+  providerCycleState.githubRateLimitCount = 0;
+  providerCycleState.githubSwappedOut = false;
+  cycleBlacklist = new Set();
+  cycleFailCounts = {};
+  dynamicProviders = [];
+  // Reset health state for all tracked providers (fresh cycle)
+  try {
+    const health = _getHealth();
+    for (const name of health.getTrackedProviders()) {
+      health.resetProviderState(name);
+    }
+  } catch {}
+  log('Provider cycle state reset (blacklist cleared, health reset)', 'INFO', 'registry');
 }
 
-// ─── Serializer Router ───
+function addProviderFailure(name: string) { 
+  const log = getLog();
+  cycleFailCounts[name] = (cycleFailCounts[name] || 0) + 1;
 
-/**
- * Get the correct serializer function for a provider.
- * Returns the serialized payload ready to be JSON.stringify'd and sent.
- */
-function serializeForProvider(
-  providerName: string,
-  model: string,
-  prompt: string,
-  options: {
-    base64Image?: string | null;
-    maxTokens?: number;
-    temperature?: number;
-    responseFormat?: { type: string } | null;
-    systemPrompt?: string | null;
-  }
-): SerializedPayload {
-  const caps = PROVIDER_CAPABILITIES[providerName];
-  const serializerType = caps?.serializerType || 'openai';
-
-  let payload: SerializedPayload;
-  switch (serializerType) {
-    case 'cloudflare':
-      payload = serializeCloudflare(providerName, model, prompt, options);
-      break;
-    case 'gemini':
-      // Gemini uses the Google SDK, not HTTP API serialization.
-      // This should never be called for Gemini, but provide a fallback.
-      payload = serializeOpenAI(providerName, model, prompt, options);
-      break;
-    case 'openai':
-    default:
-      payload = serializeOpenAI(providerName, model, prompt, options);
-      break;
+  // Gemini-specific: track 429s for escalating cooldown
+  if (name === 'Gemini') {
+    recordGemini429();
   }
 
-  // Post-serialization validation
-  const validation = validateMessages(payload.messages as ChatMessage[], providerName);
-  if (!validation.valid) {
-    // Log validation errors but don't throw — let the provider return its own error
-    // This helps with debugging without crashing the pipeline
+  // Blacklist after 2 consecutive failures in this cycle
+  if (cycleFailCounts[name] >= 2) {
+    if (!cycleBlacklist.has(name)) {
+      cycleBlacklist.add(name);
+      log(`Blacklisting ${name} for this cycle (${cycleFailCounts[name]} failures)`, 'WARN', 'registry');
+    }
+  }
+}
+
+function isProviderBlacklisted(name: string): boolean { 
+  // Check cycle blacklist
+  if (cycleBlacklist.has(name)) return true;
+
+  // Check health module availability
+  try {
+    const health = _getHealth();
+    if (!health.isProviderAvailable(name)) return true;
+    // Also check health score - below 0.2 is effectively dead
+    const snapshot = health.getHealthSnapshot(name);
+    if (snapshot.healthScore < 0.2 && snapshot.totalCalls >= 3) return true;
+  } catch {}
+
+  return false;
+}
+
+// ===============================================================================
+// PROVIDER RETIREMENT + AUTO-REPLACEMENT (P8)
+// ===============================================================================
+
+function retireProvider(name: string, reason: string) { 
+  const log = getLog();
+  retiredProviders.set(name, { reason, retiredAt: Date.now() });
+  log(`Provider ${name} retired: ${reason}`, 'WARN', 'registry');
+  try {
+    const db = _deps.database;
+    if (db?.upsertCalibration) {
+      db.upsertCalibration.run(`retired_${name}`, JSON.stringify({ reason, retiredAt: Date.now() }), Date.now());
+    }
+  } catch (e: any) {}
+
+  // P8: Attempt auto-replacement
+  try {
+    const configLoader = _getConfigLoader();
+    const replacement = configLoader.findReplacement(name);
+    if (replacement && replacement.model) {
+      const dynName = configLoader.registerReplacement(name, replacement);
+      log(`Auto-replacement registered for ${name}: ${replacement.model} (as ${dynName})`, 'INFO', 'registry');
+    } else {
+      log(`No replacement found for retired ${name}`, 'WARN', 'registry');
+    }
+  } catch (e: any) {
+    log(`Auto-replacement failed for ${name}: ${e.message}`, 'WARN', 'registry');
+  }
+}
+
+function isProviderRetired(name: string): boolean { 
+  return retiredProviders.has(name);
+}
+
+// ===============================================================================
+// HEALTH-WEIGHTED PROVIDER SELECTION (P5, P12, P16)
+// ===============================================================================
+//
+// getAvailableProviders() returns providers sorted by health score (descending).
+// This means the tribunal will consult the healthiest providers first,
+// and their votes carry the most weight (P12).
+//
+// Filtering pipeline:
+//   1. Provider factory returns non-null (API key present)
+//   2. Not disabled by default (P9: GitHub GPT)
+//   3. Not on cycle blacklist
+//   4. Not retired
+//   5. Not disabled/cooldown/circuit-open (from providers-health)
+//   6. Not Gemini on 429 cooldown (P10)
+//   7. Vision-only filter if requested (Phase 2.5)
+//   8. Sort by health score descending
+
+async function getAvailableProviders(options?: { visionOnly?: boolean }) { 
+  const log = getLog();
+  const configLoader = _getConfigLoader();
+  let candidates: Array<{ name: string; fn: any; healthScore: number }> = [];
+
+  // --- Phase 1: Collect candidates from PROVIDER_TABLE ---
+  for (const entry of PROVIDER_TABLE) {
+    // P9: Skip disabled-by-default providers (GitHub GPT)
+    if (configLoader.isProviderDisabledByDefault(entry.name)) {
+      continue;
+    }
+
+    // Instantiate the provider (checks for API key)
+    // Guard: factory itself may be null if the provider module failed to load
+    if (!entry.factory) {
+      getLog()(`Provider ${entry.name} skipped — factory not loaded (module error)`, 'WARN', 'registry');
+      continue;
+    }
+    const fn = entry.factory();
+    if (!fn) {
+      // Log why each provider was skipped for diagnostics
+      const envKeys = configLoader.getEnvKeys?.(entry.name) || [];
+      const missingKeys = envKeys.filter((k: string) => !process.env[k]);
+      if (missingKeys.length > 0) {
+        getLog()(`Provider ${entry.name} skipped — missing env keys: ${missingKeys.join(', ')}`, 'DEBUG', 'registry');
+      } else {
+        getLog()(`Provider ${entry.name} factory returned null (unknown reason)`, 'DEBUG', 'registry');
+      }
+      continue;
+    }
+
+    // Check all exclusion filters
+    if (isProviderBlacklisted(entry.name)) continue;
+    if (isProviderRetired(entry.name)) continue;
+
+    // P10: Gemini-specific cooldown check
+    if (entry.name === 'Gemini' && isGeminiOnCooldown()) continue;
+
+    // Get health score for sorting
+    let healthScore = 0.5; // default for untracked providers
     try {
-      const { log } = require('./logger');
-      log(`Serializer validation warning for ${providerName}: ${validation.errors.join('; ')}`, 'WARN', 'serializers');
+      const health = _getHealth();
+      const snapshot = health.getHealthSnapshot(entry.name);
+      healthScore = snapshot.healthScore;
     } catch {}
+
+    candidates.push({ name: entry.name, fn, healthScore });
   }
 
-  return payload;
-}
+  // --- Phase 2: Add dynamic providers ---
+  for (const dp of dynamicProviders) {
+    if (isProviderBlacklisted(dp.name) || isProviderRetired(dp.name)) continue;
+    let healthScore = 0.5;
+    try {
+      const health = _getHealth();
+      const snapshot = health.getHealthSnapshot(dp.name);
+      healthScore = snapshot.healthScore;
+    } catch {}
+    candidates.push({ name: dp.name, fn: dp.fn, healthScore });
+  }
 
-/**
- * Check if a provider supports vision (image input) for the given model.
- * Uses capability registry plus optional model-level override.
- */
-function providerSupportsVision(providerName: string, model?: string): boolean {
-  const caps = PROVIDER_CAPABILITIES[providerName];
-  if (!caps) return false;
-  // Some models within a provider may not support vision even if the provider does
-  // (e.g., OpenRouter has both vision and text-only models)
-  if (model) {
-    // Known text-only model patterns
-    const textOnlyPatterns = [
-      'llama-3.3-70b',         // text-only
-      'llama-4-scout',         // text-only
-      'deepseek-r1-distill',  // text-only
-      'qwen3-0.6b',           // text-only
-      'gemma2-9b-it',         // text-only
-      'qwen3-coder',          // inference-focused, not vision
-    ];
-    for (const pattern of textOnlyPatterns) {
-      if (model.toLowerCase().includes(pattern.toLowerCase())) return false;
+  // --- Phase 2.5: Vision-only filtering ---
+  if (options?.visionOnly) {
+    const serializers = _getSerializers();
+    const beforeCount = candidates.length;
+    candidates = candidates.filter(candidate => {
+      const caps = serializers.getProviderCapabilities?.(candidate.name);
+      const isVisionCapable = caps ? caps.supportsVision : true;
+      return isVisionCapable;
+    });
+    const filtered = beforeCount - candidates.length;
+    log(`Vision filter: ${filtered} text-only providers excluded`, 'DEBUG', 'registry');
+  }
+
+  // --- Phase 3: Sort by health score (highest first) ---
+  candidates.sort((a, b) => b.healthScore - a.healthScore);
+
+  // --- Phase 4: Fail-fast on empty (P16) ---
+  if (candidates.length === 0) {
+    const now = Date.now();
+    // Rate-limit CRITICAL log to once per 10 minutes to avoid spam
+    if (now - _lastEmptyProviderLogTime > EMPTY_PROVIDER_LOG_COOLDOWN_MS) {
+      log('CRITICAL: No providers available after all filters. Attempting emergency discovery + registration.', 'ERROR', 'registry');
+      _lastEmptyProviderLogTime = now;
+    }
+    // Rate-limit emergency discovery to once per 10 minutes
+    if (now - _lastEmergencyDiscoveryTime > EMERGENCY_DISCOVERY_COOLDOWN_MS) {
+      _lastEmergencyDiscoveryTime = now;
+    try {
+      const discovered = await configLoader.autoDiscoverModels();
+      if (discovered.length > 0) {
+        log(`Emergency discovery found ${discovered.length} model(s). Attempting to register as dynamic providers.`, 'WARN', 'registry');
+        // Try to create callable providers from discovered models
+        const PROVIDER_ENDPOINT_MAP: Record<string, {endpoint: string; envKey: string}> = {
+          openrouter: { endpoint: 'https://openrouter.ai/api/v1/chat/completions', envKey: 'OPENROUTER_API_KEY' },
+          groq: { endpoint: 'https://api.groq.com/openai/v1/chat/completions', envKey: 'GROQ_API_KEY' },
+          nvidia: { endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions', envKey: 'NVIDIA_API_KEY' },
+          deepinfra: { endpoint: 'https://api.deepinfra.com/v1/openai/chat/completions', envKey: 'DEEPINFRA_API_KEY' },
+        };
+        for (const disc of discovered.slice(0, 2)) {
+          const providerConfig = PROVIDER_ENDPOINT_MAP[disc.provider];
+          if (providerConfig && process.env[providerConfig.envKey]) {
+            const { callChatCompletionWithRollback, extractJSON, validateActionResponse, retryWithBackoff } = require('./providers-base');
+            const modelId = disc.model;
+            const endpoint = providerConfig.endpoint;
+            const apiKey = process.env[providerConfig.envKey];
+            const dynName = `discovered-${modelId.replace(/[^a-z0-9]/gi, '-').slice(0, 30)}`;
+            const dynFn = async (base64Image: any, prompt: any, signal: any, options: any = {}) => {
+              const rawContent = await retryWithBackoff(() =>
+                callChatCompletionWithRollback(endpoint, apiKey, modelId, base64Image, prompt, dynName, { signal }),
+                { providerName: dynName }
+              );
+              if (options.validate === false) return rawContent;
+              return validateActionResponse(extractJSON(rawContent, dynName), dynName);
+            };
+            registerDynamicProvider(dynName, dynFn);
+            candidates.push({ name: dynName, fn: dynFn, healthScore: 0.4 }); // lower initial score
+          }
+        }
+      }
+    } catch (e: any) { log(`Emergency discovery failed: ${e.message}`, 'ERROR', 'registry'); }
+    } else {
+      log('No providers available — skipping emergency discovery (cooldown active).', 'DEBUG', 'registry');
     }
   }
-  return caps.supportsVision;
-}
 
-/**
- * Get capabilities for a provider. Returns null if unknown provider.
- */
-function getProviderCapabilities(providerName: string): ProviderCapabilities | null {
-  return PROVIDER_CAPABILITIES[providerName] || null;
-}
-
-/**
- * Check if a provider is enabled and free-tier.
- */
-function isFreeProvider(providerName: string): boolean {
-  const caps = PROVIDER_CAPABILITIES[providerName];
-  return caps ? (caps.freeTier && caps.enabled) : false;
-}
-
-/**
- * Get all enabled free-tier provider names.
- */
-function getEnabledFreeProviders(): string[] {
-  return Object.entries(PROVIDER_CAPABILITIES)
-    .filter(([, caps]) => caps.freeTier && caps.enabled)
-    .map(([name]) => name);
-}
-
-/**
- * Update a provider's capabilities (e.g., disable a provider after auth failure).
- */
-function updateProviderCapabilities(providerName: string, updates: Partial<ProviderCapabilities>): void {
-  const caps = PROVIDER_CAPABILITIES[providerName];
-  if (caps) {
-    Object.assign(caps, updates);
+  // Log final provider list with health scores
+  if (candidates.length > 0) {
+    const summary = candidates.map(c => `${c.name}(${c.healthScore.toFixed(2)})`).join(', ');
+    log(`Available providers (${candidates.length}): ${summary}`, 'INFO', 'registry');
+  } else {
+    log('FATAL: No providers available even after emergency discovery. Bot will idle.', 'ERROR', 'registry');
   }
+
+  return candidates;
 }
+
+// ===============================================================================
+// LEGACY COMPATIBILITY
+// ===============================================================================
+
+function getProviderCycleState() { return providerCycleState; }
 
 module.exports = {
-  // Serialization
-  serializeForProvider,
-  serializeOpenAI,
-  serializeCloudflare,
-  validateMessages,
-  // Capability queries
-  providerSupportsVision,
-  getProviderCapabilities,
-  isFreeProvider,
-  getEnabledFreeProviders,
-  updateProviderCapabilities,
-  PROVIDER_CAPABILITIES,
-  // Types for JS consumers
+  getAvailableProviders,
+  addProviderFailure,
+  resetCycleProviderState,
+  isProviderBlacklisted,
+  getProviderCycleState,
+  recordProviderResult,
+  isProviderHealthy,
+  registerDynamicProvider,
+  retireProvider,
+  isProviderRetired,
+  // Gemini-specific (exposed for monitoring)
+  getGeminiCooldownRemainingMs,
+  isGeminiOnCooldown,
+  // DI
+  _injectDependencies,
 };
