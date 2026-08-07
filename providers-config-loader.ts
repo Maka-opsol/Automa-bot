@@ -148,13 +148,13 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'OpenRouter': {
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
-    model: 'google/gemma-3-27b-it',
+    model: 'openrouter/free',
     envKeys: ['OPENROUTER_API_KEY'],
     visionCapable: true,
     fallbackModels: [
-      'google/gemma-4-31b-it',
-      'nvidia/nemotron-nano-12b-2-vl',
-      'qwen/qwen3-0.6b',
+      'google/gemma-3-27b-it:free',
+      'google/gemma-3-12b-it:free',
+      'qwen/qwen3-0.6b:free',
     ],
   },
 };
@@ -217,12 +217,18 @@ async function autoDiscoverModels() {
     const { fetchJSON } = require('./utils-fetch');
     const data = await fetchJSON('https://openrouter.ai/api/v1/models', {}, 15000);
     if (data && data.data) {
-      // Filter: free pricing + supports image modality
+      // Filter: FREE pricing + supports image modality
+      // ── HARD COST GUARD ── Both prompt AND completion must be exactly '0'.
+      // OpenRouter uses string pricing. Spending $0.20 breaks everything.
       const visionFree = data.data.filter((m: any) => {
-        const promptCost = parseFloat(m.pricing?.prompt || '1');
-        const completionCost = parseFloat(m.pricing?.completion || '1');
-        const isFree = (promptCost === 0 && completionCost === 0) || m.id.includes(':free');
+        const promptCost = m.pricing?.prompt;
+        const completionCost = m.pricing?.completion;
+        // Strict check: must be exactly '0' string, not undefined, not '0.000001'
+        const isFree = promptCost === '0' && completionCost === '0';
         if (!isFree) return false;
+        // Also require :free in model ID as double-check
+        const hasFreeTag = m.id.includes(':free');
+        if (!hasFreeTag) return false;
         // Check modality for vision support
         const modality = m.architecture?.modality;
         const hasImage = Array.isArray(modality) && modality.includes('image');
