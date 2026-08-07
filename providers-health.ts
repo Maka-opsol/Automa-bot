@@ -69,8 +69,11 @@ function classifyError(err: unknown): ClassifiedError {
   if (statusCode === 422 || msg.includes('HTTP_ERROR_422')) {
     return { category: 'bad_format', retryable: false, disableProvider: false, retireProvider: false, retryAfterMs: 0, description: `Unprocessable (422): ${truncateMsg(msg)}` };
   }
-  if (statusCode === 429 || msg.includes('RATE_LIMIT') || msg.includes('rate_limit') || msg.includes('rate limit') || msg.includes('too many requests')) {
-    return { category: 'rate_limited', retryable: true, disableProvider: false, retireProvider: false, retryAfterMs: retryAfterMs || 45000, description: `Rate limited (429): retry after ${retryAfterMs || 45000}ms` };
+  if (statusCode === 429 || msg.includes('RATE_LIMIT') || msg.includes('rate_limit') || msg.includes('rate limit') || msg.includes('too many requests') || msg.includes('OPENROUTER_DAILY_LIMIT') || msg.includes('OPENROUTER_PACING')) {
+    const dailyMatch = msg.match(/OPENROUTER_DAILY_LIMIT.*?(\d+)\/(\d+)/);
+    const pacingMatch = msg.includes('OPENROUTER_PACING');
+    const retryMs = dailyMatch ? 3600000 : (pacingMatch ? 60000 : (retryAfterMs || 45000)); // 1h daily, 1min pacing, 45s default
+    return { category: 'rate_limited', retryable: true, disableProvider: false, retireProvider: false, retryAfterMs: retryMs, description: dailyMatch ? `OpenRouter daily limit reached (${dailyMatch[1]}/${dailyMatch[2]}). Resumes at UTC midnight.` : pacingMatch ? `OpenRouter pacing: request too soon, wait 60s` : `Rate limited (429): retry after ${retryMs}ms` };
   }
   if (statusCode >= 500 && statusCode < 600) {
     return { category: 'server_error', retryable: true, disableProvider: false, retireProvider: false, retryAfterMs: 0, description: `Server error (${statusCode}): ${truncateMsg(msg)}` };
