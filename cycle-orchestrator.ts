@@ -32,10 +32,15 @@ function getRandomStartupDelay() {
 
 function getNextAllowedStart() { 
   const CONFIG = getCONFIG();
+  const tz = process.env.TZ || 'Africa/Johannesburg';
   const now = new Date();
   const startHour = CONFIG.ALLOWED_ACTIVITY_START_HOUR;
   const endHour = CONFIG.ALLOWED_ACTIVITY_END_HOUR;
-  const currentHour = now.getHours();
+  // Use timezone-aware hour (Render defaults to UTC; config hours are in local time)
+  const currentHour = parseInt(
+    now.toLocaleString('en-US', { timeZone: tz, hour: 'numeric', hour12: false }),
+    10
+  );
   if (startHour === undefined || endHour === undefined) return now.getTime();
   const startH = Number(startHour);
   const endH = Number(endHour);
@@ -45,10 +50,13 @@ function getNextAllowedStart() {
     ? (currentHour >= startH || currentHour < endH)
     : (currentHour >= startH && currentHour < endH);
   if (inWindow) return now.getTime();
-  const next = new Date(now);
-  next.setHours(startH, 0, 0, 0);
-  if (!isWrap && currentHour >= endH) next.setDate(next.getDate() + 1);
-  return next.getTime();
+  // Calculate next window start in local timezone
+  const localNow = new Date(now.toLocaleString('en-US', { timeZone: tz }));
+  localNow.setHours(startH, 0, 0, 0);
+  // Convert back to UTC for correct Date.now() comparison
+  const nextStart = new Date(localNow.toLocaleString('en-US', { timeZone: 'UTC' }));
+  if (nextStart.getTime() <= now.getTime()) nextStart.setDate(nextStart.getDate() + 1);
+  return nextStart.getTime();
 }
 
 function sleep(ms: any) {  return new Promise(resolve => setTimeout(resolve, ms)); }
