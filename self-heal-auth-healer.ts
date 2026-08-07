@@ -532,13 +532,19 @@ class AuthHealer {
           return Date.now() - session.authenticatedAt;
         }
       }
+      // Ensure last_validated_at column exists before querying
+      try {
+        getDb()?.exec('ALTER TABLE session_pool ADD COLUMN last_validated_at INTEGER');
+      } catch (_e: any) { /* column already exists — expected */ }
       const row = getDb()?.prepare('SELECT MAX(last_validated_at) as last_auth FROM session_pool').get();
       if (row?.last_auth) {
         return Date.now() - row.last_auth;
       }
       return null;
     } catch (err: any) {
-      logError('Failed to estimate session age', err);
+      // Non-critical — session age estimation is best-effort
+      const { log } = require('./logger');
+      log(`Session age estimation skipped: ${(err as Error).message}`, 'DEBUG', 'auth-healer');
       return null;
     }
   }
