@@ -91,12 +91,15 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'Cloudflare': {
     endpoint: null,  // built dynamically from CF_ACCOUNT_ID
-    model: '@cf/meta/llama-4-scout-17b-16e-instruct',
+    model: '@cf/moondream/moondream3.1-9B-A2B',
     envKeys: ['CF_API_KEY', 'CF_ACCOUNT_ID'],
     visionCapable: true,
     fallbackModels: [
-      '@cf/meta/llama-3.3-70b-instruct',
-      '@cf/meta/llama-3.1-8b-instruct',
+      '@cf/moonshotai/kimi-k2.7-code',
+      '@cf/moonshotai/kimi-k2.6',
+      '@cf/google/gemma-4-26b-a4b-it',
+      '@cf/meta/llama-4-scout-17b-16e-instruct',
+      '@cf/meta/llama-3.2-11b-vision-instruct',
     ],
   },
   'Cerebras': {
@@ -125,7 +128,23 @@ const DEFAULTS: Record<string, ProviderDefault> = {
     model: 'gemini-2.5-flash',
     envKeys: ['GEMINI_API_KEY'],
     visionCapable: true,
-    fallbackModels: ['gemini-2.0-flash', 'gemini-1.5-flash'],
+    // Fallback chain ordered by: free RPM limits, capability, and recency.
+    // When primary model hits 429/rate-limit, the provider cycles through these.
+    // Gemini 2.5 Flash:    5 RPM, 250K TPM, 58 RPD  (current primary — best vision quality)
+    // Gemini 3 Flash:     5 RPM, 250K TPM, 20 RPD  (next-gen, same limits)
+    // Gemini 3.5 Flash:   5 RPM, 250K TPM, 20 RPD  (newer)
+    // Gemini 3.6 Flash:   5 RPM, 250K TPM, 20 RPD  (latest)
+    // Gemini 2.5 Flash Lite: 10 RPM, 250K TPM, 20 RPD (higher RPM, lighter)
+    // Gemini 3.1 Flash Lite: 15 RPM, 250K TPM, 500 RPD (highest RPM + RPD)
+    // Gemini 3.5 Flash Lite: 15 RPM, 250K TPM, 500 RPD (highest RPM + RPD)
+    fallbackModels: [
+      'gemini-3-flash',
+      'gemini-3.5-flash',
+      'gemini-3.6-flash',
+      'gemini-2.5-flash-lite',
+      'gemini-3.1-flash-lite',
+      'gemini-3.5-flash-lite',
+    ],
   },
   'OpenRouter': {
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
