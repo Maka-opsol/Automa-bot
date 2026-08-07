@@ -33,7 +33,7 @@ function _logError(msg: string, err: Error) { if (_deps.logger?.logError) { _dep
 //   - Agnes: agnes-2.0-flash (free tier)
 //   - Cloudflare: @cf/meta/llama-4-scout-17b-16e-instruct (free Workers AI)
 
-export interface ProviderDefault {
+interface ProviderDefault {
   endpoint: string | null;
   model: string;
   disabled?: boolean;           // P9: if true, provider is skipped by default
