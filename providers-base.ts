@@ -2,15 +2,15 @@
 
 import type { Deps } from './types/di-types';
 
-// --- Dependency Injection ---------------------------------------------------
+// ─── Dependency Injection ───────────────────────────────────────────────────
 let _deps: Deps = {};
 function _injectDependencies(deps: Deps) { _deps = deps; }
 
-// --- Lazy Requires (avoid top-level circular dependency chains) -------------
-// providers-base ??? logger ??? config (cycle risk)
-// providers-base ??? utils-fetch ??? logger (cycle risk)
-// providers-base ??? providers-health (new, loaded on first use)
-// providers-base ??? providers-serializers (new, loaded on first use)
+// ─── Lazy Requires (avoid top-level circular dependency chains) ─────────────
+// providers-base → logger → config (cycle risk)
+// providers-base → utils-fetch → logger (cycle risk)
+// providers-base → providers-health (new, loaded on first use)
+// providers-base → providers-serializers (new, loaded on first use)
 let _utilsFetch: any = null;
 function _getUtilsFetch() { if (!_utilsFetch) _utilsFetch = require('./utils-fetch'); return _utilsFetch; }
 let _loggerMod: any = null;
@@ -20,17 +20,17 @@ function safeLog(...args: any[]) { return _getLogger().safeLog(...args); }
 function logError(...args: any[]) { return _getLogger().logError(...args); }
 function getCONFIG(): Record<string, any> { return _deps.config || require('./get-config'); }
 
-// Lazy health module - loaded on first use to avoid circular deps
+// Lazy health module — loaded on first use to avoid circular deps
 let _healthMod: any = null;
 function _getHealth() { if (!_healthMod) _healthMod = require('./providers-health'); return _healthMod; }
 
-// Lazy serializers module - loaded on first use
+// Lazy serializers module — loaded on first use
 let _serializersMod: any = null;
 function _getSerializers() { if (!_serializersMod) _serializersMod = require('./providers-serializers'); return _serializersMod; }
 
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // UTILITY FUNCTIONS (preserved from original)
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 function sanitizeErrorText(text: any, maxLength = 100) {
   if (!text) return 'Unknown error';
@@ -65,26 +65,7 @@ function extractJSON(raw: any, context: any) {
     return str;
   }
   const jsonStr = extractFirstJSON(cleaned);
-  try { return JSON.parse(jsonStr); } catch {
-    // Common LLM JSON fixes: trailing commas, unescaped newlines, control chars
-    let repaired = jsonStr
-      .replace(/,\s*}/g, '}')
-      .replace(/,\s*]/g, ']')
-      .replace(/[\x00-\x09\x0b\x0c\x0e-\x1f]/g, '')
-      .replace(/\n/g, '\\n')
-      .replace(/\r/g, '\\r')
-      .replace(/\t/g, '\\t');
-    try { return JSON.parse(repaired); } catch (e2: any) {
-      // Last resort: try extracting actionType with regex from raw content
-      const actionMatch = cleaned.match(/"actionType"\s*:\s*"([^"]+)"/);
-      if (actionMatch) {
-        log(`${context}: JSON parse failed, extracted actionType="${actionMatch[1]}" from raw content`, 'WARN', 'base');
-        return { actionType: actionMatch[1], currentState: 'unknown', reasoning: 'Extracted from malformed JSON' };
-      }
-      logError(`JSON parse error in ${context} (repaired also failed)`, e2);
-      throw new Error(`${context}: JSON parse failed`);
-    }
-  }
+  try { return JSON.parse(jsonStr); } catch (e: any) { logError(`JSON parse error in ${context}`, e); throw new Error(`${context}: JSON parse failed`); }
 }
 
 function validateActionResponse(obj: any, modelName: any) { 
@@ -105,11 +86,11 @@ function validateActionResponse(obj: any, modelName: any) {
   return obj;
 }
 
-const { rollbackProvider, getProviderConfig } = require('./providers-config-loader');
+const { rollbackProvider, getProviderConfig, getFallbackModels } = require('./providers-config-loader');
 
-// ===============================================================================
-// CORE CHAT COMPLETION - P1: Provider-Specific Serialization
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
+// CORE CHAT COMPLETION — P1: Provider-Specific Serialization
+// ═══════════════════════════════════════════════════════════════════════════════
 //
 // BREAKING CHANGE from original: providerName is now a REQUIRED 6th parameter.
 // Previous signature: (endpoint, apiKey, model, base64Image, prompt, options)
@@ -124,16 +105,13 @@ const { rollbackProvider, getProviderConfig } = require('./providers-config-load
 // and array content only when the provider supports vision AND multipart.
 
 async function callChatCompletion(endpoint: string, apiKey: string, model: string, base64Image: string | null, prompt: string, providerName: string, options: any = {}) { 
-  // Safety net: strip ':free' suffix that OpenRouter uses for pricing tier -
-  // most provider APIs reject it as an unknown model variant.
-  const cleanModel = model.replace(/:free$/, '');
   const config = getCONFIG();
   const maxTokens = options.maxTokens || config.MAX_TOKENS || 4096;
   const temperature = options.temperature !== undefined ? options.temperature : (config.TEMPERATURE !== undefined ? config.TEMPERATURE : 0.1);
   const signal = options.signal;
   const responseFormat = options.responseFormat || null;
 
-  // --- Serializer-based payload construction (P1) ---
+  // ─── Serializer-based payload construction (P1) ───
   // Each provider gets the correct content format:
   //   - OpenAI-compatible: string when no image, array when image + provider supports multipart
   //   - Cloudflare: always plain string
@@ -145,16 +123,16 @@ async function callChatCompletion(endpoint: string, apiKey: string, model: strin
   // For 'openai' type or unknown, we build the payload inline for maximum control.
   let payload: any;
   if (caps && caps.serializerType === 'cloudflare') {
-    // Cloudflare has a completely different URL structure - this function
+    // Cloudflare has a completely different URL structure — this function
     // should not be called for Cloudflare. If it is, fall back to openai format.
-    payload = _buildOpenAIPayload(providerName, cleanModel, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
+    payload = _buildOpenAIPayload(providerName, model, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
   } else if (caps && caps.serializerType === 'gemini') {
-    // Gemini uses the Google SDK - this function should not be called.
+    // Gemini uses the Google SDK — this function should not be called.
     // Build an OpenAI-format payload as fallback (may not work but won't crash).
-    payload = _buildOpenAIPayload(providerName, cleanModel, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
+    payload = _buildOpenAIPayload(providerName, model, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
   } else {
     // OpenAI-compatible: use provider-aware serialization
-    payload = _buildOpenAIPayload(providerName, cleanModel, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
+    payload = _buildOpenAIPayload(providerName, model, prompt, base64Image, caps, maxTokens, temperature, responseFormat);
   }
 
   const response = await _getUtilsFetch().fetchWithTimeout(endpoint, {
@@ -164,7 +142,7 @@ async function callChatCompletion(endpoint: string, apiKey: string, model: strin
     signal,
   });
 
-  // --- 429 handling with retry-after extraction ---
+  // ─── 429 handling with retry-after extraction ───
   if (response.status === 429) {
     const retryAfter = response.headers.get('retry-after');
     let retryMs = 45000; // P7: reduced from 60s to 45s default
@@ -182,13 +160,13 @@ async function callChatCompletion(endpoint: string, apiKey: string, model: strin
     throw err;
   }
 
-  // --- Non-429 error handling ---
+  // ─── Non-429 error handling ───
   if (!response.ok) {
     const errorText = sanitizeErrorText(await response.text().catch(() => 'Unknown error'));
     throw new Error(`HTTP_ERROR_${response.status}: ${errorText}`);
   }
 
-  // --- Response size guard (OOM prevention) ---
+  // ─── Response size guard (OOM prevention) ───
   const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
   const responseText = await response.text();
   if (responseText.length > MAX_RESPONSE_BYTES) {
@@ -238,7 +216,7 @@ function _buildOpenAIPayload(
   } else {
     // Plain string format (always safe for OpenAI-compatible APIs)
     // If we have an image but provider doesn't support multipart,
-    // the image is silently dropped - the prompt text still guides the model.
+    // the image is silently dropped — the prompt text still guides the model.
     userContent = prompt;
   }
 
@@ -258,9 +236,9 @@ function _buildOpenAIPayload(
   return payload;
 }
 
-// ===============================================================================
-// ROLLBACK WRAPPER - Updated to pass providerName through
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROLLBACK WRAPPER — Updated to pass providerName through
+// ═══════════════════════════════════════════════════════════════════════════════
 //
 // On 404/401/403, attempts to roll back to the previous model config.
 // Now uses classifyError from providers-health for consistent error handling.
@@ -315,9 +293,9 @@ async function _callChatCompletionInternal(endpoint: string, apiKey: string, mod
   }
 }
 
-// ===============================================================================
-// SMART RETRY - P7: Error-Type-Aware Retry with Backoff
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMART RETRY — P7: Error-Type-Aware Retry with Backoff
+// ═══════════════════════════════════════════════════════════════════════════════
 //
 // Replaces the old retryWithBackoff() which retried ALL errors equally.
 // Now uses classifyError + getRetryDecision from providers-health to:
@@ -344,7 +322,7 @@ async function retryWithBackoff(fn: () => Promise<unknown>, opts: any = {}) {
       const result = await fn();
       // Record success for health tracking if providerName is known
       if (providerName !== 'unknown') {
-        // Don't record here - the caller (safeCall or provider) records with latency
+        // Don't record here — the caller (safeCall or provider) records with latency
       }
       return result;
     } catch (err: any) {
@@ -365,15 +343,15 @@ async function retryWithBackoff(fn: () => Promise<unknown>, opts: any = {}) {
   }
 }
 
-// ===============================================================================
-// SAFE CALL - P22: Circuit Breaker Integration + P5: Health Recording
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
+// SAFE CALL — P22: Circuit Breaker Integration + P5: Health Recording
+// ═══════════════════════════════════════════════════════════════════════════════
 //
 // The main entry point for the tribunal. Wraps provider calls with:
 //   1. Circuit breaker check (skip provider if open)
 //   2. Timeout with AbortController
 //   3. Smart retry with error-type awareness
-//   4. Health recording (success/failure ??? ProviderHealth + CircuitBreaker)
+//   4. Health recording (success/failure → ProviderHealth + CircuitBreaker)
 //   5. Structured logging (P20)
 
 async function safeCall(fn: (signal: AbortSignal) => Promise<unknown>, context: string, opts: any = {}) {
@@ -385,7 +363,7 @@ async function safeCall(fn: (signal: AbortSignal) => Promise<unknown>, context: 
   const externalSignal = opts.signal || null;
   const health = _getHealth();
 
-  // --- P22: Circuit breaker pre-check ---
+  // ─── P22: Circuit breaker pre-check ───
   if (!health.isProviderAvailable(providerName)) {
     const snapshot = health.getHealthSnapshot(providerName);
     const reason = snapshot.disabled ? 'disabled' :
@@ -422,11 +400,11 @@ async function safeCall(fn: (signal: AbortSignal) => Promise<unknown>, context: 
       clearTimeout(timeoutId);
       if (externalSignal && externalHandler) externalSignal.removeEventListener('abort', externalHandler);
 
-      // --- P5: Record success ---
+      // ─── P5: Record success ───
       health.recordCallResult(providerName, true, latency);
       cb.recordSuccess();
 
-      // --- P20: Structured success log ---
+      // ─── P20: Structured success log ───
       const healthScore = health.getProviderHealth(providerName).healthScore();
       log(health.formatProviderLog(providerName, '', latency, true, null, attempt - 1, healthScore), 'INFO', 'base');
 
@@ -441,16 +419,16 @@ async function safeCall(fn: (signal: AbortSignal) => Promise<unknown>, context: 
         throw err;
       }
 
-      // --- P6 + P7: Classify and decide retry ---
+      // ─── P6 + P7: Classify and decide retry ───
       const classified = health.classifyError(err);
       health.recordCallResult(providerName, false, latency, err);
       cb.recordFailure(classified.category);
 
-      // --- P20: Structured failure log ---
+      // ─── P20: Structured failure log ───
       const healthScore = health.getProviderHealth(providerName).healthScore();
       log(health.formatProviderLog(providerName, '', latency, false, classified.category, attempt - 1, healthScore), 'WARN', 'base');
 
-      // --- Check if provider should be retired ---
+      // ─── Check if provider should be retired ───
       if (classified.retireProvider) {
         log(`\ud83d\uded1 Retiring ${providerName}: ${classified.description}`, 'ERROR', 'base');
         try {
@@ -460,14 +438,14 @@ async function safeCall(fn: (signal: AbortSignal) => Promise<unknown>, context: 
         throw err;
       }
 
-      // --- Check if provider should be disabled ---
+      // ─── Check if provider should be disabled ───
       if (classified.disableProvider) {
         log(`\u26d4 Disabling ${providerName}: ${classified.description}`, 'ERROR', 'base');
         // Health module already disables via recordCallResult
         throw err;
       }
 
-      // --- P7: Smart retry decision ---
+      // ─── P7: Smart retry decision ───
       const decision = health.getRetryDecision(classified, attempt - 1);
       if (!decision.shouldRetry || attempt >= safeMaxRetries) {
         throw err;
@@ -480,9 +458,9 @@ async function safeCall(fn: (signal: AbortSignal) => Promise<unknown>, context: 
   }
 }
 
-// ===============================================================================
-// ERROR CLASSIFICATION - P6: Delegates to providers-health
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR CLASSIFICATION — P6: Delegates to providers-health
+// ═══════════════════════════════════════════════════════════════════════════════
 //
 // Kept for backward compatibility. Returns the same shape as before
 // { code, retryable, healable } but now backed by the 11-category classifier.
@@ -513,9 +491,9 @@ function classifyError(err: unknown) {
   }
 }
 
-// ===============================================================================
-// CIRCUIT BREAKER - P22: Delegates to providers-health
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
+// CIRCUIT BREAKER — P22: Delegates to providers-health
+// ═══════════════════════════════════════════════════════════════════════════════
 //
 // Kept for backward compatibility. Returns a plain object with the same shape
 // as the old inline circuit breaker (failures, lastFailure, state) but backed
@@ -544,9 +522,9 @@ function getCircuitBreaker(urlOrName: string) {
   return _compatCircuitBreakers.get(urlOrName);
 }
 
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // REQUEST COALESCER (preserved from original)
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 class RequestCoalescer {
   pending: any;
@@ -561,9 +539,9 @@ class RequestCoalescer {
 
 const coalescer = new RequestCoalescer();
 
-// ===============================================================================
-// PROTOCOL CHAMELEON - Lazy loader (preserved from original)
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROTOCOL CHAMELEON — Lazy loader (preserved from original)
+// ═══════════════════════════════════════════════════════════════════════════════
 
 let _protocolChameleon: any = null;
 let _protocolChameleonChecked = false;
@@ -577,9 +555,9 @@ function getProtocolChameleon() {
   return _protocolChameleon;
 }
 
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // EXPORTS
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 module.exports = {
   // Fetch utility (lazy getter)
@@ -593,6 +571,7 @@ module.exports = {
   callChatCompletionWithRollback,
   // Config access (unchanged)
   getProviderConfig,
+  getFallbackModels,
   // Retry (P7: now uses smart retry from providers-health)
   retryWithBackoff,
   // Safe call (P22: now uses circuit breakers + health recording from providers-health)
