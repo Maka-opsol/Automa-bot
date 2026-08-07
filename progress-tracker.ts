@@ -10,12 +10,11 @@ const os = require('os');
 const CONFIG = require('./get-config');
 const { log, logError } = require('./logger');
 
-// Lazy path resolution — ensures we pick up env vars set by render-free-plan.ts
-// before any module load, not the frozen default from config.ts.
-// On Render free tier, env vars from render-free-plan.ts point to /tmp which is
-// always writable. The fallback also uses /tmp to avoid EACCES on read-only CWD.
-function getProgressLogPath() { return process.env.PROGRESS_LOG_PATH || CONFIG.PROGRESS_LOG_PATH || path.join(os.tmpdir(), 'mathu-logs', 'progress.jsonl'); }
-function getLastStatePath() { return process.env.LAST_STATE_PATH || CONFIG.LAST_STATE_PATH || path.join(os.tmpdir(), 'last-state.json'); }
+// Lazy path resolution — reads process.env directly (not CONFIG) because
+// render-free-plan.ts overrides env vars after config module is cached.
+// On Render free tier, env vars point to /tmp which is always writable.
+function getProgressLogPath() { return process.env.PROGRESS_LOG_PATH || path.join(os.tmpdir(), 'mathu-logs', 'progress.jsonl'); }
+function getLastStatePath() { return process.env.LAST_STATE_PATH || path.join(os.tmpdir(), 'last-state.json'); }
 
 function trackProgress(entry: any) { 
   const PROGRESS_LOG_PATH = getProgressLogPath();
