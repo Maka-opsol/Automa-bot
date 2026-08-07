@@ -1,43 +1,59 @@
 'use strict';
-// Last modified: 2026-08-06 - All providers vision-capable; updated comments, removed text-only skip logic
+// Last modified: 2026-08-08 — OpenRouter rate limiter integration, graceful sleep
 
 // ─── OpenRouter Tribunal Provider ───────────────────────────────────────────
 //
-// Uses OpenRouter's API to access multiple free models.
-// This is the most flexible provider - it can route to any OpenRouter model.
-// All current models are vision-capable.
+// Uses OpenRouter's API to access multiple free vision models.
+// This is the most flexible provider — it can route to any OpenRouter model.
 //
 // Key behaviors:
 //   - Uses callChatCompletionWithRollback (not bare callChatCompletion)
 //     for protocol chameleon 422 recovery and config rollback support
-//   - Falls back through a chain of known free models
+//   - Falls back through a chain of known free vision models
+//   - Model-level vision capability check via providers-serializers
+//     (e.g., llama-4-scout is text-only and will be skipped for vision tasks)
 //   - P7: providerName passed to retryWithBackoff for health-aware retries
-//   - P19: Fallback chain includes multiple free models for resilience
+//   - P19: Fallback chain includes multiple free vision models for resilience
+//   - Rate limiter: delegates to openrouter-rate-limiter.ts for budget tracking
+//   - Graceful sleep: when budget exhausted AND no other providers, sleeps
+//     until midnight UTC (the "OpenRouter is the only provider" scenario)
 
-const { extractJSON, validateActionResponse, callChatCompletionWithRollback, retryWithBackoff } = require('./providers-base');
+const { extractJSON, validateActionResponse, callChatCompletionWithRollback, retryWithBackoff, _getOrLimiter } = require('./providers-base');
+const { providerSupportsVision } = require('./providers-serializers');
 
 // Lazy logger
 let _logger: any = null;
 function _getLogger() { if (!_logger) _logger = require('./logger'); return _logger; }
 
+// Lazy registry (for checking if other providers are available)
+let _registry: any = null;
+function _getRegistry() { if (!_registry) _registry = require('./providers-registry'); return _registry; }
+
 /**
- * Primary vision models on OpenRouter, ordered by quality.
- * All models are now vision-capable.
+ * Known free vision models on OpenRouter, ordered by quality.
+ * Text-only models are filtered out at runtime via providerSupportsVision().
+ *
+ * Models marked with (V) are confirmed vision-capable.
+ * Models marked with (T) are text-only — included as last-resort fallbacks
+ * when no image is present, or when vision providers all fail.
  */
 const VISION_FALLBACK_MODELS = [
-  'google/gemma-3-27b-it',           // Best free vision model on OpenRouter
-  'nvidia/nemotron-nano-12b-2-vl',   // NVIDIA Nemotron vision - OCR-optimized
-  'google/gemma-3-12b-it',           // Smaller Gemma, still good vision
-  'qwen/qwen2.5-vl-72b-instruct',   // Qwen vision - excellent at math OCR
+  'google/gemma-3-27b-it:free',           // (V) Best free vision model on OpenRouter
+  'nvidia/nemotron-nano-12b-2-vl:free',   // (V) NVIDIA Nemotron vision — OCR-optimized
+  'google/gemma-3-12b-it:free',           // (V) Smaller Gemma, still good vision
+  'qwen/qwen2.5-vl-72b-instruct:free',   // (V) Qwen vision — excellent at math OCR
 ];
 
 /**
- * Additional fallback models for resilience when primary models fail.
+ * Text-only fallback models. Used only when:
+ *   1. No image is provided (text-only request), OR
+ *   2. All vision models failed and we have no other option
+ * These are cheap, fast, but CANNOT process images.
  */
 const TEXT_FALLBACK_MODELS = [
-  'google/gemma-4-31b-it',                     // Updated Aug 2026
-  'nvidia/nemotron-3-super-120b',               // Efficient MoE, strong reasoning
-  'deepseek/deepseek-r1-distill-llama-70b',      // Reasoning (if still available)
+  'google/gemma-4-31b-it:free',                     // (T) Updated Aug 2026
+  'nvidia/nemotron-3-super-120b:free',               // (T) Efficient MoE, strong reasoning
+  'deepseek/deepseek-r1-distill-llama-70b:free',      // (T) Reasoning (if still available)
 ];
 
 function OpenRouterTribunalProvider() {
@@ -47,15 +63,20 @@ function OpenRouterTribunalProvider() {
   }
 
   // The primary model can be overridden via env var
-  const primaryModel = process.env.OPENROUTER_TRIBUNAL_MODEL || 'google/gemma-3-27b-it';
+  const primaryModel = process.env.OPENROUTER_TRIBUNAL_MODEL || 'openrouter/free';
   const endpoint = 'https://openrouter.ai/api/v1/chat/completions';
 
   return async (base64Image: any, prompt: any, signal: any, options: any = {}) => {
     const log = _getLogger().log;
+    const hasImage = !!base64Image;
 
-    // Build fallback chain: primary model first, then all fallback models
+    // Build fallback chain based on whether we have an image
+    // If image present: try vision models first, then text fallbacks
+    // If no image: try primary model, then text fallbacks
     const candidates = [primaryModel];
-    const fallbackPool = [...VISION_FALLBACK_MODELS, ...TEXT_FALLBACK_MODELS];
+    const fallbackPool = hasImage
+      ? [...VISION_FALLBACK_MODELS, ...TEXT_FALLBACK_MODELS]
+      : [...TEXT_FALLBACK_MODELS];
 
     // Deduplicate (primary model might be in the fallback pool)
     const seen = new Set<string>();
@@ -69,7 +90,12 @@ function OpenRouterTribunalProvider() {
 
     let lastErr: any = null;
     for (const m of models) {
-      // All models are vision-capable - no need to skip for missing vision support
+      // P1: Skip text-only models when we have an image
+      // (the serializer would strip the image, resulting in a blind analysis)
+      if (hasImage && !providerSupportsVision('OpenRouter', m)) {
+        log(`OpenRouter: skipping text-only model ${m} for vision request`, 'DEBUG', 'openrouter');
+        continue;
+      }
 
       try {
         // Use callChatCompletionWithRollback for:
@@ -101,7 +127,7 @@ function OpenRouterTribunalProvider() {
           log(`OpenRouter: model ${m} transient error, trying next fallback`, 'WARN', 'openrouter');
           continue;
         }
-        // Permanent errors (400, 401, 403) - no point trying other models with same key
+        // Permanent errors (400, 401, 403) — no point trying other models with same key
         throw err;
       }
     }
@@ -110,4 +136,50 @@ function OpenRouterTribunalProvider() {
   };
 }
 
-module.exports = { OpenRouterTribunalProvider };
+/**
+ * Check if OpenRouter is the ONLY available provider right now.
+ * Used to decide whether to sleep until midnight when budget is exhausted.
+ */
+async function _isOnlyProvider(): Promise<boolean> {
+  try {
+    const registry = _getRegistry();
+    const providers = await registry.getAvailableProviders();
+    // Filter out OpenRouter itself — are there any OTHER providers?
+    const others = providers.filter((p: any) => p.name !== 'OpenRouter');
+    return others.length === 0;
+  } catch {
+    return true; // Assume only provider if we can't check
+  }
+}
+
+/**
+ * Graceful wait: if OpenRouter budget is exhausted AND no other providers
+ * are available, sleep until midnight UTC (or 30min, whichever is shorter).
+ * This prevents the death spiral when OpenRouter is the ONLY provider.
+ */
+async function waitForOpenRouterBudget(): Promise<void> {
+  const limiter = _getOrLimiter();
+  const log = _getLogger().log;
+
+  try {
+    limiter.checkBudget('critical');
+    // Budget available — no need to wait
+    return;
+  } catch {
+    // Budget exhausted
+  }
+
+  // Check if other providers are available
+  const onlyProvider = await _isOnlyProvider();
+  if (!onlyProvider) {
+    log('OpenRouter budget exhausted but other providers available — letting them handle it', 'INFO', 'openrouter');
+    return;
+  }
+
+  // No other providers — sleep until midnight
+  await limiter.waitForBudget('critical', {
+    checkOtherProviders: async () => !(await _isOnlyProvider()),
+  });
+}
+
+module.exports = { OpenRouterTribunalProvider, waitForOpenRouterBudget };
