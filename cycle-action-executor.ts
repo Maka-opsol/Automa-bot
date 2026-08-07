@@ -1,4 +1,5 @@
 'use strict';
+// Last modified: 2026-08-05 — Response 20: Dynamic wait timeout (waitTime + 5s buffer instead of 30s cap)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Cycle Action Executor — Executes validated actions on the Playwright page.
@@ -249,6 +250,12 @@ async function _executeActionInner(page: any, action: any) {
         : CONFIG.BETWEEN_STEPS_MS * wm;
       log(`Waiting ${waitTime}ms...`, 'DEBUG', 'action');
       await sleep(waitTime);
+      break;
+    }
+    case 'reload': {
+      log('Reloading page (stagnation recovery)...', 'INFO', 'action');
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+      await sleep(3000);
       break;
     }
     default:
