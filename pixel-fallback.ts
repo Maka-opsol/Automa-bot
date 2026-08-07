@@ -1,21 +1,34 @@
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════════════════
-// pixel-fallback.ts — Pure pixel-based page analysis & action generation
+// pixel-fallback.ts — Pure pixel-based page analysis & action generation v2
 // ═══════════════════════════════════════════════════════════════════════════
 // When ALL AI providers fail AND DOM is empty (Flutter canvas) AND semantics
 // return nothing, this module falls back to raw screenshot pixel analysis.
 //
-// How it works:
-//   1. Takes a PNG screenshot → decodes to raw RGBA pixels (built-in zlib)
-//   2. Scans pixels for color patterns (white rects = inputs, blue rects = buttons)
-//   3. Uses URL context + pixel analysis to determine page type
-//   4. Returns a concrete action with coordinates for the executor
+// LOGIN FLOW HANDLED:
+//   1. MathU redirects to Microsoft login (login.microsoftonline.com)
+//      → detects email input field → types email → clicks Next
+//   2. Microsoft redirects to ADVLEARN password page
+//      → detects password input field → types password → clicks Sign in
+//   3. "Stay signed in?" prompt
+//      → clicks Yes/Stay signed in button
+//   4. "Use another account" option
+//      → detects and clicks if needed
+//   5. Various intermediate screens (Continue, etc.)
 //
-// Capabilities:
-//   - Microsoft login: finds email/password input fields, Next/Sign-in buttons
-//   - Assignment pages: finds colored Watch/Start buttons
-//   - Generic: finds any prominent clickable-looking rectangle
+// APP PAGES HANDLED:
+//   - Assignments: finds Start/Watch/Redo blue buttons
+//   - Quiz: finds Done/Submit teal-green buttons, numeric keypad
+//   - Exercise: finds Next/Previous navigation
+//   - Score screen: finds Continue to pathway button
+//   - Video player: skips (no clickable elements needed)
+//
+// Detection methods:
+//   - URL pattern matching (primary for Microsoft auth pages)
+//   - Background color analysis (blue = Microsoft/assignment, mint = quiz)
+//   - Pixel region scanning for white input fields, blue buttons, green buttons
+//   - Aspect ratio filtering for shape classification
 //
 // No external dependencies — uses only Node.js built-ins (zlib, Buffer).
 // Memory: ~4 MB for a 1280×720 RGBA decode. CPU: ~20-30ms total.
@@ -38,7 +51,6 @@ function _paethPredictor(a: number, b: number, c: number): number {
 
 function _decodePNG(buffer: Buffer): { width: number; height: number; rgba: Uint8ClampedArray } | null {
   try {
-    // Validate PNG signature
     if (buffer.length < 24 ||
         buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4E ||
         buffer[3] !== 0x47 || buffer[4] !== 0x0D || buffer[5] !== 0x0A ||
@@ -66,11 +78,10 @@ function _decodePNG(buffer: Buffer): { width: number; height: number; rgba: Uint
       }
 
       offset += 12 + chunkLen;
-      if (chunkLen > buffer.length) break; // Malformed chunk
+      if (chunkLen > buffer.length) break;
     }
 
     if (width === 0 || height === 0 || width > 4096 || height > 4096) return null;
-    // Only support RGBA 8-bit (colorType 6) and RGB 8-bit (colorType 2)
     if (bitDepth !== 8 || (colorType !== 6 && colorType !== 2)) return null;
 
     const channels = colorType === 6 ? 4 : 3;
@@ -86,7 +97,7 @@ function _decodePNG(buffer: Buffer): { width: number; height: number; rgba: Uint
 
       for (let x = 0; x < width; x++) {
         for (let c = 0; c < 4; c++) {
-          const srcC = c < channels ? c : channels - 1; // Map alpha=3 for RGB
+          const srcC = c < channels ? c : channels - 1;
           const rawVal = raw[rowSrc + x * channels + srcC];
           const left = x > 0 ? rgba[rowDst + (x - 1) * 4 + c] : 0;
           const above = y > 0 ? rgba[rowDst - width * 4 + x * 4 + c] : 0;
@@ -102,7 +113,6 @@ function _decodePNG(buffer: Buffer): { width: number; height: number; rgba: Uint
           }
           rgba[rowDst + x * 4 + c] = val & 0xFF;
         }
-        // For RGB (no alpha channel), set alpha to 255
         if (channels === 3) {
           rgba[rowDst + x * 4 + 3] = 255;
         }
@@ -126,13 +136,24 @@ function _isLightGray(r: number, g: number, b: number): boolean {
   return r > 180 && g > 180 && b > 180 && !(r > 230 && g > 230 && b > 230);
 }
 
+/** Microsoft brand blue: #0078D4 → R:0-30 G:100-140 B:190-230 */
 function _isMicrosoftBlue(r: number, g: number, b: number): boolean {
-  // Microsoft brand blue: roughly #0078D4 → R:0 G:120 B:212 (with tolerance)
   return r < 60 && g > 80 && g < 180 && b > 160 && b < 240;
 }
 
+/** Deep royal blue (MathU app header/sidebar): #1e3a8a → R:20-40 G:50-70 B:120-150 */
+function _isDeepBlue(r: number, g: number, b: number): boolean {
+  return r < 50 && g > 40 && g < 80 && b > 100 && b < 170;
+}
+
+/** Teal-green gradient (quiz Submit/Done buttons): #0d9488 to #22c55e */
+function _isTealGreen(r: number, g: number, b: number): boolean {
+  return g > 140 && b > 100 && r < g - 30 && b < g + 20;
+}
+
+/** Bright green (Next button on exercise, Start on assignments): #10B981 to #22c55e */
 function _isGreenish(r: number, g: number, b: number): boolean {
-  return g > 140 && r < g - 40 && b < g - 20;
+  return g > 150 && r < g - 40 && b < g - 20 && b > 50;
 }
 
 function _isOrangeish(r: number, g: number, b: number): boolean {
@@ -141,6 +162,16 @@ function _isOrangeish(r: number, g: number, b: number): boolean {
 
 function _isDark(r: number, g: number, b: number): boolean {
   return r < 60 && g < 60 && b < 60;
+}
+
+/** Pale mint/cyan background (quiz pages): #ECFEFF → R:230+ G:250+ B:255 */
+function _isMintBackground(r: number, g: number, b: number): boolean {
+  return r > 220 && g > 240 && b > 240;
+}
+
+/** Light lavender/blue-grey (choice buttons in quiz): #e2e8f0 */
+function _isLavender(r: number, g: number, b: number): boolean {
+  return r > 200 && g > 210 && b > 230 && r < 240 && g < 240 && b < 250;
 }
 
 // ─── Rectangle detection ───────────────────────────────────────────────────
@@ -153,7 +184,6 @@ interface DetectedRect {
 /**
  * Find horizontal bands of pixels matching a color predicate.
  * Returns bounding boxes of rectangular regions.
- * @param step Sample every Nth pixel for speed (default 2)
  */
 function _findColorBands(
   rgba: Uint8ClampedArray, width: number, height: number,
@@ -181,7 +211,6 @@ function _findColorBands(
 
   if (rowBands.length === 0) return [];
 
-  // Group adjacent rows with overlapping column ranges into rectangles
   const rects: DetectedRect[] = [];
   let groupStart = 0;
 
@@ -194,7 +223,6 @@ function _findColorBands(
       Math.abs(cur.right - next.right) < 40;
 
     if (!isContinuation) {
-      // Emit rectangle from groupStart to i-1
       let minY = Infinity, maxY = -Infinity, sumLeft = 0, sumRight = 0, cnt = 0;
       for (let j = groupStart; j < i; j++) {
         const b = rowBands[j];
@@ -227,61 +255,61 @@ function _findColorBands(
 // ─── Element finders ──────────────────────────────────────────────────────
 
 /**
- * Find an input field (white rectangle with aspect ratio > 4:1).
- * Scans the center 60% of the image vertically, 20%-80% horizontally.
+ * Find input fields (white rectangle with aspect ratio > 3:1).
+ * Scans the center 60% of the image vertically, 15%-85% horizontally.
+ * Returns ALL matching input fields sorted by Y position (top first).
  */
-function _findInputField(
+function _findAllInputFields(
   rgba: Uint8ClampedArray, width: number, height: number
-): DetectedRect | null {
+): DetectedRect[] {
   const y1 = Math.floor(height * 0.25);
   const y2 = Math.floor(height * 0.75);
   const x1 = Math.floor(width * 0.15);
   const x2 = Math.floor(width * 0.85);
 
-  // Find white bands (input fields are white)
   const whiteBands = _findColorBands(rgba, width, height, _isWhiteish, y1, y2, x1, x2, 2);
-
-  // Also find light gray bands (some inputs have subtle borders)
   const grayBands = _findColorBands(rgba, width, height, _isLightGray, y1, y2, x1, x2, 2);
 
-  // Merge and deduplicate nearby rects
   const allRects = [...whiteBands, ...grayBands];
 
   // Filter for input-like aspect ratios (wide and short)
-  const inputCandidates = allRects
+  return allRects
     .filter(r => {
       const aspectRatio = r.w / Math.max(r.h, 1);
-      return aspectRatio > 3.5 && aspectRatio < 25 && r.w >= 100 && r.w <= 700 && r.h >= 15 && r.h <= 80;
+      return aspectRatio > 3.0 && aspectRatio < 25 && r.w >= 80 && r.w <= 800 && r.h >= 12 && r.h <= 80;
     })
-    // Sort by y position (top first)
     .sort((a, b) => a.cy - b.cy);
-
-  if (inputCandidates.length === 0) return null;
-
-  // Return the topmost input-like rectangle
-  return inputCandidates[0];
 }
 
 /**
- * Find a blue button (Microsoft "Next" / "Sign in" button).
- * Looks for Microsoft-blue rectangles below a given Y coordinate.
+ * Find a single input field (returns the topmost one).
+ */
+function _findInputField(
+  rgba: Uint8ClampedArray, width: number, height: number
+): DetectedRect | null {
+  const fields = _findAllInputFields(rgba, width, height);
+  return fields.length > 0 ? fields[0] : null;
+}
+
+/**
+ * Find a Microsoft-blue button (Next / Sign in).
+ * Looks for Microsoft-blue rectangles in a vertical range.
  */
 function _findBlueButton(
   rgba: Uint8ClampedArray, width: number, height: number,
-  belowY: number
+  belowY: number, aboveY?: number
 ): DetectedRect | null {
   const y1 = belowY;
-  const y2 = Math.min(Math.floor(belowY + height * 0.4), height - 10);
-  const x1 = Math.floor(width * 0.2);
-  const x2 = Math.floor(width * 0.8);
+  const y2 = aboveY ? Math.min(aboveY, height - 10) : Math.min(Math.floor(belowY + height * 0.4), height - 10);
+  const x1 = Math.floor(width * 0.15);
+  const x2 = Math.floor(width * 0.85);
 
   const blueBands = _findColorBands(rgba, width, height, _isMicrosoftBlue, y1, y2, x1, x2, 2);
 
-  // Filter for button-like sizes
   const buttons = blueBands
     .filter(r => {
       const aspectRatio = r.w / Math.max(r.h, 1);
-      return r.w >= 80 && r.w <= 500 && r.h >= 20 && r.h <= 80 && aspectRatio > 2 && aspectRatio < 20;
+      return r.w >= 60 && r.w <= 600 && r.h >= 18 && r.h <= 80 && aspectRatio > 1.5 && aspectRatio < 25;
     })
     .sort((a, b) => a.cy - b.cy);
 
@@ -289,27 +317,74 @@ function _findBlueButton(
 }
 
 /**
- * Find a prominent colored button (green, orange, or blue) on any page.
- * Used for Watch/Start/Play buttons on assignment pages.
+ * Find a teal-green gradient button (Submit/Done/Continue in quiz).
+ * These are the gradient buttons from #0EA5E9 to #10B981.
+ */
+function _findTealGreenButton(
+  rgba: Uint8ClampedArray, width: number, height: number
+): DetectedRect | null {
+  const y1 = Math.floor(height * 0.80);
+  const y2 = Math.floor(height * 0.98);
+  const x1 = Math.floor(width * 0.10);
+  const x2 = Math.floor(width * 0.90);
+
+  const greenBands = _findColorBands(rgba, width, height, _isTealGreen, y1, y2, x1, x2, 2);
+
+  const buttons = greenBands
+    .filter(r => {
+      const aspectRatio = r.w / Math.max(r.h, 1);
+      return r.w >= 80 && r.w <= 700 && r.h >= 20 && r.h <= 80 && aspectRatio > 2 && aspectRatio < 20;
+    })
+    .sort((a, b) => a.cy - b.cy);
+
+  return buttons.length > 0 ? buttons[0] : null;
+}
+
+/**
+ * Find a bright green Next button (exercise navigation).
+ * Green fill #10B981 with white text.
+ */
+function _findGreenButton(
+  rgba: Uint8ClampedArray, width: number, height: number
+): DetectedRect | null {
+  const y1 = Math.floor(height * 0.88);
+  const y2 = Math.floor(height * 0.98);
+  const x1 = Math.floor(width * 0.70);
+  const x2 = Math.floor(width * 0.98);
+
+  const greenBands = _findColorBands(rgba, width, height, _isGreenish, y1, y2, x1, x2, 2);
+
+  const buttons = greenBands
+    .filter(r => {
+      const aspectRatio = r.w / Math.max(r.h, 1);
+      return r.w >= 60 && r.w <= 300 && r.h >= 20 && r.h <= 60 && aspectRatio > 1.5 && aspectRatio < 10;
+    })
+    .sort((a, b) => a.cy - b.cy);
+
+  return buttons.length > 0 ? buttons[0] : null;
+}
+
+/**
+ * Find a prominent colored button (green, orange, blue, teal) on any page.
+ * Used for Watch/Start/Play/Redo buttons on assignment pages.
  */
 function _findActionButton(
   rgba: Uint8ClampedArray, width: number, height: number
 ): DetectedRect | null {
   const y1 = Math.floor(height * 0.15);
   const y2 = Math.floor(height * 0.85);
-  const x1 = Math.floor(width * 0.1);
-  const x2 = Math.floor(width * 0.9);
+  const x1 = Math.floor(width * 0.10);
+  const x2 = Math.floor(width * 0.90);
 
   const isButtonColor = (r: number, g: number, b: number) =>
-    _isGreenish(r, g, b) || _isOrangeish(r, g, b) || _isMicrosoftBlue(r, g, b);
+    _isGreenish(r, g, b) || _isOrangeish(r, g, b) || _isMicrosoftBlue(r, g, b) || _isTealGreen(r, g, b);
 
   const coloredBands = _findColorBands(rgba, width, height, isButtonColor, y1, y2, x1, x2, 3);
 
-  // Filter for button-like sizes
   const buttons = coloredBands
     .filter(r => {
       const aspectRatio = r.w / Math.max(r.h, 1);
-      return r.w >= 60 && r.w <= 400 && r.h >= 20 && r.h <= 80 && aspectRatio > 1.5 && aspectRatio < 15;
+      return r.w >= 50 && r.w <= 400 && r.h >= 18 && r.h <= 80 && aspectRatio > 1.5 && aspectRatio < 15;
     })
     .sort((a, b) => a.cy - b.cy);
 
@@ -330,12 +405,32 @@ function _findDarkButton(
 
   const darkBands = _findColorBands(rgba, width, height, _isDark, y1, y2, x1, x2, 2);
 
-  // We don't want the whole background — just small dark rectangles (buttons, text links)
   const buttons = darkBands
     .filter(r => r.w >= 40 && r.w <= 300 && r.h >= 10 && r.h <= 50)
     .sort((a, b) => a.cy - b.cy);
 
   return buttons.length > 0 ? buttons[0] : null;
+}
+
+/**
+ * Find lavender/blue-grey pill-shaped buttons (multiple choice options in quiz).
+ */
+function _findChoiceButtons(
+  rgba: Uint8ClampedArray, width: number, height: number
+): DetectedRect[] {
+  const y1 = Math.floor(height * 0.60);
+  const y2 = Math.floor(height * 0.85);
+  const x1 = Math.floor(width * 0.15);
+  const x2 = Math.floor(width * 0.85);
+
+  const lavenderBands = _findColorBands(rgba, width, height, _isLavender, y1, y2, x1, x2, 2);
+
+  return lavenderBands
+    .filter(r => {
+      const aspectRatio = r.w / Math.max(r.h, 1);
+      return r.w >= 60 && r.w <= 400 && r.h >= 20 && r.h <= 60 && aspectRatio > 2 && aspectRatio < 10;
+    })
+    .sort((a, b) => a.cx - b.cx);
 }
 
 // ─── Page type detection (URL-based) ──────────────────────────────────────
@@ -346,8 +441,16 @@ function _isMicrosoftLoginPage(url: string): boolean {
          url.includes('login.microsoft.com');
 }
 
-function _isPasswordPage(url: string): boolean {
-  return url.includes('/password') || url.includes('/kmsi') || url.includes('/postpassword');
+function _isMicrosoftPasswordPage(url: string): boolean {
+  return url.includes('/password') || url.includes('/postpassword');
+}
+
+function _isMicrosoftKMSIPage(url: string): boolean {
+  return url.includes('/kmsi') || url.includes('/oauth2/authorize') && url.includes('prompt=none');
+}
+
+function _isMathUAppPage(url: string): boolean {
+  return url.includes('app.mathu.co.za') || url.includes('mathu.co.za');
 }
 
 function _isAssignmentPage(url: string): boolean {
@@ -356,9 +459,11 @@ function _isAssignmentPage(url: string): boolean {
 
 // ─── Dominant color analysis ───────────────────────────────────────────────
 
-function _getDominantColor(rgba: Uint8ClampedArray, width: number, height: number): { r: number; g: number; b: number } {
+interface ColorResult { r: number; g: number; b: number }
+
+function _getDominantColor(rgba: Uint8ClampedArray, width: number, height: number): ColorResult {
   let rSum = 0, gSum = 0, bSum = 0, count = 0;
-  const step = 10; // Sample every 10th pixel for speed
+  const step = 10;
   for (let i = 0; i < width * height * 4; i += 4 * step) {
     rSum += rgba[i];
     gSum += rgba[i + 1];
@@ -372,20 +477,221 @@ function _getDominantColor(rgba: Uint8ClampedArray, width: number, height: numbe
   };
 }
 
+/** Sample a specific region's dominant color */
+function _getRegionDominantColor(
+  rgba: Uint8ClampedArray, width: number, height: number,
+  x1Pct: number, y1Pct: number, x2Pct: number, y2Pct: number
+): ColorResult {
+  const sx = Math.floor(width * x1Pct);
+  const sy = Math.floor(height * y1Pct);
+  const ex = Math.floor(width * x2Pct);
+  const ey = Math.floor(height * y2Pct);
+  let rSum = 0, gSum = 0, bSum = 0, count = 0;
+  const step = 5;
+  for (let y = sy; y < ey; y += step) {
+    for (let x = sx; x < ex; x += step) {
+      const idx = (y * width + x) * 4;
+      rSum += rgba[idx];
+      gSum += rgba[idx + 1];
+      bSum += rgba[idx + 2];
+      count++;
+    }
+  }
+  return {
+    r: Math.round(rSum / Math.max(count, 1)),
+    g: Math.round(gSum / Math.max(count, 1)),
+    b: Math.round(bSum / Math.max(count, 1))
+  };
+}
+
 function _isBlueishBackground(r: number, g: number, b: number): boolean {
   return b > r + 40 && b > g + 20 && b > 100;
 }
 
+function _isDeepBlueBackground(r: number, g: number, b: number): boolean {
+  return _isDeepBlue(r, g, b) || (b > 140 && r < 50 && g < 90);
+}
+
+function _isMintPageBackground(r: number, g: number, b: number): boolean {
+  return _isMintBackground(r, g, b);
+}
+
+/**
+ * Classify page type by background color analysis.
+ * Returns a string tag for routing.
+ */
+function _classifyPageByColor(
+  rgba: Uint8ClampedArray, width: number, height: number
+): 'microsoft_login' | 'mathu_app' | 'quiz' | 'unknown' {
+  // Check top region (header area) color
+  const headerColor = _getRegionDominantColor(rgba, width, height, 0.0, 0.0, 1.0, 0.25);
+
+  // Check overall background
+  const overallColor = _getDominantColor(rgba, width, height);
+
+  // Microsoft login: clean white/light gray background with blue accents
+  if (_isWhiteish(headerColor.r, headerColor.g, headerColor.b) ||
+      _isLightGray(headerColor.r, headerColor.g, headerColor.b)) {
+    // Check if there's a Microsoft-blue element somewhere on the page
+    const midColor = _getRegionDominantColor(rgba, width, height, 0.3, 0.35, 0.7, 0.45);
+    if (_isMicrosoftBlue(midColor.r, midColor.g, midColor.b)) {
+      return 'microsoft_login';
+    }
+  }
+
+  // MathU app: deep blue header/sidebar
+  if (_isDeepBlueBackground(headerColor.r, headerColor.g, headerColor.b)) {
+    return 'mathu_app';
+  }
+
+  // Quiz page: pale mint/cyan background
+  if (_isMintPageBackground(overallColor.r, overallColor.g, overallColor.b)) {
+    return 'quiz';
+  }
+
+  // Also check if the top 25% has deep blue (app header)
+  if (_isDeepBlueBackground(headerColor.r, headerColor.g, headerColor.b)) {
+    return 'mathu_app';
+  }
+
+  return 'unknown';
+}
+
 // ─── Action generators ────────────────────────────────────────────────────
 
+/**
+ * Handle the Microsoft email input page.
+ * Detects email input field, returns action to type email.
+ */
+function _microsoftEmailAction(
+  rgba: Uint8ClampedArray, width: number, height: number
+): any | null {
+  const inputField = _findInputField(rgba, width, height);
+  if (inputField) {
+    log(`Pixel fallback: found email input at (${inputField.cx}, ${inputField.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'input_email',
+      targetX: inputField.cx,
+      targetY: inputField.cy,
+      currentState: 'microsoft_email_input',
+      reasoning: 'Pixel fallback: found email input field on Microsoft login'
+    };
+  }
+
+  // No input field found — try to find Next button (might be already filled)
+  const midY = Math.floor(height * 0.45);
+  const blueButton = _findBlueButton(rgba, width, height, midY);
+  if (blueButton) {
+    log(`Pixel fallback: found Next button at (${blueButton.cx}, ${blueButton.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: blueButton.cx,
+      targetY: blueButton.cy,
+      currentState: 'microsoft_email_input',
+      reasoning: 'Pixel fallback: found blue Next button (email may be pre-filled)'
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Handle the Microsoft password page.
+ * This is the ADVLEARN page that appears after email submission.
+ * Detects password input field, returns action to type password.
+ */
+function _microsoftPasswordAction(
+  rgba: Uint8ClampedArray, width: number, height: number
+): any | null {
+  const inputField = _findInputField(rgba, width, height);
+  if (inputField) {
+    log(`Pixel fallback: found password input at (${inputField.cx}, ${inputField.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'input_password',
+      targetX: inputField.cx,
+      targetY: inputField.cy,
+      currentState: 'advlearn_login',
+      reasoning: 'Pixel fallback: found password input field on ADVLEARN page'
+    };
+  }
+
+  // No input — look for Sign in button (password might be pre-filled)
+  const midY = Math.floor(height * 0.45);
+  const blueButton = _findBlueButton(rgba, width, height, midY);
+  if (blueButton) {
+    log(`Pixel fallback: found Sign-in button at (${blueButton.cx}, ${blueButton.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: blueButton.cx,
+      targetY: blueButton.cy,
+      currentState: 'advlearn_login',
+      reasoning: 'Pixel fallback: found blue Sign-in button (password may be pre-filled)'
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Handle the "Stay signed in?" / KMSI page.
+ * Looks for the "Yes" or "Stay signed in" button.
+ */
+function _microsoftKMSIAction(
+  rgba: Uint8ClampedArray, width: number, height: number
+): any | null {
+  // KMSI page: find the blue "Yes" button or the "Stay signed in" button
+  // It's typically the only blue button on a white background page
+  const midY = Math.floor(height * 0.35);
+  const blueButton = _findBlueButton(rgba, width, height, midY);
+  if (blueButton) {
+    log(`Pixel fallback: found KMSI Yes button at (${blueButton.cx}, ${blueButton.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: blueButton.cx,
+      targetY: blueButton.cy,
+      currentState: 'advlearn_login',
+      reasoning: 'Pixel fallback: found "Stay signed in?" Yes button'
+    };
+  }
+
+  // Fallback: try dark button (text link "Yes" or "No")
+  const darkButton = _findDarkButton(rgba, width, height, midY);
+  if (darkButton) {
+    log(`Pixel fallback: found KMSI dark button at (${darkButton.cx}, ${darkButton.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: darkButton.cx,
+      targetY: darkButton.cy,
+      currentState: 'advlearn_login',
+      reasoning: 'Pixel fallback: found dark KMSI button'
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Handle a generic Microsoft login page (email or unknown sub-step).
+ * Tries to detect the current step based on what elements are visible.
+ */
 function _microsoftLoginAction(
   url: string,
   rgba: Uint8ClampedArray,
   width: number, height: number
 ): any | null {
-  const isPassword = _isPasswordPage(url);
+  const isPassword = _isMicrosoftPasswordPage(url);
+  const isKMSI = _isMicrosoftKMSIPage(url);
 
-  // Step 1: Find the input field
+  if (isKMSI) {
+    return _microsoftKMSIAction(rgba, width, height);
+  }
+
+  if (isPassword) {
+    return _microsoftPasswordAction(rgba, width, height);
+  }
+
+  // Email page or undetermined sub-step
+  // First try to find an input field
   const inputField = _findInputField(rgba, width, height);
   if (inputField) {
     if (isPassword) {
@@ -394,7 +700,7 @@ function _microsoftLoginAction(
         actionType: 'input_password',
         targetX: inputField.cx,
         targetY: inputField.cy,
-        currentState: 'microsoft_password_input',
+        currentState: 'advlearn_login',
         reasoning: 'Pixel fallback: found password input field'
       };
     } else {
@@ -409,9 +715,8 @@ function _microsoftLoginAction(
     }
   }
 
-  // Step 2: No input field found — try to find Next/Sign-in button
-  // (might be on a "Stay signed in?" page or confirmation page)
-  const midY = Math.floor(height * 0.45);
+  // No input field found — try to find Next/Sign-in/Yes/Continue button
+  const midY = Math.floor(height * 0.40);
   const blueButton = _findBlueButton(rgba, width, height, midY);
   if (blueButton) {
     log(`Pixel fallback: found blue button at (${blueButton.cx}, ${blueButton.cy})`, 'INFO', 'pixel-fallback');
@@ -419,12 +724,12 @@ function _microsoftLoginAction(
       actionType: 'click',
       targetX: blueButton.cx,
       targetY: blueButton.cy,
-      currentState: 'microsoft_signin',
-      reasoning: 'Pixel fallback: found blue sign-in button'
+      currentState: isPassword ? 'advlearn_login' : 'microsoft_email_input',
+      reasoning: 'Pixel fallback: found blue sign-in/next button'
     };
   }
 
-  // Step 3: Try dark button (could be "Next" styled as dark text)
+  // Try dark button (could be "Next" styled as dark text link)
   const darkButton = _findDarkButton(rgba, width, height, midY);
   if (darkButton) {
     log(`Pixel fallback: found dark button at (${darkButton.cx}, ${darkButton.cy})`, 'INFO', 'pixel-fallback');
@@ -432,7 +737,7 @@ function _microsoftLoginAction(
       actionType: 'click',
       targetX: darkButton.cx,
       targetY: darkButton.cy,
-      currentState: 'microsoft_next',
+      currentState: 'microsoft_email_input',
       reasoning: 'Pixel fallback: found dark Next button'
     };
   }
@@ -440,11 +745,14 @@ function _microsoftLoginAction(
   return null;
 }
 
+/**
+ * Handle MathU app assignment pages.
+ * Looks for colored Watch/Start/Redo buttons in the deep blue UI.
+ */
 function _assignmentPageAction(
-  rgba: Uint8ClampedArray,
-  width: number, height: number
+  rgba: Uint8ClampedArray, width: number, height: number
 ): any | null {
-  // Look for colored buttons (Watch/Start/Play)
+  // Look for colored buttons (Watch/Start/Play/Redo) on the right side
   const button = _findActionButton(rgba, width, height);
   if (button) {
     log(`Pixel fallback: found action button at (${button.cx}, ${button.cy})`, 'INFO', 'pixel-fallback');
@@ -453,37 +761,187 @@ function _assignmentPageAction(
       targetX: button.cx,
       targetY: button.cy,
       currentState: 'assignments_page',
-      reasoning: 'Pixel fallback: found colored action button'
+      reasoning: 'Pixel fallback: found colored action button (Watch/Start/Redo)'
     };
   }
 
-  // No button found — try scrolling down to find more content
+  // No button found — scroll down to find more content
   return {
     actionType: 'scroll_vertical',
     targetX: 0,
     targetY: 0,
     currentState: 'assignments_page',
-    reasoning: 'Pixel fallback: no buttons visible, scrolling'
+    reasoning: 'Pixel fallback: no buttons visible on assignments page, scrolling'
   };
 }
 
 /**
- * Detect if the page appears to be a login page by dominant blue color.
- * Used when URL detection fails (e.g., redirect chains).
+ * Handle MathU quiz question pages.
+ * Detects: multiple choice options, numeric keypad, Submit/Done button.
  */
-function _detectLoginPageByColor(
+function _quizPageAction(
   rgba: Uint8ClampedArray, width: number, height: number
-): boolean {
-  const dominant = _getDominantColor(rgba, width, height);
-  return _isBlueishBackground(dominant.r, dominant.g, dominant.b);
+): any | null {
+  // Check for teal-green Submit/Done/Continue button at the bottom
+  const tealButton = _findTealGreenButton(rgba, width, height);
+  if (tealButton) {
+    log(`Pixel fallback: found quiz Submit/Done button at (${tealButton.cx}, ${tealButton.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: tealButton.cx,
+      targetY: tealButton.cy,
+      currentState: 'assessment',
+      reasoning: 'Pixel fallback: found teal-green Submit/Done button in quiz'
+    };
+  }
+
+  // Check for choice buttons (multiple choice — click the first option)
+  const choiceButtons = _findChoiceButtons(rgba, width, height);
+  if (choiceButtons.length > 0) {
+    // Pick a random choice to avoid always picking the same wrong answer
+    const pick = choiceButtons[Math.floor(Math.random() * choiceButtons.length)];
+    log(`Pixel fallback: clicking choice button at (${pick.cx}, ${pick.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: pick.cx,
+      targetY: pick.cy,
+      currentState: 'assessment',
+      reasoning: `Pixel fallback: clicking quiz choice button (${choiceButtons.length} options available)`
+    };
+  }
+
+  // Check for input field (algebraic answer) + keypad area
+  const inputField = _findInputField(rgba, width, height);
+  if (inputField) {
+    // There's an input field but no teal button visible yet — might need to enter answer
+    // For now, just click the input field to focus it
+    log(`Pixel fallback: found quiz input field at (${inputField.cx}, ${inputField.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: inputField.cx,
+      targetY: inputField.cy,
+      currentState: 'assessment',
+      reasoning: 'Pixel fallback: found quiz answer input field'
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Handle MathU exercise pages (step-by-step content with Next/Previous).
+ * Detects the green Next button at the bottom-right.
+ */
+function _exercisePageAction(
+  rgba: Uint8ClampedArray, width: number, height: number
+): any | null {
+  // Look for green Next button at bottom-right
+  const greenButton = _findGreenButton(rgba, width, height);
+  if (greenButton) {
+    log(`Pixel fallback: found green Next button at (${greenButton.cx}, ${greenButton.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: greenButton.cx,
+      targetY: greenButton.cy,
+      currentState: 'exercise_info',
+      reasoning: 'Pixel fallback: found green Next button in exercise'
+    };
+  }
+
+  // Look for teal-green button (could be Submit on exercise)
+  const tealButton = _findTealGreenButton(rgba, width, height);
+  if (tealButton) {
+    log(`Pixel fallback: found teal button at (${tealButton.cx}, ${tealButton.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: tealButton.cx,
+      targetY: tealButton.cy,
+      currentState: 'exercise_info',
+      reasoning: 'Pixel fallback: found teal Submit button in exercise'
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Handle MathU score/results page.
+ * Detects the "Continue to pathway" button.
+ */
+function _scorePageAction(
+  rgba: Uint8ClampedArray, width: number, height: number
+): any | null {
+  // Score screen has a full-width teal-green "Continue to pathway" button
+  const tealButton = _findTealGreenButton(rgba, width, height);
+  if (tealButton) {
+    log(`Pixel fallback: found Continue button at (${tealButton.cx}, ${tealButton.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: tealButton.cx,
+      targetY: tealButton.cy,
+      currentState: 'score_screen',
+      reasoning: 'Pixel fallback: found Continue to pathway button on score screen'
+    };
+  }
+
+  return null;
+}
+
+// ─── Login flow state machine ────────────────────────────────────────────
+
+/**
+ * Track the login flow state to avoid re-entering email when we should be
+ * entering password, or clicking "Stay signed in" when we should be done.
+ * This state is ephemeral (in-memory only) and resets on process restart.
+ */
+let _loginFlowState: 'unknown' | 'email_entered' | 'password_entered' | 'kmsi' = 'unknown';
+let _lastLoginUrl: string = '';
+
+function _resetLoginFlowIfNeeded(url: string): void {
+  // If we navigated away from Microsoft and came back, reset the flow
+  if (_lastLoginUrl && !_isMicrosoftLoginPage(url) && _isMicrosoftLoginPage(url)) {
+    // Went from Microsoft to somewhere and back to Microsoft
+  }
+  if (!_isMicrosoftLoginPage(url)) {
+    _loginFlowState = 'unknown';
+    _lastLoginUrl = url;
+    return;
+  }
+  // Detect step transitions by URL
+  if (url.includes('/password')) {
+    if (_loginFlowState === 'email_entered' || _loginFlowState === 'unknown') {
+      _loginFlowState = 'email_entered'; // Email was submitted, now on password page
+    }
+  } else if (url.includes('/kmsi')) {
+    _loginFlowState = 'password_entered';
+  }
+  _lastLoginUrl = url;
+}
+
+/**
+ * After a successful action, advance the login flow state.
+ */
+function _advanceLoginFlow(action: any): void {
+  if (action.actionType === 'input_email') {
+    _loginFlowState = 'email_entered';
+  } else if (action.actionType === 'input_password') {
+    _loginFlowState = 'password_entered';
+  } else if (action.actionType === 'click' && action.currentState === 'microsoft_email_input') {
+    _loginFlowState = 'email_entered';
+  } else if (action.actionType === 'click' && action.currentState === 'advlearn_login') {
+    _loginFlowState = 'kmsi';
+  }
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────
 
 /**
  * Generate a fallback action using pure pixel analysis.
- * Takes its own screenshot if needed (only called when AI fails, so overhead is acceptable).
+ * Takes a screenshot internally for pixel analysis.
  * Returns null if no actionable element found.
+ *
+ * Called by providers-fallback.ts as Stage 0 when AI is unavailable.
+ * Also called directly by cycle-manager during stagnation recovery.
  */
 async function generatePixelFallbackAction(page: any): Promise<any> {
   try {
@@ -505,20 +963,48 @@ async function generatePixelFallbackAction(page: any): Promise<any> {
     const { width, height, rgba } = decoded;
     log(`Pixel fallback: analyzing ${width}x${height} image (${(screenshotBuffer.length / 1024).toFixed(0)} KB)`, 'DEBUG', 'pixel-fallback');
 
-    // ── Microsoft login pages ──
+    // ── Microsoft login pages (URL-based — highest priority) ──
     if (_isMicrosoftLoginPage(url)) {
+      _resetLoginFlowIfNeeded(url);
       const action = _microsoftLoginAction(url, rgba, width, height);
-      if (action) return action;
+      if (action) {
+        _advanceLoginFlow(action);
+        return action;
+      }
     }
 
-    // ── Detect login by color (for redirect chains where URL hasn't updated yet) ──
-    if (_detectLoginPageByColor(rgba, width, height)) {
+    // ── Detect login by color analysis (for redirect chains where URL hasn't updated) ──
+    const colorClass = _classifyPageByColor(rgba, width, height);
+    if (colorClass === 'microsoft_login') {
       log('Pixel fallback: blue background detected, treating as login page', 'DEBUG', 'pixel-fallback');
+      _resetLoginFlowIfNeeded(url);
       const action = _microsoftLoginAction(url, rgba, width, height);
-      if (action) return action;
+      if (action) {
+        _advanceLoginFlow(action);
+        return action;
+      }
     }
 
-    // ── Assignment / app pages ──
+    // ── MathU app pages ──
+    if (_isMathUAppPage(url) || colorClass === 'mathu_app') {
+      // Detect sub-page by visual features
+      // Quiz: mint background + teal buttons
+      if (colorClass === 'quiz' || _isQuizPageByPixels(rgba, width, height)) {
+        const quizAction = _quizPageAction(rgba, width, height);
+        if (quizAction) return quizAction;
+      }
+
+      // Check for score screen: look for large percentage text area + continue button
+      if (_isScoreScreenByPixels(rgba, width, height)) {
+        const scoreAction = _scorePageAction(rgba, width, height);
+        if (scoreAction) return scoreAction;
+      }
+
+      // Default: treat as assignments page
+      return _assignmentPageAction(rgba, width, height);
+    }
+
+    // ── Assignment URL pattern ──
     if (_isAssignmentPage(url)) {
       return _assignmentPageAction(rgba, width, height);
     }
@@ -544,4 +1030,64 @@ async function generatePixelFallbackAction(page: any): Promise<any> {
   }
 }
 
-module.exports = { generatePixelFallbackAction };
+// ─── Visual page classifiers (pixel-only, no URL) ─────────────────────────
+
+/**
+ * Detect quiz page by visual features:
+ * - Mint/cyan background
+ * - White card in center
+ * - Teal-green button at bottom
+ */
+function _isQuizPageByPixels(rgba: Uint8ClampedArray, width: number, height: number): boolean {
+  const overallColor = _getDominantColor(rgba, width, height);
+  if (!_isMintPageBackground(overallColor.r, overallColor.g, overallColor.b)) return false;
+
+  // Check for the white card area in center
+  const centerColor = _getRegionDominantColor(rgba, width, height, 0.25, 0.35, 0.75, 0.65);
+  if (!_isWhiteish(centerColor.r, centerColor.g, centerColor.b)) return false;
+
+  return true;
+}
+
+/**
+ * Detect score screen by visual features:
+ * - Large white area with text (score percentage)
+ * - Teal-green full-width button at bottom
+ * - Often on mint background
+ */
+function _isScoreScreenByPixels(rgba: Uint8ClampedArray, width: number, height: number): boolean {
+  // Check for the teal-green button at the bottom (full-width)
+  const tealButton = _findTealGreenButton(rgba, width, height);
+  if (!tealButton) return false;
+
+  // Full-width button is characteristic of score screen
+  if (tealButton.w < width * 0.6) return false;
+
+  // Check for large white text area (score display) in the upper half
+  const upperColor = _getRegionDominantColor(rgba, width, height, 0.2, 0.15, 0.8, 0.35);
+  if (!_isWhiteish(upperColor.r, upperColor.g, upperColor.b)) return false;
+
+  return true;
+}
+
+// ─── Exports ─────────────────────────────────────────────────────────────
+
+module.exports = {
+  generatePixelFallbackAction,
+  // Exported for testing
+  _decodePNG,
+  _findInputField,
+  _findAllInputFields,
+  _findBlueButton,
+  _findTealGreenButton,
+  _findGreenButton,
+  _findActionButton,
+  _findChoiceButtons,
+  _classifyPageByColor,
+  _isMicrosoftLoginPage,
+  _isMicrosoftPasswordPage,
+  _isMicrosoftKMSIPage,
+  _isMathUAppPage,
+  _isQuizPageByPixels,
+  _isScoreScreenByPixels,
+};
