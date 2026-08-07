@@ -33,7 +33,8 @@ async function generateCodeFixViaTribunal(investigationData: any, errorLogs: any
   let orModels = [];
   if (provider && getCONFIG().OPENROUTER_API_KEY) {
     const freeModels = await modelDiscovery.getFreeModels(provider.name);
-    orModels = (freeModels || []).map((m: any) => m.id);
+    // ── HARD COST GUARD ── Only keep models with :free suffix
+    orModels = (freeModels || []).map((m: any) => m.id).filter((id: string) => id.includes(':free'));
   }
   if (orModels.length === 0) { orModels = ['openrouter/free']; }
   let totalModels = orModels.length;
