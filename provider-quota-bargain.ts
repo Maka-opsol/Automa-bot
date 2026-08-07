@@ -54,7 +54,20 @@ class QuotaBargainManager {
     const budget = this.budgets.get(providerName);
     if (budget === undefined) return true;
     const spent = parseFloat(db.selectCalibration.get(`spent_${providerName}`)?.value || '0');
-    return spent < budget * 0.8;
+    if (spent >= budget * 0.8) return false;
+
+    // ─── OpenRouter rate limiter integration ───
+    // Bargain hunting is 'standard' priority (not critical)
+    if (providerName === 'openrouter') {
+      try {
+        const limiter = require('./openrouter-rate-limiter');
+        return limiter.canUse('standard');
+      } catch {
+        // If rate limiter not available, fall through to old behavior
+      }
+    }
+
+    return true;
   }
 
   recordSpend(providerName: string, tokens: number, costPerToken: number) { 
@@ -78,7 +91,10 @@ class QuotaBargainManager {
     const logError = getLogError();
     try {
       const data = await fetchJSON('https://openrouter.ai/api/v1/models', {}, 10000);
-      const freebies = (data.data || []).filter((m: any) => m.pricing?.prompt === '0' && m.pricing?.completion === '0');
+      // ── HARD COST GUARD ── Both prompt AND completion must be exactly '0'.
+      const freebies = (data.data || []).filter((m: any) =>
+        m.pricing?.prompt === '0' && m.pricing?.completion === '0' && m.id.includes(':free')
+      );
       const topCandidates = freebies.slice(0, 5).map((m: any) => m.id);
       log(`Bargain hunter found fresh free models: ${topCandidates.join(', ')}`, 'INFO', 'quota');
       const db = _deps.database;
@@ -99,7 +115,7 @@ class QuotaBargainManager {
             if (!apiKey) {
               return { actionType: 'wait', currentState: 'error', reasoning: 'No OPENROUTER_API_KEY configured', targetX: 0, targetY: 0 };
             }
-            const result = await providersBase.callChatCompletion(endpoint, apiKey, modelId, base64Image, prompt, 'openrouter', {
+            const result = await providersBase.callChatCompletion(endpoint, apiKey, modelId, base64Image, prompt, {
               ...options,
               maxTokens: options.maxTokens || 4096,
               temperature: options.temperature || 0.1,
