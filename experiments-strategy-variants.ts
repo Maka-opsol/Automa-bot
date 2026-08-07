@@ -15,10 +15,6 @@ const VARIANT_DEFINITIONS = [
     description: 'Try z.ai and Groq before GitHub GPT',
     apply: async (context: any) => {
       const providers = await context.getAvailableProviders();
-      if (!providers || !Array.isArray(providers) || providers.length === 0) {
-        log('provider_order_alt: no providers available, skipping', 'DEBUG', 'experiments');
-        return;
-      }
       const reordered = [...providers].sort((a, b) => {
         const order = ['z.ai', 'Groq', 'GitHub GPT', 'Agnes', 'NVIDIA', 'Cloudflare', 'Cerebras', 'Gemini'];
         const getOrder = (name: any) => { const idx = order.indexOf(name); return idx === -1 ? order.length : idx; };
@@ -97,17 +93,9 @@ class ExperimentContext {
     this._originalVisionPriority = [...this._visionPriority];
   }
 
-  getAvailableProviders() { 
+  async getAvailableProviders() { 
     const { getAvailableProviders } = require('./providers-registry');
-    // getAvailableProviders is async — returns a Promise.
-    // Callers must await this. For sync contexts, return empty array.
-    const result = getAvailableProviders();
-    // If it's a Promise (async), log warning — experiments should use async apply
-    if (result && typeof result.then === 'function') {
-      log('getAvailableProviders() is async — experiment variant must use async apply()', 'WARN', 'experiments');
-      return [];
-    }
-    return result || [];
+    return getAvailableProviders();
   }
 
   setProviderOrder(order: any) { 
@@ -139,7 +127,7 @@ let activeExperiment: any = null;
 
 function getActiveExperiment() {  return activeExperiment; }
 
-function setActiveExperiment(id: any) { 
+async function setActiveExperiment(id: any) { 
   const variant = VARIANT_DEFINITIONS.find(v => v.id === id);
   if (!variant) {
     log(`Unknown variant: ${id}`, 'WARN', 'experiments');
@@ -149,20 +137,15 @@ function setActiveExperiment(id: any) {
     revertExperiment(activeExperiment);
   }
   const context = new ExperimentContext();
-  // apply() may be async — handle both sync and async variants
-  const applyResult = variant.apply(context);
-  const finalize = () => {
+  try {
+    await variant.apply(context);
     activeExperiment = { id: variant.id, context, startTime: Date.now(), results: { attempts: 0, successes: 0, latencies: [] } };
     log(`Started experiment: ${variant.name}`, 'INFO', 'experiments');
     return true;
-  };
-  if (applyResult && typeof applyResult.then === 'function') {
-    applyResult.then(finalize).catch((err: any) => {
-      logError(`Failed to start experiment ${variant.id}`, err);
-    });
-    return true; // optimistic
+  } catch (err: any) {
+    logError(`Failed to start experiment ${variant.id}`, err);
+    return false;
   }
-  return finalize();
 }
 
 function revertExperiment(experiment: any) { 
@@ -289,7 +272,7 @@ function getPromotedExperiments() {
   }
 }
 
-function startRandomExperiment() { 
+async function startRandomExperiment() {
   if (activeExperiment) return;
   const available = VARIANT_DEFINITIONS.filter(v => {
     const promoted = getPromotedExperiments();
@@ -300,7 +283,7 @@ function startRandomExperiment() {
     return;
   }
   const variant = available[Math.floor(Math.random() * available.length)];
-  setActiveExperiment(variant.id);
+  await setActiveExperiment(variant.id);
 }
 
   let _experimentTimer: any = null;
