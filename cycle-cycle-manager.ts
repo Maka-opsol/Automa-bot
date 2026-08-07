@@ -741,4 +741,4 @@ async function runCycle() {
   }
 }
 
-module.exports = { runCycle, requestStop, _injectDependencies };.
+module.exports = { runCycle, requestStop, _injectDependencies };
