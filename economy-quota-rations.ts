@@ -24,6 +24,11 @@
 //   - cycle-cycle-manager.ts calls shouldThrottle() before tribunal
 //   - providers-base.ts calls recordUsage() after each API call
 //   - render-free-plan.ts reads isEconomyMode() for screenshot settings
+//   - openrouter-rate-limiter.ts handles OR-specific hard limit (50/day)
+//
+// Note: OpenRouter's hard daily limit (50/day) is enforced by openrouter-rate-limiter.ts.
+// This module handles soft throttling (at 80%) for ALL providers including OpenRouter,
+// which provides an additional layer of pacing on top of the hard limit.
 //
 // Config:
 //   QUOTA_RATIONS_DAILY_LIMIT_PER_PROVIDER — daily limit (default 100 requests)
