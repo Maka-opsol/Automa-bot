@@ -1,10 +1,11 @@
 'use strict';
 
-import type { Deps } from './types/di-types';
-
 // ─── Dependency Injection ───────────────────────────────────────────────────
-let _deps: Deps = {};
-function _injectDependencies(deps: Deps) { _deps = deps; }
+let _deps: Record<string, any> = {};
+function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
+
+// Type for deps (inlined — avoid ESM 'import type' which can trigger tsx ESM mode)
+// interface Deps { [key: string]: any; }
 
 // ─── Lazy Requires (avoid top-level circular dependency chains) ─────────────
 // providers-base → logger → config (cycle risk)
