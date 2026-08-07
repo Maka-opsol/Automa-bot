@@ -217,6 +217,19 @@ function createContainer(): DIContainerType {
     tags: ['providers'],
   });
 
+  // OpenRouter rate limiter — the single source of truth for OR daily budget
+  // Registered early so providers can use it immediately
+  c.register('openRouterRateLimiter', {
+    factory: (deps: any) => {
+      const mod = require('./openrouter-rate-limiter');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['providers'],
+  });
+
   // providersBase and providersStats are registered in FOUNDATION UTILITIES above.
   // v5-fix: moved up so dependents (providerQuotaBargain, dashboard) don't
   // rely on late lazy-resolution.
@@ -954,6 +967,68 @@ function createContainer(): DIContainerType {
     critical: false,
     tags: ['utility'],
   });
+
+  // ═══════════════════════════════════════════════════════════
+  // RESILIENCE — Worst-case survival modules (R1-R16)
+  // ═══════════════════════════════════════════════════════════
+
+  const resilienceModules: ModuleTuple[] = [
+    // R1: Pre-OOM euthanasia
+    ['runtime-heap-guardian', 'runtimeHeapGuardian', ['config', 'logger', 'browser', 'cache']],
+    // R2: Diagnostic smoke test
+    ['config-boot-validation', 'configBootValidation', ['config', 'logger', 'database', 'providers', 'browser'], ['alerting']],
+    // R3a: Env var drift detection
+    ['config-drift-detector', 'configDriftDetector', ['config', 'logger', 'database'], ['alerting']],
+    // R3b: DNS-over-HTTPS fallback
+    ['providers-dns-rotation', 'providersDnsRotation', ['config', 'logger']],
+    // R4: Remote state backup
+    ['survival-tombstone', 'survivalTombstone', ['config', 'logger', 'database'], ['alerting']],
+    // R5: Disk wipe protection
+    ['survival-ephemeral-shield', 'survivalEphemeralShield', ['config', 'logger', 'database'], ['statePersist']],
+    // R6: External liveness beacon
+    ['survival-heartbeat-beacon', 'survivalHeartbeatBeacon', ['config', 'logger']],
+    // R7: Hot module isolation
+    ['runtime-module-quarantine', 'runtimeModuleQuarantine', ['config', 'logger'], ['alerting']],
+    // R8: Crash-resistant browser
+    ['browser-phoenix', 'browserPhoenix', ['config', 'logger', 'browser'], ['alerting']],
+    // R9: Semantic progress detection
+    ['progress-semantic-detector', 'progressSemanticDetector', ['config', 'logger']],
+    // R10a: Speed benchmark timeout
+    ['progress-speed-benchmark', 'progressSpeedBenchmark', ['config', 'logger', 'database']],
+    // R10b: Circular path detection
+    ['progress-circular-path-detector', 'progressCircularPathDetector', ['config', 'logger']],
+    // R11: Cross-module failure correlation
+    ['cascade-breaker', 'cascadeBreaker', ['config', 'logger', 'database'], ['alerting']],
+    // R12: Quota rationing
+    ['economy-quota-rations', 'economyQuotaRations', ['config', 'logger', 'database'], ['alerting', 'providerRegistry']],
+    // R13a: Action whitelist per state
+    ['policy-action-validator', 'policyActionValidator', ['config', 'logger']],
+    // R13b: State transition guard
+    ['policy-state-guard', 'policyStateGuard', ['config', 'logger']],
+    // R14a: CAPTCHA loop detection
+    ['auth-captcha-loop-guard', 'authCaptchaLoopGuard', ['config', 'logger', 'database'], ['alerting']],
+    // R14b: Token lifecycle management
+    ['auth-token-graveyard', 'authTokenGraveyard', ['config', 'logger', 'database'], ['alerting', 'auth']],
+    // R15: IP rotation awareness
+    ['network-ip-rotator', 'networkIpRotator', ['config', 'logger', 'database'], ['alerting', 'providers']],
+    // R16: No-browser fallback
+    ['browser-ghost-mode', 'browserGhostMode', ['config', 'logger']],
+  ];
+
+  for (const tuple of resilienceModules) {
+    const [modPath, name, deps, optionalDeps] = tuple;
+    c.register(name, {
+      factory: (deps: any) => {
+        const mod = require(`./${modPath}`);
+        mod._injectDependencies(deps);
+        return mod;
+      },
+      deps,
+      optionalDeps: optionalDeps || [],
+      critical: false,
+      tags: ['resilience'],
+    });
+  }
 
   return c;
 }
