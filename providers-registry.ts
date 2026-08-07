@@ -68,6 +68,10 @@ const PROVIDER_TABLE: ProviderEntry[] = [
 // ===============================================================================
 
 const providerCycleState = { githubRateLimitCount: 0, githubSwappedOut: false };
+let _lastEmptyProviderLogTime = 0;
+const EMPTY_PROVIDER_LOG_COOLDOWN_MS = 10 * 60 * 1000; // 10 min between CRITICAL logs
+let _lastEmergencyDiscoveryTime = 0;
+const EMERGENCY_DISCOVERY_COOLDOWN_MS = 10 * 60 * 1000; // 10 min between emergency discoveries
 let cycleBlacklist = new Set<string>();
 let cycleFailCounts: Record<string, number> = {};
 let dynamicProviders: Array<{ name: string; fn: any }> = [];
@@ -378,7 +382,15 @@ async function getAvailableProviders(options?: { visionOnly?: boolean }) {
 
   // --- Phase 4: Fail-fast on empty (P16) ---
   if (candidates.length === 0) {
-    log('CRITICAL: No providers available after all filters. Attempting emergency discovery + registration.', 'ERROR', 'registry');
+    const now = Date.now();
+    // Rate-limit CRITICAL log to once per 10 minutes to avoid spam
+    if (now - _lastEmptyProviderLogTime > EMPTY_PROVIDER_LOG_COOLDOWN_MS) {
+      log('CRITICAL: No providers available after all filters. Attempting emergency discovery + registration.', 'ERROR', 'registry');
+      _lastEmptyProviderLogTime = now;
+    }
+    // Rate-limit emergency discovery to once per 10 minutes
+    if (now - _lastEmergencyDiscoveryTime > EMERGENCY_DISCOVERY_COOLDOWN_MS) {
+      _lastEmergencyDiscoveryTime = now;
     try {
       const discovered = await configLoader.autoDiscoverModels();
       if (discovered.length > 0) {
@@ -412,6 +424,9 @@ async function getAvailableProviders(options?: { visionOnly?: boolean }) {
         }
       }
     } catch (e: any) { log(`Emergency discovery failed: ${e.message}`, 'ERROR', 'registry'); }
+    } else {
+      log('No providers available — skipping emergency discovery (cooldown active).', 'DEBUG', 'registry');
+    }
   }
 
   // Log final provider list with health scores
