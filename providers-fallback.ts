@@ -74,6 +74,13 @@ const LOGIN_SELECTORS = [
   { selector: 'input[name="loginfmt"]', state: 'microsoft_email_input', actionType: 'input_email' },
   { selector: 'input[type="password"]', state: 'microsoft_password_input', actionType: 'input_password' },
   { selector: 'input[name="passwd"]', state: 'microsoft_password_input', actionType: 'input_password' },
+  { selector: 'input[name="password"]', state: 'advlearn_login', actionType: 'input_password' },
+];
+
+const KMSI_SELECTORS = [
+  { selector: 'button:has-text("Stay signed in")', state: 'microsoft_stay_signed_in' },
+  { selector: 'button:has-text("Yes")', state: 'microsoft_stay_signed_in' },
+  { selector: 'input[id="idBtn_Back"]', state: 'microsoft_stay_signed_in' },
 ];
 
 const SIGNIN_SELECTORS = [
@@ -173,8 +180,25 @@ async function _getFallbackActionInner(page: any, log: any): Promise<any> {
     }
   }
 
-  // Microsoft login
-  if (url.includes('login.microsoftonline.com')) {
+  // Microsoft login (all sub-pages: email, password, kmsi)
+  if (url.includes('login.microsoftonline.com') || url.includes('login.live.com') || url.includes('login.microsoft.com')) {
+    // Try KMSI selectors first (if on the stay-signed-in page)
+    if (url.includes('/kmsi')) {
+      for (const entry of KMSI_SELECTORS) {
+        const el = await _safeQuery(page, entry.selector);
+        if (el) {
+          const box = await _safeBoundingBox(page, el);
+          if (box) {
+            const action = _boxToAction(box, entry.state);
+            if (action) {
+              log(`Fallback found ${entry.selector} on KMSI page`, 'DEBUG', 'fallback');
+              return action;
+            }
+          }
+        }
+      }
+    }
+    // Login input selectors
     for (const entry of LOGIN_SELECTORS) {
       const el = await _safeQuery(page, entry.selector);
       if (el) {
@@ -191,8 +215,8 @@ async function _getFallbackActionInner(page: any, log: any): Promise<any> {
     }
   }
 
-  // Generic signin buttons (any page)
-  if (url.includes('login') || url.includes('signin') || url.includes('auth')) {
+  // ADVLEARN or generic auth pages
+  if (url.includes('login') || url.includes('signin') || url.includes('auth') || url.includes('advlearn')) {
     for (const entry of SIGNIN_SELECTORS) {
       const el = await _safeQuery(page, entry.selector);
       if (el) {
