@@ -29,6 +29,10 @@ function _getHealth() { if (!_healthMod) _healthMod = require('./providers-healt
 let _serializersMod: any = null;
 function _getSerializers() { if (!_serializersMod) _serializersMod = require('./providers-serializers'); return _serializersMod; }
 
+// ─── Lazy OpenRouter rate limiter — loaded on first use ─────────────────────
+let _orLimiter: any = null;
+function _getOrLimiter() { if (!_orLimiter) _orLimiter = require('./openrouter-rate-limiter'); return _orLimiter; }
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // UTILITY FUNCTIONS (preserved from original)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -105,7 +109,41 @@ const { rollbackProvider, getProviderConfig, getFallbackModels } = require('./pr
 // plain-string content when no image (fixes "content must be a string" errors),
 // and array content only when the provider supports vision AND multipart.
 
+// OPENROUTER DAILY REQUEST LIMIT (delegates to openrouter-rate-limiter.ts)
+// Budget logic lives in openrouter-rate-limiter.ts (single source of truth).
+// This maps providerName → priority tier and delegates.
+//
+// Priority mapping:
+//   'critical'  → OpenRouter tribunal/codegen direct callers
+//   'standard'  → Bargain, self-heal, model evolution, meta-learner
+//   'low'       → Diary, reflection, non-essential
+function _orCheckDailyLimit(providerName: string): void {
+  const limiter = _getOrLimiter();
+  const isCritical = providerName.toLowerCase().includes('openrouter');
+  const isLow = providerName.toLowerCase().includes('diary') ||
+                 providerName.toLowerCase().includes('reflection') ||
+                 providerName.toLowerCase().includes('documentation');
+  const priority = isCritical ? 'critical' : (isLow ? 'low' : 'standard');
+  limiter.checkBudget(priority);
+}
+
+// Also record usage after successful OR calls (delegates to rate limiter)
+function _orRecordUsage(providerName: string): void {
+  const limiter = _getOrLimiter();
+  const isCritical = providerName.toLowerCase().includes('openrouter');
+  const isLow = providerName.toLowerCase().includes('diary') ||
+                 providerName.toLowerCase().includes('reflection') ||
+                 providerName.toLowerCase().includes('documentation');
+  const priority = isCritical ? 'critical' : (isLow ? 'low' : 'standard');
+  limiter.recordUsage(priority);
+}
+
 async function callChatCompletion(endpoint: string, apiKey: string, model: string, base64Image: string | null, prompt: string, providerName: string, options: any = {}) { 
+  // ─── OpenRouter daily limit gate ───
+  if (endpoint.includes('openrouter.ai')) {
+    _orCheckDailyLimit(providerName);
+  }
+
   const config = getCONFIG();
   const maxTokens = options.maxTokens || config.MAX_TOKENS || 4096;
   const temperature = options.temperature !== undefined ? options.temperature : (config.TEMPERATURE !== undefined ? config.TEMPERATURE : 0.1);
@@ -177,6 +215,12 @@ async function callChatCompletion(endpoint: string, apiKey: string, model: strin
   const data = JSON.parse(responseText);
   const rawContent = data.choices?.[0]?.message?.content;
   if (!rawContent) throw new Error('EMPTY_RESPONSE');
+
+  // ─── Record OpenRouter usage after successful call ───
+  if (endpoint.includes('openrouter.ai')) {
+    _orRecordUsage(providerName);
+  }
+
   return rawContent;
 }
 
@@ -585,4 +629,8 @@ module.exports = {
   coalescer,
   // DI
   _injectDependencies,
+  // OpenRouter rate limiter getter (for other modules that need direct access)
+  _getOrLimiter,
+  // Usage recording (for providers that bypass callChatCompletion)
+  _orRecordUsage,
 };
