@@ -10,24 +10,32 @@ function log(msg: string, level?: string, mod?: string) { _deps.logger?.log?.(ms
 function getSendAlert() { return _deps.alerting?.sendAlert || (() => {}); }
 
 let lastActions: any[] = [];
-function resetStagnationState() { lastActions = []; lastScreenshotHash = null; }
-
 let lastScreenshotHash: any = null;
+let consecutiveUnchangedCount = 0;
+const MAX_CONSECUTIVE_UNCHANGED = 3; // Only alert/reload after 3 cycles with same screenshot
+
+function resetStagnationState() { lastActions = []; lastScreenshotHash = null; consecutiveUnchangedCount = 0; }
 
 async function recoverIfStuck(page: any, screenshotBuffer: any, action: any) { 
   if (!action || !action.actionType) return;
   const currentHash = require('crypto').createHash('md5').update(screenshotBuffer).digest('hex');
   if (lastScreenshotHash === currentHash) {
-    const CONFIG = getCONFIG();
-    log('⚠️ Screenshot unchanged -- possible stagnation.', 'WARN', 'stagnation');
-    if (CONFIG.ALERT_ON_STAGNATION) try { getSendAlert()('Stagnation detected: screenshot unchanged'); } catch (e: any) {}
-    await page.reload();
-    await sleep(5000);
-    _deps.browser?.scrollPage?.(page, 0, 300);
-    await sleep(2000);
-    lastScreenshotHash = null;
+    consecutiveUnchangedCount++;
+    if (consecutiveUnchangedCount >= MAX_CONSECUTIVE_UNCHANGED) {
+      const CONFIG = getCONFIG();
+      log(`⚠️ Screenshot unchanged ${consecutiveUnchangedCount} consecutive cycles -- possible stagnation.`, 'WARN', 'stagnation');
+      if (CONFIG.ALERT_ON_STAGNATION) try { getSendAlert()(`Stagnation detected: screenshot unchanged ${consecutiveUnchangedCount} cycles`); } catch (e: any) {}
+      await page.reload();
+      await sleep(5000);
+      _deps.browser?.scrollPage?.(page, 0, 300);
+      await sleep(2000);
+      lastScreenshotHash = null;
+      consecutiveUnchangedCount = 0;
+    }
     return;
   }
+  // Screenshot changed — reset counter
+  consecutiveUnchangedCount = 0;
   lastScreenshotHash = currentHash;
   const CONFIG = getCONFIG();
   lastActions.push(action.actionType);
