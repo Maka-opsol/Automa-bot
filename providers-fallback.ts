@@ -87,14 +87,15 @@ const SIGNIN_SELECTORS = [
  * Generate a fallback action when the tribunal/AI fails.
  *
  * Strategy:
- *   1. Try visual recovery (longevity-ui-recovery) — works across UI redesigns
- *   2. Context-specific selectors (assignments, login, signin)
- *   3. Return wait action as last resort
+ *   1. Pixel analysis (no DOM needed) — finds inputs/buttons by raw pixel color
+ *   2. Visual recovery (longevity-ui-recovery) — works across UI redesigns
+ *   3. Context-specific selectors (assignments, login, signin)
+ *   4. Return wait action as last resort
  *
  * On Render free plan:
  *   - Overall timeout prevents hung page.$() from consuming cycle budget
  *   - Per-selector timeout (2s) prevents individual query hangs
- *   - Removed dead code (unused viewport computation, unnecessary browser require)
+ *   - Pixel fallback is first because it works when DOM is completely empty (Flutter canvas)
  */
 async function getFallbackAction(page: any) {
   const { log } = _getLog();
@@ -112,6 +113,23 @@ async function getFallbackAction(page: any) {
 }
 
 async function _getFallbackActionInner(page: any, log: any): Promise<any> {
+  // ── Stage 0: Pixel-based analysis (works with NO DOM, NO AI, NO semantics) ──
+  // Decodes the screenshot PNG to raw RGBA pixels and scans for:
+  //   - White rectangles = input fields (email/password)
+  //   - Blue rectangles = Microsoft buttons (Next/Sign in)
+  //   - Green/orange rectangles = Watch/Start buttons
+  // This is the ultimate fallback when everything else is blind.
+  try {
+    const { generatePixelFallbackAction } = require('./pixel-fallback');
+    const pixelAction = await generatePixelFallbackAction(page);
+    if (pixelAction) {
+      log(`Pixel fallback provided action: ${pixelAction.actionType} at (${pixelAction.targetX}, ${pixelAction.targetY})`, 'INFO', 'fallback');
+      return pixelAction;
+    }
+  } catch (e: any) {
+    log(`Pixel fallback failed: ${e.message || e}`, 'DEBUG', 'fallback');
+  }
+
   // ── Stage 1: Visual recovery (works across UI redesigns) ──
   try {
     const { generateRecoveryAction } = require('./longevity-ui-recovery');
