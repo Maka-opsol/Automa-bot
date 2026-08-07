@@ -583,8 +583,23 @@ async function runCycle() {
           continue;
         }
         if (unknownStateCounter >= MAX_UNKNOWN_STATE) {
-          log(`Unknown state ${unknownStateCounter} times in a row. Forcing page reload to break loop.`, 'WARN', 'cycle');
+          log(`Unknown state ${unknownStateCounter} times in a row. Trying pixel fallback before reload.`, 'WARN', 'cycle');
           unknownStateCounter = 0;
+          // Try pixel-based fallback before reloading — it can handle login pages
+          // and other pages even when AI, DOM, and semantics are all unavailable
+          try {
+            const pixelFallback = require('./pixel-fallback');
+            const pixelAction = await pixelFallback.generatePixelFallbackAction(page);
+            if (pixelAction && pixelAction.actionType && pixelAction.actionType !== 'wait') {
+              log(`Pixel fallback saved us: ${pixelAction.actionType} at (${pixelAction.targetX}, ${pixelAction.targetY}) state=${pixelAction.currentState}`, 'INFO', 'cycle');
+              if (executeAction) await executeAction(page, pixelAction);
+              lastScreenshotChangeTime = Date.now();
+              continue;
+            }
+          } catch (pfErr: any) {
+            log(`Pixel fallback attempt failed: ${pfErr.message || pfErr}`, 'DEBUG', 'cycle');
+          }
+          // Pixel fallback didn't help — fall back to reload
           try {
             const currentUrl = page.url();
             await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
@@ -726,4 +741,4 @@ async function runCycle() {
   }
 }
 
-module.exports = { runCycle, requestStop, _injectDependencies };
+module.exports = { runCycle, requestStop, _injectDependencies };.
