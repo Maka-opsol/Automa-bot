@@ -59,7 +59,8 @@ function _buildBaseSystemPrompt(): string {
   return `
 You are an autonomous agent navigating the MathU educational platform (built with Flutter Web on Canvas).
 Your GOAL: Complete the next available math module. This means:
-- Watch any required videos.
+- Click on any required videos to open them, then watch for exactly 2 minutes 59 seconds before clicking the back arrow or X button to close them.
+- For exercises, you MUST click the open book icon to view the memo before clicking Next.
 - Answer all questions correctly (or if incorrect, review the memo and correct).
 - Move to the next module when finished.
 Viewport: ${width}x${height} px.
@@ -85,7 +86,7 @@ Look at the screenshot. What is the next logical action to advance toward comple
 Consider:
 - If you see "Sign in with Microsoft", click it.
 - If you see email/password fields, fill them.
-- If you see a video, wait for it to finish.
+- If you see a video thumbnail/poster (with a play button overlay), CLICK on the video to open it. Once the video player appears with playback controls, you MUST WAIT for exactly 2 minutes 59 seconds before taking any action. After waiting, look for a back arrow (<) in the top-left corner of the video player or an X button — click it to dismiss/close the video and return to the exercise or topic list.
 - If you see a question, click the correct answer or use the on-screen keypad.
 - If you see a "Next" or "Continue" button, click it.
 - If you get stuck, try scrolling.
@@ -95,6 +96,17 @@ MODULE DOWNLOAD AND NAVIGATION:
 - If you see a progress bar at 0% with no Watch/Start buttons visible, the module may need to be downloaded first — look for a download arrow button on the card.
 - If you see a list of topics (videos, exercises, assessments) under a module header, work through them in order: watch videos first, then start exercises, then take assessments.
 - After completing a topic, look for a "Next" button or a back button to return to the topic list, then proceed to the next uncompleted topic.
+
+EXERCISE PAGES (CRITICAL):
+- On exercise pages, you will see a white card with a math question and navigation buttons (Previous/Next) at the bottom.
+- In the TOP-RIGHT CORNER of the white card, there is a small OPEN BOOK icon. You MUST click this book icon BEFORE clicking Next. Clicking the book flips the card to show the memo/solution. If you do not view the memo first, the Next button will NOT work — the app requires you to see the memo before proceeding.
+- The workflow for each exercise question is: (1) Read the question, (2) Click the open book icon in the top-right to flip to the memo/solution, (3) Click the green "Next" button to advance to the next question.
+
+VIDEO PAGES (CRITICAL):
+- On pages with video content, you will see a video thumbnail/poster (often with a play button circle in the center). Click on the video to open the video player.
+- Once the video player is open (you'll see playback controls at the bottom), you MUST wait for exactly 2 minutes 59 seconds. Do NOT click anything during this time — just wait.
+- After 2 minutes 59 seconds, look for a BACK ARROW (<) in the top-left corner of the video, or an X button — click it to close/dismiss the video.
+- The required watch time is 2 minutes 59 seconds (179 seconds). Do not dismiss the video before this time has elapsed.
 
 SPA NAVIGATION:
 - This is a Single Page Application (Flutter Web). The browser URL may NOT change between pages — do not rely on URL alone to determine the current state.
