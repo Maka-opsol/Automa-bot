@@ -71,6 +71,12 @@ let _mathpix: any = null;
 function _getMathpix() { if (!_mathpix) { try { _mathpix = require('./services-mathpix'); } catch { _mathpix = null; } } return _mathpix; }
 let _degradationLadder: any = null;
 function _getDegradationLadder() { if (!_degradationLadder) { try { _degradationLadder = require('./self-heal-degradation-ladder'); } catch { _degradationLadder = null; } } return _degradationLadder; }
+let _solutionCache: any = null;
+function _getSolutionCache() { if (!_solutionCache) { try { _solutionCache = require('./math-solution-cache'); } catch { _solutionCache = null; } } return _solutionCache; }
+let _tmpGuardian: any = null;
+function _getTmpGuardian() { if (!_tmpGuardian) { try { _tmpGuardian = require('./longevity-tmp-guardian'); } catch { _tmpGuardian = null; } } return _tmpGuardian; }
+let _coldStart: any = null;
+function _getColdStart() { if (!_coldStart) { try { _coldStart = require('./render-cold-start'); } catch { _coldStart = null; } } return _coldStart; }
 
 async function runCycle() { 
   // ─── Resolve all dependencies at cycle start ───
@@ -153,6 +159,31 @@ async function runCycle() {
   const degradationLadder = _getDegradationLadder();
   let degradationLevel = 0;
   let degradationLevelName = 'FULL';
+
+  // ─── /tmp Disk Check (Response 6) ───
+  // Quick check before cycle — if /tmp is too full, run a prune.
+  // This prevents silent write failures mid-cycle.
+  try {
+    const tmpG = _getTmpGuardian();
+    if (tmpG) {
+      const usage = tmpG.getDiskUsage();
+      if (usage.usagePct > parseFloat(CONFIG.TMP_GUARDIAN_WARN || '0.70')) {
+        log(`/tmp usage high: ${(usage.usagePct * 100).toFixed(1)}% — running prune`, 'WARN', 'cycle');
+        tmpG.prune();
+      }
+    }
+  } catch { /* non-critical */ }
+
+  // ─── Cold Start Recovery (Response 6) ───
+  // On first cycle after a cold start, log the recovery status.
+  try {
+    const cs = _getColdStart();
+    if (cs && cs.isColdStart() && !cs._recoveryLogged) {
+      const info = cs.getColdStartInfo();
+      log(`Cold start recovery: ${info?.reason || 'unknown'}. Using fast startup path.`, 'INFO', 'cycle');
+      cs._recoveryLogged = true;
+    }
+  } catch { /* non-critical */ }
   try {
     if (degradationLadder) {
       const dlResult = degradationLadder.degradationLadder?.calculateLevel?.() || degradationLadder.calculateLevel?.();
@@ -456,6 +487,54 @@ async function runCycle() {
         }
       }
 
+      // ─── Solution Cache Check (Response 5) ───
+      // Before calling LLM, check if we've seen this exact problem before.
+      // Exact match → use cached solution directly (saves budget).
+      // Similar match → include cached solution as context hint.
+      let _cacheHitProblemText = '';
+      let _cacheHitHash = '';
+      const solutionCache = _getSolutionCache();
+      if (solutionCache && action && (action.currentState === 'question' || action.actionType === 'keypad_input' || action.value)) {
+        try {
+          // Get problem text from page or action reasoning
+          let probTextForCache = '';
+          try {
+            const bodyTextForCache = await page.evaluate(() => document.body?.innerText || '');
+            if (bodyTextForCache && bodyTextForCache.length > 20) {
+              probTextForCache = bodyTextForCache.substring(0, 2000);
+            }
+          } catch {}
+          if (!probTextForCache && action.reasoning) {
+            probTextForCache = action.reasoning;
+          }
+
+          if (probTextForCache) {
+            const cacheResult = solutionCache.lookup(probTextForCache);
+            if (cacheResult.type === 'exact' && cacheResult.solution) {
+              const sol = cacheResult.solution;
+              log(`Solution cache EXACT HIT — reusing verified solution (type=${sol.problemType}, used ${sol.successCount}x before)`, 'INFO', 'cycle');
+              // Attach cached solution to action so downstream can use it
+              action._cachedSolution = sol.solution;
+              action._cachedSteps = sol.steps;
+              action._cacheHit = 'exact';
+              _cacheHitProblemText = probTextForCache;
+              _cacheHitHash = cacheResult.hash;
+              updateStats({ solutionCacheHits: (getStats().solutionCacheHits || 0) + 1 });
+            } else if (cacheResult.type === 'similar' && cacheResult.similarSolution) {
+              const simSol = cacheResult.similarSolution;
+              log(`Solution cache SIMILAR HIT — including as context hint (type=${simSol.problemType})`, 'INFO', 'cycle');
+              action._cachedSolutionHint = simSol.solution;
+              action._cachedStepsHint = simSol.steps;
+              action._cacheHit = 'similar';
+              _cacheHitHash = cacheResult.hash;
+              updateStats({ solutionCacheSimilarHits: (getStats().solutionCacheSimilarHits || 0) + 1 });
+            }
+          }
+        } catch (cacheErr: any) {
+          log(`Solution cache lookup error: ${cacheErr.message || cacheErr}`, 'DEBUG', 'cycle');
+        }
+      }
+
       // ─── Problem Classification Pipeline (Response 4) ───
       // Classify the math problem type from available text, and optionally
       // re-OCR with Mathpix if the vision model's text quality is poor.
@@ -537,6 +616,29 @@ async function runCycle() {
             } else if (verifyResult.correct && verifyResult.method !== 'unknown') {
               log(`Math verification PASSED (method=${verifyResult.method}, conf=${verifyResult.confidence.toFixed(2)})`, 'INFO', 'cycle');
               updateStats({ mathVerifyPassed: (getStats().mathVerifyPassed || 0) + 1 });
+
+              // ─── Solution Cache Store (Response 5) ───
+              // Store the verified solution for future reuse.
+              // If this was a cache hit, record the successful reuse.
+              const solCache2 = _getSolutionCache();
+              if (solCache2) {
+                try {
+                  if (_cacheHitHash && _cacheHitProblemText) {
+                    // This was a cache hit — record successful reuse
+                    solCache2.recordReuseOutcome(_cacheHitHash, true);
+                  } else if (problemContext) {
+                    // New solution — store it
+                    const steps = action.reasoning ? action.reasoning.split(/\n|\./).filter((s: string) => s.trim().length > 10).slice(0, 10) : [];
+                    solCache2.store(problemContext, answerValue, steps, {
+                      problemType: action._problemType || 'UNKNOWN',
+                      modelUsed: action.provider || 'unknown',
+                      verified: true,
+                    });
+                  }
+                } catch (storeErr: any) {
+                  log(`Solution cache store error: ${storeErr.message || storeErr}`, 'DEBUG', 'cycle');
+                }
+              }
             }
           } catch (verifyErr: any) {
             log(`Math verification error: ${verifyErr.message || verifyErr}. Proceeding with action.`, 'WARN', 'cycle');
@@ -674,6 +776,10 @@ async function runCycle() {
         if (upsertLastState) upsertLastState.run(page.url(), action.currentState, Date.now());
         consecutiveFailures = 0;
         saveCheckpoint?.({ url: page.url(), state: action.currentState, questionsCompleted });
+        // Run solution cache maintenance every 100 questions (Response 5)
+        if (questionsCompleted % 100 === 0) {
+          try { _getSolutionCache()?.runMaintenance?.(); } catch { /* non-critical */ }
+        }
         if (currentModule && recordModuleCompletion) {
           const timeTaken = Date.now() - cycleStart;
           recordModuleCompletion(currentModule, timeTaken);
