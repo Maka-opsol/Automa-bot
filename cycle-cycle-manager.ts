@@ -806,6 +806,55 @@ async function runCycle() {
         consecutiveFailures = 0;
       }
 
+      // ─── Pixel Calibration Sampling ───
+      // After a successful click, sample the button color at click coordinates.
+      // This builds a distribution of observed colors per category, so pixel-fallback
+      // can adapt if MathU changes its color scheme.
+      if (actionSuccess && action.actionType === 'click' && (action.targetX > 0 || action.targetY > 0)) {
+        try {
+          const pixelCal = require('./pixel-calibration');
+          const pngShot = await page.screenshot({ type: 'png', fullPage: false }).catch(() => null);
+          if (pngShot && pngShot.length > 100) {
+            // Use DPR-adjusted coordinates (action coords are in viewport pixels)
+            const dprMod = require('./browser');
+            const dpr = dprMod._dprScale || 1.0;
+            pixelCal.sampleAtCoordinates(
+              pngShot,
+              Math.round(action.targetX * dpr),
+              Math.round(action.targetY * dpr),
+              action.actionType
+            ).catch(() => {});
+            // Also sample surrounding area (background, adjacent elements)
+            pixelCal.sampleSurroundings(
+              pngShot,
+              Math.round(action.targetX * dpr),
+              Math.round(action.targetY * dpr),
+              action.actionType
+            ).catch(() => {});
+          }
+        } catch (calErr: any) {
+          log(`Pixel calibration sampling failed: ${calErr.message || calErr}`, 'DEBUG', 'cycle');
+        }
+      }
+
+      // ─── Pixel Explorer Outcome Observation ───
+      // If this was a pixel-explorer action, observe the outcome to learn from it.
+      if (actionSuccess && action._pixelExplorer && action._explorationMapKey) {
+        try {
+          const pixelExplorer = require('./pixel-explorer');
+          // screenshotHash was captured before the action as `screenshotHash` variable
+          pixelExplorer.observeOutcome(
+            page,
+            typeof screenshotHash === 'string' ? screenshotHash : '',
+            action._explorationMapKey,
+            action._explorationCellCx || action.targetX,
+            action._explorationCellCy || action.targetY
+          ).catch(() => {});
+        } catch (expErr: any) {
+          log(`Pixel explorer outcome observation failed: ${expErr.message || expErr}`, 'DEBUG', 'cycle');
+        }
+      }
+
       // ─── Action Cache Save / Failure Tracking ───
       // After action execution, update the cache:
       // - Success: save the action (if not from cache) for future reuse
