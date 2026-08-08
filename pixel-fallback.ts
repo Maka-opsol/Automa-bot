@@ -18,7 +18,9 @@
 //   5. Various intermediate screens (Continue, etc.)
 //
 // APP PAGES HANDLED:
-//   - Assignments: finds Start/Watch/Redo blue buttons
+//   - Assignments: finds download arrow buttons, then Start/Watch/Redo blue buttons
+//   - Module download: detects download arrow icon on module cards, clicks to download
+//   - Module topics: detects expanded module content with topic buttons
 //   - Quiz: finds Done/Submit teal-green buttons, numeric keypad
 //   - Exercise: finds Next/Previous navigation
 //   - Score screen: finds Continue to pathway button
@@ -144,6 +146,16 @@ function _isMicrosoftBlue(r: number, g: number, b: number): boolean {
 /** Deep royal blue (MathU app header/sidebar): #1e3a8a → R:20-40 G:50-70 B:120-150 */
 function _isDeepBlue(r: number, g: number, b: number): boolean {
   return r < 50 && g > 40 && g < 80 && b > 100 && b < 170;
+}
+
+/** Download button circle color: dark navy blue (#1e3a8a range) */
+function _isDownloadButtonColor(r: number, g: number, b: number): boolean {
+  return r < 55 && g > 40 && g < 80 && b > 110 && b < 180;
+}
+
+/** White/light arrow color inside download button: R>200 G>200 B>200 */
+function _isArrowWhite(r: number, g: number, b: number): boolean {
+  return r > 200 && g > 200 && b > 200;
 }
 
 /** Teal-green gradient (quiz Submit/Done buttons): #0d9488 to #22c55e */
@@ -413,6 +425,108 @@ function _findDarkButton(
 }
 
 /**
+ * Find download arrow button on module cards.
+ * These are dark navy blue circles (~30-45px diameter) containing a white
+ * downward arrow icon, typically located in the right portion of module cards.
+ * On MathU, each module card has a download button that must be clicked
+ * before the module content (topics with Watch/Start buttons) becomes visible.
+ */
+function _findDownloadButton(
+  rgba: Uint8ClampedArray, width: number, height: number
+): DetectedRect | null {
+  // Scan the card area: roughly right 40-85% horizontally, 15-85% vertically
+  const y1 = Math.floor(height * 0.15);
+  const y2 = Math.floor(height * 0.85);
+  const x1 = Math.floor(width * 0.40);
+  const x2 = Math.floor(width * 0.85);
+
+  const downloadBands = _findColorBands(rgba, width, height, _isDownloadButtonColor, y1, y2, x1, x2, 3);
+
+  // Filter for roughly square shapes (download buttons are circular)
+  const candidates = downloadBands
+    .filter(r => {
+      const aspectRatio = r.w / Math.max(r.h, 1);
+      // Download buttons are roughly square (circles appear as squares in pixel scan)
+      return r.w >= 25 && r.w <= 55 && r.h >= 25 && r.h <= 55 &&
+             aspectRatio > 0.6 && aspectRatio < 1.6;
+    });
+
+  if (candidates.length === 0) return null;
+
+  // Verify candidate has a white arrow inside (downward pointing)
+  // Sample pixels in the center of the button for white arrow pixels
+  for (const candidate of candidates) {
+    let whitePixelsInCenter = 0;
+    let totalPixelsChecked = 0;
+    const cx = candidate.cx;
+    const cy = candidate.cy;
+    const radius = Math.min(candidate.w, candidate.h) / 2;
+
+    // Check a vertical strip in the center (the arrow shaft)
+    for (let dy = -Math.floor(radius * 0.6); dy <= Math.floor(radius * 0.6); dy += 2) {
+      const px = cx;
+      const py = cy + dy;
+      if (px >= 0 && px < width && py >= 0 && py < height) {
+        const idx = (py * width + px) * 4;
+        totalPixelsChecked++;
+        if (_isArrowWhite(rgba[idx], rgba[idx + 1], rgba[idx + 2])) {
+          whitePixelsInCenter++;
+        }
+      }
+    }
+    // Also check a horizontal strip lower-half (the arrow head)
+    for (let dx = -Math.floor(radius * 0.5); dx <= Math.floor(radius * 0.5); dx += 2) {
+      const px = cx + dx;
+      const py = Math.floor(cy + radius * 0.3);
+      if (px >= 0 && px < width && py >= 0 && py < height) {
+        const idx = (py * width + px) * 4;
+        totalPixelsChecked++;
+        if (_isArrowWhite(rgba[idx], rgba[idx + 1], rgba[idx + 2])) {
+          whitePixelsInCenter++;
+        }
+      }
+    }
+
+    // If enough white pixels inside, this is a download button with arrow
+    if (totalPixelsChecked > 0 && whitePixelsInCenter / totalPixelsChecked > 0.25) {
+      log(`Pixel fallback: found download button at (${cx}, ${cy}) size ${candidate.w}x${candidate.h}`, 'INFO', 'pixel-fallback');
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Detect if module content has loaded (topics visible with multiple small colored buttons).
+ * After clicking download, the module card expands to show individual topics.
+ * This function checks for a cluster of 2+ small colored buttons (Watch/Start)
+ * which indicates the module content is now visible.
+ */
+function _isModuleContentLoaded(
+  rgba: Uint8ClampedArray, width: number, height: number
+): boolean {
+  // Look for clusters of small colored buttons in the main content area
+  const y1 = Math.floor(height * 0.20);
+  const y2 = Math.floor(height * 0.85);
+  const x1 = Math.floor(width * 0.15);
+  const x2 = Math.floor(width * 0.85);
+
+  const isButtonColor = (r: number, g: number, b: number) =>
+    _isGreenish(r, g, b) || _isOrangeish(r, g, b) || _isTealGreen(r, g, b);
+
+  const coloredBands = _findColorBands(rgba, width, height, isButtonColor, y1, y2, x1, x2, 3);
+
+  // Filter for small button shapes (topic buttons are smaller than main action buttons)
+  const topicButtons = coloredBands.filter(r => {
+    return r.w >= 40 && r.w <= 200 && r.h >= 15 && r.h <= 50;
+  });
+
+  // If we see 2+ small colored buttons, module content is likely loaded
+  return topicButtons.length >= 2;
+}
+
+/**
  * Find lavender/blue-grey pill-shaped buttons (multiple choice options in quiz).
  */
 function _findChoiceButtons(
@@ -431,6 +545,190 @@ function _findChoiceButtons(
       return r.w >= 60 && r.w <= 400 && r.h >= 20 && r.h <= 60 && aspectRatio > 2 && aspectRatio < 10;
     })
     .sort((a, b) => a.cx - b.cx);
+}
+
+// ─── Selected choice detection ─────────────────────────────────────────────
+
+/**
+ * Detect if a choice button is already "selected" (highlighted/active state).
+ * In MathU quiz, a selected choice typically has a darker border or filled background
+ * compared to unselected lavender buttons. We check for a more saturated/colored state.
+ */
+function _isSelectedChoice(
+  rgba: Uint8ClampedArray, width: number, rect: DetectedRect
+): boolean {
+  // Sample the center of the choice button — selected choices tend to have
+  // a colored tint (teal/blue overlay) rather than pure lavender
+  const cx = Math.floor(rect.cx);
+  const cy = Math.floor(rect.cy);
+  const sampleRadius = 3;
+
+  let tealCount = 0;
+  let totalCount = 0;
+  for (let dy = -sampleRadius; dy <= sampleRadius; dy++) {
+    for (let dx = -sampleRadius; dx <= sampleRadius; dx++) {
+      const px = cx + dx;
+      const py = cy + dy;
+      if (px < 0 || px >= width || py < 0 || py >= height) continue;
+      const idx = (py * width + px) * 4;
+      const r = rgba[idx], g = rgba[idx + 1], b = rgba[idx + 2];
+      totalCount++;
+      if (_isTealGreen(r, g, b) || (b > 150 && g > 120 && r < 100)) {
+        tealCount++;
+      }
+    }
+  }
+  // If >40% of center pixels show teal/blue tint, consider it selected
+  return totalCount > 0 && (tealCount / totalCount) > 0.4;
+}
+
+/**
+ * Check if any choice button appears to be already selected on the quiz page.
+ * Returns the selected button rect or null.
+ */
+function _findSelectedChoice(
+  rgba: Uint8ClampedArray, width: number, height: number
+): DetectedRect | null {
+  const choices = _findChoiceButtons(rgba, width, height);
+  for (const choice of choices) {
+    if (_isSelectedChoice(rgba, width, choice)) {
+      return choice;
+    }
+  }
+  return null;
+}
+
+// ─── Full-width button detection ──────────────────────────────────────────
+
+/**
+ * Find a full-width colored button at the bottom of the screen.
+ * Used for "Continue to pathway" and similar wide action buttons on score screens.
+ * Wider and lower than the teal-green submit button.
+ */
+function _findFullWidthButton(
+  rgba: Uint8ClampedArray, width: number, height: number
+): DetectedRect | null {
+  const y1 = Math.floor(height * 0.82);
+  const y2 = Math.floor(height * 0.98);
+  const x1 = Math.floor(width * 0.05);
+  const x2 = Math.floor(width * 0.95);
+
+  // Accept teal-green, green, or blue full-width buttons
+  const isFullWidthColor = (r: number, g: number, b: number) =>
+    _isTealGreen(r, g, b) || _isGreenish(r, g, b) || _isMicrosoftBlue(r, g, b);
+
+  const bands = _findColorBands(rgba, width, height, isFullWidthColor, y1, y2, x1, x2, 2);
+
+  // Filter for full-width buttons: very wide, moderate height, high aspect ratio
+  const buttons = bands
+    .filter(r => {
+      const aspectRatio = r.w / Math.max(r.h, 1);
+      return r.w >= width * 0.6 && r.h >= 25 && r.h <= 70 && aspectRatio > 4 && aspectRatio < 25;
+    })
+    .sort((a, b) => a.cy - b.cy);
+
+  return buttons.length > 0 ? buttons[0] : null;
+}
+
+// ─── Next question button detection ────────────────────────────────────────
+
+/**
+ * Find a "Next" button at the bottom-right of the screen.
+ * This appears on multi-question assessments (e.g., "1/88 Chapter Test") after
+ * answering a question. It's a smaller teal/green button than the full-width submit.
+ */
+function _findNextQuestionButton(
+  rgba: Uint8ClampedArray, width: number, height: number
+): DetectedRect | null {
+  // Bottom-right region only — Next button is typically right-aligned
+  const y1 = Math.floor(height * 0.88);
+  const y2 = Math.floor(height * 0.98);
+  const x1 = Math.floor(width * 0.60);
+  const x2 = Math.floor(width * 0.95);
+
+  const isNextColor = (r: number, g: number, b: number) =>
+    _isTealGreen(r, g, b) || _isGreenish(r, g, b);
+
+  const bands = _findColorBands(rgba, width, height, isNextColor, y1, y2, x1, x2, 2);
+
+  const buttons = bands
+    .filter(r => {
+      const aspectRatio = r.w / Math.max(r.h, 1);
+      return r.w >= 50 && r.w <= 250 && r.h >= 20 && r.h <= 55 && aspectRatio > 1.5 && aspectRatio < 8;
+    })
+    .sort((a, b) => a.cx - b.cx);
+
+  return buttons.length > 0 ? buttons[0] : null;
+}
+
+// ─── Basic text region extraction ──────────────────────────────────────
+
+/**
+ * Estimate the "darkness" of a pixel region — returns a score 0-1 where
+ * 1 = very dark (likely text on light background).
+ * Used for extracting question text and choice labels from quiz pages.
+ */
+function _getTextDensityInRegion(
+  rgba: Uint8ClampedArray, width: number, height: number,
+  x1: number, y1: number, x2: number, y2: number
+): number {
+  let darkPixels = 0;
+  let totalPixels = 0;
+  const step = 2; // sample every 2 pixels for speed
+  for (let y = y1; y < y2; y += step) {
+    for (let x = x1; x < x2; x += step) {
+      if (x < 0 || x >= width || y < 0 || y >= height) continue;
+      const idx = (y * width + x) * 4;
+      const r = rgba[idx], g = rgba[idx + 1], b = rgba[idx + 2];
+      totalPixels++;
+      // Dark pixels (text): luminance < 80
+      const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+      if (luminance < 80) darkPixels++;
+    }
+  }
+  return totalPixels > 0 ? darkPixels / totalPixels : 0;
+}
+
+/**
+ * Attempt to identify question text region and choice text regions on a quiz page.
+ * Returns a summary object with estimated text positions (not actual OCR text).
+ * This provides context for the math verifier — it can't read the text but
+ * can tell WHERE text is located, enabling better coordinate-based extraction later.
+ *
+ * Returns null if no text regions found (e.g., page is all buttons/no question visible).
+ */
+function _extractTextRegions(
+  rgba: Uint8ClampedArray, width: number, height: number
+): { questionRegion: { x1: number; y1: number; x2: number; y2: number; density: number } | null; choiceRegions: Array<{ x1: number; y1: number; x2: number; y2: number; density: number; index: number }> } | null {
+  // Question text is typically in the upper portion of the white card area
+  // On MathU quiz pages, the question sits above the choice buttons
+  const qY1 = Math.floor(height * 0.25);
+  const qY2 = Math.floor(height * 0.55);
+  const qX1 = Math.floor(width * 0.10);
+  const qX2 = Math.floor(width * 0.90);
+  const questionDensity = _getTextDensityInRegion(rgba, width, height, qX1, qY1, qX2, qY2);
+
+  // Only proceed if we found meaningful text density (question text exists)
+  if (questionDensity < 0.05) return null;
+
+  const questionRegion = { x1: qX1, y1: qY1, x2: qX2, y2: qY2, density: questionDensity };
+
+  // Choice text regions are within/around each lavender button
+  const choices = _findChoiceButtons(rgba, width, height);
+  const choiceRegions: Array<{ x1: number; y1: number; x2: number; y2: number; density: number; index: number }> = [];
+
+  for (let i = 0; i < choices.length; i++) {
+    const c = choices[i];
+    // Expand slightly around each choice button to capture label text
+    const cx1 = Math.max(0, Math.floor(c.x - 5));
+    const cy1 = Math.max(0, Math.floor(c.y - 2));
+    const cx2 = Math.min(width, Math.floor(c.x + c.w + 5));
+    const cy2 = Math.min(height, Math.floor(c.y + c.h + 2));
+    const density = _getTextDensityInRegion(rgba, width, height, cx1, cy1, cx2, cy2);
+    choiceRegions.push({ x1: cx1, y1: cy1, x2: cx2, y2: cy2, density, index: i });
+  }
+
+  return { questionRegion, choiceRegions };
 }
 
 // ─── Page type detection (URL-based) ──────────────────────────────────────
@@ -522,7 +820,7 @@ function _isMintPageBackground(r: number, g: number, b: number): boolean {
  */
 function _classifyPageByColor(
   rgba: Uint8ClampedArray, width: number, height: number
-): 'microsoft_login' | 'mathu_app' | 'quiz' | 'unknown' {
+): 'microsoft_login' | 'mathu_app' | 'quiz' | 'score_screen' | 'unknown' {
   // Check top region (header area) color
   const headerColor = _getRegionDominantColor(rgba, width, height, 0.0, 0.0, 1.0, 0.25);
 
@@ -547,6 +845,12 @@ function _classifyPageByColor(
   // Quiz page: pale mint/cyan background
   if (_isMintPageBackground(overallColor.r, overallColor.g, overallColor.b)) {
     return 'quiz';
+  }
+
+  // Score screen: mint background + white center area + teal full-width button at bottom
+  // Check this BEFORE the generic mathu_app check since score screens are within the app
+  if (_isScoreScreenByPixels(rgba, width, height)) {
+    return 'score_screen';
   }
 
   // Also check if the top 25% has deep blue (app header)
@@ -752,7 +1056,23 @@ function _microsoftLoginAction(
 function _assignmentPageAction(
   rgba: Uint8ClampedArray, width: number, height: number
 ): any | null {
-  // Look for colored buttons (Watch/Start/Play/Redo) on the right side
+  // ── Priority 1: Check for download buttons on module cards ──
+  // MathU modules require downloading before topics (Watch/Start) appear.
+  // Download buttons are dark navy circles with white down-arrows.
+  const downloadBtn = _findDownloadButton(rgba, width, height);
+  if (downloadBtn) {
+    log(`Pixel fallback: found download button at (${downloadBtn.cx}, ${downloadBtn.cy}) — clicking to download module`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: downloadBtn.cx,
+      targetY: downloadBtn.cy,
+      currentState: 'module_downloading',
+      reasoning: 'Pixel fallback: found module download arrow button — clicking to initiate download'
+    };
+  }
+
+  // ── Priority 2: Look for topic buttons (Watch/Start/Play/Redo) ──
+  // These appear after a module has been downloaded and expanded.
   const button = _findActionButton(rgba, width, height);
   if (button) {
     log(`Pixel fallback: found action button at (${button.cx}, ${button.cy})`, 'INFO', 'pixel-fallback');
@@ -765,7 +1085,7 @@ function _assignmentPageAction(
     };
   }
 
-  // No button found — scroll down to find more content
+  // ── Priority 3: No button found — scroll down to find more content ──
   return {
     actionType: 'scroll_vertical',
     targetX: 0,
@@ -782,7 +1102,37 @@ function _assignmentPageAction(
 function _quizPageAction(
   rgba: Uint8ClampedArray, width: number, height: number
 ): any | null {
-  // Check for teal-green Submit/Done/Continue button at the bottom
+  // Priority 1: Check if a choice is already selected → look for Next question button
+  // On multi-question assessments (e.g., 1/88 Chapter Test), after selecting an answer
+  // the user needs to click "Next" to proceed to the next question
+  const selectedChoice = _findSelectedChoice(rgba, width, height);
+  if (selectedChoice) {
+    const nextButton = _findNextQuestionButton(rgba, width, height);
+    if (nextButton) {
+      log(`Pixel fallback: choice selected, found Next button at (${nextButton.cx}, ${nextButton.cy})`, 'INFO', 'pixel-fallback');
+      return {
+        actionType: 'click',
+        targetX: nextButton.cx,
+        targetY: nextButton.cy,
+        currentState: 'assessment',
+        reasoning: 'Pixel fallback: choice already selected, clicking Next question button'
+      };
+    }
+    // Choice selected but no Next button — try the teal-green Submit/Done button instead
+    const tealButton = _findTealGreenButton(rgba, width, height);
+    if (tealButton) {
+      log(`Pixel fallback: choice selected, clicking Submit/Done at (${tealButton.cx}, ${tealButton.cy})`, 'INFO', 'pixel-fallback');
+      return {
+        actionType: 'click',
+        targetX: tealButton.cx,
+        targetY: tealButton.cy,
+        currentState: 'assessment',
+        reasoning: 'Pixel fallback: choice already selected, clicking Submit/Done button'
+      };
+    }
+  }
+
+  // Priority 2: Check for teal-green Submit/Done/Continue button at the bottom
   const tealButton = _findTealGreenButton(rgba, width, height);
   if (tealButton) {
     log(`Pixel fallback: found quiz Submit/Done button at (${tealButton.cx}, ${tealButton.cy})`, 'INFO', 'pixel-fallback');
@@ -795,22 +1145,47 @@ function _quizPageAction(
     };
   }
 
-  // Check for choice buttons (multiple choice — click the first option)
+  // Priority 3: Check for choice buttons (multiple choice — click one)
   const choiceButtons = _findChoiceButtons(rgba, width, height);
   if (choiceButtons.length > 0) {
+    // Try to extract text region info for the math verifier
+    const textRegions = _extractTextRegions(rgba, width, height);
+    const textInfo = textRegions
+      ? ` | questionRegion density=${textRegions.questionRegion?.density.toFixed(2)}, ${textRegions.choiceRegions.length} choice text regions`
+      : '';
+
     // Pick a random choice to avoid always picking the same wrong answer
-    const pick = choiceButtons[Math.floor(Math.random() * choiceButtons.length)];
-    log(`Pixel fallback: clicking choice button at (${pick.cx}, ${pick.cy})`, 'INFO', 'pixel-fallback');
+    const pickIndex = Math.floor(Math.random() * choiceButtons.length);
+    const pick = choiceButtons[pickIndex];
+    log(`Pixel fallback: clicking choice button at (${pick.cx}, ${pick.cy}) (${choiceButtons.length} options)${textInfo}`, 'INFO', 'pixel-fallback');
+
+    // Attach text regions with the clicked choice index for math verifier
+    const textRegionsWithData = textRegions ? { ...textRegions, _clickedChoiceIndex: pickIndex } : null;
+
     return {
       actionType: 'click',
       targetX: pick.cx,
       targetY: pick.cy,
       currentState: 'assessment',
-      reasoning: `Pixel fallback: clicking quiz choice button (${choiceButtons.length} options available)`
+      reasoning: `Pixel fallback: clicking quiz choice button (${choiceButtons.length} options available)${textInfo}`,
+      _textRegions: textRegionsWithData, // Attach for downstream consumers (math verifier)
     };
   }
 
-  // Check for input field (algebraic answer) + keypad area
+  // Priority 4: Check for Next question button (might be a non-MCQ where answer was entered)
+  const nextButton = _findNextQuestionButton(rgba, width, height);
+  if (nextButton) {
+    log(`Pixel fallback: found Next question button at (${nextButton.cx}, ${nextButton.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: nextButton.cx,
+      targetY: nextButton.cy,
+      currentState: 'assessment',
+      reasoning: 'Pixel fallback: found Next question button (answer may be pre-filled)'
+    };
+  }
+
+  // Priority 5: Check for input field (algebraic answer) + keypad area
   const inputField = _findInputField(rgba, width, height);
   if (inputField) {
     // There's an input field but no teal button visible yet — might need to enter answer
@@ -872,6 +1247,20 @@ function _scorePageAction(
   rgba: Uint8ClampedArray, width: number, height: number
 ): any | null {
   // Score screen has a full-width teal-green "Continue to pathway" button
+  // Try full-width button first (more specific to score screens)
+  const fullWidthButton = _findFullWidthButton(rgba, width, height);
+  if (fullWidthButton) {
+    log(`Pixel fallback: found full-width Continue button at (${fullWidthButton.cx}, ${fullWidthButton.cy})`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: fullWidthButton.cx,
+      targetY: fullWidthButton.cy,
+      currentState: 'score_screen',
+      reasoning: 'Pixel fallback: found full-width Continue to pathway button on score screen'
+    };
+  }
+
+  // Fallback: try the regular teal-green button (smaller score screens)
   const tealButton = _findTealGreenButton(rgba, width, height);
   if (tealButton) {
     log(`Pixel fallback: found Continue button at (${tealButton.cx}, ${tealButton.cy})`, 'INFO', 'pixel-fallback');
@@ -880,7 +1269,7 @@ function _scorePageAction(
       targetX: tealButton.cx,
       targetY: tealButton.cy,
       currentState: 'score_screen',
-      reasoning: 'Pixel fallback: found Continue to pathway button on score screen'
+      reasoning: 'Pixel fallback: found Continue button on score screen'
     };
   }
 
@@ -986,21 +1375,21 @@ async function generatePixelFallbackAction(page: any): Promise<any> {
     }
 
     // ── MathU app pages ──
-    if (_isMathUAppPage(url) || colorClass === 'mathu_app') {
+    if (_isMathUAppPage(url) || colorClass === 'mathu_app' || colorClass === 'score_screen') {
       // Detect sub-page by visual features
+      // Score screen: full-width button + white text area
+      if (colorClass === 'score_screen' || _isScoreScreenByPixels(rgba, width, height)) {
+        const scoreAction = _scorePageAction(rgba, width, height);
+        if (scoreAction) return scoreAction;
+      }
+
       // Quiz: mint background + teal buttons
       if (colorClass === 'quiz' || _isQuizPageByPixels(rgba, width, height)) {
         const quizAction = _quizPageAction(rgba, width, height);
         if (quizAction) return quizAction;
       }
 
-      // Check for score screen: look for large percentage text area + continue button
-      if (_isScoreScreenByPixels(rgba, width, height)) {
-        const scoreAction = _scorePageAction(rgba, width, height);
-        if (scoreAction) return scoreAction;
-      }
-
-      // Default: treat as assignments page
+      // Default: treat as assignments page (includes download button detection)
       return _assignmentPageAction(rgba, width, height);
     }
 
@@ -1083,6 +1472,8 @@ module.exports = {
   _findGreenButton,
   _findActionButton,
   _findChoiceButtons,
+  _findDownloadButton,
+  _isModuleContentLoaded,
   _classifyPageByColor,
   _isMicrosoftLoginPage,
   _isMicrosoftPasswordPage,
@@ -1090,4 +1481,11 @@ module.exports = {
   _isMathUAppPage,
   _isQuizPageByPixels,
   _isScoreScreenByPixels,
+  // Response 5 additions
+  _findSelectedChoice,
+  _isSelectedChoice,
+  _findFullWidthButton,
+  _findNextQuestionButton,
+  _extractTextRegions,
+  _getTextDensityInRegion,
 };
