@@ -608,7 +608,7 @@ function getMemoryInfo() {
   };
 }
 
-const server = http.createServer((req: any, res: any) => {
+const server = http.createServer(async (req: any, res: any) => {
   // BUG FIX (Response 18): Only set CORS for actual allowed origins
   // instead of blindly echoing req.headers.origin (which could be
   // anything). If DASHBOARD_ALLOWED_ORIGINS is ['*'], allow all.
