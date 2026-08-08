@@ -1,4 +1,27 @@
 'use strict';
+// Last modified: 2026-08-08 — Response 3: 5-level degradation ladder with provider+OR budget awareness
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Graceful Degradation Ladder — 5-Level Resource-Aware Degradation System
+//
+// Instead of binary fail/succeed, the bot adapts its behavior based on
+// available resources (providers + OpenRouter budget). Each level adjusts
+// screenshot quality, module activation, and request pacing.
+//
+// Levels (auto-calculated each cycle):
+//   0 (FULL)       — 3+ vision providers, OR budget > 60% → normal operation
+//   1 (REDUCED)     — 1-2 vision providers or OR budget 30-60% → skip optional modules
+//   2 (CONSERVING)  — No vision providers or OR budget 10-30% → batch screenshots, text-only
+//   3 (SURVIVAL)    — Only 1 provider total or OR budget < 10% → minimal operation
+//   4 (DORMANT)     — Zero providers or budget = 0 → graceful sleep with wake checks
+//
+// Integration:
+//   - cycle-cycle-manager.ts: checks calculateLevel() at cycle start
+//   - providers-registry.ts: reports provider count via getAvailableProviderCount()
+//   - openrouter-rate-limiter.ts: reports budget % via getBudgetPct()
+//   - cycle-action-executor.ts: adjusts behavior per level
+//   - Various optional modules: skip work when level >= their threshold
+// ═══════════════════════════════════════════════════════════════════════════════
 
 let _deps: Record<string, any> = {};
 
@@ -8,13 +31,32 @@ function logError(msg: string, err: Error, ctx?: any) { _deps.logger?.logError?.
 function logAudit(msg: string, mod?: string) { _deps.logger?.logAudit?.(msg, mod) ?? console.log(msg); }
 
 function getDb() { return _deps.database?.db; }
-
 function getSendAlert() { return _deps.alerting?.sendAlert || (() => {}); }
 function updateConfig(...args: any[]) { return _deps.config?.updateConfig?.(...args); }
 
 const CONFIG = require('./get-config');
 
-const MODES = ['FULL', 'DEGRADED', 'SURVIVAL', 'HIBERNATION'];
+// ─── 5-Level System ──────────────────────────────────────────────────────────
+
+const LEVEL_NAMES = ['FULL', 'REDUCED', 'CONSERVING', 'SURVIVAL', 'DORMANT'] as const;
+export type DegradationLevelName = typeof LEVEL_NAMES[number];
+export type DegradationLevel = 0 | 1 | 2 | 3 | 4;
+
+interface LevelThresholds {
+  minProviders: number;        // minimum total providers for this level
+  minVisionProviders: number;   // minimum vision-capable providers for this level
+  minOrBudgetPct: number;       // minimum OR budget % for this level (0-100)
+}
+
+// Thresholds for each level — the system stays at the HIGHEST level
+// whose thresholds are ALL met. If any threshold fails, drops one level.
+const LEVEL_REQUIREMENTS: Record<DegradationLevelName, LevelThresholds> = {
+  FULL:       { minProviders: 3, minVisionProviders: 2, minOrBudgetPct: 60 },
+  REDUCED:    { minProviders: 1, minVisionProviders: 1, minOrBudgetPct: 30 },
+  CONSERVING: { minProviders: 1, minVisionProviders: 0, minOrBudgetPct: 10 },
+  SURVIVAL:   { minProviders: 1, minVisionProviders: 0, minOrBudgetPct: 0 },
+  DORMANT:    { minProviders: 0, minVisionProviders: 0, minOrBudgetPct: 0 },
+};
 
 const MODE_CONFIG_OVERRIDES = {
   FULL: {
@@ -27,7 +69,7 @@ const MODE_CONFIG_OVERRIDES = {
     ENABLE_FLUTTER_SEMANTICS: false,
     PAUSE_CYCLES: false
   },
-  DEGRADED: {
+  REDUCED: {
     ENABLE_EXPERIMENTS: false,
     ENABLE_EXPLORATION: false,
     PROVIDER_PREFERENCE: 'cheap',
@@ -37,7 +79,7 @@ const MODE_CONFIG_OVERRIDES = {
     ENABLE_FLUTTER_SEMANTICS: false,
     PAUSE_CYCLES: false
   },
-  SURVIVAL: {
+  CONSERVING: {
     ENABLE_EXPERIMENTS: false,
     ENABLE_EXPLORATION: false,
     PROVIDER_PREFERENCE: 'local-only',
@@ -47,11 +89,21 @@ const MODE_CONFIG_OVERRIDES = {
     ENABLE_FLUTTER_SEMANTICS: true,
     PAUSE_CYCLES: false
   },
-  HIBERNATION: {
+  SURVIVAL: {
+    ENABLE_EXPERIMENTS: false,
+    ENABLE_EXPLORATION: false,
+    PROVIDER_PREFERENCE: 'local-only',
+    SCREENSHOT_QUALITY: 5,
+    ENABLE_NETWORK_INTERCEPT: false,
+    ENABLE_VISION_TRIBUNAL: false,
+    ENABLE_FLUTTER_SEMANTICS: true,
+    PAUSE_CYCLES: false
+  },
+  DORMANT: {
     ENABLE_EXPERIMENTS: false,
     ENABLE_EXPLORATION: false,
     PROVIDER_PREFERENCE: 'none',
-    SCREENSHOT_QUALITY: 5,
+    SCREENSHOT_QUALITY: 1,
     ENABLE_NETWORK_INTERCEPT: false,
     ENABLE_VISION_TRIBUNAL: false,
     ENABLE_FLUTTER_SEMANTICS: false,
@@ -59,21 +111,36 @@ const MODE_CONFIG_OVERRIDES = {
   }
 };
 
+// ─── Level Calculation Result ───────────────────────────────────────────────────
+
+interface LevelCalculation {
+  level: DegradationLevel;
+  name: DegradationLevelName;
+  reasons: string[];
+  providerCount: number;
+  visionProviderCount: number;
+  orBudgetPct: number;
+}
+
 class DegradationLadder {
-  _currentMode: any;
-  _onModeChange: any;
+  _currentLevel: DegradationLevel;
+  _onLevelChange: any;
   _originalConfig: any;
   _evalTimer: any;
-  _recoveryTimer: any;
+  _levelEnterTime: number;      // when we entered the current level
+  _escalationTriggered: boolean;
+  _lastCalculation: LevelCalculation | null;
 
   constructor() {
-    this._currentMode = null;
+    this._currentLevel = 0;
     this._originalConfig = {};
     this._evalTimer = null;
-    this._recoveryTimer = null;
-    this._onModeChange = null;
+    this._onLevelChange = null;
+    this._levelEnterTime = Date.now();
+    this._escalationTriggered = false;
+    this._lastCalculation = null;
     this._ensureTables();
-    this._loadCurrentMode();
+    this._loadCurrentLevel();
   }
 
   _ensureTables() { 
@@ -81,9 +148,12 @@ class DegradationLadder {
       getDb()?.exec(`
         CREATE TABLE IF NOT EXISTS degradation_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
-          from_mode TEXT,
-          to_mode TEXT,
+          from_level INTEGER,
+          to_level INTEGER,
           reason TEXT,
+          provider_count INTEGER,
+          vision_count INTEGER,
+          or_budget_pct REAL,
           timestamp INTEGER
         )
       `);
@@ -96,267 +166,370 @@ class DegradationLadder {
     }
   }
 
-  _loadCurrentMode() { 
+  _loadCurrentLevel() { 
     try {
-      const row = getDb()?.prepare("SELECT value FROM calibration WHERE key = 'degradation_mode'").get();
-      if (row && row.value && MODES.includes(row.value)) {
-        this._currentMode = row.value;
-      } else {
-        this._currentMode = 'FULL';
+      const row = getDb()?.prepare("SELECT value FROM calibration WHERE key = 'degradation_level'").get();
+      if (row && row.value !== undefined && row.value !== null) {
+        const parsed = parseInt(row.value, 10);
+        if (!isNaN(parsed) && parsed >= 0 && parsed <= 4) {
+          this._currentLevel = parsed as DegradationLevel;
+        }
       }
-      log(`Degradation ladder initialized at mode: ${this._currentMode}`, 'INFO', 'degradation-ladder');
+      // Also load the enter time from calibration
+      const timeRow = getDb()?.prepare("SELECT value FROM calibration WHERE key = 'degradation_level_enter_time'").get();
+      if (timeRow && timeRow.value) {
+        this._levelEnterTime = parseInt(timeRow.value, 10) || Date.now();
+      }
+      log(`Degradation ladder initialized at level ${this._currentLevel} (${LEVEL_NAMES[this._currentLevel]})`, 'INFO', 'degradation-ladder');
     } catch (err: any) {
-      logError('Failed to load current degradation mode', err);
-      this._currentMode = 'FULL';
+      logError('Failed to load current degradation level', err);
+      this._currentLevel = 0;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Core: calculateLevel() — called at the START of each question cycle
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Calculate the appropriate degradation level based on current conditions.
+   * This is the MAIN entry point called by cycle-cycle-manager.ts at the
+   * start of each question cycle.
+   */
+  calculateLevel(): LevelCalculation {
+    const providerCount = this._getProviderCount();
+    const visionCount = this._getVisionProviderCount();
+    const orBudgetPct = this._getOrBudgetPct();
+    const reasons: string[] = [];
+
+    let determinedLevel: DegradationLevel = 0;
+
+    // Check from FULL downward — first level whose requirements are ALL met wins
+    for (let i = 0; i < 5; i++) {
+      const req = LEVEL_REQUIREMENTS[LEVEL_NAMES[i]];
+      const meetsProviders = providerCount >= req.minProviders;
+      const meetsVision = visionCount >= req.minVisionProviders;
+      const meetsBudget = orBudgetPct >= req.minOrBudgetPct;
+
+      if (meetsProviders && meetsVision && meetsBudget) {
+        determinedLevel = i as DegradationLevel;
+        break;
+      }
+
+      // Collect why we couldn't stay at this level (for logging)
+      if (i === 0 || (determinedLevel === 0 && i > 0)) {
+        if (!meetsProviders) reasons.push(`providers=${providerCount} (need ${req.minProviders})`);
+        if (!meetsVision) reasons.push(`vision=${visionCount} (need ${req.minVisionProviders})`);
+        if (!meetsBudget) reasons.push(`OR budget=${orBudgetPct.toFixed(0)}% (need ${req.minOrBudgetPct}%)`);
+      }
+    }
+
+    // If we couldn't meet even FULL requirements, determine actual level
+    if (determinedLevel === 0 && reasons.length > 0) {
+      determinedLevel = this._determineFallbackLevel(providerCount, visionCount, orBudgetPct);
+    }
+
+    const result: LevelCalculation = {
+      level: determinedLevel,
+      name: LEVEL_NAMES[determinedLevel],
+      reasons,
+      providerCount,
+      visionProviderCount: visionCount,
+      orBudgetPct,
+    };
+
+    this._lastCalculation = result;
+
+    // Auto-apply level change if different from current
+    if (determinedLevel !== this._currentLevel) {
+      this.setLevel(determinedLevel, reasons.join(', '));
+    }
+
+    // Auto-escalation check: stuck at Level 3+ for > 30 minutes
+    this._checkAutoEscalation();
+
+    return result;
+  }
+
+  /**
+   * Determine fallback level when FULL requirements aren't met.
+   */
+  _determineFallbackLevel(providers: number, vision: number, orBudget: number): DegradationLevel {
+    // Dormant: zero providers
+    if (providers === 0) return 4;
+    // Survival: 1 provider total OR budget < 10%
+    if (providers === 1 && orBudget < 10) return 3;
+    // Survival: only 1 provider regardless of budget
+    if (providers === 1) return 3;
+    // Conserving: no vision providers
+    if (vision === 0) return 2;
+    // Conserving: budget 10-30%
+    if (orBudget < 30) return 2;
+    // Reduced: 1-2 providers or budget 30-60%
+    if (providers <= 2 || orBudget < 60) return 1;
+    return 0;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Data sources: provider count + OR budget
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get total available provider count from the registry.
+   * Uses lazy-loaded registry module.
+   */
+  _getProviderCount(): number {
+    try {
+      const registry = require('./providers-registry');
+      if (typeof registry.getAvailableProviderCount === 'function') {
+        return registry.getAvailableProviderCount();
+      }
+      // Fallback: count using synchronous heuristic from provider table
+      return this._estimateProviderCount();
+    } catch (err: any) {
+      return this._estimateProviderCount();
     }
   }
 
   /**
-   * Get the current operational mode.
+   * Get vision-capable provider count from the registry.
    */
-  getCurrentMode() { 
-    return this._currentMode;
-  }
-
-  /**
-   * Get index of a mode in the MODES array for comparison.
-   */
-  _modeIndex(mode: any) { 
-    const idx = MODES.indexOf(mode);
-    return idx >= 0 ? idx : 0;
-  }
-
-  /**
-   * Set a new degradation mode with validation.
-   * Can only step down or up one level at a time, unless force is true.
-   */
-  setMode(newMode: any, reason: any, force = false) { 
+  _getVisionProviderCount(): number {
     try {
-      if (!MODES.includes(newMode)) {
-        log(`Invalid degradation mode: ${newMode}`, 'ERROR', 'degradation-ladder');
-        return { success: false, error: `Invalid mode: ${newMode}` };
+      const registry = require('./providers-registry');
+      if (typeof registry.getAvailableProviderCount === 'function') {
+        return registry.getAvailableProviderCount({ visionOnly: true });
+      }
+      return this._estimateProviderCount(true);
+    } catch (err: any) {
+      return this._estimateProviderCount(true);
+    }
+  }
+
+  /**
+   * Estimate provider count from DB model_registry (fallback when registry isn't loaded).
+   */
+  _estimateProviderCount(visionOnly = false): number {
+    try {
+      const db = getDb();
+      if (!db) return 0;
+      const rows = db.prepare("SELECT COUNT(*) as cnt FROM model_registry WHERE role = 'active' AND is_working = 1").get();
+      return rows?.cnt || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Get OpenRouter budget remaining as a percentage (0-100).
+   */
+  _getOrBudgetPct(): number {
+    try {
+      const orLimiter = require('./openrouter-rate-limiter');
+      if (typeof orLimiter.getBudgetPct === 'function') {
+        return orLimiter.getBudgetPct();
+      }
+      // Fallback: calculate from getStatus()
+      const status = orLimiter.getStatus();
+      if (status && status.dailyLimit > 0) {
+        return ((status.totalRemaining / status.dailyLimit) * 100);
+      }
+      return 100; // Assume full budget if we can't determine
+    } catch (err: any) {
+      // OR limiter not loaded — assume full budget (fail-open to FULL level)
+      return 100;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Level Management
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get the current degradation level (0-4).
+   */
+  getCurrentLevel(): DegradationLevel {
+    return this._currentLevel;
+  }
+
+  /**
+   * Get the current level name.
+   */
+  getCurrentLevelName(): DegradationLevelName {
+    return LEVEL_NAMES[this._currentLevel];
+  }
+
+  /**
+   * Check if the current level is at or above a given threshold.
+   * e.g., `isLevelAtLeast(2)` returns true for CONSERVING, SURVIVAL, DORMANT.
+   */
+  isLevelAtLeast(level: DegradationLevel): boolean {
+    return this._currentLevel >= level;
+  }
+
+  /**
+   * Check if the current level is at or below a given threshold.
+   * e.g., `isLevelAtMost(1)` returns true for FULL, REDUCED.
+   */
+  isLevelAtMost(level: DegradationLevel): boolean {
+    return this._currentLevel <= level;
+  }
+
+  /**
+   * Set a new degradation level with persistence, config overrides, and alerts.
+   */
+  setLevel(newLevel: DegradationLevel, reason: string) {
+    try {
+      if (newLevel < 0 || newLevel > 4) {
+        log(`Invalid degradation level: ${newLevel}`, 'ERROR', 'degradation-ladder');
+        return { success: false, error: `Invalid level: ${newLevel}` };
       }
 
-      const currentIdx = this._modeIndex(this._currentMode);
-      const newIdx = this._modeIndex(newMode);
-      const diff = Math.abs(newIdx - currentIdx);
+      const previousLevel = this._currentLevel;
 
-      if (!force && diff > 1) {
-        log(`Mode transition rejected: ${this._currentMode} -> ${newMode} (more than one level, use force)`, 'WARN', 'degradation-ladder');
-        return { success: false, error: 'Can only transition one level at a time' };
+      if (previousLevel === newLevel) {
+        return { success: true, previousLevel, newLevel, reason: 'no change' };
       }
 
-      const previousMode = this._currentMode;
-      this._currentMode = newMode;
+      this._currentLevel = newLevel;
+      this._levelEnterTime = Date.now();
 
       // Persist to calibration
-      getDb()?.prepare('INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (?, ?, ?)')
-        .run('degradation_mode', newMode, Date.now());
+      try {
+        getDb()?.prepare('INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (?, ?, ?)')
+          .run('degradation_level', String(newLevel), Date.now());
+        getDb()?.prepare('INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (?, ?, ?)')
+          .run('degradation_level_enter_time', String(Date.now()), Date.now());
+      } catch (e: any) { /* non-critical */ }
 
       // Log transition
-      getDb()?.prepare('INSERT INTO degradation_log (from_mode, to_mode, reason, timestamp) VALUES (?, ?, ?, ?)')
-        .run(previousMode, newMode, reason, Date.now());
+      try {
+        getDb()?.prepare(
+          'INSERT INTO degradation_log (from_level, to_level, reason, provider_count, vision_count, or_budget_pct, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        ).run(
+          previousLevel, newLevel, reason,
+          this._lastCalculation?.providerCount ?? 0,
+          this._lastCalculation?.visionProviderCount ?? 0,
+          this._lastCalculation?.orBudgetPct ?? 0,
+          Date.now()
+        );
+      } catch (e: any) { /* non-critical */ }
 
       // Apply config overrides in memory
-      this.applyModeConfig(newMode);
+      this.applyModeConfig(LEVEL_NAMES[newLevel]);
 
-      // Alert on mode change (except initial load)
-      if (previousMode !== newMode) {
-        const isDowngrade = newIdx > currentIdx;
-        const alertLevel = newMode === 'HIBERNATION' ? 1 : newMode === 'SURVIVAL' ? 2 : 3;
-        try { getSendAlert()(`Degradation mode changed: ${previousMode} -> ${newMode}. Reason: ${reason}`, alertLevel); } catch (e: any) {}
-        log(`DEGRADATION: ${previousMode} -> ${newMode} (reason: ${reason})`, isDowngrade ? 'WARN' : 'INFO', 'degradation-ladder');
+      // Alert on significant level changes
+      const isDowngrade = newLevel > previousLevel;
+      const alertLevel = newLevel >= 3 ? 1 : newLevel >= 2 ? 2 : 3;
+      const prevName = LEVEL_NAMES[previousLevel];
+      const newName = LEVEL_NAMES[newLevel];
 
-        // Notify callback
-        if (this._onModeChange) {
-          try {
-            this._onModeChange(previousMode, newMode, reason);
-          } catch (cbErr: any) {
-            logError('Error in mode change callback', cbErr);
-          }
+      try {
+        getSendAlert()(`Degradation level changed: ${prevName} (${previousLevel}) -> ${newName} (${newLevel}). Reason: ${reason}`, alertLevel);
+      } catch (e: any) {}
+
+      log(
+        `DEGRADATION: ${prevName} (${previousLevel}) -> ${newName} (${newLevel}) [${isDowngrade ? 'DOWN' : 'UP'}] reason: ${reason}`,
+        isDowngrade ? 'WARN' : 'INFO',
+        'degradation-ladder'
+      );
+
+      // Notify callback
+      if (this._onLevelChange) {
+        try {
+          this._onLevelChange(previousLevel, newLevel, reason);
+        } catch (cbErr: any) {
+          logError('Error in level change callback', cbErr);
         }
       }
 
-      return { previousMode, newMode, reason };
+      // Reset escalation flag on upgrade
+      if (!isDowngrade) {
+        this._escalationTriggered = false;
+      }
+
+      return { previousLevel, newLevel, reason };
     } catch (err: any) {
-      logError('Error setting degradation mode', err);
+      logError('Error setting degradation level', err);
       return { success: false, error: err.message };
     }
   }
 
-  /**
-   * Evaluate whether the system should degrade one level.
-   */
-  evaluateShouldDegrade() { 
-    try {
-      const currentIdx = this._modeIndex(this._currentMode);
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Auto-Escalation: stuck at Level 3+ for > 30 minutes
+  // ═══════════════════════════════════════════════════════════════════════════
 
-      // Already at bottom, cannot degrade further
-      if (currentIdx >= MODES.length - 1) {
-        return { shouldDegrade: false, targetMode: null, reason: 'Already at lowest mode' };
+  _checkAutoEscalation() {
+    const ESCALATION_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+
+    if (this._currentLevel < 3) {
+      // Not in a critical level — reset
+      this._escalationTriggered = false;
+      return;
+    }
+
+    if (this._escalationTriggered) {
+      // Already escalated — don't repeat
+      return;
+    }
+
+    const timeInLevel = Date.now() - this._levelEnterTime;
+    if (timeInLevel > ESCALATION_THRESHOLD_MS) {
+      this._escalationTriggered = true;
+      const levelName = LEVEL_NAMES[this._currentLevel];
+      log(
+        `AUTO-ESCALATION: Stuck at ${levelName} (${this._currentLevel}) for ${Math.round(timeInLevel / 60000)}min. Triggering emergency actions.`,
+        'ERROR',
+        'degradation-ladder'
+      );
+
+      try {
+        getSendAlert()(
+          `ESCALATION: Bot stuck at ${levelName} for ${Math.round(timeInLevel / 60000)}min. Emergency actions triggered.`,
+          1 // critical
+        );
+      } catch (e: any) {}
+
+      // Emergency actions:
+      // 1. Try to re-discover providers
+      try {
+        const discovery = require('./providers-provider-discovery');
+        discovery.autoDiscoverModels?.().then((models: any[]) => {
+          if (models && models.length > 0) {
+            log(`Auto-escalation: discovered ${models.length} models`, 'INFO', 'degradation-ladder');
+          }
+        }).catch(() => {});
+      } catch (e: any) {}
+
+      // 2. If on Render, trigger restart via process.exit(1)
+      if (process.env.RENDER_SERVICE_ID) {
+        log('Auto-escalation: on Render — scheduling process.exit(1) in 10s for auto-restart', 'WARN', 'degradation-ladder');
+        setTimeout(() => {
+          log('Auto-escalation: executing process.exit(1) for Render auto-restart', 'ERROR', 'degradation-ladder');
+          process.exit(1);
+        }, 10000);
       }
-
-      const targetMode = MODES[currentIdx + 1];
-      let reason = null;
-
-      switch (this._currentMode) {
-        case 'FULL': {
-          // Check: provider quota < 20%
-          const lowQuota = this._checkLowProviderQuota(20);
-          if (lowQuota) {
-            reason = `Provider quota critically low: ${lowQuota}`;
-          }
-
-          // Check: memory > 70% threshold
-          const memHigh = this._checkMemoryThreshold(0.7);
-          if (!reason && memHigh) {
-            reason = `Memory usage high: ${memHigh}`;
-          }
-
-          // Check: > 2 circuit breakers open
-          const openCBs = this._countOpenCircuitBreakers();
-          if (!reason && openCBs > 2) {
-            reason = `${openCBs} circuit breakers open (threshold: 2)`;
-          }
-
-          break;
-        }
-
-        case 'DEGRADED': {
-          // Check: no cloud providers available
-          const noCloud = this._checkNoCloudProviders();
-          if (noCloud) {
-            reason = 'No cloud providers available';
-          }
-
-          // Check: memory > 85%
-          const memCritical = this._checkMemoryThreshold(0.85);
-          if (!reason && memCritical) {
-            reason = `Memory usage critical: ${memCritical}`;
-          }
-
-          break;
-        }
-
-        case 'SURVIVAL': {
-          // Check: browser won't launch
-          const browserDead = this._checkBrowserDead();
-          if (browserDead) {
-            reason = 'Browser will not launch';
-          }
-
-          // Check: database corrupted
-          const dbCorrupt = this._checkDatabaseCorrupted();
-          if (!reason && dbCorrupt) {
-            reason = 'Database may be corrupted';
-          }
-
-          // Check: > 5 circuit breakers open
-          const openCBs = this._countOpenCircuitBreakers();
-          if (!reason && openCBs > 5) {
-            reason = `${openCBs} circuit breakers open (critical threshold: 5)`;
-          }
-
-          break;
-        }
-
-        default:
-          return { shouldDegrade: false, targetMode: null, reason: 'No evaluation for current mode' };
-      }
-
-      if (reason) {
-        return { shouldDegrade: true, targetMode, reason };
-      }
-
-      return { shouldDegrade: false, targetMode, reason: null };
-    } catch (err: any) {
-      logError('Error evaluating degradation', err);
-      return { shouldDegrade: false, targetMode: null, reason: 'Evaluation error' };
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Config Overrides
+  // ═══════════════════════════════════════════════════════════════════════════
+
   /**
-   * Evaluate whether the system should recover one level.
+   * Get effective config overrides for a given level name.
    */
-  evaluateShouldRecover() { 
-    try {
-      const currentIdx = this._modeIndex(this._currentMode);
-
-      // Already at top, cannot recover further
-      if (currentIdx <= 0) {
-        return { shouldRecover: false, targetMode: null, reason: 'Already at highest mode' };
-      }
-
-      const targetMode = MODES[currentIdx - 1];
-      let reason = null;
-
-      switch (this._currentMode) {
-        case 'HIBERNATION': {
-          // Recover to SURVIVAL: database healthy AND browser launches
-          const dbOk = !this._checkDatabaseCorrupted();
-          const browserOk = !this._checkBrowserDead();
-
-          if (dbOk && browserOk) {
-            reason = 'Database healthy and browser launching';
-          }
-
-          break;
-        }
-
-        case 'SURVIVAL': {
-          // Recover to DEGRADED: at least one cloud provider available
-          const hasCloud = !this._checkNoCloudProviders();
-
-          if (hasCloud) {
-            reason = 'Cloud provider available';
-          }
-
-          break;
-        }
-
-        case 'DEGRADED': {
-          // Recover to FULL: all providers healthy AND memory < 60% AND no circuit breakers open
-          const memOk = !this._checkMemoryThreshold(0.6);
-          const noOpenCBs = this._countOpenCircuitBreakers() === 0;
-          const quotaOk = !this._checkLowProviderQuota(30);
-
-          if (memOk && noOpenCBs && quotaOk) {
-            reason = 'All conditions healthy: memory OK, no open circuit breakers, provider quota OK';
-          }
-
-          break;
-        }
-
-        default:
-          return { shouldRecover: false, targetMode: null, reason: 'No evaluation for current mode' };
-      }
-
-      if (reason) {
-        return { shouldRecover: true, targetMode, reason };
-      }
-
-      return { shouldRecover: false, targetMode, reason: null };
-    } catch (err: any) {
-      logError('Error evaluating recovery', err);
-      return { shouldRecover: false, targetMode: null, reason: 'Evaluation error' };
-    }
+  getModeConfig(levelName: string) {
+    return (MODE_CONFIG_OVERRIDES as any)[levelName] || MODE_CONFIG_OVERRIDES.FULL;
   }
 
   /**
-   * Get effective config overrides for a given mode.
+   * Apply level config overrides to CONFIG in memory.
+   * Does NOT persist (level is persisted, config overrides are derived).
    */
-  getModeConfig(mode: any) { 
-// @ts-expect-error
-    return MODE_CONFIG_OVERRIDES[mode] || MODE_CONFIG_OVERRIDES.FULL;
-  }
-
-  /**
-   * Apply mode config overrides to CONFIG in memory.
-   * Does NOT persist (mode is persisted, config overrides are derived).
-   */
-  applyModeConfig(mode: any) { 
+  applyModeConfig(levelName: string) { 
     try {
-      const overrides = this.getModeConfig(mode);
+      const overrides = this.getModeConfig(levelName);
 
       // Save original config values on first call
       if (Object.keys(this._originalConfig).length === 0) {
@@ -371,11 +544,11 @@ class DegradationLadder {
       // Apply overrides through controlled mutation
       for (const [key, value] of Object.entries(overrides)) {
         if (key in CONFIG) {
-          try { updateConfig(key, value); } catch (e: any) { /* already logged by updateConfig */ }
+          try { updateConfig(key, value); } catch (e: any) { /* already logged */ }
         }
       }
 
-      log(`Applied ${mode} mode config overrides (${Object.keys(overrides).length} keys)`, 'INFO', 'degradation-ladder');
+      log(`Applied ${levelName} level config overrides (${Object.keys(overrides).length} keys)`, 'INFO', 'degradation-ladder');
     } catch (err: any) {
       logError('Error applying mode config', err);
     }
@@ -388,7 +561,7 @@ class DegradationLadder {
     try {
       for (const [key, value] of Object.entries(this._originalConfig)) {
         if (value !== undefined) {
-          try { updateConfig(key, value); } catch (e: any) { /* already logged by updateConfig */ }
+          try { updateConfig(key, value); } catch (e: any) {}
         }
       }
       log('Restored original config values', 'INFO', 'degradation-ladder');
@@ -397,9 +570,92 @@ class DegradationLadder {
     }
   }
 
-  // --- Health check helpers ---
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Module-Level Skip Helpers
+  //
+  // These are called by individual modules to check if they should skip work.
+  // Each module calls `degradationLadder.shouldSkip('module_name')` at the
+  // start of their operation.
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  _checkLowProviderQuota(thresholdPercent: any) { 
+  /**
+   * Module skip thresholds: the minimum level at which each module should SKIP.
+   * If current level >= module's threshold, the module should skip its work.
+   */
+  private static readonly MODULE_SKIP_THRESHOLDS: Record<string, DegradationLevel> = {
+    'self-documenting-diary': 1,      // Skip at REDUCED+ (diary is non-essential)
+    'meta-learner-reflection': 1,     // Skip at REDUCED+ 
+    'provider-quota-bargain': 1,      // Skip at REDUCED+ (bargain hunting)
+    'providers-prompt-evolution': 1,  // Skip at REDUCED+ (prompt tuning)
+    'model-evolution': 1,             // Skip at REDUCED+
+    'self-heal-auditor': 2,           // Skip at CONSERVING+ (auditing is expensive)
+    'experiments': 2,                  // Skip at CONSERVING+
+    'exploration': 2,                  // Skip at CONSERVING+
+    'providers-detection-captcha-solver': 2,  // Skip captcha solving at CONSERVING+
+  };
+
+  /**
+   * Check if a module should skip its work at the current degradation level.
+   */
+  shouldSkip(moduleName: string): boolean {
+    const threshold = (DegradationLadder as any).MODULE_SKIP_THRESHOLDS[moduleName];
+    if (threshold === undefined) return false; // Unknown module — don't skip
+    return this._currentLevel >= threshold;
+  }
+
+  /**
+   * Get the cycle sleep time based on current level.
+   * Higher levels = more time between cycles to conserve resources.
+   */
+  getCycleSleepMs(): number {
+    switch (this._currentLevel) {
+      case 0: return 0;    // FULL: no extra sleep
+      case 1: return 5000;  // REDUCED: 5s between cycles
+      case 2: return 15000; // CONSERVING: 15s between cycles
+      case 3: return 30000; // SURVIVAL: 30s between cycles
+      case 4: return 60000; // DORMANT: 60s wake checks
+      default: return 0;
+    }
+  }
+
+  /**
+   * Get the maximum retry count based on current level.
+   * Higher levels = fewer retries to save budget.
+   */
+  getMaxRetries(): number {
+    switch (this._currentLevel) {
+      case 0: return 3;  // FULL: up to 3 retries
+      case 1: return 2;  // REDUCED: up to 2 retries
+      case 2: return 1;  // CONSERVING: 1 retry
+      case 3: return 0;  // SURVIVAL: no retries
+      case 4: return 0;  // DORMANT: no retries
+      default: return 3;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Backward Compatibility (old 4-mode system)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get current mode name (backward compat — maps 5-level to old 4-mode).
+   */
+  getCurrentMode(): string {
+    const mapping: Record<DegradationLevel, string> = {
+      0: 'FULL',
+      1: 'DEGRADED',
+      2: 'SURVIVAL',
+      3: 'SURVIVAL',
+      4: 'HIBERNATION',
+    };
+    return mapping[this._currentLevel] || 'FULL';
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Health Check Helpers (used by legacy evaluateShouldDegrade/Recover)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  _checkLowProviderQuota(thresholdPercent: number): string | null { 
     try {
       const rows = getDb()?.prepare('SELECT provider, limit_val AS budget, spent FROM provider_quotas').all();
       for (const row of rows) {
@@ -412,11 +668,11 @@ class DegradationLadder {
       }
       return null;
     } catch (err: any) {
-      return null; // Table may not exist
+      return null;
     }
   }
 
-  _checkMemoryThreshold(ratio: any) { 
+  _checkMemoryThreshold(ratio: number): string | null { 
     try {
       const used = process.memoryUsage().heapUsed;
       const total = process.memoryUsage().heapTotal;
@@ -431,26 +687,24 @@ class DegradationLadder {
     }
   }
 
-  _countOpenCircuitBreakers() { 
+  _countOpenCircuitBreakers(): number { 
     let count = 0;
-    // Count from self-heal circuit breaker
     try {
       const { healerCircuitBreaker } = require('./self-heal-circuit-breaker');
       const state = healerCircuitBreaker.getState();
       if (state.state === 'OPEN') count++;
-    } catch (_e: any) { /* non-critical, suppressed */ }
-    // Count from subsystem mesh
+    } catch (_e: any) {}
     try {
       const { subsystemMesh } = require('./monitoring-subsystem-circuit-breakers');
       const status = subsystemMesh.getMeshStatus();
       for (const s of Object.values(status)) {
         if ((s as any).state === 'OPEN') count++;
       }
-    } catch (_e: any) { /* non-critical, suppressed */ }
+    } catch (_e: any) {}
     return count;
   }
 
-  _checkNoCloudProviders() { 
+  _checkNoCloudProviders(): boolean { 
     try {
       const rows = getDb()?.prepare("SELECT is_working FROM model_registry WHERE role = 'active'").all();
       const working = rows.filter((r: any) => r.is_working === 1);
@@ -460,72 +714,50 @@ class DegradationLadder {
     }
   }
 
-  _checkBrowserDead() { 
+  _checkBrowserDead(): boolean { 
     try {
-      // Quick check: try to see if browser module can report status
       const { browserManager } = require('./browser');
       if (browserManager && browserManager._browser && !browserManager._browser.closed) {
         return false;
       }
-      // Browser not connected; report as dead
       return true;
     } catch (err: any) {
-      // If we can't even load the browser module, the browser IS dead
       return true;
     }
   }
 
-  _checkDatabaseCorrupted() { 
+  _checkDatabaseCorrupted(): boolean { 
     try {
       const result = getDb()?.prepare('PRAGMA integrity_check').get();
       return result && result.integrity_check !== 'ok';
     } catch (err: any) {
-      return true; // If we can't check, assume corrupted
+      return true;
     }
   }
 
-  /**
-   * Set callback for mode change events.
-   */
-  onModeChange(callback: any) { 
-    this._onModeChange = callback;
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Callbacks & Lifecycle
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  onLevelChange(callback: (prevLevel: DegradationLevel, newLevel: DegradationLevel, reason: string) => void) { 
+    this._onLevelChange = callback;
   }
 
   /**
-   * Start periodic evaluation.
-   * @param {number} intervalMs - Evaluation interval (default 60s). Recovery check runs every 5 min.
+   * Start periodic evaluation (60s default).
+   * This is a background safety net — calculateLevel() is also called per-cycle.
    */
   start(intervalMs = 60000) { 
     try {
-      let recoveryCounter = 0;
-      const RECOVERY_CHECK_INTERVAL = Math.floor((5 * 60 * 1000) / intervalMs); // Check recovery every 5 min
-
-      this._evalTimer = setInterval(async () => {
+      this._evalTimer = setInterval(() => {
         try {
-          // Always check for degradation
-          const degradEval = this.evaluateShouldDegrade();
-          if (degradEval.shouldDegrade) {
-            log(`Auto-degrading: ${this._currentMode} -> ${degradEval.targetMode} (${degradEval.reason})`, 'WARN', 'degradation-ladder');
-            this.setMode(degradEval.targetMode, degradEval.reason);
-          }
-
-          // Check recovery less frequently
-          recoveryCounter++;
-          if (recoveryCounter >= RECOVERY_CHECK_INTERVAL) {
-            recoveryCounter = 0;
-            const recoveryEval = this.evaluateShouldRecover();
-            if (recoveryEval.shouldRecover) {
-              log(`Auto-recovering: ${this._currentMode} -> ${recoveryEval.targetMode} (${recoveryEval.reason})`, 'INFO', 'degradation-ladder');
-              this.setMode(recoveryEval.targetMode, recoveryEval.reason);
-            }
-          }
+          this.calculateLevel();
         } catch (err: any) {
-          logError('Error in degradation evaluation cycle', err);
+          logError('Error in periodic degradation evaluation', err);
         }
       }, intervalMs);
       if (this._evalTimer && this._evalTimer.unref) this._evalTimer.unref();
-
-      log(`Degradation ladder started (eval interval: ${Math.round(intervalMs / 1000)}s, recovery check: every 5min)`, 'INFO', 'degradation-ladder');
+      log(`Degradation ladder started (periodic eval interval: ${Math.round(intervalMs / 1000)}s)`, 'INFO', 'degradation-ladder');
     } catch (err: any) {
       logError('Failed to start degradation ladder', err);
     }
@@ -533,7 +765,6 @@ class DegradationLadder {
 
   stop() { 
     if (this._evalTimer) { clearInterval(this._evalTimer); this._evalTimer = null; }
-    if (this._recoveryTimer) { clearInterval(this._recoveryTimer); this._recoveryTimer = null; }
     log('Degradation ladder stopped', 'INFO', 'degradation-ladder');
   }
 
@@ -548,13 +779,28 @@ class DegradationLadder {
       return [];
     }
   }
+
+  /**
+   * Get the last calculation result (for dashboards/monitoring).
+   */
+  getLastCalculation(): LevelCalculation | null {
+    return this._lastCalculation;
+  }
+
+  /**
+   * Get time spent at current level in milliseconds.
+   */
+  getTimeAtCurrentLevelMs(): number {
+    return Date.now() - this._levelEnterTime;
+  }
 }
 
 const degradationLadder = new DegradationLadder();
 module.exports = {
   DegradationLadder,
   degradationLadder,
-  MODES,
+  LEVEL_NAMES,
+  LEVEL_REQUIREMENTS,
   MODE_CONFIG_OVERRIDES,
   _injectDependencies,
 };
