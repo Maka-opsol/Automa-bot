@@ -62,6 +62,32 @@ function createContainer(): DIContainerType {
     tags: ['core'],
   });
 
+  // Turso cloud database (PRIMARY store) — R6 refactor
+  // Must be registered after 'database' (local SQLite) since it depends on it for fallback
+  c.register('turso', {
+    factory: (deps: any) => {
+      const mod = require('./database-turso');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['core'],
+  });
+
+  // Unified DB facade — Turso-first reads, local write-through
+  // R6: All critical data operations should use this instead of raw database.ts
+  c.register('unifiedDb', {
+    factory: (deps: any) => {
+      const mod = require('./unified-db');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database', 'turso'],
+    critical: false,
+    tags: ['core'],
+  });
+
   c.register('stateMachine', {
     factory: (deps: any) => {
       const mod = require('./state-machine');
@@ -357,13 +383,14 @@ function createContainer(): DIContainerType {
   });
 
   // Action cache — skip AI calls when visual context matches a previous successful action
+  // R6: Now uses unifiedDb for Turso-first reads/writes
   c.register('actionCache', {
     factory: (deps: any) => {
       const mod = require('./services-action-cache');
       mod._injectDependencies(deps);
       return mod;
     },
-    deps: ['config', 'logger', 'database'],
+    deps: ['config', 'logger', 'database', 'unifiedDb'],
     critical: false,
     tags: ['performance'],
   });
