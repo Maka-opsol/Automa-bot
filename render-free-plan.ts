@@ -963,6 +963,12 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
             };
           } catch { return null; }
         })(),
+        actionCache: (() => {
+          try {
+            const ac = require('./services-action-cache');
+            return ac.getStats();
+          } catch { return null; }
+        })(),
       }));
     } catch (e: any) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
