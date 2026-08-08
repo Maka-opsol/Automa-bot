@@ -141,6 +141,22 @@ function buildSnapshot(triggerReason: string): Record<string, any> {
       }
     } catch { /* non-critical */ }
 
+    // Pixel color calibration (separate from regular calibration keys)
+    try {
+      const pixelCal = require('./pixel-calibration');
+      if (pixelCal.getSnapshot) {
+        snapshot.pixelCalibration = pixelCal.getSnapshot();
+      }
+    } catch { /* non-critical: pixel-calibration may not be available */ }
+
+    // Pixel exploration maps (discovered clickable regions for unknown UIs)
+    try {
+      const pixelExplorer = require('./pixel-explorer');
+      if (pixelExplorer.getSnapshot) {
+        snapshot.pixelExploration = pixelExplorer.getSnapshot();
+      }
+    } catch { /* non-critical: pixel-explorer may not be available */ }
+
     // Completed modules
     try {
       snapshot.completedModules = db.database.prepare(
@@ -395,6 +411,22 @@ async function checkAndRestore(): Promise<{ restored: boolean; details: string }
 
             // Restore DB data if available
             await restoreDbFromSnapshot(snapshot);
+
+            // Restore pixel calibration data if available
+            try {
+              if (snapshot.pixelCalibration) {
+                const pixelCal = require('./pixel-calibration');
+                await pixelCal.restoreSnapshot(snapshot.pixelCalibration);
+              }
+            } catch { /* non-critical */ }
+
+            // Restore pixel exploration maps if available
+            try {
+              if (snapshot.pixelExploration) {
+                const pixelExplorer = require('./pixel-explorer');
+                await pixelExplorer.restoreSnapshot(snapshot.pixelExploration);
+              }
+            } catch { /* non-critical */ }
 
             return { restored: true, details: `Restored from local tombstone (${(fileAgeMs / 1000).toFixed(0)}s old, ${snapshot.triggerReason})` };
           }
