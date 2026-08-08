@@ -8,7 +8,7 @@ const _getLog = () => { try { return require('./logger'); } catch { return { log
  * On Render free plan (slow CPU), individual page.$() calls can hang.
  * This prevents the fallback from consuming the entire cycle budget.
  */
-const FALLBACK_TIMEOUT_MS = 5000;
+const FALLBACK_TIMEOUT_MS = 15000;
 
 /**
  * Per-selector timeout in ms. Each page.$() is raced against this.
@@ -61,6 +61,9 @@ function _boxToAction(box: any, currentState: string): any {
 // ─── Selectors organized by page context ───
 
 const ASSIGNMENT_SELECTORS = [
+  // Download button on module cards (must be checked before Watch/Start)
+  { selector: '[class*="download"], [class*="Download"]', state: 'module_downloading' },
+  { selector: 'button:has-text("Download")', state: 'module_downloading' },
   // Video buttons
   { selector: 'button:has-text("Watch")', state: 'assignments_page' },
   { selector: 'button:has-text("Start")', state: 'assignments_page' },
@@ -162,8 +165,8 @@ async function _getFallbackActionInner(page: any, log: any): Promise<any> {
   // ── Stage 3: Context-specific selectors ──
   const url = page.url();
 
-  // Assignments page
-  if (url.includes('/assignments')) {
+  // Assignments page — also detect by SPA domain (URL may not have /assignments path)
+  if (url.includes('/assignments') || url.includes('mathu.co.za')) {
     for (const entry of ASSIGNMENT_SELECTORS) {
       const el = await _safeQuery(page, entry.selector);
       if (el) {
