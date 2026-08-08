@@ -83,12 +83,33 @@ async function _typeText(page: any, text: string, config: any): Promise<void> {
 // Main action executor
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Lazy degradation ladder loader
+let _degradationLadder: any = null;
+function _getDegradationLadder() {
+  if (!_degradationLadder) {
+    try { _degradationLadder = require('./self-heal-degradation-ladder'); } catch { _degradationLadder = null; }
+  }
+  return _degradationLadder;
+}
+
 async function executeAction(page: any, action: any) {
   // Race the entire action against a timeout.
   // Wait actions use a dynamic timeout (waitTime + buffer) since they may
   // legitimately need > 30s (e.g., BETWEEN_STEPS_MS * WAIT_MULTIPLIER = 75s).
   const isWaitAction = action.actionType === 'wait';
   const CONFIG = getCONFIG();
+
+  // ─── Degradation level adjustments (Response 3) ───
+  const dl = _getDegradationLadder();
+  const dlInst = dl?.degradationLadder || dl;
+  const currentLevel = dlInst?.getCurrentLevel?.() ?? 0;
+  // At Level 2+ (CONSERVING), skip captcha solving and complex navigation
+  if (currentLevel >= 2 && action.actionType === 'solve_captcha') {
+    log(`Degradation level ${currentLevel}: skipping captcha solve`, 'INFO', 'action');
+    return;
+  }
+  // At Level 3+ (SURVIVAL), reduce action timeout by 50%
+  // (already handled via config override SCREENSHOT_QUALITY, but timeout too)
   const wm = _waitMultiplier(CONFIG);
   const estimatedWaitTime = isWaitAction
     ? ((CONFIG.ENABLE_ADAPTIVE_PERFORMANCE && _deps.adaptivePerformanceEngine?.getAdjustedWait)
