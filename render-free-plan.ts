@@ -1098,7 +1098,37 @@ if (typeof pruneTemplateCache === 'function') {
   } catch { /* best-effort */ }
 }
 
-// Autonomous features
+// ═══════════════════════════════════════════════════════════════════════════
+// R6: Turso PRIMARY — Must initialize BEFORE subsystems that depend on it.
+// Turso is now the authoritative data source. Pull from Turso populates
+// local DB with all critical data (modules, calibration, action cache,
+// provider registry, model registry, banned actions) before any subsystem
+// reads from the local DB.
+// ═══════════════════════════════════════════════════════════════════════════
+await (async () => {
+  try {
+    const tursoSync = require('./database-turso');
+    const tursoModule = container.get('turso', { required: false });
+    if (tursoModule) {
+      log('Initializing Turso as PRIMARY data store (R6)...', 'INFO', 'render-free-plan');
+      await tursoModule.startTursoSync();
+      const status = tursoModule.getTursoStatus();
+      if (status.enabled) {
+        log(`Turso PRIMARY ready (client=${status.clientConnected}, lastPull=${status.lastPullTime > 0 ? 'yes' : 'no'})`, 'INFO', 'render-free-plan');
+      } else {
+        log('Turso not configured — operating in local-only mode', 'INFO', 'render-free-plan');
+      }
+    } else {
+      // Fallback: direct require if container doesn't have turso yet
+      await tursoSync.startTursoSync();
+      log('Turso sync started (direct require fallback)', 'INFO', 'render-free-plan');
+    }
+  } catch (err: any) {
+    log(`Turso init failed (non-fatal): ${err.message}`, 'WARN', 'render-free-plan');
+  }
+})();
+
+// Autonomous features (now Turso data is available in local DB)
 container.get('reflection', { required: false })?.startReflectionScheduler?.();
 container.get('strategyVariants', { required: false })?.runExperimentScheduler?.();
 container.get('anomalyDetector', { required: false })?.start?.();
@@ -1111,14 +1141,6 @@ container.get('failsafeCoordinator', { required: false })?.startHealthChecks?.(6
 
 // Remote config
 container.get('remoteConfig', { required: false })?.loadRemoteConfig?.().catch(() => {});
-
-// Turso cloud sync (graceful no-op if not configured)
-try {
-  const tursoSync = require('./database-turso');
-  tursoSync.startTursoSync().catch((err: any) => {
-    log(`Turso sync failed to start: ${err.message}`, 'WARN', 'render-free-plan');
-  });
-} catch { /* module not found — skip */ }
 
 // Startup smoke tests
 const smokeResult = runStartupSmokeTests();
