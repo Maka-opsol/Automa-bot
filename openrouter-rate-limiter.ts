@@ -457,6 +457,14 @@ function _resetForNewDay(): void {
   log(`OpenRouter rate limiter: new day reset (${yesterday} → ${_state.date}). Budget: ${DAILY_LIMIT} requests`, 'INFO', 'or-limiter');
 }
 
+// Get total budget remaining as percentage (0-100). Used by degradation ladder.
+function getBudgetPct(): number {
+  _ensureInitialized();
+  if (_state.date !== _todayUTC()) _resetForNewDay();
+  if (DAILY_LIMIT === 0) return 0;
+  return Math.round(((DAILY_LIMIT - _state.totalUsed) / DAILY_LIMIT) * 100);
+}
+
 // ─── Exports ───────────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -468,6 +476,7 @@ module.exports = {
   getStatus,
   canUse,
   getRemaining,
+  getBudgetPct,
   // Lifecycle
   _injectDependencies,
   // Constants (for testing/monitoring)
