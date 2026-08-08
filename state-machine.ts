@@ -1,469 +1,242 @@
 'use strict';
 
-import type { Deps } from './types/di-types';
-const EventEmitter = require('events');
-let _deps: Deps = {};
+// Lazy requires to avoid top-level dependency on heavy modules
+const _getLog = () => { try { return require('./logger'); } catch { return { log: console.log, logError: console.error }; } };
 
-function _injectDependencies(deps: Deps) {
-  _deps = deps;
+/**
+ * Overall timeout for the entire fallback action pipeline.
+ * On Render free plan (slow CPU), individual page.$() calls can hang.
+ * This prevents the fallback from consuming the entire cycle budget.
+ */
+const FALLBACK_TIMEOUT_MS = 15000;
+
+/**
+ * Per-selector timeout in ms. Each page.$() is raced against this.
+ */
+const SELECTOR_TIMEOUT_MS = 2000;
+
+/**
+ * Try a single page.$() with a per-call timeout.
+ * Returns null on timeout or error (never throws).
+ */
+async function _safeQuery(page: any, selector: string): Promise<any> {
+  const { sleep } = require('./utils-sleep');
+  try {
+    return await Promise.race([
+      page.$(selector),
+      sleep(SELECTOR_TIMEOUT_MS).then(() => null),
+    ]);
+  } catch { return null; }
 }
 
-function getCONFIG(): any { return _deps.config || {}; }
-function getDb(): any { return _deps.database?.db; }
-
-// Wrapper functions that delegate to injected logger with console fallbacks
-function log(msg: string, level?: string, mod?: string) { _deps.logger?.log?.(msg, level, mod) ?? console.log(msg); }
-function safeLog(obj: any, level?: string, mod?: string) { _deps.logger?.safeLog?.(obj, level, mod) ?? console.log(JSON.stringify(obj)); }
-function logError(msg: string, err: Error, ctx?: any) { _deps.logger?.logError?.(msg, err, ctx) ?? console.error(msg, err); }
-
-// Read CONFIG values at call-time (not module load) to reflect config changes at runtime
-function getStateHistoryMax(): number { return getCONFIG().STATE_HISTORY_MAX ?? 1000; }
-function getStateTimeoutMs(): number { return getCONFIG().STATE_TIMEOUT_MS ?? 5 * 60 * 1000; }
-
-// --- Types & Interfaces ---
-
-interface HistoryEntry {
-  state: string;
-  timestamp: number;
+/**
+ * Get bounding box from an element handle with timeout.
+ * Returns null on any failure.
+ */
+async function _safeBoundingBox(page: any, element: any): Promise<any> {
+  if (!element) return null;
+  const { sleep } = require('./utils-sleep');
+  try {
+    return await Promise.race([
+      element.boundingBox(),
+      sleep(SELECTOR_TIMEOUT_MS).then(() => null),
+    ]);
+  } catch { return null; }
 }
 
-type Hook = {
-  type: 'enter' | 'exit';
-  fn: (state: string) => void | Promise<void>;
-};
-
-type GuardFn = () => boolean | Promise<boolean>;
-
-// --- State Constants ---
-
-const STATES: Readonly<Record<string, string>> = {
-  MATHU_LOGIN: 'mathu_login',
-  MICROSOFT_EMAIL_INPUT: 'microsoft_email_input',
-  MICROSOFT_PASSWORD_INPUT: 'microsoft_password_input',
-  MICROSOFT_STAY_SIGNED_IN: 'microsoft_stay_signed_in',
-  ADVLEARN_LOGIN: 'advlearn_login',
-  ASSIGNMENTS_PAGE: 'assignments_page',
-  VIDEO_PLAYER: 'video_player',
-  EXERCISE_INFO: 'exercise_info',
-  EXERCISE_MEMO: 'exercise_memo',
-  ASSESSMENT: 'assessment',
-  SCORE_SCREEN: 'score_screen',
-  PATHWAY: 'pathway',
-  PATHWAY_FEEDBACK: 'pathway_feedback',
-  ASSESSMENT_CORRECTION: 'assessment_correction',
-  ANYWHERE_CLICK_RECOVERY: 'anywhere_click_recovery',
-  ERROR: 'error',
-  UI_DISCOVERED: 'ui_discovered',
-  FLUTTER_MODAL: 'flutter_modal',
-  FLUTTER_BOTTOM_SHEET: 'flutter_bottom_sheet',
-  EXPLORATION: 'exploration',
-};
-
-const VALID_STATES_SET: Set<string> = new Set(Object.values(STATES));
-
-// --- Action Constants ---
-
-const ACTIONS: Readonly<Record<string, string>> = {
-  CLICK: 'click',
-  INPUT_EMAIL: 'input_email',
-  INPUT_PASSWORD: 'input_password',
-  KEYPAD_INPUT: 'keypad_input',
-  SCROLL_VERTICAL: 'scroll_vertical',
-  SCROLL_HORIZONTAL: 'scroll_horizontal',
-  WAIT: 'wait',
-  FLUTTER_SWIPE: 'flutter_swipe',
-  FLUTTER_TAP: 'flutter_tap',
-};
-
-const VALID_ACTIONS_SET: ReadonlySet<string> = new Set(Object.values(ACTIONS));
-const ACTIONS_REQUIRING_COORDS: ReadonlySet<string> = new Set([
-  ACTIONS.CLICK,
-  ACTIONS.INPUT_EMAIL,
-  ACTIONS.INPUT_PASSWORD,
-  ACTIONS.FLUTTER_TAP,
-]);
-
-// --- Transitions ---
-
-// VALID_TRANSITIONS is intentionally mutable — `updateTransitions` and `addState` extend it at runtime
-const VALID_TRANSITIONS: Record<string, string[]> = {
-  [STATES.MATHU_LOGIN]: [STATES.MICROSOFT_EMAIL_INPUT, STATES.MICROSOFT_PASSWORD_INPUT, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.MICROSOFT_EMAIL_INPUT]: [STATES.MICROSOFT_PASSWORD_INPUT, STATES.ADVLEARN_LOGIN, STATES.MICROSOFT_STAY_SIGNED_IN, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.MICROSOFT_PASSWORD_INPUT]: [STATES.MICROSOFT_STAY_SIGNED_IN, STATES.ADVLEARN_LOGIN, STATES.ASSIGNMENTS_PAGE, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.MICROSOFT_STAY_SIGNED_IN]: [STATES.ADVLEARN_LOGIN, STATES.ASSIGNMENTS_PAGE, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.ADVLEARN_LOGIN]: [STATES.ASSIGNMENTS_PAGE, STATES.MICROSOFT_STAY_SIGNED_IN, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.ASSIGNMENTS_PAGE]: [STATES.VIDEO_PLAYER, STATES.EXERCISE_INFO, STATES.ASSESSMENT, STATES.ASSIGNMENTS_PAGE, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR, STATES.UI_DISCOVERED, STATES.EXPLORATION],
-  [STATES.VIDEO_PLAYER]: [STATES.EXERCISE_INFO, STATES.ASSESSMENT, STATES.SCORE_SCREEN, STATES.ASSIGNMENTS_PAGE, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.EXERCISE_INFO]: [STATES.EXERCISE_MEMO, STATES.ASSIGNMENTS_PAGE, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.EXERCISE_MEMO]: [STATES.ASSESSMENT, STATES.ASSIGNMENTS_PAGE, STATES.SCORE_SCREEN, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.ASSESSMENT]: [STATES.SCORE_SCREEN, STATES.PATHWAY, STATES.ASSESSMENT_CORRECTION, STATES.ASSESSMENT, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.SCORE_SCREEN]: [STATES.PATHWAY, STATES.ASSIGNMENTS_PAGE, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.PATHWAY]: [STATES.PATHWAY_FEEDBACK, STATES.ASSIGNMENTS_PAGE, STATES.SCORE_SCREEN, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.PATHWAY_FEEDBACK]: [STATES.PATHWAY, STATES.ASSIGNMENTS_PAGE, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.ASSESSMENT_CORRECTION]: [STATES.SCORE_SCREEN, STATES.PATHWAY, STATES.ASSESSMENT_CORRECTION, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.ANYWHERE_CLICK_RECOVERY]: [STATES.MATHU_LOGIN, STATES.ASSIGNMENTS_PAGE, STATES.VIDEO_PLAYER, STATES.EXERCISE_INFO, STATES.ASSESSMENT, STATES.SCORE_SCREEN, STATES.PATHWAY, STATES.ERROR],
-  [STATES.ERROR]: [STATES.MATHU_LOGIN, STATES.ASSIGNMENTS_PAGE, STATES.ERROR, STATES.ANYWHERE_CLICK_RECOVERY],
-  [STATES.UI_DISCOVERED]: [STATES.ASSIGNMENTS_PAGE, STATES.VIDEO_PLAYER, STATES.ERROR],
-  [STATES.FLUTTER_MODAL]: [STATES.ASSIGNMENTS_PAGE, STATES.VIDEO_PLAYER, STATES.ERROR],
-  [STATES.FLUTTER_BOTTOM_SHEET]: [STATES.ASSIGNMENTS_PAGE, STATES.ERROR],
-  [STATES.EXPLORATION]: [STATES.ASSIGNMENTS_PAGE, STATES.ERROR],
-};
-
-const TRANSITION_SETS: Record<string, Set<string>> = {};
-for (const [from, toList] of Object.entries(VALID_TRANSITIONS)) {
-  TRANSITION_SETS[from] = new Set(toList);
+/**
+ * Build a click action from a bounding box.
+ * Returns null if box is invalid.
+ */
+function _boxToAction(box: any, currentState: string): any {
+  if (!box || box.width <= 0 || box.height <= 0) return null;
+  return {
+    actionType: 'click',
+    currentState,
+    targetX: Math.round(box.x + box.width / 2),
+    targetY: Math.round(box.y + box.height / 2),
+  };
 }
 
-// --- StateMachine Class ---
+// ─── Selectors organized by page context ───
 
-class StateMachine extends EventEmitter {
-  public currentState: string | null;
-  public history: HistoryEntry[];
-  public deadlockDetected: boolean;
-  private stateStartTime: number | null;
-  private guards: Map<string, GuardFn>;
-  private hooks: Map<string, Hook[]>;
-  private _initialized: boolean;
-  private _transitionLock: boolean;
-  private _maxListeners: number;
+const ASSIGNMENT_SELECTORS = [
+  // Download button on module cards (must be checked before Watch/Start)
+  { selector: '[class*="download"], [class*="Download"]', state: 'module_downloading' },
+  { selector: 'button:has-text("Download")', state: 'module_downloading' },
+  // Video buttons
+  { selector: 'button:has-text("Watch")', state: 'assignments_page' },
+  { selector: 'button:has-text("Start")', state: 'assignments_page' },
+  { selector: 'button:has-text("Play")', state: 'assignments_page' },
+  // Module/assignment cards — click top area (title)
+  { selector: '.module-card, .card, [class*="assignment"], [class*="module"]', state: 'assignments_page', offsetY: 30 },
+];
 
-  constructor() {
-    super();
-    this.currentState = null;
-    this.stateStartTime = null;
-    this.guards = new Map<string, GuardFn>();
-    this.hooks = new Map<string, Hook[]>();
-    this.history = [];
-    this.deadlockDetected = false;
-    this._initialized = false;
-    this._transitionLock = false;
-    this._maxListeners = 50;
-    this.setMaxListeners(this._maxListeners);
-    this.on('error', (err: Error): void => {
-      logError('StateMachine event error', err, { state: this.currentState });
-    });
+const LOGIN_SELECTORS = [
+  { selector: 'input[type="email"]', state: 'microsoft_email_input', actionType: 'input_email' },
+  { selector: 'input[name="loginfmt"]', state: 'microsoft_email_input', actionType: 'input_email' },
+  { selector: 'input[type="password"]', state: 'microsoft_password_input', actionType: 'input_password' },
+  { selector: 'input[name="passwd"]', state: 'microsoft_password_input', actionType: 'input_password' },
+  { selector: 'input[name="password"]', state: 'advlearn_login', actionType: 'input_password' },
+];
+
+const KMSI_SELECTORS = [
+  { selector: 'button:has-text("Stay signed in")', state: 'microsoft_stay_signed_in' },
+  { selector: 'button:has-text("Yes")', state: 'microsoft_stay_signed_in' },
+  { selector: 'input[id="idBtn_Back"]', state: 'microsoft_stay_signed_in' },
+];
+
+const SIGNIN_SELECTORS = [
+  { selector: 'button:has-text("Sign in")', state: 'signin_page' },
+  { selector: 'button:has-text("Log in")', state: 'signin_page' },
+  { selector: 'button:has-text("Next")', state: 'signin_page' },
+  { selector: 'button:has-text("Continue")', state: 'signin_page' },
+];
+
+/**
+ * Generate a fallback action when the tribunal/AI fails.
+ *
+ * Strategy:
+ *   1. Pixel analysis (no DOM needed) — finds inputs/buttons by raw pixel color
+ *   2. Visual recovery (longevity-ui-recovery) — works across UI redesigns
+ *   3. Context-specific selectors (assignments, login, signin)
+ *   4. Return wait action as last resort
+ *
+ * On Render free plan:
+ *   - Overall timeout prevents hung page.$() from consuming cycle budget
+ *   - Per-selector timeout (2s) prevents individual query hangs
+ *   - Pixel fallback is first because it works when DOM is completely empty (Flutter canvas)
+ */
+async function getFallbackAction(page: any) {
+  const { log } = _getLog();
+  const { sleep } = require('./utils-sleep');
+
+  // Wrap entire pipeline in a timeout
+  const result = await Promise.race([
+    _getFallbackActionInner(page, log),
+    sleep(FALLBACK_TIMEOUT_MS).then(() => {
+      log('Fallback action pipeline timed out', 'WARN', 'fallback');
+      return { actionType: 'wait', currentState: 'error', targetX: 0, targetY: 0 };
+    }),
+  ]);
+  return result;
+}
+
+async function _getFallbackActionInner(page: any, log: any): Promise<any> {
+  // ── Stage 0: Pixel-based analysis (works with NO DOM, NO AI, NO semantics) ──
+  // Decodes the screenshot PNG to raw RGBA pixels and scans for:
+  //   - White rectangles = input fields (email/password)
+  //   - Blue rectangles = Microsoft buttons (Next/Sign in)
+  //   - Green/orange rectangles = Watch/Start buttons
+  // This is the ultimate fallback when everything else is blind.
+  try {
+    const { generatePixelFallbackAction } = require('./pixel-fallback');
+    const pixelAction = await generatePixelFallbackAction(page);
+    if (pixelAction) {
+      log(`Pixel fallback provided action: ${pixelAction.actionType} at (${pixelAction.targetX}, ${pixelAction.targetY})`, 'INFO', 'fallback');
+      return pixelAction;
+    }
+  } catch (e: any) {
+    log(`Pixel fallback failed: ${e.message || e}`, 'DEBUG', 'fallback');
   }
 
-  async initialize(): Promise<void> {
-    if (this._initialized) return;
-    try {
-      const db = getDb();
-      if (!db) {
-        log('Database not initialized — starting fresh at MATHU_LOGIN', 'WARN', 'state-machine');
-        this.currentState = STATES.MATHU_LOGIN;
-        this.stateStartTime = Date.now();
-        this._initialized = true;
-        this.emit('initialized', this.currentState);
-        return;
-      }
-      const last: { state: string; timestamp: number } | undefined =
-        db.prepare(`SELECT state, timestamp FROM state_history ORDER BY timestamp DESC LIMIT 1`).get() as
-          | { state: string; timestamp: number }
-          | undefined;
-      if (last && last.state && VALID_STATES_SET.has(last.state)) {
-        const timeSinceLastState: number = Date.now() - last.timestamp;
-        if (timeSinceLastState < 3600000) {
-          this.currentState = last.state;
-          log(
-            `Recovered state: ${this.currentState} (age: ${Math.round(timeSinceLastState / 1000)}s)`,
-            'INFO',
-            'state-machine',
-          );
-        } else {
-          log(
-            `Last state too old (${Math.round(timeSinceLastState / 1000 / 60)}min), starting fresh`,
-            'INFO',
-            'state-machine',
-          );
-          this.currentState = STATES.MATHU_LOGIN;
-        }
-      } else {
-        this.currentState = STATES.MATHU_LOGIN;
-      }
-      this.stateStartTime = Date.now();
-      this._initialized = true;
-      this.emit('initialized', this.currentState);
-    } catch (err: unknown) {
-      logError('State machine initialization failed', err as Error);
-      this.currentState = STATES.MATHU_LOGIN;
-      this.stateStartTime = Date.now();
-      this._initialized = true;
+  // ── Stage 1: Visual recovery (works across UI redesigns) ──
+  try {
+    const { generateRecoveryAction } = require('./longevity-ui-recovery');
+    const recoveryAction = await generateRecoveryAction(page);
+    if (recoveryAction) {
+      log('Visual recovery provided fallback action', 'DEBUG', 'fallback');
+      return recoveryAction;
     }
+  } catch (e: any) {
+    log(`UI recovery failed, using selector-based fallback: ${e.message || e}`, 'DEBUG', 'fallback');
   }
 
-  onEnter(state: string, hook: (state: string) => void | Promise<void>): void {
-    if (!VALID_STATES_SET.has(state)) throw new Error(`Invalid state for onEnter hook: ${state}`);
-    if (typeof hook !== 'function') throw new Error('Hook must be a function');
-    if (!this.hooks.has(state)) this.hooks.set(state, []);
-    this.hooks.get(state)!.push({ type: 'enter', fn: hook });
-  }
+  // ── Stage 2: Wait for DOM readiness ──
+  // After navigation or error, DOM may not be ready.
+  // Non-blocking: if waitForLoadState hangs, the per-selector timeouts will catch it.
+  try {
+    await Promise.race([
+      page.waitForLoadState('domcontentloaded', { timeout: 2000 }),
+      require('./utils-sleep').sleep(2500).then(() => null),
+    ]);
+  } catch { /* proceed with selectors anyway */ }
 
-  onExit(state: string, hook: (state: string) => void | Promise<void>): void {
-    if (!VALID_STATES_SET.has(state)) throw new Error(`Invalid state for onExit hook: ${state}`);
-    if (typeof hook !== 'function') throw new Error('Hook must be a function');
-    if (!this.hooks.has(state)) this.hooks.set(state, []);
-    this.hooks.get(state)!.push({ type: 'exit', fn: hook });
-  }
+  // ── Stage 3: Context-specific selectors ──
+  const url = page.url();
 
-  addGuard(fromState: string, toState: string, guardFn: GuardFn): void {
-    if (!VALID_STATES_SET.has(fromState) || !VALID_STATES_SET.has(toState)) {
-      throw new Error(`Invalid states for guard: ${fromState} -> ${toState}`);
-    }
-    if (typeof guardFn !== 'function') throw new Error('Guard must be a function');
-    const key: string = `${fromState}->${toState}`;
-    this.guards.set(key, guardFn);
-  }
-
-  async transition(newState: string): Promise<boolean> {
-    if (!this._initialized) await this.initialize();
-    if (!VALID_STATES_SET.has(newState)) throw new Error(`Invalid target state: ${newState}`);
-    if (this.currentState === null) {
-      log('Transition attempted with null currentState, initializing to MATHU_LOGIN', 'WARN', 'state-machine');
-      this.currentState = STATES.MATHU_LOGIN;
-      this.stateStartTime = Date.now();
-    }
-    if (this._transitionLock) {
-      log(`Transition blocked - lock held: ${this.currentState} → ${newState}`, 'WARN', 'state-machine');
-      return false;
-    }
-    if (!this.isValidTransition(this.currentState, newState)) {
-      const validTargets: Set<string> = TRANSITION_SETS[this.currentState] || new Set<string>();
-      throw new Error(
-        `Invalid transition: ${this.currentState} → ${newState}. Valid: [${[...validTargets].join(', ')}]`,
-      );
-    }
-    this._transitionLock = true;
-    try {
-      const guardKey: string = `${this.currentState}->${newState}`;
-      const guard: GuardFn | undefined = this.guards.get(guardKey);
-      if (guard) {
-        try {
-          const guardResult: boolean = await Promise.race<boolean>([
-            guard(),
-            new Promise<boolean>((_, reject) =>
-              setTimeout(() => reject(new Error('Guard timeout')), 5000),
-            ),
-          ]);
-          if (!guardResult) {
-            this.emit('guardRejected', { from: this.currentState, to: newState });
-            log(`Guard rejected: ${this.currentState} → ${newState}`, 'DEBUG', 'state-machine');
-            return false;
+  // Assignments page — also detect by SPA domain (URL may not have /assignments path)
+  if (url.includes('/assignments') || url.includes('mathu.co.za')) {
+    for (const entry of ASSIGNMENT_SELECTORS) {
+      const el = await _safeQuery(page, entry.selector);
+      if (el) {
+        const box = await _safeBoundingBox(page, el);
+        if (box) {
+          const action = _boxToAction(box, entry.state);
+          if (action) {
+            if (entry.offsetY) { action.targetY = Math.round(box.y + entry.offsetY); }
+            log(`Fallback found ${entry.selector} on assignments page`, 'DEBUG', 'fallback');
+            return action;
           }
-        } catch (err: unknown) {
-          const message: string = err instanceof Error ? err.message : String(err);
-          log(`Guard error (${guardKey}): ${message}`, 'ERROR', 'state-machine');
-          this.emit('guardError', { from: this.currentState, to: newState, error: message });
-          return false;
         }
       }
-      await this._runHooks(this.currentState, 'exit');
-      const oldState: string = this.currentState;
-      this.currentState = newState;
-      this.stateStartTime = Date.now();
-      this._persistState(oldState, newState);
-      this.history.push({ state: newState, timestamp: Date.now() });
-      if (this.history.length > getStateHistoryMax()) {
-        this.history = this.history.slice(-getStateHistoryMax());
+    }
+  }
+
+  // Microsoft login (all sub-pages: email, password, kmsi)
+  if (url.includes('login.microsoftonline.com') || url.includes('login.live.com') || url.includes('login.microsoft.com')) {
+    // Try KMSI selectors first (if on the stay-signed-in page)
+    if (url.includes('/kmsi')) {
+      for (const entry of KMSI_SELECTORS) {
+        const el = await _safeQuery(page, entry.selector);
+        if (el) {
+          const box = await _safeBoundingBox(page, el);
+          if (box) {
+            const action = _boxToAction(box, entry.state);
+            if (action) {
+              log(`Fallback found ${entry.selector} on KMSI page`, 'DEBUG', 'fallback');
+              return action;
+            }
+          }
+        }
       }
-      await this._runHooks(newState, 'enter');
-      this.emit('transition', { from: oldState, to: newState, timestamp: Date.now() });
-      return true;
-    } finally {
-      this._transitionLock = false;
     }
-  }
-
-  private _persistState(oldState: string | null, newState: string): void {
-    try {
-      const db = getDb();
-      if (!db) return;
-      db.prepare(`INSERT INTO state_history (state, timestamp, previous_state) VALUES (?, ?, ?)`).run(
-        newState,
-        Date.now(),
-        oldState,
-      );
-    } catch (err: unknown) {
-      logError('Failed to persist state', err as Error, { from: oldState, to: newState });
-    }
-  }
-
-  private async _runHooks(state: string, type: 'enter' | 'exit'): Promise<void> {
-    const hooks: Hook[] = this.hooks.get(state)?.filter((h: Hook) => h.type === type) || [];
-    for (const hook of hooks) {
-      try {
-        await Promise.race<void>([
-          hook.fn(state) as Promise<void>,
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('Hook timeout')), 30000),
-          ),
-        ]);
-      } catch (err: unknown) {
-        logError(`Hook error (${type} ${state})`, err as Error);
+    // Login input selectors
+    for (const entry of LOGIN_SELECTORS) {
+      const el = await _safeQuery(page, entry.selector);
+      if (el) {
+        const box = await _safeBoundingBox(page, el);
+        if (box) {
+          const action = _boxToAction(box, entry.state);
+          if (action) {
+            action.actionType = entry.actionType || action.actionType;
+            log(`Fallback found ${entry.selector} on login page`, 'DEBUG', 'fallback');
+            return action;
+          }
+        }
       }
     }
   }
 
-  isValidTransition(from: string | null, to: string): boolean {
-    if (from === null || !VALID_STATES_SET.has(from) || !VALID_STATES_SET.has(to)) return false;
-    if (to === STATES.ANYWHERE_CLICK_RECOVERY || to === STATES.ERROR) return true;
-    const validSet: Set<string> | undefined = TRANSITION_SETS[from];
-    return validSet !== undefined ? validSet.has(to) : false;
-  }
-
-  detectDeadlock(): boolean {
-    // v5-fix M5: Increased from 20 to 50 entries. The previous window was too
-    // small — a slow oscillation (e.g. cycle of 5 states with delays between
-    // each) could have >20 history entries between repetitions and evade detection.
-    const recent: HistoryEntry[] = this.history.slice(-50);
-    if (recent.length < 10) return false;
-    const uniqueStates: Set<string> = new Set(recent.map((r: HistoryEntry) => r.state));
-    if (uniqueStates.size <= 3) {
-      const stateSequence: string[] = recent.map((r: HistoryEntry) => r.state);
-      const hasOscillation: boolean = this._detectOscillation(stateSequence);
-      if (hasOscillation) {
-        this.deadlockDetected = true;
-        log(
-          `Deadlock detected: oscillation between ${[...uniqueStates].join(', ')}`,
-          'WARN',
-          'state-machine',
-        );
-        return true;
+  // ADVLEARN or generic auth pages
+  if (url.includes('login') || url.includes('signin') || url.includes('auth') || url.includes('advlearn')) {
+    for (const entry of SIGNIN_SELECTORS) {
+      const el = await _safeQuery(page, entry.selector);
+      if (el) {
+        const box = await _safeBoundingBox(page, el);
+        if (box) {
+          const action = _boxToAction(box, entry.state);
+          if (action) {
+            log(`Fallback found ${entry.selector} on auth page`, 'DEBUG', 'fallback');
+            return action;
+          }
+        }
       }
     }
-    if (this.stateStartTime !== null && Date.now() - this.stateStartTime > getStateTimeoutMs()) {
-      this.deadlockDetected = true;
-      log(`Deadlock detected: state timeout (${this.currentState})`, 'WARN', 'state-machine');
-      return true;
-    }
-    this.deadlockDetected = false;
-    return false;
   }
 
-  private _detectOscillation(sequence: string[]): boolean {
-    if (sequence.length < 6) return false;
-    const last4: string[] = sequence.slice(-4);
-    if (last4[0] === last4[2] && last4[1] === last4[3] && last4[0] !== last4[1]) return true;
-    const last6: string[] = sequence.slice(-6);
-    if (
-      last6.length === 6 &&
-      last6[0] === last6[3] &&
-      last6[1] === last6[4] &&
-      last6[2] === last6[5]
-    )
-      return true;
-    return false;
-  }
-
-  resetDeadlock(): void {
-    const oldHistoryLength: number = this.history.length;
-    this.history = [];
-    this.deadlockDetected = false;
-    this.stateStartTime = Date.now();
-    log(
-      `Deadlock reset (cleared ${oldHistoryLength} history entries)`,
-      'INFO',
-      'state-machine',
-    );
-  }
-
-  getCurrentState(): string | null {
-    return this.currentState;
-  }
-
-  getStateAge(): number {
-    return this.stateStartTime !== null ? Date.now() - this.stateStartTime : 0;
-  }
-
-  getHistory(): HistoryEntry[] {
-    return [...this.history];
-  }
-
-  getValidNextStates(state: string): string[] {
-    if (!VALID_STATES_SET.has(state)) return [];
-    return [...(VALID_TRANSITIONS[state] || [])];
-  }
-
-  updateTransitions(newTransitions: Record<string, string[]>): void {
-    if (!newTransitions || typeof newTransitions !== 'object')
-      throw new Error('newTransitions must be an object');
-    for (const [from, toList] of Object.entries(newTransitions)) {
-      if (!VALID_STATES_SET.has(from)) {
-        log(`Invalid source state in updateTransitions: ${from}`, 'WARN', 'state-machine');
-        continue;
-      }
-      if (!Array.isArray(toList)) {
-        log(`Invalid transitions list for ${from}`, 'WARN', 'state-machine');
-        continue;
-      }
-      const validToList: string[] = (toList as string[]).filter((to: string) =>
-        VALID_STATES_SET.has(to),
-      );
-      const existing: string[] = VALID_TRANSITIONS[from] || [];
-      const mergedSet = new Set([...existing, ...validToList]);
-      VALID_TRANSITIONS[from] = [...mergedSet];
-      TRANSITION_SETS[from] = mergedSet;
-    }
-  }
-
-  addState(newState: string, transitions: string[] = []): void {
-    if (typeof newState !== 'string' || newState.length === 0)
-      throw new Error('State name must be a non-empty string');
-    if (VALID_STATES_SET.has(newState)) throw new Error(`State already exists: ${newState}`);
-    if (!Array.isArray(transitions)) throw new Error('Transitions must be an array');
-    VALID_STATES_SET.add(newState);
-    const validTransitions: string[] = transitions.filter((t: string) => VALID_STATES_SET.has(t));
-    VALID_TRANSITIONS[newState] = validTransitions;
-    TRANSITION_SETS[newState] = new Set(validTransitions);
-    log(
-      `Added new state: ${newState} with ${validTransitions.length} transitions`,
-      'INFO',
-      'state-machine',
-    );
-  }
-
-  forceState(newState: string, reason: string = 'unspecified'): void {
-    if (!VALID_STATES_SET.has(newState))
-      throw new Error(`Cannot force invalid state: ${newState}`);
-    const oldState: string | null = this.currentState;
-    this.currentState = newState;
-    this.stateStartTime = Date.now();
-    this.deadlockDetected = false;
-    safeLog({ action: 'force_state', from: oldState, to: newState, reason }, 'WARN', 'state-machine');
-    this._persistState(oldState, newState);
-    this.emit('forceState', { from: oldState, to: newState, reason });
-  }
+  // ── Stage 4: Last resort ──
+  return { actionType: 'wait', currentState: 'error', targetX: 0, targetY: 0 };
 }
 
-// --- Singleton ---
-
-const stateMachine: StateMachine = new StateMachine();
-
-module.exports = {
-  STATES,
-  ACTIONS,
-  ACTIONS_REQUIRING_COORDS,
-  VALID_TRANSITIONS,
-  stateMachine,
-  _injectDependencies,
-  isValidTransition: (from: string, to: string): boolean =>
-    stateMachine.isValidTransition(from, to),
-  getValidNextStates: (state: string): string[] => stateMachine.getValidNextStates(state),
-  isValidState: (state: string): boolean => VALID_STATES_SET.has(state),
-  isValidAction: (action: string): boolean => VALID_ACTIONS_SET.has(action),
-  pushState: (state: string): Promise<boolean> => stateMachine.transition(state),
-  detectDeadlock: (): boolean => stateMachine.detectDeadlock(),
-  resetDeadlockDetection: (): void => stateMachine.resetDeadlock(),
-  forceState: (state: string, reason?: string): void =>
-    stateMachine.forceState(state, reason),
-  getStateDiagnostics: (): {
-    currentState: string | null;
-    stateAge: number;
-    historyLength: number;
-    deadlockDetected: boolean;
-  } => ({
-    currentState: stateMachine.currentState,
-    stateAge: stateMachine.getStateAge(),
-    historyLength: stateMachine.history.length,
-    deadlockDetected: stateMachine.deadlockDetected,
-  }),
-};
+module.exports = { getFallbackAction };
