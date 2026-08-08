@@ -477,9 +477,16 @@ registerShutdownHook(async () => {
   } catch { /* best effort */ }
 }, 1);
 registerShutdownHook(async () => {
+  log('Flushing pixel calibration data...', 'INFO', 'render-free-plan');
+  try {
+    const pixelCal = require('./pixel-calibration');
+    await pixelCal.flush();
+  } catch { /* best effort */ }
+}, 3);
+registerShutdownHook(async () => {
   log('Closing database...', 'INFO', 'render-free-plan');
   try { closeDatabase(); } catch { /* best effort */ }
-}, 2);
+}, 4);
 
 // \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
 // MEMORY MANAGEMENT \u2014 Tuned for 512 MB
