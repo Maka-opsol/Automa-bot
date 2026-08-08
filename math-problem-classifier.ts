@@ -267,9 +267,11 @@ Show all simplification steps.`,
   MODULE_NAVIGATION: `Navigate the MathU module interface.
 1. If on the assignments page, look for module cards with download buttons — click download first if the module is not yet downloaded.
 2. After downloading, click Watch or Start on the first uncompleted topic.
-3. Work through topics in order: watch videos, then complete exercises, then take assessments.
-4. After finishing a topic, return to the topic list and proceed to the next one.
-5. Look for progress indicators to identify which topics are already complete.`,
+3. When a video appears, click on it to open the video player. Then wait for exactly 2 minutes 59 seconds (179 seconds) while the video plays. After the required watch time, click the back arrow (top-left) or X button to close it.
+4. When on an exercise page, you MUST click the open book icon in the TOP-RIGHT CORNER of the white card BEFORE clicking Next. The app requires viewing the memo before proceeding. The workflow is: click book icon → view memo → click green Next button.
+5. Work through topics in order: watch videos for 2m59s then close them, complete exercises (view memo then Next), then take assessments.
+6. After finishing a topic, return to the topic list and proceed to the next one.
+7. Look for progress indicators to identify which topics are already complete.`,
 
   UNKNOWN: `Analyze this problem and solve step by step. Show all working.`,
 };
