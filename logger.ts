@@ -17,21 +17,40 @@ const os = require('os');
 const pino = require('pino');
 const pinoRoll = require('pino-roll');
 
+// ═══════════════════════════════════════════════════════════════
+// BetterStack Logtail — ships all logs to BetterStack
+// ═══════════════════════════════════════════════════════════════
+let logtail: any = null;
+try {
+  const { Node: Logtail } = require('@logtail/js');
+  logtail = new Logtail('NHp5ngRUznwzrAZBsi2NZYpZ', {
+    endpoint: 'https://s2663647.eu-central-1a.betterstackdata.com',
+  });
+} catch (e: any) {
+  console.error(`[logger] BetterStack Logtail not available: ${e.message}`);
+}
+
+// pino destination that forwards to BetterStack
+const logtailDestination = logtail ? pino.destination({
+  write: (data: string) => {
+    try {
+      const parsed = JSON.parse(data);
+      logtail.log(parsed.message || data, {
+        level: parsed.level || 'info',
+        module: parsed.module || 'main',
+        timestamp: parsed.timestamp || new Date().toISOString(),
+        pid: parsed.pid,
+        host: parsed.host,
+      });
+    } catch { /* best effort */ }
+  },
+  sync: false,
+}) : null;
+
 const VALID_LOG_LEVELS = new Set(['trace', 'debug', 'info', 'warn', 'error', 'fatal']);
 const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW_MS = 1000;
 const RATE_LIMIT_MAX_PER_WINDOW = 100;
-
-// BetterStack integration flag — checked after each log write
-let _betterStackStarted = false;
-function _ensureBetterStack() {
-  if (_betterStackStarted) return;
-  _betterStackStarted = true;
-  try {
-    const bs = require('./logging-betterstack');
-    bs.startBetterStackLogging();
-  } catch { /* not available */ }
-}
 
 // v5-fix: Lazy-load CONFIG to avoid circular dependency.
 // DO NOT convert this to a top-level require — see guard above.
@@ -141,6 +160,10 @@ function parseLogLevel(level: any) {
 
 // Start with stdout; _initLogStream() is called after config is fully loaded
 // (called from config.js or agent.js) to switch to file logging
+// If BetterStack Logtail is available, use multi-stream to ship logs to both file and BetterStack
+const streams = [logStream];
+if (logtailDestination) streams.push(logtailDestination);
+
 const logger = pino({
   level: parseLogLevel(process.env.LOG_LEVEL),
   formatters: {
@@ -151,7 +174,10 @@ const logger = pino({
   base: undefined,
   serializers: { err: pino.stdSerializers.err, error: pino.stdSerializers.err },
   redact: { paths: ['req.headers.authorization', 'req.headers.cookie'], censor: '[REDACTED]' }
-}, logStream);
+}, logtailDestination
+  ? pino.multistream(streams)
+  : logStream
+);
 
 logger.on('error', (err: any) => { console.error(`Logger error: ${err.message}`); });
 
@@ -182,18 +208,6 @@ function log(message: any, level = 'INFO', module = 'main') {
     let child = _childLoggerCache.get(safeModule);
     if (!child) { child = logger.child({ module: safeModule }); _childLoggerCache.set(safeModule, child); }
     child[lvl](safeMessage);
-
-    // Ship to BetterStack Logtail (non-blocking, lazy-init on first log)
-    _ensureBetterStack();
-    try {
-      const bs = require('./logging-betterstack');
-      bs.send({
-        level: lvl,
-        message: safeMessage,
-        module: safeModule,
-        timestamp: new Date().toISOString(),
-      });
-    } catch { /* betterstack not available */ }
   } catch (err: any) {
     console.error(`Log failure: ${err.message}`, { originalMessage: String(message)?.substring(0, 100) });
   }
@@ -248,4 +262,5 @@ module.exports = {
   redactSensitive,
   deepRedact,
   initFileLogging: _initLogStream,
+  logtail,
 };
