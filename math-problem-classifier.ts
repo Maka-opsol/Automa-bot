@@ -39,13 +39,14 @@ export type ProblemType =
   | 'EXPONENTS'
   | 'ALGEBRAIC_EXPRESSION'
   | 'NUMBER_PATTERN'
+  | 'MODULE_NAVIGATION'
   | 'UNKNOWN';
 
 const PROBLEM_TYPES: ProblemType[] = [
   'LINEAR_EQUATION', 'QUADRATIC', 'CALCULUS', 'GEOMETRY',
   'WORD_PROBLEM', 'STATISTICS', 'PROOF', 'GRAPHING',
   'SYSTEM_OF_EQUATIONS', 'FRACTIONS', 'EXPONENTS',
-  'ALGEBRAIC_EXPRESSION', 'NUMBER_PATTERN', 'UNKNOWN',
+  'ALGEBRAIC_EXPRESSION', 'NUMBER_PATTERN', 'MODULE_NAVIGATION', 'UNKNOWN',
 ];
 
 // ─── Regex Patterns (Fast Path) ─────────────────────────────────────────────
@@ -177,6 +178,15 @@ const TYPE_PATTERNS: Array<{ type: ProblemType; patterns: RegExp[]; weight: numb
       /\b(like\s+terms|coefficients|variables)\b/i,
     ],
   },
+  {
+    type: 'MODULE_NAVIGATION',
+    weight: 2,
+    patterns: [
+      /\b(download|module|topic|watch|start\s+video|assignment)\b/i,
+      /\b(assess|quiz|exercise|continue\s+to\s+pathway)\b/i,
+      /\b(progress|completed|uncompleted|redo)\b/i,
+    ],
+  },
 ];
 
 // ─── Prompt Strategies ──────────────────────────────────────────────────────
@@ -253,6 +263,13 @@ Show all simplification steps.`,
 2. Identify if arithmetic, geometric, or other pattern
 3. State the general rule
 4. Find the requested term(s)`,
+
+  MODULE_NAVIGATION: `Navigate the MathU module interface.
+1. If on the assignments page, look for module cards with download buttons — click download first if the module is not yet downloaded.
+2. After downloading, click Watch or Start on the first uncompleted topic.
+3. Work through topics in order: watch videos, then complete exercises, then take assessments.
+4. After finishing a topic, return to the topic list and proceed to the next one.
+5. Look for progress indicators to identify which topics are already complete.`,
 
   UNKNOWN: `Analyze this problem and solve step by step. Show all working.`,
 };
