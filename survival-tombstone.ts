@@ -268,14 +268,14 @@ function pushToLocalFile(snapshotJson: string): boolean {
   try {
     const fs = require('fs');
     const path = require('path');
-    const dataDir = path.join(process.cwd(), 'data');
+    const dataDir = path.join(process.env.TMPDIR || '/tmp', 'mathu-data');
 
     if (!fs.existsSync(dataDir)) {
       fs.mkdirSync(dataDir, { recursive: true });
     }
 
     const compressed = gzipCompress(snapshotJson);
-    const filePath = path.join(process.cwd(), LOCAL_BACKUP_FILE);
+    const filePath = path.join(dataDir, LOCAL_BACKUP_FILE);
     fs.writeFileSync(filePath, compressed);
     log(`Tombstone saved locally (${compressed.length} bytes at ${filePath})`, 'DEBUG');
     return true;
@@ -368,7 +368,8 @@ async function checkAndRestore(): Promise<{ restored: boolean; details: string }
   try {
     const fs = require('fs');
     const path = require('path');
-    const filePath = path.join(process.cwd(), LOCAL_BACKUP_FILE);
+    const dataDir = path.join(process.env.TMPDIR || '/tmp', 'mathu-data');
+    const filePath = path.join(dataDir, LOCAL_BACKUP_FILE);
 
     if (fs.existsSync(filePath)) {
       const stat = fs.statSync(filePath);
