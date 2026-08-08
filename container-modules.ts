@@ -356,6 +356,18 @@ function createContainer(): DIContainerType {
     tags: ['monitoring'],
   });
 
+  // Action cache — skip AI calls when visual context matches a previous successful action
+  c.register('actionCache', {
+    factory: (deps: any) => {
+      const mod = require('./services-action-cache');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['performance'],
+  });
+
   // Health watchdog — self-ping with scoring + auto-restart (Response 2)
   c.register('healthWatchdog', {
     factory: (deps: any) => {
