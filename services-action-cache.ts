@@ -3,28 +3,24 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // Action Cache — Remembers successful actions keyed by visual context.
 //
+// R6 refactor: Now uses unified-db for Turso-primary persistence.
+// - READS: Local DB first (sync, zero latency for hot path), then Turso
+//   fallback for cold starts where local is empty
+// - WRITES: Local DB (sync) + Turso (async, fire-and-forget via unifiedDb)
+//
 // Purpose: Skip expensive AI/tribunal calls when the bot has already seen
 // the exact same visual layout and knows what action to take.
 //
-// Example: If the "Next" button is always at (0.85, 0.93) on quiz pages,
-// and the screenshot layout hash matches, execute the saved click directly
-// instead of burning a vision API call.
-//
 // Context signature: SHA-256 of (state + screenshotRegionHash + dominantColors)
-// - state: tribunal-reported state (e.g., "assessment", "exercise_info")
-// - screenshotRegionHash: MD5 of a cropped region of the screenshot that
-//   contains the action-relevant area (buttons, inputs)
-// - dominantColors: hash of the 4 quadrant dominant colors (page classifier)
 //
 // TTL: Entries expire after 4 hours (layouts may change after updates).
 // Max entries: 200 (prevents unbounded growth).
 // Failure threshold: 3 consecutive failures → entry evicted.
 //
-// SQLite table: action_cache
+// Storage: action_cache table (local + Turso)
 // ═══════════════════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
-const zlib = require('zlib');
 
 let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
@@ -42,7 +38,6 @@ function _getLog() {
 const DEFAULT_MAX_ENTRIES = 200;
 const DEFAULT_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const DEFAULT_MAX_FAILURES = 3;
-const DEFAULT_MIN_HITS_BEFORE_SAVE = 1; // Save after first successful use
 
 // ─── Context Signature Computation ─────────────────────────────────────────
 
@@ -63,10 +58,8 @@ function computeContextSignature(
 ): string | null {
   if (!state || !base64Screenshot || base64Screenshot.length < 100) return null;
 
-  // Decode screenshot buffer for region hashing
   let imageBuffer: Buffer;
   try {
-    // Handle both raw base64 and data URI format
     const b64 = base64Screenshot.startsWith('data:')
       ? base64Screenshot.split(',')[1] || ''
       : base64Screenshot;
@@ -77,14 +70,6 @@ function computeContextSignature(
 
   if (imageBuffer.length < 100) return null;
 
-  // Hash key regions of the image (not the full image — that changes with text content)
-  // Focus on the bottom 40% where buttons typically live, and the top 20% for headers
-  const width = 1280; // approximate — we work with raw bytes
-  const totalPixels = imageBuffer.length / 3; // rough RGB estimate (ignoring PNG structure)
-
-  // For speed, hash a sampled subset rather than decoding the full PNG
-  // Use the raw buffer — even with PNG encoding overhead, the button regions
-  // will produce consistent hashes for identical layouts
   const hashSource = [
     `state:${state}`,
     `imgLen:${imageBuffer.length}`,
@@ -98,14 +83,10 @@ function computeContextSignature(
  * Compute a lightweight layout fingerprint from a decoded RGBA image buffer.
  * Samples specific regions (bottom buttons area, center content, top header)
  * and hashes the color distribution, not the exact pixels.
- *
- * This is more stable than a full screenshot hash because it ignores text
- * content changes while still detecting layout shifts.
  */
 function computeLayoutFingerprint(
   rgba: Uint8ClampedArray, width: number, height: number
 ): string {
-  // Sample 4 quadrants, count color buckets per quadrant
   const quadrants = [
     { name: 'top', x1: 0.0, y1: 0.0, x2: 1.0, y2: 0.2 },
     { name: 'center', x1: 0.2, y1: 0.3, x2: 0.8, y2: 0.6 },
@@ -121,7 +102,7 @@ function computeLayoutFingerprint(
     const ey = Math.floor(height * q.y2);
 
     let rSum = 0, gSum = 0, bSum = 0, count = 0;
-    const step = 12; // coarse sampling for speed
+    const step = 12;
     for (let y = sy; y < ey; y += step) {
       for (let x = sx; x < ex; x += step) {
         if (x < 0 || x >= width || y < 0 || y >= height) continue;
@@ -134,8 +115,7 @@ function computeLayoutFingerprint(
     }
 
     if (count > 0) {
-      // Bucket the average color into 8 ranges per channel (3 bits each = 9-bit descriptor)
-      const rAvg = Math.floor(rSum / count / 32); // 0-7
+      const rAvg = Math.floor(rSum / count / 32);
       const gAvg = Math.floor(gSum / count / 32);
       const bAvg = Math.floor(bSum / count / 32);
       parts.push(`${q.name}:${rAvg}${gAvg}${bAvg}`);
@@ -145,10 +125,28 @@ function computeLayoutFingerprint(
   return parts.join(',');
 }
 
-// ─── Cache Operations ──────────────────────────────────────────────────────
+// ─── Cache Operations (sync — local DB fast path) ─────────────────────────
+
+const _stats = { hits: 0, misses: 0, saves: 0, evictions: 0, tursoHits: 0 };
+function updateStats(type: string) { _stats[type] = (_stats as any)[type] + 1 || 1; }
+
+let _db: any = null;
+function _getDb() {
+  if (_db) return _db;
+  try {
+    const dbMod = require('./database');
+    _db = dbMod.getDb?.() || dbMod.db;
+    return _db;
+  } catch { return null; }
+}
+
+function _getUnifiedDb() {
+  return _deps.unifiedDb || null;
+}
 
 /**
  * Look up a cached action for the given context signature.
+ * R6: Checks local DB first (fast), then falls back to Turso via unifiedDb.
  * Returns the cached action if found and not expired, null otherwise.
  */
 function lookup(contextSignature: string): {
@@ -163,56 +161,98 @@ function lookup(contextSignature: string): {
   lastUsed: number;
 } | null {
   const log = _getLog();
+
+  // FAST PATH: Check local DB first (sync, zero latency)
   try {
     const dbMod = _getDb();
-    if (!dbMod) return null;
+    if (dbMod) {
+      const row = dbMod.prepare(
+        `SELECT action_type, target_x, target_y, value, keypad_sequence, current_state,
+                reasoning, hit_count, last_used
+         FROM action_cache WHERE context_sig = ? AND evicted = 0`
+      ).get(contextSignature);
 
-    const row = dbMod.prepare(
-      `SELECT action_type, target_x, target_y, value, keypad_sequence, current_state,
-              reasoning, hit_count, last_used
-       FROM action_cache WHERE context_sig = ? AND evicted = 0`
-    ).get(contextSignature);
+      if (row) {
+        // Check TTL
+        const config = _getConfig();
+        const ttlMs = config.ACTION_CACHE_TTL_MS || DEFAULT_TTL_MS;
+        if (Date.now() - row.last_used > ttlMs) {
+          _markEvicted(contextSignature);
+          // Don't return — fall through to Turso check below
+        } else {
+          log(`Action cache HIT (local): sig=${contextSignature.substring(0, 8)} type=${row.action_type} hits=${row.hit_count}`, 'INFO', 'action-cache');
+          updateStats('hits');
 
-    if (!row) return null;
+          // Update hit count and last used locally
+          dbMod.prepare(
+            `UPDATE action_cache SET hit_count = hit_count + 1, last_used = ? WHERE context_sig = ?`
+          ).run(Date.now(), contextSignature);
 
-    // Check TTL
-    const config = _getConfig();
-    const ttlMs = config.ACTION_CACHE_TTL_MS || DEFAULT_TTL_MS;
-    if (Date.now() - row.last_used > ttlMs) {
-      // Expired — silently evict
-      _markEvicted(contextSignature);
-      return null;
+          // Async: update hit count in Turso via unifiedDb
+          const udb = _getUnifiedDb();
+          if (udb) {
+            udb.getActionCache(contextSignature).catch(() => {}); // updates hit count
+          }
+
+          return {
+            actionType: row.action_type,
+            targetX: row.target_x,
+            targetY: row.target_y,
+            value: row.value || '',
+            keypadSequence: row.keypad_sequence ? JSON.parse(row.keypad_sequence) : [],
+            currentState: row.current_state,
+            reasoning: row.reasoning || '[cached action]',
+            hitCount: row.hit_count,
+            lastUsed: row.last_used,
+          };
+        }
+      }
     }
-
-    log(`Action cache HIT: sig=${contextSignature.substring(0, 8)} type=${row.action_type} hits=${row.hit_count}`, 'INFO', 'action-cache');
-    updateStats('hits');
-
-    // Update hit count and last used
-    dbMod.prepare(
-      `UPDATE action_cache SET hit_count = hit_count + 1, last_used = ? WHERE context_sig = ?`
-    ).run(Date.now(), contextSignature);
-
-    return {
-      actionType: row.action_type,
-      targetX: row.target_x,
-      targetY: row.target_y,
-      value: row.value || '',
-      keypadSequence: row.keypad_sequence ? JSON.parse(row.keypad_sequence) : [],
-      currentState: row.current_state,
-      reasoning: row.reasoning || '[cached action]',
-      hitCount: row.hit_count,
-      lastUsed: row.last_used,
-    };
   } catch (e: any) {
-    log(`Action cache lookup error: ${e.message || e}`, 'DEBUG', 'action-cache');
-    return null;
+    log(`Action cache local lookup error: ${e.message || e}`, 'DEBUG', 'action-cache');
   }
+
+  // SLOW PATH: Try Turso via unifiedDb (async — but we're in sync context,
+  // so this is a fire-and-forget population for NEXT cycle)
+  const udb = _getUnifiedDb();
+  if (udb) {
+    udb.getActionCache(contextSignature).then((tursoRow: any) => {
+      if (tursoRow) {
+        // Found in Turso but not local — populate local for future fast hits
+        const config = _getConfig();
+        const ttlMs = config.ACTION_CACHE_TTL_MS || DEFAULT_TTL_MS;
+        if (Date.now() - tursoRow.last_used <= ttlMs) {
+          try {
+            const dbMod = _getDb();
+            if (dbMod) {
+              const keypadJson = tursoRow.keypad_sequence || null;
+              dbMod.prepare(
+                `INSERT OR REPLACE INTO action_cache (context_sig, action_type, target_x, target_y, value,
+                  keypad_sequence, current_state, reasoning, success_count, failure_count,
+                  hit_count, created_at, last_used, evicted)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+              ).run(
+                contextSignature, tursoRow.action_type, tursoRow.target_x, tursoRow.target_y,
+                tursoRow.value || '', keypadJson, tursoRow.current_state, tursoRow.reasoning || '',
+                tursoRow.success_count || 1, tursoRow.failure_count || 0,
+                tursoRow.hit_count || 0, Date.now(), tursoRow.last_used
+              );
+              log(`Action cache: populated local from Turso for sig=${contextSignature.substring(0, 8)}`, 'DEBUG', 'action-cache');
+            }
+          } catch {}
+        }
+      }
+    }).catch(() => {});
+  }
+
+  updateStats('misses');
+  return null;
 }
 
 /**
  * Save a successful action to the cache.
- * If an entry already exists for this context, update it. Otherwise insert.
- * Only saves actions that have been successful at least once.
+ * R6: Writes to local DB (sync) + Turso (async via unifiedDb).
+ * Local write is immediate; Turso write is fire-and-forget.
  */
 function save(
   contextSignature: string,
@@ -231,7 +271,7 @@ function save(
     const dbMod = _getDb();
     if (!dbMod) return;
 
-    // Check if we're at max capacity
+    // Check capacity and evict if needed (local)
     const config = _getConfig();
     const maxEntries = config.ACTION_CACHE_MAX_ENTRIES || DEFAULT_MAX_ENTRIES;
     const count = dbMod.prepare(
@@ -239,8 +279,7 @@ function save(
     ).get()?.cnt || 0;
 
     if (count >= maxEntries) {
-      // Evict oldest/least-used entries
-      const toEvict = Math.max(1, Math.floor(maxEntries * 0.1)); // evict 10%
+      const toEvict = Math.max(1, Math.floor(maxEntries * 0.1));
       dbMod.prepare(
         `UPDATE action_cache SET evicted = 1 WHERE context_sig IN (
           SELECT context_sig FROM action_cache WHERE evicted = 0
@@ -252,7 +291,7 @@ function save(
     const now = Date.now();
     const keypadJson = action.keypadSequence ? JSON.stringify(action.keypadSequence) : null;
 
-    // Upsert: insert or update existing
+    // Upsert to local DB (sync)
     dbMod.prepare(
       `INSERT INTO action_cache (context_sig, action_type, target_x, target_y, value,
         keypad_sequence, current_state, reasoning, success_count, failure_count,
@@ -282,7 +321,23 @@ function save(
       now
     );
 
+    // Async: write to Turso via unifiedDb (fire-and-forget)
+    const udb = _getUnifiedDb();
+    if (udb) {
+      udb.saveActionCache({
+        contextSig: contextSignature,
+        actionType: action.actionType,
+        targetX: action.targetX,
+        targetY: action.targetY,
+        value: action.value || '',
+        keypadSequence: keypadJson,
+        currentState: action.currentState,
+        reasoning: action.reasoning || '',
+      }).catch(() => {});
+    }
+
     log(`Action cache SAVE: sig=${contextSignature.substring(0, 8)} type=${action.actionType} state=${action.currentState}`, 'DEBUG', 'action-cache');
+    updateStats('saves');
   } catch (e: any) {
     log(`Action cache save error: ${e.message || e}`, 'DEBUG', 'action-cache');
   }
@@ -290,8 +345,8 @@ function save(
 
 /**
  * Record a failure for a cached action.
- * If the same context fails MAX_FAILURES times consecutively, evict it.
- * Returns true if the entry was evicted.
+ * R6: Updates local (sync) + Turso (async via unifiedDb).
+ * If MAX_FAILURES consecutive failures → evict from both stores.
  */
 function recordFailure(contextSignature: string): boolean {
   const log = _getLog();
@@ -314,10 +369,23 @@ function recordFailure(contextSignature: string): boolean {
     ).run(newFailCount, Date.now(), contextSignature);
 
     if (newFailCount >= maxFailures) {
-      log(`Action cache EVICT: sig=${contextSignature.substring(0, 8)} failed ${newFailures} times — evicting`, 'WARN', 'action-cache');
+      log(`Action cache EVICT: sig=${contextSignature.substring(0, 8)} failed ${newFailCount} times — evicting`, 'WARN', 'action-cache');
       _markEvicted(contextSignature);
       updateStats('evictions');
+
+      // Async: evict from Turso too
+      const udb = _getUnifiedDb();
+      if (udb) {
+        udb.evictActionCache(contextSignature).catch(() => {});
+      }
+
       return true;
+    }
+
+    // Async: record failure in Turso
+    const udb = _getUnifiedDb();
+    if (udb) {
+      udb.recordActionCacheFailure(contextSignature).catch(() => {});
     }
 
     return false;
@@ -329,16 +397,6 @@ function recordFailure(contextSignature: string): boolean {
 
 // ─── Internal Helpers ──────────────────────────────────────────────────────
 
-let _db: any = null;
-function _getDb() {
-  if (_db) return _db;
-  try {
-    const dbMod = require('./database');
-    _db = dbMod.getDb?.() || dbMod.db;
-    return _db;
-  } catch { return null; }
-}
-
 function _markEvicted(contextSignature: string): void {
   try {
     const dbMod = _getDb();
@@ -347,37 +405,32 @@ function _markEvicted(contextSignature: string): void {
   } catch { /* non-critical */ }
 }
 
-const _stats = { hits: 0, misses: 0, saves: 0, evictions: 0 };
-function updateStats(type: 'hits' | 'misses' | 'saves' | 'evictions') {
-  _stats[type]++;
-}
-
 // ─── Maintenance ──────────────────────────────────────────────────────────
 
 /**
  * Run maintenance: evict expired entries, clear old evicted rows.
- * Called periodically (e.g., every 100 questions).
+ * R6: Also runs Turso-side maintenance via unifiedDb.
  */
-function runMaintenance(): void {
+async function runMaintenanceAsync(): Promise<void> {
   const log = _getLog();
+  const config = _getConfig();
+  const ttlMs = config.ACTION_CACHE_TTL_MS || DEFAULT_TTL_MS;
+  const maxEntries = config.ACTION_CACHE_MAX_ENTRIES || DEFAULT_MAX_ENTRIES;
+
+  // Local maintenance (sync)
   try {
     const dbMod = _getDb();
     if (!dbMod) return;
 
-    const config = _getConfig();
-    const ttlMs = config.ACTION_CACHE_TTL_MS || DEFAULT_TTL_MS;
     const cutoff = Date.now() - ttlMs;
-
-    // Evict expired entries
     const result = dbMod.prepare(
       `UPDATE action_cache SET evicted = 1 WHERE last_used < ? AND evicted = 0`
     ).run(cutoff);
     if (result.changes > 0) {
-      log(`Action cache maintenance: evicted ${result.changes} expired entries`, 'INFO', 'action-cache');
+      log(`Action cache maintenance: evicted ${result.changes} expired local entries`, 'INFO', 'action-cache');
       updateStats('evictions');
     }
 
-    // Delete old evicted rows (keep last 50 for debugging)
     dbMod.prepare(
       `DELETE FROM action_cache WHERE evicted = 1 AND context_sig NOT IN (
         SELECT context_sig FROM action_cache WHERE evicted = 1 ORDER BY last_used DESC LIMIT 50
@@ -386,6 +439,50 @@ function runMaintenance(): void {
   } catch (e: any) {
     log(`Action cache maintenance error: ${e.message || e}`, 'DEBUG', 'action-cache');
   }
+
+  // Turso maintenance (async via unifiedDb)
+  const udb = _getUnifiedDb();
+  if (udb) {
+    try {
+      const result = await udb.runActionCacheMaintenance(ttlMs, maxEntries);
+      if (result.evicted > 0) {
+        log(`Action cache maintenance: evicted ${result.evicted} expired Turso entries`, 'INFO', 'action-cache');
+      }
+    } catch {}
+  }
+}
+
+/**
+ * Sync version of maintenance for backward compatibility.
+ * Fires off async Turso maintenance in the background.
+ */
+function runMaintenance(): void {
+  // Run local maintenance synchronously (fast path)
+  try {
+    const dbMod = _getDb();
+    if (!dbMod) return;
+
+    const config = _getConfig();
+    const ttlMs = config.ACTION_CACHE_TTL_MS || DEFAULT_TTL_MS;
+    const cutoff = Date.now() - ttlMs;
+
+    const result = dbMod.prepare(
+      `UPDATE action_cache SET evicted = 1 WHERE last_used < ? AND evicted = 0`
+    ).run(cutoff);
+    if (result.changes > 0) {
+      _getLog()(`Action cache maintenance: evicted ${result.changes} expired entries`, 'INFO', 'action-cache');
+      updateStats('evictions');
+    }
+
+    dbMod.prepare(
+      `DELETE FROM action_cache WHERE evicted = 1 AND context_sig NOT IN (
+        SELECT context_sig FROM action_cache WHERE evicted = 1 ORDER BY last_used DESC LIMIT 50
+      )`
+    ).run();
+  } catch {}
+
+  // Fire off Turso maintenance in background
+  runMaintenanceAsync().catch(() => {});
 }
 
 /**
@@ -396,6 +493,7 @@ function getStats(): {
   misses: number;
   saves: number;
   evictions: number;
+  tursoHits: number;
   activeEntries: number;
   topActions: Array<{ actionType: string; state: string; hitCount: number }>;
 } {
@@ -433,18 +531,49 @@ function getStats(): {
 
 /**
  * Clear all cached actions. Used for testing or manual reset.
+ * R6: Clears both local and Turso.
+ */
+async function clearAsync(): Promise<void> {
+  _stats.hits = 0;
+  _stats.misses = 0;
+  _stats.saves = 0;
+  _stats.evictions = 0;
+  _stats.tursoHits = 0;
+  try {
+    const dbMod = _getDb();
+    if (dbMod) {
+      dbMod.prepare(`DELETE FROM action_cache`).run();
+    }
+  } catch {}
+
+  // Clear Turso via unifiedDb
+  const udb = _getUnifiedDb();
+  if (udb) {
+    try { await udb.clearActionCache(); } catch {}
+  }
+}
+
+/**
+ * Sync clear for backward compatibility.
  */
 function clear(): void {
   _stats.hits = 0;
   _stats.misses = 0;
   _stats.saves = 0;
   _stats.evictions = 0;
+  _stats.tursoHits = 0;
   try {
     const dbMod = _getDb();
     if (dbMod) {
       dbMod.prepare(`DELETE FROM action_cache`).run();
     }
-  } catch { /* non-critical */ }
+  } catch {}
+
+  // Fire off Turso clear in background
+  const udb = _getUnifiedDb();
+  if (udb) {
+    udb.clearActionCache().catch(() => {});
+  }
 }
 
 module.exports = {
@@ -455,6 +584,8 @@ module.exports = {
   save,
   recordFailure,
   runMaintenance,
+  runMaintenanceAsync,
   getStats,
   clear,
+  clearAsync,
 };
