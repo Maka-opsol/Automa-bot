@@ -280,6 +280,82 @@ function createContainer(): DIContainerType {
     tags: ['services'],
   });
 
+  // Response 5: Solution cache (uses calibration table, no extra DI deps)
+  c.register('solutionCache', {
+    factory: (deps: any) => {
+      const mod = require('./math-solution-cache');
+      mod._injectDependencies(deps);
+      mod.init();
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['services'],
+  });
+
+  // Response 6: /tmp disk guardian (prevents silent /tmp fill-up)
+  c.register('tmpGuardian', {
+    factory: (deps: any) => {
+      const mod = require('./longevity-tmp-guardian');
+      mod._injectDependencies(deps);
+      mod.init();
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['longevity'],
+  });
+
+  // Response 6: Render cold start detection + recovery
+  c.register('coldStart', {
+    factory: (deps: any) => {
+      const mod = require('./render-cold-start');
+      mod._injectDependencies(deps);
+      mod.init();
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['longevity'],
+  });
+
+  // Work shift scheduler — time + resource aware shift management (Response 7)
+  c.register('workShifts', {
+    factory: (deps: any) => {
+      const mod = require('./services-work-shifts');
+      mod._injectDependencies(deps);
+      mod.recoverFromDB();
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['scheduling'],
+  });
+
+  // API key vault — centralized key validation + health tracking (Response 8)
+  c.register('apiKeyVault', {
+    factory: (deps: any) => {
+      const mod = require('./services-api-key-vault');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['monitoring'],
+  });
+
+  // Contextual alert manager — proactive NTFY alerts based on bot state (Response 8)
+  c.register('contextualAlerts', {
+    factory: (deps: any) => {
+      const mod = require('./services-ntfy-alerts');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['monitoring'],
+  });
+
   // Health watchdog — self-ping with scoring + auto-restart (Response 2)
   c.register('healthWatchdog', {
     factory: (deps: any) => {
