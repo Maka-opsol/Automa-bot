@@ -230,6 +230,32 @@ function createContainer(): DIContainerType {
     tags: ['providers'],
   });
 
+  // WolframAlpha oracle — external math verification (Response 1)
+  // Registered before math-verify so it's available as a dependency
+  c.register('wolfram', {
+    factory: (deps: any) => {
+      const mod = require('./services-wolfram');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['services'],
+  });
+
+  // Math verification module — catches LLM math errors (Response 1)
+  // Uses nerdamer locally + WolframAlpha as external oracle
+  c.register('mathVerify', {
+    factory: (deps: any) => {
+      const mod = require('./math-verify');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'wolfram'],
+    critical: false,
+    tags: ['services'],
+  });
+
   // providersBase and providersStats are registered in FOUNDATION UTILITIES above.
   // v5-fix: moved up so dependents (providerQuotaBargain, dashboard) don't
   // rely on late lazy-resolution.
