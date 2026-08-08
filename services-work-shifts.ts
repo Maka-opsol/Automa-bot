@@ -267,6 +267,12 @@ function evaluateShift(): ShiftState {
     else if (resSig === 'CONSERVING') reasons.push('rate limiter pacing high');
 
     _state.reason = reasons.join(', ');
+
+    // Notify contextual alert manager (Response 8)
+    try {
+      const alerts = require('./services-ntfy-alerts');
+      alerts.alertShiftTransition?.(previous, resolved, _state.reason).catch(() => {});
+    } catch { /* non-critical */ }
   }
 
   _state.timeSignal = timeSig;
