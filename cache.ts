@@ -159,12 +159,31 @@ function addCompletedModule(moduleName: any) {
   if (!moduleName || typeof moduleName !== 'string') { log('Invalid module name for completion', 'WARN', 'cache'); return false; }
   const sanitizedName = moduleName.trim().substring(0, 500);
   if (!sanitizedName) { log('Empty module name after sanitization', 'WARN', 'cache'); return false; }
-  try { _deps.database?.insertModule?.(sanitizedName); log(`Marked module as completed: "${sanitizedName.substring(0, 50)}..."`, 'INFO', 'cache'); return true; } catch (err: any) { logError('Failed to save completed module', err, { moduleName: sanitizedName.substring(0, 50) }); return false; }
+  try {
+    // R6: Write to local (sync) + Turso (async via unifiedDb)
+    _deps.database?.insertModule?.(sanitizedName);
+    if (_deps.unifiedDb) {
+      _deps.unifiedDb.saveModule(sanitizedName).catch(() => {});
+    }
+    log(`Marked module as completed: "${sanitizedName.substring(0, 50)}..."`, 'INFO', 'cache'); return true;
+  } catch (err: any) { logError('Failed to save completed module', err, { moduleName: sanitizedName.substring(0, 50) }); return false; }
 }
 
 function isModuleCompleted(moduleName: any) { 
   if (!moduleName || typeof moduleName !== 'string') return false;
+  // R6: Check local first (fast), Turso serves as backup
   try { return !!_deps.database?.selectModule?.(moduleName.trim().substring(0, 500)); } catch (err: any) { logError('Failed to check module completion', err); return false; }
+}
+
+async function loadCompletedModulesAsync() { 
+  // R6: Try Turso first for authoritative data, fall back to local
+  if (_deps.unifiedDb) {
+    try {
+      const tursoModules = await _deps.unifiedDb.getAllModules();
+      if (tursoModules.length > 0) return tursoModules;
+    } catch {}
+  }
+  try { return _deps.database?.getAllModules?.() || []; } catch (err: any) { logError('Failed to load completed modules', err); return []; }
 }
 
 function loadCompletedModules() {  try { return _deps.database?.getAllModules?.() || []; } catch (err: any) { logError('Failed to load completed modules', err); return []; } }
@@ -200,6 +219,7 @@ module.exports = {
   addCompletedModule,
   isModuleCompleted,
   loadCompletedModules,
+  loadCompletedModulesAsync,
   cleanupStaleFiles,
   _injectDependencies,
 };
