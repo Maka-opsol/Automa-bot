@@ -249,6 +249,35 @@ try {
     degradationLadder.start(60000); // evaluate every 60s
     log('Degradation ladder started (periodic eval every 60s)', 'INFO', 'render-free-plan');
   }
+
+  // Cold start detection (Response 6)
+  try {
+    const coldStart = container.get('coldStart', { required: false });
+    if (coldStart && typeof coldStart.detectColdStart === 'function') {
+      const csInfo = coldStart.detectColdStart();
+      if (csInfo.isColdStart) {
+        log(`Cold start detected: ${csInfo.reason}`, 'WARN', 'render-free-plan');
+        // Start last-seen updates so next cold start is detectable
+        coldStart.startLastSeenUpdates();
+      } else {
+        log(`Startup type: ${csInfo.startupType} — ${csInfo.reason}`, 'INFO', 'render-free-plan');
+        coldStart.startLastSeenUpdates();
+      }
+    }
+  } catch (e) {
+    log('Cold start detection failed: ' + (e as any).message, 'WARN', 'render-free-plan');
+  }
+
+  // /tmp disk guardian (Response 6)
+  try {
+    const tmpGuardian = container.get('tmpGuardian', { required: false });
+    if (tmpGuardian && typeof tmpGuardian.start === 'function') {
+      tmpGuardian.start();
+      log('/tmp disk guardian started', 'INFO', 'render-free-plan');
+    }
+  } catch (e) {
+    log('/tmp disk guardian start failed: ' + (e as any).message, 'WARN', 'render-free-plan');
+  }
 } catch (e) {
   log('Health watchdog / degradation ladder start failed: ' + e.message, 'WARN', 'render-free-plan');
 }
@@ -613,6 +642,12 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
     // Include degradation level (Response 3)
     const degradationLadder = container.get('degradationLadder', { required: false });
     const degradationInfo = degradationLadder?.getLastCalculation?.() || null;
+    // Include /tmp guardian status (Response 6)
+    const tmpGuardian = container.get('tmpGuardian', { required: false });
+    const tmpGuardianStatus = tmpGuardian?.getStatus?.() || null;
+    // Include cold start info (Response 6)
+    const coldStart = container.get('coldStart', { required: false });
+    const coldStartStatus = coldStart?.getStatus?.() || null;
     const health = {
       status: watchdogHealth ? watchdogHealth.level : 'ok',
       timestamp: new Date().toISOString(),
@@ -638,6 +673,20 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
         visionProviderCount: degradationInfo.visionProviderCount,
         orBudgetPct: degradationInfo.orBudgetPct,
         reasons: degradationInfo.reasons,
+      } : null,
+      tmpGuardian: tmpGuardianStatus ? {
+        usagePct: Math.round(tmpGuardianStatus.usagePct * 100),
+        usedMB: tmpGuardianStatus.usedMB,
+        totalMB: tmpGuardianStatus.totalMB,
+        lastPruneLevel: tmpGuardianStatus.lastPruneLevel,
+        checks: tmpGuardianStatus.checks,
+        prunes: tmpGuardianStatus.prunes,
+      } : null,
+      coldStart: coldStartStatus ? {
+        startupType: coldStartStatus.startupType,
+        isColdStart: coldStartStatus.isColdStart,
+        gapMinutes: coldStartStatus.gapMinutes,
+        lastSeenAt: coldStartStatus.lastSeenAt,
       } : null,
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
