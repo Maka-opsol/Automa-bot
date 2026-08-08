@@ -71,6 +71,8 @@ let _mathpix: any = null;
 function _getMathpix() { if (!_mathpix) { try { _mathpix = require('./services-mathpix'); } catch { _mathpix = null; } } return _mathpix; }
 let _degradationLadder: any = null;
 function _getDegradationLadder() { if (!_degradationLadder) { try { _degradationLadder = require('./self-heal-degradation-ladder'); } catch { _degradationLadder = null; } } return _degradationLadder; }
+let _actionCache: any = null;
+function _getActionCache() { if (!_actionCache) { try { _actionCache = require('./services-action-cache'); } catch { _actionCache = null; } } return _actionCache; }
 let _solutionCache: any = null;
 function _getSolutionCache() { if (!_solutionCache) { try { _solutionCache = require('./math-solution-cache'); } catch { _solutionCache = null; } } return _solutionCache; }
 let _tmpGuardian: any = null;
@@ -424,6 +426,35 @@ async function runCycle() {
       if (economyQuotaRations?.isEconomyMode?.()) {
         log('Economy mode active — reducing tribunal calls', 'INFO', 'cycle');
       }
+
+      // ─── Action Cache Lookup ───
+      // Before calling the tribunal (expensive AI call), check if we have
+      // a cached action for this exact visual context. If hit, skip the AI
+      // call entirely and use the saved action.
+      let _actionCacheSig: string | null = null;
+      let _actionCacheHit = false;
+      const actionCache = _getActionCache();
+      if (!action && actionCache && currentState) {
+        try {
+          // Compute context signature from current state + screenshot
+          // Use previous cycle's state as the context key (currentState is set from last cycle)
+          _actionCacheSig = actionCache.computeContextSignature(currentState, base64);
+          if (_actionCacheSig) {
+            const cachedAction = actionCache.lookup(_actionCacheSig);
+            if (cachedAction) {
+              action = cachedAction;
+              _actionCacheHit = true;
+              log(`Action cache HIT: type=${cachedAction.actionType} at (${cachedAction.targetX.toFixed(2)}, ${cachedAction.targetY.toFixed(2)}) state=${cachedAction.currentState}`, 'INFO', 'cycle');
+              updateStats({ actionCacheHits: (getStats().actionCacheHits || 0) + 1 });
+            } else {
+              updateStats({ actionCacheMisses: (getStats().actionCacheMisses || 0) + 1 });
+            }
+          }
+        } catch (cacheErr: any) {
+          log(`Action cache lookup error: ${cacheErr.message || cacheErr}`, 'DEBUG', 'cycle');
+        }
+      }
+
       // Vision tribunal
       if (!action) {
         try {
@@ -775,6 +806,36 @@ async function runCycle() {
         consecutiveFailures = 0;
       }
 
+      // ─── Action Cache Save / Failure Tracking ───
+      // After action execution, update the cache:
+      // - Success: save the action (if not from cache) for future reuse
+      // - Failure: record failure count; evict if too many consecutive failures
+      if (_actionCacheSig && actionCache) {
+        if (actionSuccess && !_actionCacheHit) {
+          // Save new successful action to cache (only if it wasn't already from cache)
+          // This builds the cache over time as the bot discovers working actions
+          try {
+            actionCache.save(_actionCacheSig, {
+              actionType: action.actionType,
+              targetX: action.targetX,
+              targetY: action.targetY,
+              value: action.value || '',
+              keypadSequence: action.keypadSequence,
+              currentState: action.currentState || currentState || 'unknown',
+              reasoning: action.reasoning,
+            });
+          } catch (saveErr: any) {
+            log(`Action cache save error: ${saveErr.message || saveErr}`, 'DEBUG', 'cycle');
+          }
+        } else if (!actionSuccess && _actionCacheHit) {
+          // Cached action failed — record failure and possibly evict
+          const evicted = actionCache.recordFailure(_actionCacheSig);
+          if (evicted) {
+            log('Action cache entry evicted due to repeated failures — will re-query AI next cycle', 'WARN', 'cycle');
+          }
+        }
+      }
+
       // ─── Module Download Wait Logic (Response 3) ───
       // After executing a download click, wait for the module content to appear.
       // Uses screenshot hash comparison to detect when the page changes.
@@ -921,6 +982,7 @@ async function runCycle() {
         // Run solution cache maintenance every 100 questions (Response 5)
         if (questionsCompleted % 100 === 0) {
           try { _getSolutionCache()?.runMaintenance?.(); } catch { /* non-critical */ }
+          try { _getActionCache()?.runMaintenance?.(); } catch { /* non-critical */ }
         }
         if (currentModule && recordModuleCompletion) {
           const timeTaken = Date.now() - cycleStart;
