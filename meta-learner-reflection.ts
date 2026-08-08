@@ -19,6 +19,13 @@ let lastReflectionTime = 0;
 let isReflectionRunning = false;
 
 async function runReflection() { 
+  // Response 3: skip reflection at degradation level 1+ (REDUCED)
+  try {
+    const { degradationLadder } = require('./self-heal-degradation-ladder');
+    if (degradationLadder.shouldSkip('meta-learner-reflection')) {
+      return; // silently skip
+    }
+  } catch {}
   if (isReflectionRunning) {
     log('Reflection already running, skipping', 'DEBUG', 'reflection');
     return;
