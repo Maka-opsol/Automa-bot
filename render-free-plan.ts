@@ -228,6 +228,24 @@ if (CONFIG.MAX_UPTIME_HOURS && CONFIG.MAX_UPTIME_HOURS > 0) {
   log('Render: Disabled MAX_UPTIME_HOURS forced restart', 'INFO', 'render-free-plan');
 }
 
+// HEALTH WATCHDOG - Self-ping with scoring + auto-restart (Response 2)
+try {
+  const healthWatchdog = container.get('healthWatchdog', { required: false });
+  if (healthWatchdog && typeof healthWatchdog.start === 'function') {
+    healthWatchdog.start({
+      onLevelChange: (from, to, state) => {
+        log('Health watchdog: ' + from + ' -> ' + to + ' (score: ' + state.score + '/12)', 'WARN', 'render-free-plan');
+        if (to === 'critical' || to === 'fatal') {
+          try { sendAlert('Health level ' + to + ': score=' + state.score + '/12'); } catch {}
+        }
+      },
+    });
+    log('Health watchdog started', 'INFO', 'render-free-plan');
+  }
+} catch (e) {
+  log('Health watchdog start failed: ' + e.message, 'WARN', 'render-free-plan');
+}
+
 // \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
 // KEEPALIVE PINGER \u2014 Prevents Render 15-min spin-down
 // \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
@@ -521,7 +539,7 @@ function getMemoryInfo() {
   };
 }
 
-const server = http.createServer(async (req: any, res: any) => {
+const server = http.createServer((req: any, res: any) => {
   // BUG FIX (Response 18): Only set CORS for actual allowed origins
   // instead of blindly echoing req.headers.origin (which could be
   // anything). If DASHBOARD_ALLOWED_ORIGINS is ['*'], allow all.
@@ -582,8 +600,11 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
     const stateMachine = container.get('stateMachine');
     const stats = getStats();
     const memInfo = getMemoryInfo();
+    // Include health watchdog score (Response 2)
+    const watchdog = container.get('healthWatchdog', { required: false });
+    const watchdogHealth = watchdog?.getHealth?.() || null;
     const health = {
-      status: 'ok',
+      status: watchdogHealth ? watchdogHealth.level : 'ok',
       timestamp: new Date().toISOString(),
       uptime: process.uptime(),
       stats: { questionsCompleted: stats.questionsCompleted || 0, cycleCount: stats.cycleCount || 0 },
@@ -593,6 +614,13 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
       isRender: IS_RENDER,
       features: 'all-enabled',
       workers: 'in-process',
+      healthWatchdog: watchdogHealth ? {
+        score: watchdogHealth.score,
+        level: watchdogHealth.level,
+        checks: watchdogHealth.checks,
+        totalRestarts: watchdogHealth.totalRestarts,
+        inExtendedSleep: watchdogHealth.inExtendedSleep,
+      } : null,
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(health));
@@ -935,12 +963,6 @@ try {
   tursoSync.startTursoSync().catch((err: any) => {
     log(`Turso sync failed to start: ${err.message}`, 'WARN', 'render-free-plan');
   });
-} catch { /* module not found — skip */ }
-
-// BetterStack Logtail (graceful no-op if not configured)
-try {
-  const betterstack = require('./logging-betterstack');
-  betterstack.startBetterStackLogging();
 } catch { /* module not found — skip */ }
 
 // Startup smoke tests
