@@ -157,6 +157,20 @@ async function _getFallbackActionInner(page: any, log: any): Promise<any> {
     log(`Pixel fallback failed: ${e.message || e}`, 'DEBUG', 'fallback');
   }
 
+  // ── Stage 0.5: Blind pixel exploration (for completely unknown UIs) ──
+  // When pixel-fallback's pattern matching fails (UI completely redesigned),
+  // this systematically probes the viewport grid and learns from outcomes.
+  try {
+    const pixelExplorer = require('./pixel-explorer');
+    const explorerAction = await pixelExplorer.explore(page);
+    if (explorerAction) {
+      log(`Pixel explorer provided action: ${explorerAction.actionType} at (${explorerAction.targetX}, ${explorerAction.targetY})`, 'INFO', 'fallback');
+      return explorerAction;
+    }
+  } catch (e: any) {
+    log(`Pixel explorer failed: ${e.message || e}`, 'DEBUG', 'fallback');
+  }
+
   // ── Stage 1: Visual recovery (works across UI redesigns) ──
   try {
     const { generateRecoveryAction } = require('./longevity-ui-recovery');
