@@ -447,6 +447,64 @@ async function getAvailableProviders(options?: { visionOnly?: boolean }) {
 }
 
 // ===============================================================================
+// PROVIDER COUNT (for degradation ladder — synchronous count)
+// ===============================================================================
+
+/**
+ * Get the number of currently available providers.
+ * This is a synchronous approximation that checks loaded providers from
+ * the table against their API key availability and health status.
+ * Used by the degradation ladder to determine resource levels.
+ * 
+ * Note: This is an approximation — the full getAvailableProviders() is async
+ * and does more thorough checks. This sync version is sufficient for level
+ * determination since it runs every cycle.
+ */
+function getAvailableProviderCount(options?: { visionOnly?: boolean }): number {
+  let count = 0;
+  const configLoader = _getConfigLoader();
+
+  for (const entry of PROVIDER_TABLE) {
+    if (configLoader.isProviderDisabledByDefault(entry.name)) continue;
+    if (!entry.factory) continue;
+    try {
+      const fn = entry.factory();
+      if (!fn) continue;
+    } catch {
+      continue;
+    }
+    if (isProviderBlacklisted(entry.name) || isProviderRetired(entry.name)) continue;
+    if (entry.name === 'Gemini' && isGeminiOnCooldown()) continue;
+
+    // Vision-only filtering
+    if (options?.visionOnly) {
+      try {
+        const serializers = _getSerializers();
+        const caps = serializers.getProviderCapabilities?.(entry.name);
+        if (caps && !caps.supportsVision) continue;
+      } catch {}
+    }
+
+    count++;
+  }
+
+  // Add dynamic providers
+  for (const dp of dynamicProviders) {
+    if (isProviderBlacklisted(dp.name) || isProviderRetired(dp.name)) continue;
+    if (options?.visionOnly) {
+      try {
+        const serializers = _getSerializers();
+        const caps = serializers.getProviderCapabilities?.(dp.name);
+        if (caps && !caps.supportsVision) continue;
+      } catch {}
+    }
+    count++;
+  }
+
+  return count;
+}
+
+// ===============================================================================
 // LEGACY COMPATIBILITY
 // ===============================================================================
 
@@ -454,6 +512,7 @@ function getProviderCycleState() { return providerCycleState; }
 
 module.exports = {
   getAvailableProviders,
+  getAvailableProviderCount,
   addProviderFailure,
   resetCycleProviderState,
   isProviderBlacklisted,
