@@ -34,6 +34,9 @@ function logError(msg: string, err: Error, ctx?: any) { _deps.logger?.logError?.
 
 function getDb() { return _deps.database?.db; }
 
+// R6: unifiedDb for Turso-first reads/writes on calibration table
+function getUnifiedDb() { return _deps.unifiedDb || null; }
+
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 const MAX_ENTRIES = parseInt(process.env.SOLUTION_CACHE_MAX || '500', 10);
@@ -231,8 +234,15 @@ function _storeEntry(hash: string, entry: SolutionEntry): boolean {
   try {
     const db = getDb();
     if (!db) return false;
+    const now = Date.now();
     db.prepare('INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (?, ?, ?)')
-      .run(`${KEY_PREFIX}${hash}`, JSON.stringify(entry), Date.now());
+      .run(`${KEY_PREFIX}${hash}`, JSON.stringify(entry), now);
+
+    // R6: Async write to Turso via unifiedDb (fire-and-forget)
+    const udb = getUnifiedDb();
+    if (udb) {
+      udb.setCalibration(`${KEY_PREFIX}${hash}`, JSON.stringify(entry), now).catch(() => {});
+    }
     return true;
   } catch (e: any) {
     logError('Solution cache store failed', e);
@@ -251,12 +261,29 @@ function _loadEntry(hash: string): SolutionEntry | null {
   } catch { return null; }
 }
 
+// R6: Async load from Turso-first (used during cold start population)
+async function _loadEntryFromTurso(hash: string): Promise<SolutionEntry | null> {
+  const udb = getUnifiedDb();
+  if (!udb) return null;
+  try {
+    const value = await udb.getCalibration(`${KEY_PREFIX}${hash}`);
+    if (!value) return null;
+    return JSON.parse(value);
+  } catch { return null; }
+}
+
 function _deleteEntry(hash: string): boolean {
   try {
     const db = getDb();
     if (!db) return false;
     db.prepare("DELETE FROM calibration WHERE key = ?")
       .run(`${KEY_PREFIX}${hash}`);
+
+    // R6: Async delete from Turso
+    const udb = getUnifiedDb();
+    if (udb) {
+      udb.deleteCalibration(`${KEY_PREFIX}${hash}`).catch(() => {});
+    }
     return true;
   } catch { return false; }
 }
