@@ -269,6 +269,18 @@ async function runCycle() {
     let stagnationAutoBanTriggered = false;
     const STAGNATION_AUTO_BAN_MS = 20 * 60 * 1000;
 
+    // Module download flow state machine (Response 3)
+    // Tracks whether we just clicked a download button and need to wait
+    // for the module to download before looking for Watch/Start buttons.
+    type DownloadState = 'idle' | 'download_clicked' | 'downloading' | 'content_visible';
+    let _moduleDownloadState: DownloadState = 'idle';
+    let _moduleDownloadStartTime: number = 0;
+    let _moduleDownloadRetryCount: number = 0;
+    const MODULE_DOWNLOAD_TIMEOUT_MS = 60000; // 60s max wait for download
+    const MODULE_DOWNLOAD_POLL_INTERVAL_MS = 3000; // poll every 3s
+    const MODULE_DOWNLOAD_MAX_RETRIES = 2;
+    let _preDownloadScreenshotHash: string | null = null;
+
     // Select module using dynamic planning
     let currentModule = getNextModule?.();
     if (currentModule) { log(`Selected module: ${currentModule}`, 'INFO', 'cycle'); }
@@ -352,12 +364,27 @@ async function runCycle() {
           log(`State guard blocked transition: ${stateCheck.reason}`, 'WARN', 'cycle');
         }
       }
-      // Resilience: circular path detection
+      // Resilience: circular path detection (SPA-aware)
       if (progressCircularPathDetector) {
-        const loopCheck = progressCircularPathDetector.checkUrlLoop(beforeUrl);
-        if (loopCheck?.isLooping) {
-          log(`Circular path detected! URL ${beforeUrl} seen ${loopCheck.loopCount} times. Navigating away.`, 'WARN', 'cycle');
-          await page.goto(CONFIG.BASE_URL || 'about:blank', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+        // On SPA domains, URL never changes — use state+hash visual loop detection.
+        // On non-SPA domains, use traditional URL-based detection.
+        const spaDomains = (CONFIG.MATHU_SPA_DOMAINS || 'app.mathu.co.za,mathu.co.za').split(',').map((d: string) => d.trim());
+        const isSpa = spaDomains.some((d: string) => beforeUrl.includes(d));
+        let loopCheck;
+        if (isSpa && currentState) {
+          loopCheck = progressCircularPathDetector.checkStateLoop(currentState, screenshotHash);
+          if (loopCheck?.isLooping) {
+            log(`SPA visual loop detected! State "${currentState}" hash "${screenshotHash.substring(0, 8)}" repeated ${loopCheck.loopCount} times. ${loopCheck.suggestion}`, 'WARN', 'cycle');
+            // On SPA: scroll down to break the visual stalemate before navigating away
+            try { await page.evaluate(() => window.scrollBy(0, 300)); } catch { /* non-critical */ }
+            await new Promise(r => setTimeout(r, 2000));
+          }
+        } else {
+          loopCheck = progressCircularPathDetector.checkUrlLoop(beforeUrl);
+          if (loopCheck?.isLooping) {
+            log(`Circular path detected! URL ${beforeUrl} seen ${loopCheck.loopCount} times. Navigating away.`, 'WARN', 'cycle');
+            await page.goto(CONFIG.BASE_URL || 'about:blank', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+          }
         }
       }
 
@@ -458,6 +485,21 @@ async function runCycle() {
             action.targetY += (Math.random() - 0.5) * jitter / 100;
           }
         }
+      }
+
+      // ─── Module Download Flow Detection (Response 3) ───
+      // Before executing, check if this action is a download button click.
+      // If so, record the pre-download screenshot hash and set state.
+      const isDownloadClick = action.actionType === 'click' &&
+        (action.currentState === 'module_downloading' ||
+         (action.reasoning && action.reasoning.includes('download')));
+
+      if (isDownloadClick && _moduleDownloadState === 'idle') {
+        _moduleDownloadState = 'download_clicked';
+        _moduleDownloadStartTime = Date.now();
+        _moduleDownloadRetryCount = 0;
+        _preDownloadScreenshotHash = screenshotHash;
+        log('Module download flow: click detected, entering download_clicked state', 'INFO', 'cycle');
       }
 
       // Resilience: action validation before execution
@@ -598,11 +640,25 @@ async function runCycle() {
       // Math verification: check answer before submitting (Response 1)
       const mathVerify = _getMathVerify();
       if (mathVerify && action && mathVerify.shouldVerify(action.currentState || '')) {
-        const answerValue = action.value || action.keypadSequence?.map((k: any) => k.digit || k.label || '').join('') || '';
+        // For keypad/input actions: verify the typed value
+        // For click actions on assessment: verify using text regions from pixel fallback
+        let answerValue = action.value || action.keypadSequence?.map((k: any) => k.digit || k.label || '').join('') || '';
+        let problemContext = action.reasoning || '';
+
+        // Response 5: For click actions with _textRegions (pixel fallback MCQ),
+        // try to construct a verification context from the text region metadata.
+        // Note: pixel fallback can't OCR the actual text, but it provides density
+        // and position info. The math verifier uses this as supplementary context.
+        if (!answerValue && action.actionType === 'click' && action._textRegions) {
+          const tr = action._textRegions;
+          answerValue = `[choice at index ${action._textRegions._clickedChoiceIndex ?? '?'}]`;
+          problemContext += ` [pixel-fallback: question text density=${tr.questionRegion?.density.toFixed(2)}, ` +
+            `${tr.choiceRegions.length} choices detected]`;
+        }
+
         if (answerValue && typeof answerValue === 'string' && answerValue.trim().length > 0) {
           try {
             // Use reasoning/action text as problem context, the answer value as proposed answer
-            const problemContext = action.reasoning || '';
             const verifyResult = await mathVerify.verifyAnswer(problemContext, answerValue);
             if (!verifyResult.correct && verifyResult.confidence > 0.7) {
               log(`Math verification FAILED (method=${verifyResult.method}, conf=${verifyResult.confidence.toFixed(2)}): ${verifyResult.explanation}. Skipping submit.`, 'WARN', 'cycle');
@@ -717,6 +773,92 @@ async function runCycle() {
         if (executeAction) await executeAction(page, action);
         actionSuccess = true;
         consecutiveFailures = 0;
+      }
+
+      // ─── Module Download Wait Logic (Response 3) ───
+      // After executing a download click, wait for the module content to appear.
+      // Uses screenshot hash comparison to detect when the page changes.
+      if (_moduleDownloadState === 'download_clicked' && actionSuccess) {
+        log('Module download flow: waiting for content to change...', 'INFO', 'cycle');
+        const downloadStartTime = Date.now();
+        let contentAppeared = false;
+        const { sleep: dlSleep } = require('./utils-sleep');
+
+        // Poll for screenshot change (indicates download started/completed)
+        while (Date.now() - downloadStartTime < MODULE_DOWNLOAD_TIMEOUT_MS) {
+          await dlSleep(MODULE_DOWNLOAD_POLL_INTERVAL_MS);
+          try {
+            const pollScreenshot = await page.screenshot({ type: 'jpeg', quality: 30 });
+            const pollHash = crypto.createHash('md5').update(pollScreenshot).digest('hex');
+
+            if (pollHash !== _preDownloadScreenshotHash) {
+              // Screenshot changed — download has started or completed
+              _moduleDownloadState = 'downloading';
+              log('Module download flow: screenshot changed, download in progress', 'INFO', 'cycle');
+
+              // Wait additional time for content to fully render
+              await dlSleep(2000);
+
+              // Check if module content (topic buttons) is now visible via pixel analysis
+              try {
+                const pngScreenshot = await page.screenshot({ type: 'png', fullPage: false });
+                const pixelMod = require('./pixel-fallback');
+                const decoded = pixelMod._decodePNG?.(pngScreenshot);
+                if (decoded && pixelMod._isModuleContentLoaded?.(decoded.rgba, decoded.width, decoded.height)) {
+                  _moduleDownloadState = 'content_visible';
+                  log('Module download flow: content loaded! Topics visible.', 'INFO', 'cycle');
+                  contentAppeared = true;
+                }
+              } catch (pxErr: any) {
+                log(`Module download flow: pixel check failed (${pxErr.message || pxErr}), assuming content loaded`, 'DEBUG', 'cycle');
+                // If pixel check fails, assume content loaded after screenshot change
+                contentAppeared = true;
+                _moduleDownloadState = 'content_visible';
+              }
+              break;
+            }
+          } catch (pollErr: any) {
+            log(`Module download flow: poll screenshot failed (${pollErr.message || pollErr})`, 'DEBUG', 'cycle');
+          }
+        }
+
+        if (!contentAppeared) {
+          // Download may still be in progress or failed
+          const elapsed = Date.now() - downloadStartTime;
+          if (elapsed >= MODULE_DOWNLOAD_TIMEOUT_MS) {
+            log(`Module download flow: timeout after ${elapsed / 1000}s. Scrolling and retrying.`, 'WARN', 'cycle');
+            _moduleDownloadRetryCount++;
+            if (_moduleDownloadRetryCount <= MODULE_DOWNLOAD_MAX_RETRIES) {
+              // Try scrolling and clicking the card again
+              try { await page.evaluate(() => window.scrollBy(0, -200)); } catch { /* non-critical */ }
+              await dlSleep(1000);
+              _moduleDownloadState = 'idle'; // Reset to try again on next cycle
+            } else {
+              log(`Module download flow: max retries (${MODULE_DOWNLOAD_MAX_RETRIES}) exceeded. Moving on.`, 'WARN', 'cycle');
+              _moduleDownloadState = 'idle';
+            }
+          } else {
+            // Still waiting — stay in download_clicked state for next cycle to continue polling
+            log('Module download flow: still waiting, will poll again next cycle', 'DEBUG', 'cycle');
+          }
+        }
+
+        // If content is now visible, let the next cycle iteration find Watch/Start buttons
+        if (_moduleDownloadState === 'content_visible') {
+          _moduleDownloadState = 'idle';
+          _preDownloadScreenshotHash = null;
+          // Don't set currentState to module_downloading — let the next iteration
+          // detect the assignments page with visible topic buttons
+          // Force a new screenshot on the next iteration by jumping to top of loop
+          await dlSleep((CONFIG.BETWEEN_STEPS_MS || 2000) * 1);
+          continue;
+        }
+      }
+
+      // If download was clicked but action failed (click didn't register)
+      if (_moduleDownloadState === 'download_clicked' && !actionSuccess) {
+        log('Module download flow: click failed, will retry on next cycle', 'DEBUG', 'cycle');
+        _moduleDownloadState = 'idle'; // Reset so we can try again
       }
 
       // Record experiment result
