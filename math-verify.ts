@@ -438,8 +438,48 @@ function shouldVerify(currentState: string): boolean {
   return mathStates.some(s => lower.includes(s));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Cached Solution Verification (Response 5)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Verify a cached solution before reusing it.
+ * Uses only Tier 0 (numeric) and Tier 1 (nerdamer) — skips WolframAlpha
+ * to save budget on cache hits (the whole point of caching is to save resources).
+ *
+ * @param problemText - The current problem text
+ * @param cachedAnswer - The cached answer to verify
+ * @returns VerifyResult with correct/confidence/method
+ */
+async function verifyCachedSolution(problemText: string, cachedAnswer: string): Promise<VerifyResult> {
+  if (!problemText || !cachedAnswer) {
+    return { correct: true, confidence: 0.1, method: 'unknown', explanation: 'Empty inputs — skipped' };
+  }
+
+  // Tier 0: Numeric check (instant)
+  const numericResult = _verifyNumeric(cachedAnswer, problemText);
+  if (numericResult && numericResult.confidence >= 0.9) {
+    return numericResult;
+  }
+
+  // Tier 1: nerdamer symbolic (fast, free) — but no Wolfram escalation
+  const nerdamerResult = _verifyTier1(problemText, cachedAnswer);
+  if (nerdamerResult && nerdamerResult.confidence >= 0.8) {
+    return nerdamerResult;
+  }
+
+  // Can't verify with free tiers — allow with low confidence
+  return {
+    correct: true,
+    confidence: 0.2,
+    method: 'unknown',
+    explanation: 'Cached solution could not be verified with free tiers — allowing reuse',
+  };
+}
+
 module.exports = {
   verifyAnswer,
+  verifyCachedSolution,
   shouldVerify,
   getStats,
   _injectDependencies,
