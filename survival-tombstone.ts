@@ -62,7 +62,7 @@ const DEFAULT_PUSH_INTERVAL_MS = 60 * 1000; // 60 seconds
 const DEFAULT_MAX_SNAPSHOT_SIZE_BYTES = 100000; // 100KB
 const TOMBSTONE_VERSION = 1;
 const TOMBSTONE_DB_KEY = 'last_tombstone_ts';
-const LOCAL_BACKUP_FILE = 'data/tombstone_latest.json.gz';
+const LOCAL_BACKUP_FILE = 'tombstone_latest.json.gz';
 
 // ─── State ───
 let _pushInterval: ReturnType<typeof setInterval> | null = null;
@@ -507,7 +507,8 @@ function stop(): void {
 function getStatus(): Record<string, any> {
   const fs = require('fs');
   const path = require('path');
-  const filePath = path.join(process.cwd(), LOCAL_BACKUP_FILE);
+  const dataDir = path.join(process.env.TMPDIR || '/tmp', 'mathu-data');
+  const filePath = path.join(dataDir, LOCAL_BACKUP_FILE);
   let localExists = false;
   let localSize = 0;
   let localAge = 0;
