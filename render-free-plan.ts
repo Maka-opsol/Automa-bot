@@ -1105,7 +1105,7 @@ if (typeof pruneTemplateCache === 'function') {
 // provider registry, model registry, banned actions) before any subsystem
 // reads from the local DB.
 // ═══════════════════════════════════════════════════════════════════════════
-await (async () => {
+(async () => {
   try {
     const tursoSync = require('./database-turso');
     const tursoModule = container.get('turso', { required: false });
