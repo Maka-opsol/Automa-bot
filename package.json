@@ -2,7 +2,7 @@
   "name": "mathu-bot",
   "version": "6.0.0",
   "description": "Autonomous bot for MathU educational platform with self-improvement, experimentation, and cross-domain capabilities",
-  "main": "hf-spaces.ts",
+  "main": "render-free-plan.ts",
   "scripts": {
     "start": "node --expose-gc --max-old-space-size=3584 --import tsx hf-spaces.ts",
     "start:agent": "node --import tsx --expose-gc --max-old-space-size=512 agent.ts",
