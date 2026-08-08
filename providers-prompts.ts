@@ -122,6 +122,45 @@ function getUserInstruction() {
   return baseInstruction;
 }
 
-module.exports = { getSystemPrompt, getUserInstruction, _injectDependencies, VALID_ACTION_TYPES };
+/**
+ * Get user instruction enhanced with problem-type-specific strategy.
+ * (Response 4) Appends a solving strategy hint based on problem type.
+ */
+function getUserInstructionWithType(problemType?: string, problemText?: string) {
+  const baseInstruction = getUserInstruction();
+  const remoteBrain = _getRemoteBrain();
+  const remote = remoteBrain?.getActiveInstruction?.();
+
+  // Load type-specific prompt from classifier
+  let typeHint = '';
+  if (problemType && problemType !== 'UNKNOWN') {
+    try {
+      const classifier = require('./math-problem-classifier');
+      const typePrompts = classifier.TYPE_PROMPTS;
+      if (typePrompts[problemType]) {
+        typeHint = `
+
+[MATH PROBLEM TYPE: ${problemType}]
+Solving strategy: ${typePrompts[problemType]}`;
+      }
+    } catch {}
+  }
+
+  // Append problem text context if available
+  let problemContext = '';
+  if (problemText && problemText.trim().length > 0) {
+    problemContext = `
+
+[OCR TEXT]: ${problemText}`;
+  }
+
+  let result = baseInstruction + typeHint + problemContext;
+  if (remote) {
+    result += `\n\n[REMOTE OVERRIDE]: ${remote}`;
+  }
+  return result;
+}
+
+module.exports = { getSystemPrompt, getUserInstruction, getUserInstructionWithType, _injectDependencies, VALID_ACTION_TYPES };
 Object.defineProperty(module.exports, 'SYSTEM_PROMPT', { get: getSystemPrompt, enumerable: true });
 Object.defineProperty(module.exports, 'USER_INSTRUCTION', { get: getUserInstruction, enumerable: true });
