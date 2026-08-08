@@ -72,6 +72,23 @@ const ASSIGNMENT_SELECTORS = [
   { selector: '.module-card, .card, [class*="assignment"], [class*="module"]', state: 'assignments_page', offsetY: 30 },
 ];
 
+const EXERCISE_SELECTORS = [
+  // Open book icon — MUST be clicked before Next (app requires viewing memo)
+  { selector: '[class*="memo"], [class*="Memo"], [class*="book"], [class*="Book"]', state: 'exercise_info' },
+  { selector: 'button:has-text("Memo"), button:has-text("memo")', state: 'exercise_info' },
+  // Next button (only works AFTER memo has been viewed)
+  { selector: 'button:has-text("Next")', state: 'exercise_info' },
+  { selector: 'button:has-text("Previous")', state: 'exercise_info' },
+];
+
+const VIDEO_SELECTORS = [
+  // Video back/close button inside the player
+  { selector: '[class*="back"], [class*="Back"], [class*="close"], [class*="Close"]', state: 'video_player' },
+  { selector: 'button:has-text("Back"), button:has-text("Close")', state: 'video_player' },
+  // Video thumbnail/play area (to open the video)
+  { selector: '[class*="video"], [class*="Video"], [class*="player"], video', state: 'video_player' },
+];
+
 const LOGIN_SELECTORS = [
   { selector: 'input[type="email"]', state: 'microsoft_email_input', actionType: 'input_email' },
   { selector: 'input[name="loginfmt"]', state: 'microsoft_email_input', actionType: 'input_email' },
@@ -167,6 +184,38 @@ async function _getFallbackActionInner(page: any, log: any): Promise<any> {
 
   // Assignments page — also detect by SPA domain (URL may not have /assignments path)
   if (url.includes('/assignments') || url.includes('mathu.co.za')) {
+    // Exercise selectors — MUST check these before generic assignment selectors
+    // because the URL doesn't change between pages (SPA)
+    for (const entry of EXERCISE_SELECTORS) {
+      const el = await _safeQuery(page, entry.selector);
+      if (el) {
+        const box = await _safeBoundingBox(page, el);
+        if (box) {
+          const action = _boxToAction(box, entry.state);
+          if (action) {
+            log(`Fallback found ${entry.selector} on exercise page`, 'DEBUG', 'fallback');
+            return action;
+          }
+        }
+      }
+    }
+
+    // Video selectors — check for video elements
+    for (const entry of VIDEO_SELECTORS) {
+      const el = await _safeQuery(page, entry.selector);
+      if (el) {
+        const box = await _safeBoundingBox(page, el);
+        if (box) {
+          const action = _boxToAction(box, entry.state);
+          if (action) {
+            log(`Fallback found ${entry.selector} on video page`, 'DEBUG', 'fallback');
+            return action;
+          }
+        }
+      }
+    }
+
+    // Standard assignment selectors
     for (const entry of ASSIGNMENT_SELECTORS) {
       const el = await _safeQuery(page, entry.selector);
       if (el) {
