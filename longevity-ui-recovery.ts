@@ -274,10 +274,15 @@ async function generateRecoveryAction(page: any) {
       break;
     }
     case 'video_playing': {
+      // Video is playing — must wait for 2m59s before dismissing
+      // The pixel fallback has its own timer, but longevity recovery is a
+      // separate path. Return wait so the cycle loop continues taking
+      // screenshots and giving pixel fallback a chance to manage the timer.
       return {
-        actionType: 'wait', currentState: 'video_playing',
+        actionType: 'wait', currentState: 'video_player',
         targetX: 0, targetY: 0,
-        reasoning: 'Visual recovery: video is playing, waiting', recovery: true,
+        reasoning: 'Visual recovery: video is playing, waiting for 2m59s watch requirement before dismissing',
+        recovery: true,
       };
     }
     case 'assignments_browsing': {
