@@ -65,6 +65,8 @@ let _mathVerify: any = null;
 function _getMathVerify() { if (!_mathVerify) { try { _mathVerify = require('./math-verify'); } catch { _mathVerify = null; } } return _mathVerify; }
 let _healthWatchdog: any = null;
 function _getHealthWatchdog() { if (!_healthWatchdog) { try { _healthWatchdog = require('./longevity-self-ping'); } catch { _healthWatchdog = null; } } return _healthWatchdog; }
+let _degradationLadder: any = null;
+function _getDegradationLadder() { if (!_degradationLadder) { try { _degradationLadder = require('./self-heal-degradation-ladder'); } catch { _degradationLadder = null; } } return _degradationLadder; }
 
 async function runCycle() { 
   // ─── Resolve all dependencies at cycle start ───
@@ -142,6 +144,35 @@ async function runCycle() {
   const authCaptchaLoopGuard = getDep('authCaptchaLoopGuard');
   const authTokenGraveyard = getDep('authTokenGraveyard');
   const browserPhoenix = getDep('browserPhoenix');
+
+  // ─── Degradation Level Check (Response 3) ───
+  const degradationLadder = _getDegradationLadder();
+  let degradationLevel = 0;
+  let degradationLevelName = 'FULL';
+  try {
+    if (degradationLadder) {
+      const dlResult = degradationLadder.degradationLadder?.calculateLevel?.() || degradationLadder.calculateLevel?.();
+      if (dlResult) {
+        degradationLevel = dlResult.level;
+        degradationLevelName = dlResult.name;
+        // Apply cycle sleep if level requires it
+        const cycleSleepMs = degradationLadder.degradationLadder?.getCycleSleepMs?.() || degradationLadder.getCycleSleepMs?.() || 0;
+        if (cycleSleepMs > 0) {
+          const { sleep } = require('./utils-sleep');
+          log(`Degradation level ${degradationLevelName}: sleeping ${cycleSleepMs}ms between cycles`, 'INFO', 'cycle');
+          await sleep(cycleSleepMs);
+        }
+        // DORMANT level: skip the entire cycle (just wake check)
+        if (degradationLevel >= 4) {
+          log('Degradation level DORMANT: skipping cycle (zero providers/budget)', 'WARN', 'cycle');
+          return;
+        }
+      }
+    }
+  } catch (e: any) {
+    // Non-critical: degradation check failure shouldn't break the cycle
+    log(`Degradation check failed: ${e.message || e}`, 'DEBUG', 'cycle');
+  }
 
   // Reset module quarantine at cycle start
   runtimeModuleQuarantine?.resetCycle?.();
