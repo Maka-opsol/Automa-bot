@@ -29,6 +29,13 @@ class Diary {
   }
 
   logEntry(type: any, message: any, data = {}) { 
+    // Response 3: skip diary at degradation level 1+ (REDUCED)
+    try {
+      const { degradationLadder } = require('./self-heal-degradation-ladder');
+      if (degradationLadder.shouldSkip('self-documenting-diary')) {
+        return;
+      }
+    } catch {}
     const entry = {
       timestamp: new Date().toISOString(),
       type,
