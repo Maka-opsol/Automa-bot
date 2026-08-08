@@ -427,12 +427,14 @@ function shouldVerify(currentState: string): boolean {
     'answering',
     'input_visible',
     'keypad_visible',
+    'assessment',
   ];
   // If currentState contains math-related keywords
   const lower = currentState.toLowerCase();
   if (lower.includes('solv') || lower.includes('problem') ||
       lower.includes('answer') || lower.includes('input') ||
-      lower.includes('keypad') || lower.includes('math')) {
+      lower.includes('keypad') || lower.includes('math') ||
+      lower.includes('assess') || lower.includes('quiz')) {
     return true;
   }
   return mathStates.some(s => lower.includes(s));
