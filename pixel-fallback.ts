@@ -22,9 +22,12 @@
 //   - Module download: detects download arrow icon on module cards, clicks to download
 //   - Module topics: detects expanded module content with topic buttons
 //   - Quiz: finds Done/Submit teal-green buttons, numeric keypad
-//   - Exercise: finds Next/Previous navigation
+//   - Exercise: MUST click open book icon (top-right of card) to view memo BEFORE
+//     clicking Next — the app requires viewing the memo before proceeding.
+//     Detects the book icon as a small blue element in the top-right of the white card.
 //   - Score screen: finds Continue to pathway button
-//   - Video player: skips (no clickable elements needed)
+//   - Video player: clicks video to open it, watches for exactly 2 minutes 59 seconds,
+//     then finds back/X button to dismiss.
 //
 // Detection methods:
 //   - URL pattern matching (primary for Microsoft auth pages)
@@ -820,7 +823,7 @@ function _isMintPageBackground(r: number, g: number, b: number): boolean {
  */
 function _classifyPageByColor(
   rgba: Uint8ClampedArray, width: number, height: number
-): 'microsoft_login' | 'mathu_app' | 'quiz' | 'score_screen' | 'unknown' {
+): 'microsoft_login' | 'mathu_app' | 'quiz' | 'score_screen' | 'exercise_info' | 'unknown' {
   // Check top region (header area) color
   const headerColor = _getRegionDominantColor(rgba, width, height, 0.0, 0.0, 1.0, 0.25);
 
@@ -856,6 +859,11 @@ function _classifyPageByColor(
   // Also check if the top 25% has deep blue (app header)
   if (_isDeepBlueBackground(headerColor.r, headerColor.g, headerColor.b)) {
     return 'mathu_app';
+  }
+
+  // Exercise page: deep blue header + white card center + green Next button bottom-right
+  if (_isExercisePageByPixels(rgba, width, height)) {
+    return 'exercise_info';
   }
 
   return 'unknown';
@@ -1204,39 +1212,216 @@ function _quizPageAction(
 }
 
 /**
+ * Handle MathU video player page.
+ * The bot must: (1) click on the video to open it, (2) watch for exactly
+ * 2 minutes 59 seconds, (3) then click the back/X button to dismiss.
+ *
+ * Video watch timer is tracked in-memory across iterations.
+ *
+ * When the video is NOT yet opened (thumbnail/poster visible):
+ *   - Click the center of the video to open it
+ *   - Start the 2m59s watch timer
+ *
+ * When the video IS open AND watch time < 2m59s:
+ *   - Return 'wait' — keep watching
+ *
+ * When the video IS open AND watch time >= 2m59s:
+ *   - Find and click the back arrow / X button to dismiss
+ *   - Reset the timer
+ */
+function _videoPlayerAction(
+  rgba: Uint8ClampedArray, width: number, height: number
+): any | null {
+  // ── Check if video player is OPEN (controls visible, back arrow in top-left) ──
+  // Look for a dark/back button in the top-left quadrant of the content area
+  // The video player back arrow is typically at roughly (5-15%, 10-25%) of the screen
+  const backX1 = Math.floor(width * 0.02);
+  const backX2 = Math.floor(width * 0.15);
+  const backY1 = Math.floor(height * 0.10);
+  const backY2 = Math.floor(height * 0.30);
+
+  const darkBands = _findColorBands(rgba, width, height, _isDark, backY1, backY2, backX1, backX2, 2);
+  const backButtons = darkBands
+    .filter(r => {
+      const aspectRatio = r.w / Math.max(r.h, 1);
+      return r.w >= 10 && r.w <= 60 && r.h >= 15 && r.h <= 60 && aspectRatio > 0.3 && aspectRatio < 3.0;
+    })
+    .sort((a, b) => a.cx - b.cx);
+
+  // ── Also check for white arrow on dark background ──
+  let whitePixelCount = 0;
+  let totalPixels = 0;
+  for (let y = backY1; y < backY2; y += 3) {
+    for (let x = backX1; x < backX2; x += 3) {
+      const idx = (y * width + x) * 4;
+      totalPixels++;
+      if (_isWhiteish(rgba[idx], rgba[idx + 1], rgba[idx + 2]) ||
+          (rgba[idx] > 180 && rgba[idx + 1] > 180 && rgba[idx + 2] > 180)) {
+        whitePixelCount++;
+      }
+    }
+  }
+  const hasWhiteArrow = totalPixels > 10 && whitePixelCount / totalPixels > 0.3;
+
+  // Video player is OPEN if we found a back button OR a white arrow cluster
+  const videoIsOpen = backButtons.length > 0 || hasWhiteArrow;
+
+  if (videoIsOpen) {
+    // Start the watch timer if not already started
+    _startVideoTimer();
+
+    const elapsed = _getVideoWatchElapsed();
+    const remaining = Math.max(0, VIDEO_WATCH_DURATION_MS - elapsed);
+    const remainingSec = Math.ceil(remaining / 1000);
+
+    if (!_isVideoWatchComplete()) {
+      // Still watching — return wait action
+      log(`Pixel fallback: video watching... ${Math.floor(elapsed / 1000)}s elapsed, ${remainingSec}s remaining`, 'INFO', 'pixel-fallback');
+      return {
+        actionType: 'wait',
+        targetX: 0,
+        targetY: 0,
+        currentState: 'video_player',
+        reasoning: `Pixel fallback: watching video (${Math.floor(elapsed / 1000)}s/${VIDEO_WATCH_DURATION_MS / 1000}s), ${remainingSec}s remaining before dismiss`
+      };
+    }
+
+    // Watch time complete — dismiss the video
+    _resetVideoTimer();
+
+    if (backButtons.length > 0) {
+      const btn = backButtons[0];
+      log(`Pixel fallback: video watch complete (${VIDEO_WATCH_DURATION_MS / 1000}s), clicking back button at (${btn.cx}, ${btn.cy}) to dismiss`, 'INFO', 'pixel-fallback');
+      return {
+        actionType: 'click',
+        targetX: btn.cx,
+        targetY: btn.cy,
+        currentState: 'video_player',
+        reasoning: `Pixel fallback: video watch complete (${VIDEO_WATCH_DURATION_MS / 1000}s), clicking back/close to dismiss`
+      };
+    }
+
+    // Fallback: click the top-left area where the back arrow is
+    const clickX = Math.floor((backX1 + backX2) / 2);
+    const clickY = Math.floor((backY1 + backY2) / 2);
+    log(`Pixel fallback: video watch complete, clicking back arrow area (${clickX}, ${clickY}) to dismiss`, 'INFO', 'pixel-fallback');
+    return {
+      actionType: 'click',
+      targetX: clickX,
+      targetY: clickY,
+      currentState: 'video_player',
+      reasoning: `Pixel fallback: video watch complete (${VIDEO_WATCH_DURATION_MS / 1000}s), clicking back arrow area to dismiss`
+    };
+  }
+
+  // ── Video is not yet open (showing thumbnail/poster) ──
+  // Reset timer (in case of stale state) and click to open
+  _resetVideoTimer();
+  const centerX = Math.floor(width / 2);
+  const centerY = Math.floor(height / 2);
+  log(`Pixel fallback: video thumbnail visible, clicking center (${centerX}, ${centerY}) to open video`, 'INFO', 'pixel-fallback');
+  return {
+    actionType: 'click',
+    targetX: centerX,
+    targetY: centerY,
+    currentState: 'video_player',
+    reasoning: 'Pixel fallback: video thumbnail/poster visible, clicking to open video player'
+  };
+}
+
+/**
  * Handle MathU exercise pages (step-by-step content with Next/Previous).
- * Detects the green Next button at the bottom-right.
+ *
+ * CRITICAL: The bot MUST click the open book icon in the top-right corner
+ * of the white card BEFORE clicking Next. The app requires viewing the
+ * memo before the Next button becomes active.
+ *
+ * The book icon is a small blue icon in the top-right area of the
+ * white content card (roughly 75-95% from left, 5-20% from top).
+ *
+ * Workflow per question:
+ *   1. Click the open book icon to flip to memo/solution
+ *   2. After memo is visible, click the green "Next" button
  */
 function _exercisePageAction(
   rgba: Uint8ClampedArray, width: number, height: number
 ): any | null {
-  // Look for green Next button at bottom-right
-  const greenButton = _findGreenButton(rgba, width, height);
-  if (greenButton) {
-    log(`Pixel fallback: found green Next button at (${greenButton.cx}, ${greenButton.cy})`, 'INFO', 'pixel-fallback');
+  // ── Priority 1: Find the open book icon in the top-right of the card ──
+  // The book icon is a small blue element in the top-right corner of the
+  // white content card. It appears at roughly 75-95% horizontal, 5-20% vertical.
+  const bookX1 = Math.floor(width * 0.72);
+  const bookX2 = Math.floor(width * 0.96);
+  const bookY1 = Math.floor(height * 0.05);
+  const bookY2 = Math.floor(height * 0.22);
+
+  // Look for a small blue/dark-blue element (the book icon)
+  // Book icons are typically small: 20-50px wide, 20-50px tall
+  const bookBands = _findColorBands(rgba, width, height, _isDeepBlue, bookY1, bookY2, bookX1, bookX2, 2);
+  const bookCandidates = bookBands
+    .filter(r => {
+      const aspectRatio = r.w / Math.max(r.h, 1);
+      return r.w >= 15 && r.w <= 60 && r.h >= 15 && r.h <= 60 && aspectRatio > 0.5 && aspectRatio < 2.5;
+    })
+    .sort((a, b) => a.cx - b.cx);
+
+  // Also check for Microsoft-blue book icons (some themes use brighter blue)
+  const bookBandsBright = _findColorBands(rgba, width, height, _isMicrosoftBlue, bookY1, bookY2, bookX1, bookX2, 2);
+  const bookCandidatesBright = bookBandsBright
+    .filter(r => {
+      const aspectRatio = r.w / Math.max(r.h, 1);
+      return r.w >= 15 && r.w <= 60 && r.h >= 15 && r.h <= 60 && aspectRatio > 0.5 && aspectRatio < 2.5;
+    })
+    .sort((a, b) => a.cx - b.cx);
+
+  const allBookCandidates = [...bookCandidates, ...bookCandidatesBright];
+
+  if (allBookCandidates.length > 0) {
+    // Pick the rightmost/topmost candidate (most likely the book icon)
+    const book = allBookCandidates[allBookCandidates.length - 1];
+    log(`Pixel fallback: found open book icon at (${book.cx}, ${book.cy}) — clicking to view memo`, 'INFO', 'pixel-fallback');
     return {
       actionType: 'click',
-      targetX: greenButton.cx,
-      targetY: greenButton.cy,
+      targetX: book.cx,
+      targetY: book.cy,
       currentState: 'exercise_info',
-      reasoning: 'Pixel fallback: found green Next button in exercise'
+      reasoning: 'Pixel fallback: found open book icon in top-right of exercise card — clicking to flip to memo/solution (REQUIRED before Next)'
     };
   }
 
-  // Look for teal-green button (could be Submit on exercise)
-  const tealButton = _findTealGreenButton(rgba, width, height);
-  if (tealButton) {
-    log(`Pixel fallback: found teal button at (${tealButton.cx}, ${tealButton.cy})`, 'INFO', 'pixel-fallback');
+  // ── Priority 2: Book icon not found — look for any small blue/dark element in top-right ──
+  // Broader search: any colored element that could be the book icon
+  const anyBands = _findColorBands(rgba, width, height, (r, g, b) =>
+    _isDeepBlue(r, g, b) || _isMicrosoftBlue(r, g, b) || (r < 80 && g < 100 && b < 180),
+    bookY1, bookY2, bookX1, bookX2, 2
+  );
+  const anyCandidates = anyBands
+    .filter(r => r.w >= 10 && r.w <= 70 && r.h >= 10 && r.h <= 70)
+    .sort((a, b) => a.cx - b.cx);
+
+  if (anyCandidates.length > 0) {
+    const candidate = anyCandidates[anyCandidates.length - 1];
+    log(`Pixel fallback: found possible book icon candidate at (${candidate.cx}, ${candidate.cy}) — clicking to view memo`, 'INFO', 'pixel-fallback');
     return {
       actionType: 'click',
-      targetX: tealButton.cx,
-      targetY: tealButton.cy,
+      targetX: candidate.cx,
+      targetY: candidate.cy,
       currentState: 'exercise_info',
-      reasoning: 'Pixel fallback: found teal Submit button in exercise'
+      reasoning: 'Pixel fallback: found possible book/memo icon in exercise card — clicking (REQUIRED before Next)'
     };
   }
 
-  return null;
+  // ── Priority 3: No book icon detected — click the general top-right area of the card ──
+  // This is a safe fallback: the book icon is always in the top-right of the white card
+  const fallbackBookX = Math.floor(width * 0.88);
+  const fallbackBookY = Math.floor(height * 0.12);
+  log(`Pixel fallback: no book icon detected, clicking top-right area (${fallbackBookX}, ${fallbackBookY}) as fallback for memo icon`, 'INFO', 'pixel-fallback');
+  return {
+    actionType: 'click',
+    targetX: fallbackBookX,
+    targetY: fallbackBookY,
+    currentState: 'exercise_info',
+    reasoning: 'Pixel fallback: clicking top-right of exercise card as fallback for open book/memo icon (REQUIRED before Next)'
+  };
 }
 
 /**
@@ -1274,6 +1459,36 @@ function _scorePageAction(
   }
 
   return null;
+}
+
+// ─── Video watch timer ─────────────────────────────────────────────────
+
+/**
+ * Track video watch time. The bot must watch videos for 2 minutes 59 seconds
+ * (179,000 ms) before clicking the back/X button to dismiss.
+ * This state is ephemeral (in-memory only) and resets on process restart.
+ */
+let _videoOpenedAt: number | null = null;
+const VIDEO_WATCH_DURATION_MS = 179000; // 2 minutes 59 seconds
+
+function _resetVideoTimer(): void {
+  _videoOpenedAt = null;
+}
+
+function _getVideoWatchElapsed(): number {
+  if (_videoOpenedAt === null) return 0;
+  return Date.now() - _videoOpenedAt;
+}
+
+function _startVideoTimer(): void {
+  if (_videoOpenedAt === null) {
+    _videoOpenedAt = Date.now();
+    log(`Video watch timer started — must watch for ${VIDEO_WATCH_DURATION_MS / 1000}s before dismiss`, 'INFO', 'pixel-fallback');
+  }
+}
+
+function _isVideoWatchComplete(): boolean {
+  return _videoOpenedAt !== null && _getVideoWatchElapsed() >= VIDEO_WATCH_DURATION_MS;
 }
 
 // ─── Login flow state machine ────────────────────────────────────────────
@@ -1375,8 +1590,9 @@ async function generatePixelFallbackAction(page: any): Promise<any> {
     }
 
     // ── MathU app pages ──
-    if (_isMathUAppPage(url) || colorClass === 'mathu_app' || colorClass === 'score_screen') {
+    if (_isMathUAppPage(url) || colorClass === 'mathu_app' || colorClass === 'score_screen' || colorClass === 'exercise_info') {
       // Detect sub-page by visual features
+
       // Score screen: full-width button + white text area
       if (colorClass === 'score_screen' || _isScoreScreenByPixels(rgba, width, height)) {
         const scoreAction = _scorePageAction(rgba, width, height);
@@ -1387,6 +1603,18 @@ async function generatePixelFallbackAction(page: any): Promise<any> {
       if (colorClass === 'quiz' || _isQuizPageByPixels(rgba, width, height)) {
         const quizAction = _quizPageAction(rgba, width, height);
         if (quizAction) return quizAction;
+      }
+
+      // Video player: dark content area OR white thumbnail with no green Next button
+      if (_isVideoPlayerByPixels(rgba, width, height)) {
+        const videoAction = _videoPlayerAction(rgba, width, height);
+        if (videoAction) return videoAction;
+      }
+
+      // Exercise page: white card + green Next button + deep blue header
+      if (colorClass === 'exercise_info' || _isExercisePageByPixels(rgba, width, height)) {
+        const exerciseAction = _exercisePageAction(rgba, width, height);
+        if (exerciseAction) return exerciseAction;
       }
 
       // Default: treat as assignments page (includes download button detection)
@@ -1439,6 +1667,68 @@ function _isQuizPageByPixels(rgba: Uint8ClampedArray, width: number, height: num
 }
 
 /**
+ * Detect exercise page by visual features:
+ * - Deep blue header (MathU app header with "Exercise" title)
+ * - Large white card in the center (question content)
+ * - Green Next button at the bottom-right
+ * - Typically shows "X/Y" progress indicator and Previous/Next buttons
+ */
+function _isExercisePageByPixels(rgba: Uint8ClampedArray, width: number, height: number): boolean {
+  // Check for deep blue header (MathU app)
+  const headerColor = _getRegionDominantColor(rgba, width, height, 0.0, 0.0, 1.0, 0.12);
+  if (!_isDeepBlueBackground(headerColor.r, headerColor.g, headerColor.b)) return false;
+
+  // Check for large white card in center
+  const centerColor = _getRegionDominantColor(rgba, width, height, 0.15, 0.15, 0.85, 0.85);
+  if (!_isWhiteish(centerColor.r, centerColor.g, centerColor.b)) return false;
+
+  // Check for green Next button at bottom-right (characteristic of exercise pages)
+  const greenButton = _findGreenButton(rgba, width, height);
+  if (!greenButton) return false;
+
+  return true;
+}
+
+/**
+ * Detect video player page by visual features:
+ * - Large dark/gray rectangular area (video frame) occupying most of the content
+ * - Either a play button overlay (video not yet opened) or playback controls at bottom
+ */
+function _isVideoPlayerByPixels(rgba: Uint8ClampedArray, width: number, height: number): boolean {
+  // Check for deep blue header (MathU app)
+  const headerColor = _getRegionDominantColor(rgba, width, height, 0.0, 0.0, 1.0, 0.12);
+  const hasAppHeader = _isDeepBlueBackground(headerColor.r, headerColor.g, headerColor.b);
+
+  // Check the content area (below header) — video content is typically dark/gray
+  const contentColor = _getRegionDominantColor(rgba, width, height, 0.15, 0.15, 0.85, 0.80);
+
+  // Video thumbnails/posters are typically darker than white but not pure black
+  const isDarkish = contentColor.r < 160 && contentColor.g < 160 && contentColor.b < 160;
+
+  // Also check for a large dark rectangle (video frame)
+  // This distinguishes video pages from exercise pages (which have white cards)
+  const isWhiteContent = _isWhiteish(contentColor.r, contentColor.g, contentColor.b);
+
+  // If we have the app header and the content is NOT white (not exercise/quiz)
+  // and NOT mint (not quiz), it's likely a video page
+  if (hasAppHeader && !isWhiteContent && isDarkish) return true;
+
+  // Video with white thumbnail text (like "CONVERTING BETWEEN CUBIC UNITS")
+  // Check for a mostly white/light center with dark text
+  if (hasAppHeader && _isWhiteish(contentColor.r, contentColor.g, contentColor.b)) {
+    // Could be exercise OR video thumbnail with white background
+    // Distinguish by checking bottom area: video has controls, exercise has green Next
+    const greenButton = _findGreenButton(rgba, width, height);
+    if (!greenButton) {
+      // No green Next button at bottom-right → likely video, not exercise
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Detect score screen by visual features:
  * - Large white area with text (score percentage)
  * - Teal-green full-width button at bottom
@@ -1481,6 +1771,10 @@ module.exports = {
   _isMathUAppPage,
   _isQuizPageByPixels,
   _isScoreScreenByPixels,
+  _isExercisePageByPixels,
+  _isVideoPlayerByPixels,
+  _videoPlayerAction,
+  _exercisePageAction,
   // Response 5 additions
   _findSelectedChoice,
   _isSelectedChoice,
