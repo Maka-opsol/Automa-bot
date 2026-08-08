@@ -59,6 +59,19 @@ function getNextAllowedStart() {
   return nextStart.getTime();
 }
 
+/**
+ * Lazy-load the work shifts module (Response 7).
+ * Avoids circular dependency — only loaded when needed.
+ */
+function _getWorkShifts(): any {
+  try {
+    const mod = require('./services-work-shifts');
+    return mod;
+  } catch (e: any) {
+    return null;
+  }
+}
+
 function sleep(ms: any) {  return new Promise(resolve => setTimeout(resolve, ms)); }
 
 async function startDaemon() {
@@ -71,8 +84,38 @@ async function startDaemon() {
   let backoffMs = 1000;
   const isHFSpaces = !!(process.env.PORT || process.env.SPACE_ID || process.env.SPACE_AUTHOR_NAME);
 
+  // Response 7: Lazy-load work shifts for shift-aware scheduling
+  const workShifts = _getWorkShifts();
+
   while (!stopRequested) {
-    // HF Spaces: Reduce startup delay (already have keepalive covering activity)
+    // ── Work Shifts: REST/RECOVERY → keepalive sleep instead of full cycle ──
+    if (workShifts && typeof workShifts.getShift === 'function') {
+      const shift = workShifts.getShift();
+
+      if (!workShifts.shouldRunFullCycle()) {
+        // In REST or RECOVERY: sleep for a while, then re-evaluate
+        const restMs = workShifts.getCycleSleepMultiplier() > 2
+          ? (10 * 60 * 1000 + Math.random() * 10 * 60 * 1000) // 10-20 min in REST
+          : (5 * 60 * 1000 + Math.random() * 5 * 60 * 1000);  // 5-10 min in RECOVERY
+
+        log(`Shift ${shift.current}: keepalive mode (${shift.reason}). Sleeping ${(restMs / 60000).toFixed(0)} mins...`, 'INFO', 'orchestrator');
+
+        // In REST, still ping keepalive to prevent Render spin-down
+        if (shift.current === 'REST' && !isHFSpaces) {
+          try {
+            const healthWatchdog = _getHealthWatchdog();
+            if (healthWatchdog && typeof healthWatchdog.checkNow === 'function') {
+              healthWatchdog.checkNow();
+            }
+          } catch (e: any) { /* non-critical */ }
+        }
+
+        await sleep(restMs);
+        continue;
+      }
+    }
+
+    // ── Original activity window check (kept as hard gate) ──
     let nextStart = getNextAllowedStart();
     const now = Date.now();
     if (nextStart > now) {
@@ -82,13 +125,22 @@ async function startDaemon() {
       await sleep(waitMs);
       continue;
     }
-    const delayMs = isHFSpaces ? 5000 : getRandomStartupDelay(); // 5s on HF Spaces vs 15-45min
+
+    const delayMs = isHFSpaces ? 5000 : getRandomStartupDelay();
     if (delayMs > 10000) log(`Waking up, waiting ${(delayMs/60000).toFixed(0)} mins...`, 'INFO', 'orchestrator');
     await sleep(delayMs);
+
     try {
       await _deps.cycleManager?.runCycle?.();
       cyclesRun++;
+
+      // Response 7: Notify work shifts of cycle completion
+      if (workShifts && typeof workShifts.notifyCycleCompleted === 'function') {
+        workShifts.notifyCycleCompleted();
+      }
+
       backoffMs = 1000;
+
       // HF Spaces: NEVER process.exit — reset counter and continue
       if (cyclesRun >= CONFIG.MAX_CYCLES_BEFORE_RESTART) {
         if (isHFSpaces) {
@@ -97,30 +149,43 @@ async function startDaemon() {
         } else {
           log(`Reached ${cyclesRun} cycles -- restarting process`, 'INFO', 'orchestrator');
           await (_deps.shutdown?.gracefulShutdown || (() => {}))('scheduled');
-          // v6-fix: CRITICAL — exit(1) so Render auto-restarts.
-          // On Render free plan, exit(0) = "clean exit" = service STOPS permanently.
-          // exit(1) = "crashed" = Render auto-restarts the service.
-          // Note: hf-spaces.ts intercepts process.exit to prevent actual exit.
           process.exit(1);
         }
       }
-      // HF Spaces: Much shorter sleep between cycles (keep the space active)
-      const sleepMs = isHFSpaces
-        ? (15 * 60 * 1000 + Math.random() * 15 * 60 * 1000) // 15-30 min on HF Spaces
-        : getRandomSleepTime();
+
+      // Response 7: Apply shift-aware sleep multiplier
+      let baseSleepMs: number;
+      if (isHFSpaces) {
+        baseSleepMs = 15 * 60 * 1000 + Math.random() * 15 * 60 * 1000;
+      } else {
+        baseSleepMs = getRandomSleepTime();
+      }
+
+      const shiftMultiplier = (workShifts && typeof workShifts.getCycleSleepMultiplier === 'function')
+        ? workShifts.getCycleSleepMultiplier()
+        : 1.0;
+      const sleepMs = Math.round(baseSleepMs * shiftMultiplier);
       const sleepMin = (sleepMs / 60000).toFixed(0);
-      log(`Cycle ${cyclesRun} done. Sleeping ${sleepMin} mins...`, 'INFO', 'orchestrator');
+      const shiftName = workShifts?.getShift?.()?.current || 'N/A';
+      log(`Cycle ${cyclesRun} done. Sleeping ${sleepMin} mins (shift=${shiftName}, x${shiftMultiplier})`, 'INFO', 'orchestrator');
       await sleep(sleepMs);
     } catch (err: any) {
       logError('Daemon error', err);
       if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Daemon error: ${err instanceof Error ? err.message : String(err)}`); } catch (e: any) {}
-      // HF Spaces: Cap backoff at 5 minutes (not 10 minutes)
       const maxBackoff = isHFSpaces ? 5 * 60 * 1000 : 60000 * 10;
       await sleep(backoffMs);
       backoffMs = Math.min(backoffMs * 2, maxBackoff);
     }
   }
   log('Daemon stopped gracefully', 'INFO', 'orchestrator');
+}
+
+function _getHealthWatchdog(): any {
+  try {
+    return require('./longevity-self-ping');
+  } catch (e: any) {
+    return null;
+  }
 }
 
 function resumeDaemon() {
