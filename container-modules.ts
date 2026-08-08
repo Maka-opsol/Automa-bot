@@ -256,6 +256,30 @@ function createContainer(): DIContainerType {
     tags: ['services'],
   });
 
+  // Response 4: Problem classifier (no DI deps needed — uses lazy requires)
+  c.register('problemClassifier', {
+    factory: (deps: any) => {
+      const mod = require('./math-problem-classifier');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['services'],
+  });
+
+  // Response 4: Mathpix OCR client (no DI deps needed — uses lazy requires)
+  c.register('mathpix', {
+    factory: (deps: any) => {
+      const mod = require('./services-mathpix');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['services'],
+  });
+
   // Health watchdog — self-ping with scoring + auto-restart (Response 2)
   c.register('healthWatchdog', {
     factory: (deps: any) => {
