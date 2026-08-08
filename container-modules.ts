@@ -33,6 +33,17 @@ type ModuleTuple = [string, string, string[], string[]?];
 function createContainer(): DIContainerType {
   const c = new DIContainer('mathu-bot');
 
+  // Defensive helper: safely inject dependencies into a module
+  function injectDeps(modPath: string, deps: any) {
+    const mod = require(modPath);
+    if (typeof mod._injectDependencies === 'function') {
+      mod._injectDependencies(deps);
+    } else {
+      _log(`[DI] WARNING: ${modPath} does not export _injectDependencies — skipping DI`, 'WARN', 'container-modules');
+    }
+    return mod;
+  }
+
   // ═══════════════════════════════════════════════════════════
   // CORE (critical — failure prevents startup)
   // ═══════════════════════════════════════════════════════════
@@ -1160,6 +1171,10 @@ function createContainer(): DIContainerType {
     ['providers-dns-rotation', 'providersDnsRotation', ['config', 'logger']],
     // R4: Remote state backup
     ['survival-tombstone', 'survivalTombstone', ['config', 'logger', 'database'], ['alerting']],
+    // R4b: Pixel color self-calibration (adapts to UI color changes)
+    ['pixel-calibration', 'pixelCalibration', ['config', 'logger', 'database']],
+    // R4c: Blind pixel exploration (discovers clickable regions in unknown UIs)
+    ['pixel-explorer', 'pixelExplorer', ['config', 'logger', 'database']],
     // R5: Disk wipe protection
     ['survival-ephemeral-shield', 'survivalEphemeralShield', ['config', 'logger', 'database'], ['statePersist']],
     // R6: External liveness beacon
