@@ -65,6 +65,10 @@ let _mathVerify: any = null;
 function _getMathVerify() { if (!_mathVerify) { try { _mathVerify = require('./math-verify'); } catch { _mathVerify = null; } } return _mathVerify; }
 let _healthWatchdog: any = null;
 function _getHealthWatchdog() { if (!_healthWatchdog) { try { _healthWatchdog = require('./longevity-self-ping'); } catch { _healthWatchdog = null; } } return _healthWatchdog; }
+let _problemClassifier: any = null;
+function _getProblemClassifier() { if (!_problemClassifier) { try { _problemClassifier = require('./math-problem-classifier'); } catch { _problemClassifier = null; } } return _problemClassifier; }
+let _mathpix: any = null;
+function _getMathpix() { if (!_mathpix) { try { _mathpix = require('./services-mathpix'); } catch { _mathpix = null; } } return _mathpix; }
 let _degradationLadder: any = null;
 function _getDegradationLadder() { if (!_degradationLadder) { try { _degradationLadder = require('./self-heal-degradation-ladder'); } catch { _degradationLadder = null; } } return _degradationLadder; }
 
@@ -449,6 +453,66 @@ async function runCycle() {
           log('UI Drifted! Entering Discovery Mode.', 'WARN', 'cycle');
           await uiDrift.discoverUI(page);
           await stateMachine.transition(STATES.UI_DISCOVERED);
+        }
+      }
+
+      // ─── Problem Classification Pipeline (Response 4) ───
+      // Classify the math problem type from available text, and optionally
+      // re-OCR with Mathpix if the vision model's text quality is poor.
+      // This runs before math verification to provide better context.
+      const classifier = _getProblemClassifier();
+      if (classifier && action && (action.currentState === 'question' || action.actionType === 'keypad_input' || action.value)) {
+        try {
+          // Get text from the page (a11y snapshot or body text)
+          let ocrText = '';
+          try {
+            const bodyText = await page.evaluate(() => document.body?.innerText || '');
+            if (bodyText && bodyText.length > 20) {
+              ocrText = bodyText.substring(0, 2000); // Limit to prevent huge prompts
+            }
+          } catch {}
+
+          // Fallback: use action reasoning as text source
+          if (!ocrText && action.reasoning) {
+            ocrText = action.reasoning;
+          }
+
+          if (ocrText) {
+            const classification = classifier.classifyProblem(ocrText);
+
+            // Check if Mathpix should re-OCR this image
+            const mathpix = _getMathpix();
+            if (mathpix && mathpix.ENABLED && classifier.shouldUseMathpix(ocrText, classification.type, false)) {
+              const mathpixResult = await mathpix.ocrMath(base64);
+              if (mathpixResult.text && mathpixResult.text.length > 10) {
+                log(`Mathpix re-OCR: ${mathpixResult.text.length} chars (conf=${mathpixResult.confidence}%)`, 'INFO', 'cycle');
+                // Use Mathpix text for re-classification
+                const reclassified = classifier.classifyProblem(mathpixResult.text);
+                // Attach to action for downstream consumers
+                action._mathpixText = mathpixResult.text;
+                action._mathpixLatex = mathpixResult.latex;
+                action._problemType = reclassified.type;
+                action._problemConfidence = reclassified.confidence;
+                action._ocrQuality = reclassified.ocrQuality;
+
+                // Record model-type affinity after this attempt
+                const providerName = action.provider || 'unknown';
+                classifier.recordModelTypeAffinity(reclassified.type, providerName, true); // optimistic, updated later on failure
+              }
+            } else {
+              // No Mathpix needed — use regex classification
+              action._problemType = classification.type;
+              action._problemConfidence = classification.confidence;
+              action._ocrQuality = classification.ocrQuality;
+            }
+
+            if (action._problemType && action._problemType !== 'UNKNOWN') {
+              log(`Problem classified: ${action._problemType} (conf=${(action._problemConfidence || 0).toFixed(0)}%, OCR quality=${(action._ocrQuality || 0).toFixed(0)}%)`, 'INFO', 'cycle');
+            }
+          }
+        } catch (classErr: any) {
+          // Non-critical: classification failure shouldn't break the cycle
+          log(`Problem classification failed: ${classErr.message || classErr}`, 'DEBUG', 'cycle');
         }
       }
 
