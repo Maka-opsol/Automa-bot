@@ -242,8 +242,15 @@ try {
     });
     log('Health watchdog started', 'INFO', 'render-free-plan');
   }
+
+  // Start degradation ladder periodic evaluation (Response 3)
+  const degradationLadder = container.get('degradationLadder', { required: false });
+  if (degradationLadder && typeof degradationLadder.start === 'function') {
+    degradationLadder.start(60000); // evaluate every 60s
+    log('Degradation ladder started (periodic eval every 60s)', 'INFO', 'render-free-plan');
+  }
 } catch (e) {
-  log('Health watchdog start failed: ' + e.message, 'WARN', 'render-free-plan');
+  log('Health watchdog / degradation ladder start failed: ' + e.message, 'WARN', 'render-free-plan');
 }
 
 // \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
@@ -603,6 +610,9 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
     // Include health watchdog score (Response 2)
     const watchdog = container.get('healthWatchdog', { required: false });
     const watchdogHealth = watchdog?.getHealth?.() || null;
+    // Include degradation level (Response 3)
+    const degradationLadder = container.get('degradationLadder', { required: false });
+    const degradationInfo = degradationLadder?.getLastCalculation?.() || null;
     const health = {
       status: watchdogHealth ? watchdogHealth.level : 'ok',
       timestamp: new Date().toISOString(),
@@ -620,6 +630,14 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
         checks: watchdogHealth.checks,
         totalRestarts: watchdogHealth.totalRestarts,
         inExtendedSleep: watchdogHealth.inExtendedSleep,
+      } : null,
+      degradation: degradationInfo ? {
+        level: degradationInfo.level,
+        name: degradationInfo.name,
+        providerCount: degradationInfo.providerCount,
+        visionProviderCount: degradationInfo.visionProviderCount,
+        orBudgetPct: degradationInfo.orBudgetPct,
+        reasons: degradationInfo.reasons,
       } : null,
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -814,6 +832,13 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
         screenshotAvailable: !!shot,
         providers: providerSummary,
         timestamp: Date.now(),
+        degradation: degradationLadder?.getLastCalculation?.() ? {
+          level: degradationLadder.getLastCalculation().level,
+          name: degradationLadder.getLastCalculation().name,
+          providerCount: degradationLadder.getLastCalculation().providerCount,
+          visionProviderCount: degradationLadder.getLastCalculation().visionProviderCount,
+          orBudgetPct: degradationLadder.getLastCalculation().orBudgetPct,
+        } : null,
       }));
     } catch (e: any) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
