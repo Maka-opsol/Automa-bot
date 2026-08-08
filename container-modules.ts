@@ -256,6 +256,18 @@ function createContainer(): DIContainerType {
     tags: ['services'],
   });
 
+  // Health watchdog — self-ping with scoring + auto-restart (Response 2)
+  c.register('healthWatchdog', {
+    factory: (deps: any) => {
+      const mod = require('./longevity-self-ping');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'browser', 'cache', 'providersBase'],
+    critical: false,
+    tags: ['longevity'],
+  });
+
   // providersBase and providersStats are registered in FOUNDATION UTILITIES above.
   // v5-fix: moved up so dependents (providerQuotaBargain, dashboard) don't
   // rely on late lazy-resolution.
