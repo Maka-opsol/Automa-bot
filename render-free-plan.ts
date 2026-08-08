@@ -250,6 +250,39 @@ try {
     log('Degradation ladder started (periodic eval every 60s)', 'INFO', 'render-free-plan');
   }
 
+  // Start work shift scheduler (Response 7)
+  try {
+    const workShifts = container.get('workShifts', { required: false });
+    if (workShifts && typeof workShifts.start === 'function') {
+      workShifts.start(60000); // evaluate every 60s (same cadence as degradation ladder)
+      log('Work shift scheduler started (eval every 60s)', 'INFO', 'render-free-plan');
+    }
+  } catch (e) {
+    log('Work shift scheduler failed to start: ' + (e as any).message, 'WARN', 'render-free-plan');
+  }
+
+  // API key vault — validate all keys on startup + every 6h (Response 8)
+  try {
+    const vault = container.get('apiKeyVault', { required: false });
+    if (vault && typeof vault.start === 'function') {
+      vault.start(6 * 60 * 60 * 1000); // validate every 6 hours
+      log('API key vault started (validate every 6h)', 'INFO', 'render-free-plan');
+    }
+  } catch (e) {
+    log('API key vault failed to start: ' + (e as any).message, 'WARN', 'render-free-plan');
+  }
+
+  // Contextual alert manager — proactive NTFY alerts based on state (Response 8)
+  try {
+    const alerts = container.get('contextualAlerts', { required: false });
+    if (alerts && typeof alerts.start === 'function') {
+      alerts.start(120000); // evaluate every 2 min
+      log('Contextual alert manager started (eval every 2min)', 'INFO', 'render-free-plan');
+    }
+  } catch (e) {
+    log('Contextual alert manager failed to start: ' + (e as any).message, 'WARN', 'render-free-plan');
+  }
+
   // Cold start detection (Response 6)
   try {
     const coldStart = container.get('coldStart', { required: false });
@@ -688,9 +721,34 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
         gapMinutes: coldStartStatus.gapMinutes,
         lastSeenAt: coldStartStatus.lastSeenAt,
       } : null,
+      workShift: (() => {
+        try {
+          const ws = require('./services-work-shifts');
+          const shift = ws.getShift();
+          return {
+            current: shift.current,
+            reason: shift.reason,
+            fullCycle: ws.shouldRunFullCycle(),
+          };
+        } catch { return null; }
+      })(),
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(health));
+    return;
+  }
+
+  // ── Heartbeat (Response 8) — UptimeRobot-compatible external monitoring ──
+  if (pathname === '/api/health/heartbeat') {
+    try {
+      const heartbeat = require('./services-heartbeat-endpoint');
+      const payload = await heartbeat.getHeartbeat();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(payload));
+    } catch (e: any) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'error', error: e.message }));
+    }
     return;
   }
 
@@ -888,6 +946,23 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
           visionProviderCount: degradationLadder.getLastCalculation().visionProviderCount,
           orBudgetPct: degradationLadder.getLastCalculation().orBudgetPct,
         } : null,
+        workShifts: (() => {
+          try {
+            const ws = require('./services-work-shifts');
+            const shift = ws.getShift();
+            return {
+              current: shift.current,
+              previous: shift.previous,
+              reason: shift.reason,
+              timeSignal: shift.timeSignal,
+              resourceSignal: shift.resourceSignal,
+              cyclesInCurrentShift: shift.cyclesInCurrentShift,
+              totalActiveHours: Math.round(shift.totalActiveMs / (1000 * 60 * 60) * 10) / 10,
+              totalCyclesActive: shift.totalCyclesActive,
+              lastEvalAt: shift.lastEvalAt,
+            };
+          } catch { return null; }
+        })(),
       }));
     } catch (e: any) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
