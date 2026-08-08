@@ -63,6 +63,8 @@ let _processRetrainer: any = null;
 function _getProcessRetrainer() { if (!_processRetrainer) { try { _processRetrainer = require('./cycle-process-retrainer'); } catch { _processRetrainer = null; } } return _processRetrainer; }
 let _mathVerify: any = null;
 function _getMathVerify() { if (!_mathVerify) { try { _mathVerify = require('./math-verify'); } catch { _mathVerify = null; } } return _mathVerify; }
+let _healthWatchdog: any = null;
+function _getHealthWatchdog() { if (!_healthWatchdog) { try { _healthWatchdog = require('./longevity-self-ping'); } catch { _healthWatchdog = null; } } return _healthWatchdog; }
 
 async function runCycle() { 
   // ─── Resolve all dependencies at cycle start ───
@@ -571,6 +573,8 @@ async function runCycle() {
         lastQuestionCompletionTime = Date.now();
         lastScreenshotChangeTime = Date.now();
         updateStats({ questionsCompleted });
+        // Notify health watchdog of progress (Response 2)
+        _getHealthWatchdog()?.notifyProgress?.();
         trackProgress?.({ action: action.actionType, state: action.currentState, timestamp: new Date().toISOString(), questionsCompleted });
         if (upsertLastState) upsertLastState.run(page.url(), action.currentState, Date.now());
         consecutiveFailures = 0;
