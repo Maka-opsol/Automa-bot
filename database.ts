@@ -95,7 +95,7 @@ function runMigrations() {
   const log = getLog();
   const logError = getLogError();
   let current = getCurrentVersion();
-  const target = 21;
+  const target = 22;
   if (current === target) { log(`Database schema version ${target} ready.`, 'INFO', 'database'); return; }
   if (current > target) { log(`Database schema version ${current} is ahead of expected ${target}`, 'WARN', 'database'); return; }
   const backupPath = CONFIG.DB_PATH + '.backup.' + Date.now();
@@ -126,6 +126,7 @@ function runMigrations() {
     () => {},
     () => {},
     () => { try { db.exec(`ALTER TABLE session_pool ADD COLUMN last_validated_at INTEGER;`); } catch (_e: any) { /* column may already exist */ } },
+    () => { db.exec(`CREATE TABLE IF NOT EXISTS action_cache ( context_sig TEXT PRIMARY KEY, action_type TEXT NOT NULL, target_x REAL NOT NULL, target_y REAL NOT NULL, value TEXT DEFAULT '', keypad_sequence TEXT, current_state TEXT NOT NULL, reasoning TEXT DEFAULT '', success_count INTEGER DEFAULT 0, failure_count INTEGER DEFAULT 0, hit_count INTEGER DEFAULT 0, created_at INTEGER NOT NULL, last_used INTEGER NOT NULL, evicted INTEGER DEFAULT 0 ); CREATE INDEX IF NOT EXISTS idx_action_cache_state ON action_cache(current_state); CREATE INDEX IF NOT EXISTS idx_action_cache_last_used ON action_cache(last_used);`); },
   ];
 
   const transaction = db.transaction(() => {
