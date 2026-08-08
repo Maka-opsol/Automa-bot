@@ -61,6 +61,8 @@ let _providerDiscovery: any = null;
 function _getProviderDiscovery() { if (!_providerDiscovery) { try { _providerDiscovery = require('./providers-provider-discovery'); } catch { _providerDiscovery = null; } } return _providerDiscovery; }
 let _processRetrainer: any = null;
 function _getProcessRetrainer() { if (!_processRetrainer) { try { _processRetrainer = require('./cycle-process-retrainer'); } catch { _processRetrainer = null; } } return _processRetrainer; }
+let _mathVerify: any = null;
+function _getMathVerify() { if (!_mathVerify) { try { _mathVerify = require('./math-verify'); } catch { _mathVerify = null; } } return _mathVerify; }
 
 async function runCycle() { 
   // ─── Resolve all dependencies at cycle start ───
@@ -414,6 +416,34 @@ async function runCycle() {
           log('UI Drifted! Entering Discovery Mode.', 'WARN', 'cycle');
           await uiDrift.discoverUI(page);
           await stateMachine.transition(STATES.UI_DISCOVERED);
+        }
+      }
+
+      // Math verification: check answer before submitting (Response 1)
+      const mathVerify = _getMathVerify();
+      if (mathVerify && action && mathVerify.shouldVerify(action.currentState || '')) {
+        const answerValue = action.value || action.keypadSequence?.map((k: any) => k.digit || k.label || '').join('') || '';
+        if (answerValue && typeof answerValue === 'string' && answerValue.trim().length > 0) {
+          try {
+            // Use reasoning/action text as problem context, the answer value as proposed answer
+            const problemContext = action.reasoning || '';
+            const verifyResult = await mathVerify.verifyAnswer(problemContext, answerValue);
+            if (!verifyResult.correct && verifyResult.confidence > 0.7) {
+              log(`Math verification FAILED (method=${verifyResult.method}, conf=${verifyResult.confidence.toFixed(2)}): ${verifyResult.explanation}. Skipping submit.`, 'WARN', 'cycle');
+              // Skip this action — the answer is likely wrong. Let the next iteration re-analyze.
+              action = { actionType: 'wait', currentState: action.currentState, reasoning: `Verification failed: ${verifyResult.explanation}`, targetX: 0, targetY: 0 };
+              consecutiveTribunalFailures++;
+              updateStats({ mathVerifyFailed: (getStats().mathVerifyFailed || 0) + 1 });
+              // Continue to next loop iteration (re-screenshot and retry)
+              await sleep(CONFIG.BETWEEN_STEPS_MS * wm);
+              continue;
+            } else if (verifyResult.correct && verifyResult.method !== 'unknown') {
+              log(`Math verification PASSED (method=${verifyResult.method}, conf=${verifyResult.confidence.toFixed(2)})`, 'INFO', 'cycle');
+              updateStats({ mathVerifyPassed: (getStats().mathVerifyPassed || 0) + 1 });
+            }
+          } catch (verifyErr: any) {
+            log(`Math verification error: ${verifyErr.message || verifyErr}. Proceeding with action.`, 'WARN', 'cycle');
+          }
         }
       }
 
