@@ -9,7 +9,8 @@
 //
 // P7: providerName passed to retryWithBackoff for health-aware retries.
 // P20: Structured error logging.
-// FIX: Signal (abortSignal) now passed to SDK. Stale closure fixed on rollback.
+// FIX: Signal now passed via RequestOptions (second arg to create()),
+// not as abortSignal in the body — Groq SDK doesn't support abortSignal.
 
 const { extractJSON, validateActionResponse, getProviderConfig, retryWithBackoff } = require('./providers-base');
 
@@ -65,18 +66,17 @@ function GroqProvider() {
     const makeRequest = async () => {
       const { model, userContent } = buildRequest();
 
-      // FIX: Pass signal as abortSignal to the Groq SDK so requests are cancellable
-      const sdkOptions: any = {
+      // Groq SDK (OpenAI-compatible): pass signal via RequestOptions (2nd arg),
+      // NOT as abortSignal in the request body — the SDK rejects that with 400.
+      const body: any = {
         model,
         messages: [{ role: 'user', content: userContent }],
         max_tokens: 4096,
         temperature: 0.1,
       };
-      if (signal) {
-        sdkOptions.abortSignal = signal;
-      }
+      const requestOptions: any = signal ? { signal } : undefined;
 
-      const response = await client.chat.completions.create(sdkOptions);
+      const response = await client.chat.completions.create(body, requestOptions);
 
       if (!response?.choices?.[0]?.message?.content) {
         throw new Error('GROQ_EMPTY_RESPONSE');
