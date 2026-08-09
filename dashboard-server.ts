@@ -209,9 +209,26 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
   const pathname = url.pathname;
 
   // Require auth for dashboard API routes (except /health)
+  // Accepts both raw ADMIN_SECRET and JWT tokens (via requireAuth)
   const requireAuth = getRequireAuth();
   const authWrap = (cb: () => void) => {
-    if (requireAuth) { requireAuth(req, res, cb); } else { cb(); }
+    // First check: raw ADMIN_SECRET (timing-safe)
+    if (ADMIN_SECRET) {
+      const authHdr = req.headers.authorization || '';
+      if (authHdr.startsWith('Bearer ') && _timingSafeEqual(authHdr.slice(7), ADMIN_SECRET)) {
+        cb();
+        return;
+      }
+    }
+    // Second check: JWT via requireAuth (if available)
+    if (requireAuth) {
+      requireAuth(req, res, () => {
+        cb();
+      });
+      return;
+    }
+    // No auth configured — allow through
+    cb();
   };
 
   // ═══════════════════════════════════════════════════════════════
