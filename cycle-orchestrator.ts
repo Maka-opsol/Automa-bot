@@ -1,9 +1,8 @@
 'use strict';
 
-import type { Deps } from './types/di-types';
-let _deps: Deps = {};
+let _deps: any = {};
 
-function _injectDependencies(deps: Deps) { _deps = deps; }
+function _injectDependencies(deps: any) { _deps = deps; }
 function getCONFIG(): any { return _deps.config || {}; }
 function log(msg: string, level?: string, mod?: string) { _deps.logger?.log?.(msg, level, mod) ?? console.log(msg); }
 function logError(msg: string, err: Error, ctx?: any) { _deps.logger?.logError?.(msg, err, ctx) ?? console.error(msg, err); }
@@ -87,31 +86,61 @@ async function startDaemon() {
   // Response 7: Lazy-load work shifts for shift-aware scheduling
   const workShifts = _getWorkShifts();
 
+  // FIX: Log provider diagnostic at startup so we know immediately
+  // why providers may be unavailable (module load failure vs missing keys)
+  try {
+    const registry = require('./providers-registry');
+    if (typeof registry.logProviderDiagnostic === 'function') {
+      registry.logProviderDiagnostic();
+    }
+  } catch (e: any) {
+    log(`Provider diagnostic failed: ${e.message}`, 'WARN', 'orchestrator');
+  }
+
   while (!stopRequested) {
     // ── Work Shifts: REST/RECOVERY → keepalive sleep instead of full cycle ──
     if (workShifts && typeof workShifts.getShift === 'function') {
       const shift = workShifts.getShift();
 
       if (!workShifts.shouldRunFullCycle()) {
-        // In REST or RECOVERY: sleep for a while, then re-evaluate
-        const restMs = workShifts.getCycleSleepMultiplier() > 2
-          ? (10 * 60 * 1000 + Math.random() * 10 * 60 * 1000) // 10-20 min in REST
-          : (5 * 60 * 1000 + Math.random() * 5 * 60 * 1000);  // 5-10 min in RECOVERY
+        // FIX: Log WHY we're not running a full cycle — critical for debugging idle bots
+        log(`Shift ${shift.current}: fullCycle=false, reason: ${shift.reason} (time=${shift.timeSignal}, resource=${shift.resourceSignal})`, 'INFO', 'orchestrator');
 
-        log(`Shift ${shift.current}: keepalive mode (${shift.reason}). Sleeping ${(restMs / 60000).toFixed(0)} mins...`, 'INFO', 'orchestrator');
+        // In REST or RECOVERY: run a pixel-only cycle instead of full sleep.
+        // This ensures pixel-fallback and pixel-explorer still work even when
+        // AI providers are unavailable. These cost no API quota.
+        // Only REST (outside productive hours) does true sleep.
+        if (shift.current === 'REST') {
+          const restMs = 10 * 60 * 1000 + Math.random() * 10 * 60 * 1000; // 10-20 min
+          log(`Shift REST: keepalive mode (${shift.reason}). Sleeping ${(restMs / 60000).toFixed(0)} mins...`, 'INFO', 'orchestrator');
 
-        // In REST, still ping keepalive to prevent Render spin-down
-        if (shift.current === 'REST' && !isHFSpaces) {
-          try {
-            const healthWatchdog = _getHealthWatchdog();
-            if (healthWatchdog && typeof healthWatchdog.checkNow === 'function') {
-              healthWatchdog.checkNow();
-            }
-          } catch (e: any) { /* non-critical */ }
+          // Ping keepalive to prevent Render spin-down
+          if (!isHFSpaces) {
+            try {
+              const healthWatchdog = _getHealthWatchdog();
+              if (healthWatchdog && typeof healthWatchdog.runHealthCheck === 'function') {
+                healthWatchdog.runHealthCheck().catch(() => {});
+              }
+            } catch (e: any) { /* non-critical */ }
+          }
+
+          await sleep(restMs);
+          continue;
         }
 
-        await sleep(restMs);
+        // RECOVERY: attempt a pixel-only cycle (no AI providers, no API cost)
+        const recoveryMs = 5 * 60 * 1000 + Math.random() * 5 * 60 * 1000; // 5-10 min
+        log(`Shift RECOVERY: attempting pixel-only cycle (${shift.reason})`, 'INFO', 'orchestrator');
+        try {
+          await _deps.cycleManager?.runCycle?.({ pixelOnly: true });
+        } catch (err: any) {
+          log(`Pixel-only cycle failed: ${err.message}`, 'WARN', 'orchestrator');
+        }
+        await sleep(recoveryMs);
         continue;
+      } else {
+        // FIX: Log shift status even when fullCycle=true for visibility
+        log(`Shift ${shift.current}: fullCycle=true, reason: ${shift.reason}`, 'DEBUG', 'orchestrator');
       }
     }
 
