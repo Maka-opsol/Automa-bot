@@ -264,13 +264,13 @@ function prune(): PruneResult {
     const deletableFiles = _getDeletableFiles();
 
     if (level === 'warn') {
-      // Prune only screenshots (oldest first) until below 60%
+      // Prune screenshots AND browser cache (oldest first) until below 60%
       const targetPct = THRESHOLD_WARN - 0.10; // Target 60%
       let freedSoFar = 0;
 
       for (const file of deletableFiles) {
         if (before.usagePct - (freedSoFar + file.size) / before.totalBytes < targetPct) break;
-        if (!_isScreenshot(file.path)) continue; // Only screenshots at this level
+        if (!_isScreenshot(file.path) && !_isBrowserCache(file.path)) continue;
 
         try {
           fs.unlinkSync(file.path);
@@ -280,7 +280,27 @@ function prune(): PruneResult {
         } catch { /* skip */ }
       }
 
-      log(`/tmp guardian WARN prune: ${filesDeleted} screenshots freed ${_formatBytes(freedBytes)} (usage: ${(before.usagePct * 100).toFixed(1)}%)`, 'WARN', 'tmp-guardian');
+      // Also clean Chromium cache dirs directly (biggest space hogs)
+      const userDataDir = path.join(TMP_DIR, '.browser-data');
+      if (fs.existsSync(userDataDir)) {
+        const cacheDirs = ['Default/Cache', 'Default/Code Cache', 'Default/Service Worker/CacheStorage',
+          'Default/GPUCache', 'GrShaderCache', 'ShaderCache', 'DawnGraphiteCache', 'DawnWebGPUCache'];
+        for (const cacheDir of cacheDirs) {
+          try {
+            const cachePath = path.join(userDataDir, cacheDir);
+            if (fs.existsSync(cachePath)) {
+              const size = _dirSize(cachePath);
+              if (size > 0) {
+                _rmrf(cachePath);
+                freedBytes += size;
+                filesDeleted++;
+              }
+            }
+          } catch { /* skip */ }
+        }
+      }
+
+      log(`/tmp guardian WARN prune: ${filesDeleted} files freed ${_formatBytes(freedBytes)} (usage: ${(before.usagePct * 100).toFixed(1)}%)`, 'WARN', 'tmp-guardian');
     } else if (level === 'aggressive') {
       // Delete ALL screenshots, logs, dumps — keep only state/DB
       for (const file of deletableFiles) {
@@ -333,6 +353,42 @@ function prune(): PruneResult {
 function _isScreenshot(filePath: string): boolean {
   const ext = path.extname(filePath).toLowerCase();
   return ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.webp';
+}
+
+function _isBrowserCache(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, '/');
+  return normalized.includes('/Cache') || normalized.includes('/GPUCache') ||
+         normalized.includes('/ShaderCache') || normalized.includes('/Crashpad');
+}
+
+function _dirSize(dir: string): number {
+  let total = 0;
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      try {
+        const s = fs.statSync(full);
+        if (s.isFile()) total += s.size;
+        else if (s.isDirectory()) total += _dirSize(full);
+      } catch { /* skip */ }
+    }
+  } catch { /* skip */ }
+  return total;
+}
+
+function _rmrf(dir: string): void {
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      try {
+        if (e.isFile()) fs.unlinkSync(full);
+        else if (e.isDirectory()) { _rmrf(full); fs.rmdirSync(full); }
+      } catch { /* skip */ }
+    }
+    fs.rmdirSync(dir);
+  } catch { /* skip */ }
 }
 
 function _cleanEmptyDirs(dir: string) {
