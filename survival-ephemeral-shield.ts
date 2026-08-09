@@ -576,6 +576,36 @@ function getDiskUsagePercent(checkPath: string): number {
 function cleanupNonCriticalFiles(): { freedBytes: number; filesDeleted: number } {
   const fs = getFs();
   const path = getPath();
+
+  function _recursiveSize(dir: string, fs: any): number {
+    let total = 0;
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        try {
+          const s = fs.statSync(full);
+          if (s.isFile()) total += s.size;
+          else if (s.isDirectory()) total += _recursiveSize(full, fs);
+        } catch { /* skip */ }
+      }
+    } catch { /* skip */ }
+    return total;
+  }
+
+  function _rmrf(dir: string, fs: any): void {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        try {
+          if (e.isFile()) fs.unlinkSync(full);
+          else if (e.isDirectory()) { _rmrf(full, fs); fs.rmdirSync(full); }
+        } catch { /* skip */ }
+      }
+      fs.rmdirSync(dir);
+    } catch { /* skip */ }
+  }
   let freedBytes = 0;
   let filesDeleted = 0;
 
@@ -622,9 +652,10 @@ function cleanupNonCriticalFiles(): { freedBytes: number; filesDeleted: number }
     logError('Log cleanup failed', e);
   }
 
-  // 2. Clean old screenshot files
+  // 2. Clean old screenshot files (use SCREENSHOT_DIR, not cwd)
   try {
-    const screenshotDir = path.join(process.cwd(), 'screenshots');
+    const screenshotDir = process.env.SCREENSHOT_DIR
+      || path.join(getOs().tmpdir(), 'mathu-logs', 'screenshots');
     if (fs.existsSync(screenshotDir)) {
       const now = Date.now();
       const entries = fs.readdirSync(screenshotDir);
@@ -651,7 +682,45 @@ function cleanupNonCriticalFiles(): { freedBytes: number; filesDeleted: number }
     logError('Screenshot cleanup failed', e);
   }
 
-  // 3. Clean old temp files in /tmp/ matching mathu-* pattern
+  // 3. Clean Chromium browser cache (often 50-150MB)
+  try {
+    const userDataDir = process.env.USER_DATA_DIR
+      || path.join(getOs().tmpdir(), '.browser-data');
+    if (fs.existsSync(userDataDir)) {
+      const cacheDirs = ['Default/Cache', 'Default/Code Cache', 'Default/Service Worker/CacheStorage',
+        'Default/GPUCache', 'GrShaderCache', 'ShaderCache', 'DawnGraphiteCache', 'DawnWebGPUCache'];
+      for (const cacheDir of cacheDirs) {
+        const fullPath = path.join(userDataDir, cacheDir);
+        if (fs.existsSync(fullPath)) {
+          const size = _recursiveSize(fullPath, fs);
+          if (size > 0) {
+            _rmrf(fullPath, fs);
+            freedBytes += size;
+            filesDeleted++;
+          }
+        }
+      }
+      // Also clean chromium temp files in the profile dir
+      const entries = fs.readdirSync(userDataDir).filter((f: string) =>
+        f.startsWith('Crashpad') || f.endsWith('.tmp') || f === 'lockfile');
+      for (const entry of entries) {
+        try {
+          const fullPath = path.join(userDataDir, entry);
+          const stat = fs.statSync(fullPath);
+          if (stat.isFile()) {
+            fs.unlinkSync(fullPath);
+            freedBytes += stat.size;
+            filesDeleted++;
+          }
+        } catch { /* skip */ }
+      }
+      if (freedBytes > 0) {
+        log(`Cleaned browser cache (${(freedBytes / 1024).toFixed(0)} KB freed)`, 'INFO');
+      }
+    }
+  } catch { /* non-critical */ }
+
+  // 4. Clean old temp files in /tmp/ matching mathu-* pattern
   try {
     const os = getOs();
     const tmpDir = os.tmpdir();
