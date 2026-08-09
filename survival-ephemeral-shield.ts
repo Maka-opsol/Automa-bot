@@ -67,7 +67,8 @@ const DEFAULT_SYNC_INTERVAL_MS = 30 * 1000;      // 30 seconds
 const DEFAULT_MANIFEST_CHECK_MS = 10 * 1000;     // 10 seconds
 const DEFAULT_DISK_CHECK_INTERVAL_MS = 60 * 1000; // 60 seconds
 const DISK_SPACE_CRITICAL_PERCENT = 90;           // Trigger cleanup above this
-const DISK_SPACE_LOW_PERCENT = 80;                // Log warning above this
+const DISK_SPACE_LOW_PERCENT = 75;                // Log warning + aggressive cleanup above this
+const DISK_SPACE_HIGH_PERCENT = 85;               // Delete everything possible above this
 const MAX_LOG_FILES = 5;                          // Keep only N most recent log files
 const MAX_LOG_AGE_MS = 2 * 60 * 60 * 1000;       // 2 hours
 const MAX_SCREENSHOT_AGE_MS = 30 * 60 * 1000;     // 30 minutes
@@ -755,6 +756,159 @@ function cleanupNonCriticalFiles(): { freedBytes: number; filesDeleted: number }
   return { freedBytes, filesDeleted };
 }
 
+// ─── Module-level helpers for aggressive cleanup (shared across functions) ───
+
+function _nukeRecursiveSize(dir: string): number {
+  const fs = getFs();
+  const pathMod = require('path');
+  let total = 0;
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of entries) {
+      const full = pathMod.join(dir, e.name);
+      try {
+        const s = fs.statSync(full);
+        if (s.isFile()) total += s.size;
+        else if (s.isDirectory()) total += _nukeRecursiveSize(full);
+      } catch {}
+    }
+  } catch {}
+  return total;
+}
+
+function _nukeRmrf(dir: string): void {
+  const fs = getFs();
+  const pathMod = require('path');
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of entries) {
+      const full = pathMod.join(dir, e.name);
+      try {
+        if (e.isFile()) fs.unlinkSync(full);
+        else if (e.isDirectory()) { _nukeRmrf(full); fs.rmdirSync(full); }
+      } catch {}
+    }
+    fs.rmdirSync(dir);
+  } catch {}
+}
+
+/**
+ * Aggressively delete ALL non-protected files in /tmp.
+ * Unlike cleanupNonCriticalFiles (which is age-based), this deletes regardless of age.
+ * Used when disk usage is HIGH (>85%).
+ */
+function _nukeAllDeletable(): { freedBytes: number; filesDeleted: number } {
+  const fs = getFs();
+  const path = getPath();
+  const os = getOs();
+  const tmpDir = os.tmpdir();
+
+  let freedBytes = 0;
+  let filesDeleted = 0;
+
+  // Protected patterns (never delete these)
+  const PROTECTED_BASENAMES = new Set([
+    'openrouter-rate-limit.json', 'mathpix-rate-limit.json', 'render-last-seen.json',
+    'checkpoint.json', 'last-state.json', 'state.json', 'manifest.json',
+    'mathu-persist.json', '.heartbeat',
+  ]);
+
+  function isProtected(filePath: string): boolean {
+    const basename = path.basename(filePath);
+    if (PROTECTED_BASENAMES.has(basename)) return true;
+    if (basename.endsWith('.db') || basename.endsWith('.db-wal') || basename.endsWith('.db-shm')) return true;
+    if (basename.endsWith('.lock')) return true;
+    if (filePath.startsWith(SHADOW_DIR)) return true; // Never delete shadow copies
+    return false;
+  }
+
+  function walkAndDelete(dir: string): void {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        if (isProtected(fullPath)) continue;
+        // Skip .browser-data — handled separately (larger impact)
+        if (fullPath.includes('.browser-data')) continue;
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.isFile()) {
+            fs.unlinkSync(fullPath);
+            freedBytes += stat.size;
+            filesDeleted++;
+          } else if (stat.isDirectory()) {
+            walkAndDelete(fullPath);
+            try { fs.rmdirSync(fullPath); } catch { /* not empty yet */ }
+          }
+        } catch { /* skip */ }
+      }
+    } catch { /* skip */ }
+  }
+
+  // 1. Delete all non-protected files in /tmp (except .browser-data)
+  walkAndDelete(tmpDir);
+
+  // 2. Nuke browser cache directories (these are the biggest space hogs: 50-200MB)
+  try {
+    const userDataDir = process.env.USER_DATA_DIR || path.join(tmpDir, '.browser-data');
+    if (fs.existsSync(userDataDir)) {
+      const cachePatterns = ['Default/Cache', 'Default/Code Cache', 'Default/Service Worker',
+        'Default/GPUCache', 'GrShaderCache', 'ShaderCache', 'DawnGraphiteCache',
+        'DawnWebGPUCache', 'Default/Session Storage', 'Default/Local Storage/leveldb',
+        'Default/IndexedDB', 'Crashpad'];
+
+      for (const cacheDir of cachePatterns) {
+        const fullPath = path.join(userDataDir, cacheDir);
+        if (fs.existsSync(fullPath)) {
+          try {
+            const size = _nukeRecursiveSize(fullPath);
+            _nukeRmrf(fullPath);
+            freedBytes += size;
+            filesDeleted++;
+          } catch {}
+        }
+      }
+
+      // Also delete all *.tmp, Crashpad files, and lockfile in browser data root
+      try {
+        const rootEntries = fs.readdirSync(userDataDir);
+        for (const entry of rootEntries) {
+          if (entry.startsWith('Crashpad') || entry.endsWith('.tmp') || entry === 'lockfile') {
+            const fullPath = path.join(userDataDir, entry);
+            try {
+              const stat = fs.statSync(fullPath);
+              fs.unlinkSync(fullPath);
+              freedBytes += stat.size;
+              filesDeleted++;
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+  } catch {}
+
+  // 3. Clean all screenshots regardless of age
+  try {
+    const screenshotDir = process.env.SCREENSHOT_DIR || path.join(tmpDir, 'mathu-logs', 'screenshots');
+    if (fs.existsSync(screenshotDir)) {
+      const entries = fs.readdirSync(screenshotDir);
+      for (const entry of entries) {
+        try {
+          const fullPath = path.join(screenshotDir, entry);
+          const stat = fs.statSync(fullPath);
+          if (stat.isFile()) {
+            fs.unlinkSync(fullPath);
+            freedBytes += stat.size;
+            filesDeleted++;
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  return { freedBytes, filesDeleted };
+}
+
 /**
  * Check disk space and trigger cleanup if needed.
  */
@@ -772,7 +926,9 @@ function checkDiskSpace(): void {
   if (_diskUsagePercent > DISK_SPACE_CRITICAL_PERCENT) {
     log(`Disk usage CRITICAL: ${_diskUsagePercent.toFixed(1)}% — triggering emergency cleanup`, 'ERROR');
     const result = cleanupNonCriticalFiles();
-    log(`Emergency cleanup freed ${(result.freedBytes / 1024).toFixed(0)} KB`, 'WARN');
+    const nukeResult = _nukeAllDeletable();
+    const totalFreed = result.freedBytes + nukeResult.freedBytes;
+    log(`Emergency cleanup freed ${(totalFreed / 1024).toFixed(0)} KB (standard=${(result.freedBytes / 1024).toFixed(0)}KB, nuke=${(nukeResult.freedBytes / 1024).toFixed(0)}KB, files=${result.filesDeleted + nukeResult.filesDeleted})`, 'WARN');
 
     // Also push tombstone if disk is critically low
     try {
@@ -781,9 +937,16 @@ function checkDiskSpace(): void {
         tombstone.pushTombstone('disk_critical').catch(() => {});
       }
     } catch { /* non-critical */ }
+  } else if (_diskUsagePercent > DISK_SPACE_HIGH_PERCENT) {
+    log(`Disk usage HIGH: ${_diskUsagePercent.toFixed(1)}% — aggressive cleanup (deleting ALL deletable files)`, 'WARN');
+    const nukeResult = _nukeAllDeletable();
+    log(`Aggressive cleanup freed ${(nukeResult.freedBytes / 1024).toFixed(0)} KB (${nukeResult.filesDeleted} files)`, 'WARN');
   } else if (_diskUsagePercent > DISK_SPACE_LOW_PERCENT) {
-    log(`Disk usage HIGH: ${_diskUsagePercent.toFixed(1)}% — preemptive cleanup`, 'WARN');
-    cleanupNonCriticalFiles();
+    log(`Disk usage elevated: ${_diskUsagePercent.toFixed(1)}% — preemptive cleanup`, 'WARN');
+    const result = cleanupNonCriticalFiles();
+    if (result.filesDeleted > 0) {
+      log(`Preemptive cleanup freed ${(result.freedBytes / 1024).toFixed(0)} KB (${result.filesDeleted} files)`, 'INFO');
+    }
   }
 }
 
