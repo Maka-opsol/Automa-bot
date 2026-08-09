@@ -505,6 +505,7 @@ module.exports = {
   check,
 
   // Lifecycle
+  init,
   start,
   stop,
 
