@@ -255,6 +255,19 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     }
     if (CONFIG.FLUTTER_DPR_AUTO_CALIBRATE && dpr) { await dpr.calibrate(page); }
 
+    // Navigate to app if browser landed on about:blank (fresh start, no checkpoint)
+    if (!checkpoint && page.url() === 'about:blank') {
+      const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
+      if (targetUrl) {
+        log(`Fresh start: navigating to ${targetUrl}`, 'INFO', 'cycle');
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
+          log(`Initial navigation failed: ${e.message || e}`, 'WARN', 'cycle');
+        });
+      } else {
+        log('Fresh start at about:blank — no BASE_URL or APP_URL configured', 'WARN', 'cycle');
+      }
+    }
+
     let questionsCompleted = checkpoint?.questionsCompleted || 0;
     let lastProgressTime = Date.now();
     let browserLastRestart = Date.now();
