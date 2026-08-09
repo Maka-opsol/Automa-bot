@@ -303,6 +303,61 @@ async function safeCall(
   }
 }
 
+// ─── coalescer ──────────────────────────────────────────────────────────
+
+/**
+ * Call coalescer — deduplicates concurrent async calls with the same key.
+ * If a call with the same key is already in-flight, returns the same promise
+ * instead of firing a duplicate request. Results are cached for ttlMs after
+ * the call resolves so that near-duplicate keys also hit the cache.
+ *
+ * Usage:  const result = await coalescer.execute('my-key', () => doExpensiveWork(), 5000);
+ */
+const coalescer = {
+  _inflight: new Map<string, Promise<any>>(),
+  _cached: new Map<string, { result: any; expiry: number }>(),
+
+  /**
+   * Execute fn(key) with coalescing.
+   * @param key   - Deduplication key (e.g. screenshot hash)
+   * @param fn    - The async function to call
+   * @param ttlMs - Cache TTL in ms after the call resolves (default 5000)
+   */
+  async execute(key: string, fn: () => Promise<any>, ttlMs: number = 5000): Promise<any> {
+    const now = Date.now();
+
+    // 1. Check cache
+    const cached = this._cached.get(key);
+    if (cached && cached.expiry > now) {
+      return cached.result;
+    }
+    if (cached) this._cached.delete(key); // expired
+
+    // 2. Check in-flight
+    const inflight = this._inflight.get(key);
+    if (inflight) return inflight;
+
+    // 3. Execute
+    const promise = fn().then((result: any) => {
+      this._inflight.delete(key);
+      this._cached.set(key, { result, expiry: Date.now() + ttlMs });
+      return result;
+    }).catch((err: any) => {
+      this._inflight.delete(key);
+      throw err;
+    });
+
+    this._inflight.set(key, promise);
+    return promise;
+  },
+
+  /** Clear all cached and in-flight state */
+  clear(): void {
+    this._inflight.clear();
+    this._cached.clear();
+  },
+};
+
 module.exports = {
   extractJSON,
   validateActionResponse,
@@ -310,5 +365,6 @@ module.exports = {
   retryWithBackoff,
   classifyError,
   safeCall,
+  coalescer,
   _injectDependencies,
 };
