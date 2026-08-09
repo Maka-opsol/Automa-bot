@@ -626,7 +626,7 @@ function getMemoryInfo() {
   };
 }
 
-const server = http.createServer(async (req: any, res: any) => {
+const server = http.createServer((req: any, res: any) => {
   // BUG FIX (Response 18): Only set CORS for actual allowed origins
   // instead of blindly echoing req.headers.origin (which could be
   // anything). If DASHBOARD_ALLOWED_ORIGINS is ['*'], allow all.
@@ -638,8 +638,13 @@ const server = http.createServer(async (req: any, res: any) => {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const pathname = url.pathname;
+  // Wrap async handler to prevent unhandled rejections causing
+  // "Cannot write headers after they are sent" errors.
+  // When an async handler throws AFTER partial response, we must
+  // check res.headersSent before trying to send an error response.
+  ;(async () => {
+    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const pathname = url.pathname;
 
   // ── Root: full control dashboard (from dashboard-server module) ──
   if (pathname === '/' || pathname === '/index.html') {
@@ -1141,6 +1146,16 @@ const server = http.createServer(async (req: any, res: any) => {
 
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('Not found');
+  }).catch((err: any) => {
+    // Prevent "Cannot write headers after they are sent" by checking
+    // whether the response was already partially sent.
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || 'Internal server error' }));
+    } else {
+      log(`HTTP handler error (response already sent): ${err.message}`, 'WARN', 'http');
+    }
+  });
 });
 
 // \u2500\u2500 Start HTTP server FIRST (Render requirement) \u2500\u2500
