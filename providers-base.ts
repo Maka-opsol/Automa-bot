@@ -54,6 +54,10 @@ function extractJSON(raw: any, context: any) {
   let cleaned = raw.trim();
   if (cleaned.startsWith('```json')) cleaned = cleaned.replace(/^```json\s*/, '').replace(/\s*```$/, '');
   else if (cleaned.startsWith('```')) cleaned = cleaned.replace(/^```\s*/, '').replace(/\s*```$/, '');
+  // FIX: Strip common LLM response preambles that precede JSON
+  // OpenRouter "openrouter/free" model returns safety text like "User Safety: safe" before JSON
+  // Gemini sometimes returns "Here is the JSON:" or similar
+  cleaned = cleaned.replace(/^(?:User Safety:\s*\w+\s*[\n\r]+|Here is(?:\s+the)?(?:\s+JSON)?:?\s*[\n\r]+|Sure,?\s+here(?:'s| is)?:?\s*[\n\r]+|I'll\s+provide[^{]*?)(?=\s*[\[{])/gi, '');
   cleaned = cleaned.trim();
   cleaned = cleaned.replace(/,\s*}/g, '}').replace(/,\s*\]/g, ']');
   function extractFirstJSON(str: any) {
@@ -67,9 +71,17 @@ function extractJSON(raw: any, context: any) {
       if (ch === '{') { if (depth === 0) start = i; depth++; }
       else if (ch === '}') { depth--; if (depth === 0 && start !== -1) return str.substring(start, i + 1); }
     }
-    return str;
+    // FIX: If no JSON object found, return empty — caller will throw a clear error
+    // instead of trying to JSON.parse the entire non-JSON string
+    return '';
   }
   const jsonStr = extractFirstJSON(cleaned);
+  if (!jsonStr) {
+    // FIX: Log what the model actually returned (first 200 chars) for debugging
+    const preview = cleaned.substring(0, 200).replace(/\n/g, ' ');
+    log(`extractJSON: no JSON object found in ${context} response. Preview: "${preview}"`, 'WARN', 'base');
+    throw new Error(`${context}: No JSON object in response (model returned non-JSON content)`);
+  }
   try { return JSON.parse(jsonStr); } catch (e: any) { logError(`JSON parse error in ${context}`, e); throw new Error(`${context}: JSON parse failed`); }
 }
 
