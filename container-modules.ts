@@ -413,7 +413,7 @@ function createContainer(): DIContainerType {
       mod._injectDependencies(deps);
       return mod;
     },
-    deps: ['config', 'logger', 'browser', 'cache', 'providersBase'],
+    deps: ['config', 'logger', 'browser', 'cache', 'database', 'providersBase'],
     critical: false,
     tags: ['longevity'],
   });
