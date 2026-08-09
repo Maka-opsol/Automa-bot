@@ -1,29 +1,75 @@
 'use strict';
-let _deps: Record<string, any> = {};
-function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
-function getProviderStats() { return _deps.providersStats?.getStats; }
-function getProviderUpdateStats() { return _deps.providersStats?.updateStats; }
-function getStateDiagnostics() { return _deps.stateMachine?.getStateDiagnostics; }
-function getCacheStats() { return _deps.cache?.getCacheStats; }
-function getDatabaseStats() { return _deps.database?.getDatabaseStats; }
-function getFailsafeDiagnostics() { return _deps.failsafeCoordinator?.getDiagnostics; }
-function getBrowserMetrics() { return _deps.browser?.getBrowserMetrics; }
-function getGenerateToken() { return _deps.jwt?.generateToken; }
-function getRequireAuth() { return _deps.jwt?.requireAuth; }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Dashboard Server — Connected to render-free-plan.ts via container
+// ═══════════════════════════════════════════════════════════════════════
+// This module provides the full dashboard UI and all management API
+// endpoints. It exports handleDashboardRequest() for mounting into
+// an existing HTTP server (render-free-plan.ts), and also exports
+// createDashboardServer() / startDashboard() for standalone use.
+//
+// Dependencies come from the container module (same as render-free-plan.ts).
+// ═══════════════════════════════════════════════════════════════════════
 
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { PROJECT_ROOT } = require('./project-root');
-const { log, logError } = require('./logger');
-function getCONFIG(): Record<string, any> { return _deps.config || require('./get-config'); }
 const crypto = require('crypto');
-function _timingSafeEqual(a: any, b: any) { if (typeof a !== 'string' || typeof b !== 'string') return false; if (a.length !== b.length) return false; try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch { return false; } }
+const { container } = require('./container');
+
+// ── Resolve logger from container (with fallback) ──
+function getLog() {
+  try { return container.get('logger'); } catch { return require('./logger'); }
+}
+
+const log    = (...args: any[]) => getLog().log(...args);
+const logErr = (...args: any[]) => getLog().logError(...args);
+
+function getCONFIG(): Record<string, any> {
+  try { return container.get('config'); } catch { return require('./get-config'); }
+}
+
+// ── Resolve dependencies from container ──
+function getProviderStats() {
+  try { return container.get('providersStats')?.getStats; } catch { return undefined; }
+}
+function getStateDiagnostics() {
+  try { return container.get('stateMachine')?.getStateDiagnostics; } catch { return undefined; }
+}
+function getCacheStats() {
+  try { return container.get('cache')?.getCacheStats; } catch { return undefined; }
+}
+function getDatabaseStats() {
+  try { return container.get('database')?.getDatabaseStats; } catch { return undefined; }
+}
+function getFailsafeDiagnostics() {
+  try { return container.get('failsafeCoordinator')?.getDiagnostics; } catch { return undefined; }
+}
+function getBrowserMetrics() {
+  try { return container.get('browser')?.getBrowserMetrics; } catch { return undefined; }
+}
+function getGenerateToken() {
+  try { return container.get('jwt')?.generateToken; } catch { return undefined; }
+}
+function getRequireAuth() {
+  try { return container.get('jwt')?.requireAuth; } catch { return undefined; }
+}
+
+function _timingSafeEqual(a: any, b: any) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch { return false; }
+}
 
 const DASHBOARD_DIR = path.join(PROJECT_ROOT, 'public');
 const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
 
-// ── Screenshot cache (mirrors render-free-plan.ts) ──
+// ── Screenshot cache (shared with render-free-plan.ts via globals) ──
+// render-free-plan.ts sets (globalThis).__setLatestScreenshot and
+// (globalThis).__getLatestScreenshot. We mirror them here so the
+// dashboard can serve screenshots even when loaded standalone.
+
 let _latestScreenshot: { screenshot: string; timestamp: number; action?: any } | null = null;
 
 function setLatestScreenshot(base64Jpeg: string, action?: any) {
@@ -38,9 +84,9 @@ function getLatestScreenshot() {
   return _latestScreenshot;
 }
 
-// Expose globally so cycle manager can call it
-(globalThis as any).__setLatestScreenshot = setLatestScreenshot;
-(globalThis as any).__getLatestScreenshot = getLatestScreenshot;
+// Expose globally so cycle manager can call it (same globals as render-free-plan)
+if (!(globalThis as any).__setLatestScreenshot) (globalThis as any).__setLatestScreenshot = setLatestScreenshot;
+if (!(globalThis as any).__getLatestScreenshot) (globalThis as any).__getLatestScreenshot = getLatestScreenshot;
 
 // ── Helper: read JSON body from request ──
 function readBody(req: any, res: any, cb: (body: string) => void) {
@@ -100,12 +146,10 @@ async function captureLiveScreenshot(): Promise<string | null> {
     if (!page || page.isClosed()) return null;
     const buf = await page.screenshot({ type: 'jpeg', quality: 40 });
     const base64 = buf.toString('base64');
-    // Compress via sharp if available
     try {
       const compressed = await browserMod.compressScreenshot?.(base64, 800, 30);
       if (compressed) return compressed;
     } catch { /* sharp not available, use raw */ }
-    // Cap raw at 300KB
     if (base64.length > 300_000) return base64.substring(0, 300_000);
     return base64;
   } catch (e: any) {
@@ -142,456 +186,481 @@ function serveStaticFile(res: any, filePath: any, contentType: any) {
   });
 }
 
-function createDashboardServer() {
-  const server = http.createServer(async (req: any, res: any) => {
-    const DASHBOARD_ALLOWED_ORIGINS = process.env.DASHBOARD_ALLOWED_ORIGINS
-        ? process.env.DASHBOARD_ALLOWED_ORIGINS.split(',')
-        : ['http://localhost:8080'];
-    const origin = req.headers.origin || '';
-    if (DASHBOARD_ALLOWED_ORIGINS.includes(origin) || DASHBOARD_ALLOWED_ORIGINS.includes('*')) {
-      res.setHeader('Access-Control-Allow-Origin', origin || '*');
+// ═══════════════════════════════════════════════════════════════════════
+//  REQUEST HANDLER — Can be mounted into any HTTP server
+// ═══════════════════════════════════════════════════════════════════════
+// Returns true if the request was handled (caller should NOT send 404).
+// Returns false if the request didn't match any dashboard route.
+// ═══════════════════════════════════════════════════════════════════════
+
+async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
+  const DASHBOARD_ALLOWED_ORIGINS = process.env.DASHBOARD_ALLOWED_ORIGINS
+      ? process.env.DASHBOARD_ALLOWED_ORIGINS.split(',')
+      : ['*'];
+  const origin = req.headers.origin || '';
+  if (DASHBOARD_ALLOWED_ORIGINS.includes(origin) || DASHBOARD_ALLOWED_ORIGINS.includes('*')) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return true; }
+
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const pathname = url.pathname;
+
+  // Require auth for dashboard API routes (except /health)
+  const requireAuth = getRequireAuth();
+  const authWrap = (cb: () => void) => {
+    if (requireAuth) { requireAuth(req, res, cb); } else { cb(); }
+  };
+
+  // ═══════════════════════════════════════════════════════════════
+  //  HTML DASHBOARD
+  // ═══════════════════════════════════════════════════════════════
+  if (pathname === '/dashboard' || pathname === '/dashboard/') {
+    const indexPath = path.join(DASHBOARD_DIR, 'index.html');
+    if (fs.existsSync(indexPath)) {
+      serveStaticFile(res, indexPath, 'text/html');
+      return true;
     }
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(getDashboardHTML());
+    return true;
+  }
 
-    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-    const pathname = url.pathname;
+  // ═══════════════════════════════════════════════════════════════
+  //  READ-ONLY API ENDPOINTS
+  // ═══════════════════════════════════════════════════════════════
 
-    // ═══════════════════════════════════════════════════════════════
-    //  HTML DASHBOARD
-    // ═══════════════════════════════════════════════════════════════
-    if (pathname === '/' || pathname === '/index.html') {
-      const indexPath = path.join(DASHBOARD_DIR, 'index.html');
-      if (fs.existsSync(indexPath)) {
-        serveStaticFile(res, indexPath, 'text/html');
-        return;
-      }
-      // Embedded dashboard (when no public/index.html)
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getDashboardHTML());
-      return;
-    }
+  // Status
+  if (pathname === '/api/status') {
+    authWrap(() => {
+      const stats = getProviderStats();
+      jsonRes(res, stats ? stats() : {});
+    });
+    return true;
+  }
 
-    // ═══════════════════════════════════════════════════════════════
-    //  READ-ONLY API ENDPOINTS
-    // ═══════════════════════════════════════════════════════════════
+  // State diagnostics
+  if (pathname === '/api/state') {
+    authWrap(() => {
+      const diagnostics = getStateDiagnostics();
+      jsonRes(res, diagnostics ? diagnostics() : {});
+    });
+    return true;
+  }
 
-    // Status
-    if (pathname === '/api/status') {
-      getRequireAuth()(req, res, () => {
-        const stats = getProviderStats()();
-        jsonRes(res, stats);
-      });
-      return;
-    }
+  // Daemon state (running/paused)
+  if (pathname === '/api/daemon') {
+    authWrap(() => {
+      jsonRes(res, getDaemonState());
+    });
+    return true;
+  }
 
-    // State diagnostics
-    if (pathname === '/api/state') {
-      getRequireAuth()(req, res, () => {
-        const diagnostics = getStateDiagnostics ? getStateDiagnostics()() : {};
-        jsonRes(res, diagnostics);
-      });
-      return;
-    }
+  // Available states list
+  if (pathname === '/api/states') {
+    authWrap(() => {
+      jsonRes(res, { states: getAllStates() });
+    });
+    return true;
+  }
 
-    // Daemon state (running/paused)
-    if (pathname === '/api/daemon') {
-      getRequireAuth()(req, res, () => {
-        jsonRes(res, getDaemonState());
-      });
-      return;
-    }
+  // Available actions list
+  if (pathname === '/api/actions') {
+    authWrap(() => {
+      jsonRes(res, { actions: getAllActions() });
+    });
+    return true;
+  }
 
-    // Available states list
-    if (pathname === '/api/states') {
-      getRequireAuth()(req, res, () => {
-        jsonRes(res, { states: getAllStates() });
-      });
-      return;
-    }
-
-    // Available actions list
-    if (pathname === '/api/actions') {
-      getRequireAuth()(req, res, () => {
-        jsonRes(res, { actions: getAllActions() });
-      });
-      return;
-    }
-
-    // Logs
-    if (pathname === '/api/logs') {
-      getRequireAuth()(req, res, () => {
-        try {
-          const logFile = path.join(getCONFIG().LOG_DIR, 'daemon.log');
-          if (fs.existsSync(logFile)) {
-            const data = fs.readFileSync(logFile, 'utf8');
-            const lines = data.split('\n').filter(Boolean);
-            const tail = lines.slice(-200);
-            res.writeHead(200, { 'Content-Type': 'text/plain' });
-            res.end(tail.join('\n'));
-          } else {
-            res.writeHead(200, { 'Content-Type': 'text/plain' });
-            res.end('No log file found');
-          }
-        } catch (e: any) {
-          res.writeHead(500);
-          res.end('Error reading log file');
+  // Logs
+  if (pathname === '/api/logs') {
+    authWrap(() => {
+      try {
+        const logFile = path.join(getCONFIG().LOG_DIR, 'daemon.log');
+        if (fs.existsSync(logFile)) {
+          const data = fs.readFileSync(logFile, 'utf8');
+          const lines = data.split('\n').filter(Boolean);
+          const tail = lines.slice(-200);
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.end(tail.join('\n'));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.end('No log file found');
         }
-      });
-      return;
-    }
+      } catch (e: any) {
+        res.writeHead(500);
+        res.end('Error reading log file');
+      }
+    });
+    return true;
+  }
 
-    // Health (deep)
-    if (pathname === '/api/health' || pathname === '/api/health/deep') {
-      getRequireAuth()(req, res, () => {
+  // Health (deep)
+  if (pathname === '/api/health' || pathname === '/api/health/deep') {
+    authWrap(() => {
+      const mem = process.memoryUsage();
+      const stats = getProviderStats();
+      const health = {
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        stats: stats ? stats() : {},
+        state: (() => { const d = getStateDiagnostics(); return d ? d() : {}; })(),
+        daemon: getDaemonState(),
+        memory: {
+          heapUsed: (mem.heapUsed / 1024 / 1024).toFixed(0) + 'MB',
+          heapTotal: (mem.heapTotal / 1024 / 1024).toFixed(0) + 'MB',
+          rss: (mem.rss / 1024 / 1024).toFixed(0) + 'MB',
+          rssPercent: ((mem.rss / (512 * 1024 * 1024)) * 100).toFixed(1) + '%',
+        },
+        uptime: process.uptime(),
+        uptimeFormatted: formatUptime(process.uptime()),
+        browser: (() => { const m = getBrowserMetrics(); return m ? m() : {}; })(),
+        database: (() => { const s = getDatabaseStats(); return s ? s() : {}; })(),
+        cache: (() => { const s = getCacheStats(); return s ? s() : {}; })(),
+        failsafe: (() => { const d = getFailsafeDiagnostics(); return d ? d() : {}; })(),
+      };
+      jsonRes(res, health);
+    });
+    return true;
+  }
+
+  // Metrics
+  if (pathname === '/api/metrics') {
+    authWrap(() => {
+      try {
+        const { metrics } = require('./metrics');
+        jsonRes(res, metrics.getSummary ? metrics.getSummary() : {});
+      } catch { jsonRes(res, {}); }
+    });
+    return true;
+  }
+
+  // ── Cached screenshot (set by cycle manager) ──
+  if (pathname === '/api/screenshot') {
+    authWrap(() => {
+      const shot = getLatestScreenshot();
+      if (!shot) { jsonRes(res, { available: false }, 204); return; }
+      jsonRes(res, {
+        available: true,
+        timestamp: shot.timestamp,
+        age: Date.now() - shot.timestamp,
+        action: shot.action ? {
+          actionType: shot.action.actionType,
+          currentState: shot.action.currentState,
+          reasoning: shot.action.reasoning?.substring(0, 200),
+        } : null,
+        screenshot: shot.screenshot,
+      });
+    });
+    return true;
+  }
+
+  // ── Live screenshot (capture right now) ──
+  if (pathname === '/api/screenshot/live') {
+    authWrap(async () => {
+      try {
+        const jpeg = await captureLiveScreenshot();
+        if (!jpeg) { jsonRes(res, { available: false, error: 'Browser not available' }, 503); return; }
+        jsonRes(res, { available: true, timestamp: Date.now(), screenshot: jpeg });
+      } catch (e: any) {
+        jsonRes(res, { available: false, error: e.message }, 500);
+      }
+    });
+    return true;
+  }
+
+  // ── Provider health ──
+  if (pathname === '/api/providers') {
+    authWrap(async () => {
+      try {
+        const healthMod = require('./providers-health');
+        const registryMod = require('./providers-registry');
+        const providers = registryMod.getAvailableProviders ? await registryMod.getAvailableProviders() : [];
+        const healthDetails = providers.map((p: any) => {
+          const snapshot = healthMod.getHealthSnapshot?.(p.name) || {};
+          return {
+            name: p.name,
+            healthScore: p.healthScore,
+            totalCalls: snapshot.totalCalls || 0,
+            successRate: snapshot.successRate || 0,
+            avgLatencyMs: snapshot.avgLatencyMs || 0,
+            isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
+            circuitBreaker: snapshot.circuitBreakerState || 'closed',
+          };
+        });
+        const loadFailures = registryMod.getLoadFailures ? registryMod.getLoadFailures() : [];
+        jsonRes(res, { providers: healthDetails, loadFailures, providerCount: healthDetails.length, timestamp: Date.now() });
+      } catch (e: any) {
+        jsonRes(res, { error: e.message }, 500);
+      }
+    });
+    return true;
+  }
+
+  // ── Banned actions (GET) ──
+  if (pathname === '/api/banned-actions' && req.method === 'GET') {
+    authWrap(() => {
+      try {
+        const { listBannedActions } = require('./database');
+        jsonRes(res, listBannedActions());
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── Full status (combined) ──
+  if (pathname === '/api/full-status') {
+    authWrap(async () => {
+      try {
+        const stats = getProviderStats();
         const mem = process.memoryUsage();
-        const health = {
-          status: 'healthy',
-          timestamp: new Date().toISOString(),
-          stats: getProviderStats()(),
-          state: getStateDiagnostics ? getStateDiagnostics()() : {},
+        const shot = getLatestScreenshot();
+        const healthMod = require('./providers-health');
+        const registryMod = require('./providers-registry');
+        const providers = registryMod.getAvailableProviders ? await registryMod.getAvailableProviders() : [];
+        const providerSummary = providers.map((p: any) => ({
+          name: p.name, healthScore: p.healthScore,
+          isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
+        }));
+        const loadFailures = registryMod.getLoadFailures ? registryMod.getLoadFailures() : [];
+        const providerCount = registryMod.getAvailableProviderCount ? registryMod.getAvailableProviderCount() : 0;
+        jsonRes(res, {
+          ...(stats ? stats() : {}),
           daemon: getDaemonState(),
           memory: {
             heapUsed: (mem.heapUsed / 1024 / 1024).toFixed(0) + 'MB',
             heapTotal: (mem.heapTotal / 1024 / 1024).toFixed(0) + 'MB',
             rss: (mem.rss / 1024 / 1024).toFixed(0) + 'MB',
-            rssPercent: ((mem.rss / (512 * 1024 * 1024)) * 100).toFixed(1) + '%',
           },
           uptime: process.uptime(),
           uptimeFormatted: formatUptime(process.uptime()),
-          browser: getBrowserMetrics ? getBrowserMetrics()() : {},
-          database: getDatabaseStats ? getDatabaseStats()() : {},
-          cache: getCacheStats ? getCacheStats()() : {},
-          failsafe: getFailsafeDiagnostics ? getFailsafeDiagnostics()() : {},
-        };
-        jsonRes(res, health);
-      });
-      return;
-    }
-
-    // Metrics
-    if (pathname === '/api/metrics') {
-      getRequireAuth()(req, res, () => {
-        try {
-          const { metrics } = require('./metrics');
-          jsonRes(res, metrics.getSummary ? metrics.getSummary() : {});
-        } catch { jsonRes(res, {}); }
-      });
-      return;
-    }
-
-    // ── Cached screenshot (set by cycle manager) ──
-    if (pathname === '/api/screenshot') {
-      getRequireAuth()(req, res, () => {
-        const shot = getLatestScreenshot();
-        if (!shot) { jsonRes(res, { available: false }, 204); return; }
-        jsonRes(res, {
-          available: true,
-          timestamp: shot.timestamp,
-          age: Date.now() - shot.timestamp,
-          action: shot.action ? {
-            actionType: shot.action.actionType,
-            currentState: shot.action.currentState,
-            reasoning: shot.action.reasoning?.substring(0, 200),
-          } : null,
-          screenshot: shot.screenshot,
+          screenshotAvailable: !!shot,
+          providers: providerSummary,
+          providerLoadFailures: loadFailures,
+          providerCount,
+          timestamp: Date.now(),
+          actionCache: (() => { try { return require('./services-action-cache').getStats(); } catch { return null; } })(),
+          workShifts: (() => { try { const ws = require('./services-work-shifts'); const s = ws.getShift(); return { current: s.current, reason: s.reason, fullCycle: ws.shouldRunFullCycle() }; } catch { return null; } })(),
         });
-      });
-      return;
-    }
-
-    // ── Live screenshot (capture right now) ──
-    if (pathname === '/api/screenshot/live') {
-      getRequireAuth()(req, res, async () => {
-        try {
-          const jpeg = await captureLiveScreenshot();
-          if (!jpeg) { jsonRes(res, { available: false, error: 'Browser not available' }, 503); return; }
-          jsonRes(res, { available: true, timestamp: Date.now(), screenshot: jpeg });
-        } catch (e: any) {
-          jsonRes(res, { available: false, error: e.message }, 500);
-        }
-      });
-      return;
-    }
-
-    // ── Provider health ──
-    if (pathname === '/api/providers') {
-      getRequireAuth()(req, res, async () => {
-        try {
-          const healthMod = require('./providers-health');
-          const registryMod = require('./providers-registry');
-          const providers = registryMod.getAvailableProviders ? await registryMod.getAvailableProviders() : [];
-          const healthDetails = providers.map((p: any) => {
-            const snapshot = healthMod.getHealthSnapshot?.(p.name) || {};
-            return {
-              name: p.name,
-              healthScore: p.healthScore,
-              totalCalls: snapshot.totalCalls || 0,
-              successRate: snapshot.successRate || 0,
-              avgLatencyMs: snapshot.avgLatencyMs || 0,
-              isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
-              circuitBreaker: snapshot.circuitBreakerState || 'closed',
-            };
-          });
-          const loadFailures = registryMod.getLoadFailures ? registryMod.getLoadFailures() : [];
-          jsonRes(res, { providers: healthDetails, loadFailures, providerCount: healthDetails.length, timestamp: Date.now() });
-        } catch (e: any) {
-          jsonRes(res, { error: e.message }, 500);
-        }
-      });
-      return;
-    }
-
-    // ── Banned actions (GET) ──
-    if (pathname === '/api/banned-actions' && req.method === 'GET') {
-      getRequireAuth()(req, res, () => {
-        try {
-          const { listBannedActions } = require('./database');
-          jsonRes(res, listBannedActions());
-        } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
-      });
-      return;
-    }
-
-    // ── Full status (combined) ──
-    if (pathname === '/api/full-status') {
-      getRequireAuth()(req, res, async () => {
-        try {
-          const stats = getProviderStats()();
-          const mem = process.memoryUsage();
-          const shot = getLatestScreenshot();
-          const healthMod = require('./providers-health');
-          const registryMod = require('./providers-registry');
-          const providers = registryMod.getAvailableProviders ? await registryMod.getAvailableProviders() : [];
-          const providerSummary = providers.map((p: any) => ({
-            name: p.name, healthScore: p.healthScore,
-            isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
-          }));
-          const loadFailures = registryMod.getLoadFailures ? registryMod.getLoadFailures() : [];
-          const providerCount = registryMod.getAvailableProviderCount ? registryMod.getAvailableProviderCount() : 0;
-          jsonRes(res, {
-            ...stats,
-            daemon: getDaemonState(),
-            memory: {
-              heapUsed: (mem.heapUsed / 1024 / 1024).toFixed(0) + 'MB',
-              heapTotal: (mem.heapTotal / 1024 / 1024).toFixed(0) + 'MB',
-              rss: (mem.rss / 1024 / 1024).toFixed(0) + 'MB',
-            },
-            uptime: process.uptime(),
-            uptimeFormatted: formatUptime(process.uptime()),
-            screenshotAvailable: !!shot,
-            providers: providerSummary,
-            providerLoadFailures: loadFailures,
-            providerCount,
-            timestamp: Date.now(),
-            actionCache: (() => { try { return require('./services-action-cache').getStats(); } catch { return null; } })(),
-            workShifts: (() => { try { const ws = require('./services-work-shifts'); const s = ws.getShift(); return { current: s.current, reason: s.reason, fullCycle: ws.shouldRunFullCycle() }; } catch { return null; } })(),
-          });
-        } catch (e: any) {
-          jsonRes(res, { error: e.message, timestamp: Date.now() }, 500);
-        }
-      });
-      return;
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  CONTROL API ENDPOINTS (write operations)
-    // ═══════════════════════════════════════════════════════════════
-
-    // Admin token
-    if (pathname === '/api/admin/token' && req.method === 'GET') {
-      if (!ADMIN_SECRET) { jsonRes(res, { error: 'Admin secret not set' }, 503); return; }
-      const authHeader = req.headers.authorization;
-      if (!authHeader || !authHeader.startsWith('Bearer ') || !_timingSafeEqual(authHeader.slice(7), ADMIN_SECRET)) {
-        jsonRes(res, { error: 'Unauthorized' }, 401);
-        return;
+      } catch (e: any) {
+        jsonRes(res, { error: e.message, timestamp: Date.now() }, 500);
       }
-      jsonRes(res, { token: getGenerateToken()({ admin: true }) });
-      return;
-    }
+    });
+    return true;
+  }
 
-    // ── Emergency stop ──
-    if (pathname === '/api/emergency/stop' && req.method === 'POST') {
-      getRequireAuth()(req, res, () => {
-        try {
-          const { requestStop } = require('./cycle-orchestrator');
-          requestStop();
-          log('Emergency stop via dashboard', 'WARN', 'dashboard');
-          jsonRes(res, { success: true, message: 'Emergency stop requested' });
-        } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
-      });
-      return;
-    }
+  // ═══════════════════════════════════════════════════════════════
+  //  CONTROL API ENDPOINTS (write operations)
+  // ═══════════════════════════════════════════════════════════════
 
-    // ── Resume daemon ──
-    if (pathname === '/api/daemon/resume' && req.method === 'POST') {
-      getRequireAuth()(req, res, () => {
-        try {
-          const { resumeDaemon } = require('./cycle-orchestrator');
-          resumeDaemon();
-          log('Daemon resumed via dashboard', 'INFO', 'dashboard');
-          jsonRes(res, { success: true, message: 'Daemon resumed' });
-        } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
-      });
-      return;
+  // Admin token
+  if (pathname === '/api/admin/token' && req.method === 'GET') {
+    if (!ADMIN_SECRET) { jsonRes(res, { error: 'Admin secret not set' }, 503); return true; }
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ') || !_timingSafeEqual(authHeader.slice(7), ADMIN_SECRET)) {
+      jsonRes(res, { error: 'Unauthorized' }, 401);
+      return true;
     }
+    const gen = getGenerateToken();
+    jsonRes(res, { token: gen ? gen({ admin: true }) : null });
+    return true;
+  }
 
-    // ── Self-heal trigger ──
-    if (pathname === '/api/self-heal/trigger' && req.method === 'POST') {
-      getRequireAuth()(req, res, () => {
-        try {
-          const { performSelfHeal } = require('./self-heal');
-          performSelfHeal().then((result: any) => {
-            jsonRes(res, { success: result });
-          }).catch((err: any) => {
-            jsonRes(res, { error: err.message }, 500);
-          });
-        } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
-      });
-      return;
-    }
+  // ── Emergency stop ──
+  if (pathname === '/api/emergency/stop' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        const { requestStop } = require('./cycle-orchestrator');
+        requestStop();
+        log('Emergency stop via dashboard', 'WARN', 'dashboard');
+        jsonRes(res, { success: true, message: 'Emergency stop requested' });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
 
-    // ── GitOps rollback ──
-    if (pathname === '/api/gitops/rollback' && req.method === 'POST') {
-      getRequireAuth()(req, res, () => {
-        try {
-          const gitOps = require('./self-heal-gitops');
-          const result = gitOps.gitops?.rollbackToPrevious ? gitOps.gitops.rollbackToPrevious() : false;
+  // ── Resume daemon ──
+  if (pathname === '/api/daemon/resume' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        const { resumeDaemon } = require('./cycle-orchestrator');
+        resumeDaemon();
+        log('Daemon resumed via dashboard', 'INFO', 'dashboard');
+        jsonRes(res, { success: true, message: 'Daemon resumed' });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── Self-heal trigger ──
+  if (pathname === '/api/self-heal/trigger' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        const { performSelfHeal } = require('./self-heal');
+        performSelfHeal().then((result: any) => {
           jsonRes(res, { success: result });
-        } catch (err: any) {
-          logError('GitOps rollback failed', err);
-          jsonRes(res, { success: false, error: err.message }, 500);
+        }).catch((err: any) => {
+          jsonRes(res, { error: err.message }, 500);
+        });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── GitOps rollback ──
+  if (pathname === '/api/gitops/rollback' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        const gitOps = require('./self-heal-gitops');
+        const result = gitOps.gitops?.rollbackToPrevious ? gitOps.gitops.rollbackToPrevious() : false;
+        jsonRes(res, { success: result });
+      } catch (err: any) {
+        logErr('GitOps rollback failed', err);
+        jsonRes(res, { success: false, error: err.message }, 500);
+      }
+    });
+    return true;
+  }
+
+  // ── Force state (via state-machine) ──
+  if (pathname === '/api/force-state' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.state || typeof data.state !== 'string') {
+            jsonRes(res, { error: 'state is required' }, 400); return;
+          }
+          const { forceState } = require('./state-machine');
+          forceState(data.state, 'dashboard_admin');
+          log(`State forced via dashboard: ${data.state}`, 'WARN', 'dashboard');
+          jsonRes(res, { success: true, state: data.state });
+        } catch (e: any) {
+          jsonRes(res, { error: e.message }, 400);
         }
       });
-      return;
-    }
+    });
+    return true;
+  }
 
-    // ── Force state (via state-machine) ──
-    if (pathname === '/api/force-state' && req.method === 'POST') {
-      getRequireAuth()(req, res, () => {
-        readBody(req, res, (body) => {
-          try {
-            const data = JSON.parse(body);
-            if (!data.state || typeof data.state !== 'string') {
-              jsonRes(res, { error: 'state is required' }, 400); return;
-            }
-            const { forceState } = require('./state-machine');
-            forceState(data.state, 'dashboard_admin');
-            log(`State forced via dashboard: ${data.state}`, 'WARN', 'dashboard');
-            jsonRes(res, { success: true, state: data.state });
-          } catch (e: any) {
-            jsonRes(res, { error: e.message }, 400);
-          }
-        });
-      });
-      return;
-    }
-
-    // ── Ban action ──
-    if (pathname === '/api/banned-actions' && req.method === 'POST') {
-      getRequireAuth()(req, res, () => {
-        readBody(req, res, (body) => {
-          try {
-            const data = JSON.parse(body);
-            if (!data.action_type) { jsonRes(res, { error: 'action_type is required' }, 400); return; }
-            const { insertBannedAction } = require('./database');
-            insertBannedAction(data.action_type, 'dashboard', Date.now(), data.reason || 'Manual ban via dashboard');
-            log(`Action banned via dashboard: ${data.action_type} (${data.reason || 'no reason'})`, 'WARN', 'dashboard');
-            jsonRes(res, { success: true, banned: data.action_type });
-          } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
-        });
-      });
-      return;
-    }
-
-    // ── Unban action ──
-    if (pathname === '/api/banned-actions' && req.method === 'DELETE') {
-      getRequireAuth()(req, res, () => {
-        readBody(req, res, (body) => {
-          try {
-            const data = JSON.parse(body);
-            if (!data.action_type) { jsonRes(res, { error: 'action_type is required' }, 400); return; }
-            const { deleteBannedAction } = require('./database');
-            deleteBannedAction(data.action_type);
-            log(`Action unbanned via dashboard: ${data.action_type}`, 'INFO', 'dashboard');
-            jsonRes(res, { success: true, unbanned: data.action_type });
-          } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
-        });
-      });
-      return;
-    }
-
-    // ── Action cache management ──
-    if (pathname === '/api/action-cache/clear' && req.method === 'POST') {
-      getRequireAuth()(req, res, () => {
+  // ── Ban action ──
+  if (pathname === '/api/banned-actions' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
         try {
-          const ac = require('./services-action-cache');
-          ac.clear();
-          log('Action cache cleared via dashboard', 'INFO', 'dashboard');
-          jsonRes(res, { success: true });
-        } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+          const data = JSON.parse(body);
+          if (!data.action_type) { jsonRes(res, { error: 'action_type is required' }, 400); return; }
+          const { insertBannedAction } = require('./database');
+          insertBannedAction(data.action_type, 'dashboard', Date.now(), data.reason || 'Manual ban via dashboard');
+          log(`Action banned via dashboard: ${data.action_type} (${data.reason || 'no reason'})`, 'WARN', 'dashboard');
+          jsonRes(res, { success: true, banned: data.action_type });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
       });
-      return;
-    }
+    });
+    return true;
+  }
 
-    // ── Set config ──
-    if (pathname === '/api/config' && req.method === 'POST') {
-      getRequireAuth()(req, res, () => {
-        readBody(req, res, (body) => {
-          try {
-            const data = JSON.parse(body);
-            if (!SAFE_CONFIG_KEYS.has(data.key)) {
-              jsonRes(res, { error: 'Config key not allowed. Allowed: ' + [...SAFE_CONFIG_KEYS].join(', ') }, 403); return;
+  // ── Unban action ──
+  if (pathname === '/api/banned-actions' && req.method === 'DELETE') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.action_type) { jsonRes(res, { error: 'action_type is required' }, 400); return; }
+          const { deleteBannedAction } = require('./database');
+          deleteBannedAction(data.action_type);
+          log(`Action unbanned via dashboard: ${data.action_type}`, 'INFO', 'dashboard');
+          jsonRes(res, { success: true, unbanned: data.action_type });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+      });
+    });
+    return true;
+  }
+
+  // ── Action cache management ──
+  if (pathname === '/api/action-cache/clear' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        const ac = require('./services-action-cache');
+        ac.clear();
+        log('Action cache cleared via dashboard', 'INFO', 'dashboard');
+        jsonRes(res, { success: true });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── Set config ──
+  if (pathname === '/api/config' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          if (!SAFE_CONFIG_KEYS.has(data.key)) {
+            jsonRes(res, { error: 'Config key not allowed. Allowed: ' + [...SAFE_CONFIG_KEYS].join(', ') }, 403); return;
+          }
+          const { updateConfig } = require('./get-config');
+          updateConfig(data.key, data.value);
+          log(`Config changed via dashboard: ${data.key} = ${data.value}`, 'INFO', 'dashboard');
+          jsonRes(res, { success: true, key: data.key, value: data.value });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+      });
+    });
+    return true;
+  }
+
+  // ── Generic command endpoint (legacy compat) ──
+  if (pathname === '/api/command' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          const { action, params } = data;
+          if (action === 'force_state' && params?.state) {
+            const { forceState } = require('./state-machine');
+            forceState(params.state, 'admin_command');
+            jsonRes(res, { success: true, state: params.state });
+          } else if (action === 'restart') {
+            jsonRes(res, { success: true, message: 'Restarting in 5 seconds...' });
+            log('Restart requested via dashboard', 'WARN', 'dashboard');
+            setTimeout(() => process.exit(0), 5000);
+          } else if (action === 'gc') {
+            if (global.gc) global.gc();
+            jsonRes(res, { success: true });
+          } else if (action === 'set_config') {
+            if (!SAFE_CONFIG_KEYS.has(params.key)) {
+              jsonRes(res, { error: 'Config key not allowed' }, 403); return;
             }
             const { updateConfig } = require('./get-config');
-            updateConfig(data.key, data.value);
-            log(`Config changed via dashboard: ${data.key} = ${data.value}`, 'INFO', 'dashboard');
-            jsonRes(res, { success: true, key: data.key, value: data.value });
-          } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
-        });
+            updateConfig(params.key, params.value);
+            jsonRes(res, { success: true });
+          } else {
+            jsonRes(res, { error: 'Unknown command' }, 400);
+          }
+        } catch (e: any) { jsonRes(res, { error: 'Invalid JSON' }, 400); }
       });
-      return;
-    }
+    });
+    return true;
+  }
 
-    // ── Generic command endpoint (legacy compat) ──
-    if (pathname === '/api/command' && req.method === 'POST') {
-      getRequireAuth()(req, res, () => {
-        readBody(req, res, (body) => {
-          try {
-            const data = JSON.parse(body);
-            const { action, params } = data;
-            if (action === 'force_state' && params?.state) {
-              const { forceState } = require('./state-machine');
-              forceState(params.state, 'admin_command');
-              jsonRes(res, { success: true, state: params.state });
-            } else if (action === 'restart') {
-              jsonRes(res, { success: true, message: 'Restarting in 5 seconds...' });
-              log('Restart requested via dashboard', 'WARN', 'dashboard');
-              setTimeout(() => process.exit(0), 5000);
-            } else if (action === 'gc') {
-              if (global.gc) global.gc();
-              jsonRes(res, { success: true });
-            } else if (action === 'set_config') {
-              if (!SAFE_CONFIG_KEYS.has(params.key)) {
-                jsonRes(res, { error: 'Config key not allowed' }, 403); return;
-              }
-              const { updateConfig } = require('./get-config');
-              updateConfig(params.key, params.value);
-              jsonRes(res, { success: true });
-            } else {
-              jsonRes(res, { error: 'Unknown command' }, 400);
-            }
-          } catch (e: any) { jsonRes(res, { error: 'Invalid JSON' }, 400); }
-        });
-      });
-      return;
-    }
+  // ── Not a dashboard route ──
+  return false;
+}
 
-    res.writeHead(404);
-    res.end('Not found');
+// ═══════════════════════════════════════════════════════════════════════
+//  STANDALONE SERVER CREATION (for non-render-free-plan use)
+// ═══════════════════════════════════════════════════════════════════════
+
+function createDashboardServer() {
+  const server = http.createServer(async (req: any, res: any) => {
+    const handled = await handleDashboardRequest(req, res);
+    if (!handled) {
+      res.writeHead(404);
+      res.end('Not found');
+    }
   });
-
   return server;
 }
 
@@ -997,12 +1066,6 @@ async function unbanAction(actionType) {
   toast(r?.success ? 'Unbanned: ' + actionType : 'Failed', r?.success ? 'success' : 'error');
   refreshBans();
 }
-async function refreshBans() {
-  const rows = await api('/api/banned-actions');
-  const el = document.getElementById('bannedList');
-  if (!rows || rows.length === 0) { el.innerHTML = '<div class="empty">No banned actions</div>'; return; }
-  el.innerHTML = rows.map(r => '<div class="banned-item"><span>'+r.action_type+(r.reason ? ' <span style="color:var(--text2)">- '+r.reason+'</span>' : '')+'</span><button class="btn sm" onclick="unbanAction(\\''+r.action_type+'\\')">Unban</button></div>').join('');
-}
 
 // ── Config ──
 async function setConfig() {
@@ -1100,4 +1163,11 @@ async function refreshAll() {
 </html>`;
 }
 
-module.exports = { startDashboard, createDashboardServer, _injectDependencies, getLatestScreenshot, setLatestScreenshot, _getDashboardHTML: getDashboardHTML };
+module.exports = {
+  handleDashboardRequest,
+  createDashboardServer,
+  startDashboard,
+  getLatestScreenshot,
+  setLatestScreenshot,
+  _getDashboardHTML: getDashboardHTML,
+};
