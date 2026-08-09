@@ -263,6 +263,24 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
           log(`Initial navigation failed: ${e.message || e}`, 'WARN', 'cycle');
         });
+        // Flutter apps need extra time after domcontentloaded to paint the canvas.
+        // Wait for the page to actually have visible content before entering the cycle.
+        log('Fresh start: waiting for Flutter canvas to render...', 'DEBUG', 'cycle');
+        for (let w = 0; w < 10; w++) {
+          await new Promise(r => setTimeout(r, 2000)); // 2s per check, max 20s
+          try {
+            const h = await page.evaluate(() => Math.max(
+              document.body?.scrollHeight || 0,
+              document.body?.offsetHeight || 0,
+              document.documentElement?.scrollHeight || 0,
+              document.documentElement?.clientHeight || 0
+            ));
+            if (h > 0) {
+              log(`Fresh start: page height=${h}px after ${(w + 1) * 2}s — proceeding`, 'INFO', 'cycle');
+              break;
+            }
+          } catch { break; }
+        }
       } else {
         log('Fresh start at about:blank — no BASE_URL or APP_URL configured', 'WARN', 'cycle');
       }
@@ -352,8 +370,84 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       if (modalSlayer) await modalSlayer.dismissAnyModal(page);
       if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
 
+      // ── Blank-page guard ──
+      // Flutter apps can report "stabilized" with height=0 (canvas not yet painted).
+      // If we screenshot a blank page, every AI provider will fail to see anything.
+      // Detect blank pages by checking document height and retry with backoff.
+      {
+        const MAX_BLANK_RETRIES = 4;
+        const BLANK_RETRY_BASE_MS = 2000;
+        let isBlank = false;
+        try {
+          const pageHeight = await page.evaluate(() => {
+            return Math.max(
+              document.body?.scrollHeight || 0,
+              document.body?.offsetHeight || 0,
+              document.documentElement?.scrollHeight || 0,
+              document.documentElement?.clientHeight || 0
+            );
+          });
+          isBlank = pageHeight === 0;
+        } catch { /* evaluate may fail on some pages — not blank, proceed */ }
+
+        if (isBlank) {
+          log('Blank-page guard: page height=0 after stability wait — retrying with backoff', 'WARN', 'cycle');
+          for (let retry = 0; retry < MAX_BLANK_RETRIES; retry++) {
+            const waitMs = BLANK_RETRY_BASE_MS * (retry + 1); // 2s, 4s, 6s, 8s
+            log(`Blank-page retry ${retry + 1}/${MAX_BLANK_RETRIES}: waiting ${waitMs}ms`, 'DEBUG', 'cycle');
+            await new Promise(r => setTimeout(r, waitMs));
+
+            // Check height again
+            try {
+              const h = await page.evaluate(() => {
+                return Math.max(
+                  document.body?.scrollHeight || 0,
+                  document.body?.offsetHeight || 0,
+                  document.documentElement?.scrollHeight || 0,
+                  document.documentElement?.clientHeight || 0
+                );
+              });
+              if (h > 0) {
+                log(`Blank-page guard: page height recovered to ${h}px after ${waitMs}ms`, 'INFO', 'cycle');
+                isBlank = false;
+                break;
+              }
+            } catch { break; /* evaluate failed — something is there */ }
+          }
+
+          // If still blank after retries, try a page reload
+          if (isBlank) {
+            log('Blank-page guard: still blank after retries — reloading page', 'WARN', 'cycle');
+            try {
+              await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+              // Wait extra for Flutter to render after reload
+              await new Promise(r => setTimeout(r, 5000));
+              if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+            } catch (reloadErr: any) {
+              log(`Blank-page guard: reload failed: ${reloadErr.message || reloadErr}`, 'WARN', 'cycle');
+            }
+          }
+        }
+      }
+
       const beforeUrl = page.url();
-      const screenshot = await page.screenshot({ type: 'jpeg', quality: 30 });
+      let screenshot = await page.screenshot({ type: 'jpeg', quality: 30 });
+
+      // ── Screenshot validity check ──
+      // A valid screenshot of a rendered page should be >5KB even at quality:30.
+      // If it's tiny, the page is likely blank (white rectangle).
+      if (screenshot.length < 5000) {
+        log(`Screenshot suspiciously small (${screenshot.length} bytes) — page may be blank. Waiting 3s and retaking...`, 'WARN', 'cycle');
+        await new Promise(r => setTimeout(r, 3000));
+        try {
+          const retryShot = await page.screenshot({ type: 'jpeg', quality: 30 });
+          if (retryShot.length > screenshot.length) {
+            log(`Retry screenshot is ${retryShot.length} bytes (was ${screenshot.length}) — using retry`, 'INFO', 'cycle');
+            screenshot = retryShot;
+          }
+        } catch { /* retry failed — proceed with original */ }
+      }
+
       const base64 = screenshot.toString('base64');
       // Feed screenshot to dashboard cache (non-blocking)
       try {
