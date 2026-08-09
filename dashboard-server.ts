@@ -18,6 +18,7 @@ const os = require('os');
 const { PROJECT_ROOT } = require('./project-root');
 const crypto = require('crypto');
 const { container } = require('./container');
+const persistConfig = require('./persistent-config');
 
 // ── Resolve logger from container (with fallback) ──
 function getLog() {
@@ -26,8 +27,9 @@ function getLog() {
 
 // ── In-memory log ring buffer ──
 // Captures logs from this module and from hooked pino instances
+// Reduced from 500 to 200 for memory savings on Render free plan
 const _logRingBuffer: string[] = [];
-const _LOG_RING_MAX = 500;
+const _LOG_RING_MAX = 200;
 function _pushLogRing(entry: string) {
   if (_logRingBuffer.length >= _LOG_RING_MAX) _logRingBuffer.shift();
   _logRingBuffer.push(entry);
@@ -266,6 +268,14 @@ const SAFE_CONFIG_KEYS = new Set([
   'WEB_SEARCH_ENABLED', 'TEMPLATE_CACHE_ENABLED', 'TEMPLATE_MATCH_THRESHOLD',
   'STATE_TIMEOUT_MS', 'STATE_HISTORY_MAX',
   'HEADLESS', 'AUTO_INSTALL_DEPENDENCIES',
+  // Mode & feature flags (safe to toggle from dashboard)
+  'DEGRADED_MODE', 'SELF_HEAL_ENABLED', 'ENABLE_STATUS_SERVER',
+  // Human emulation
+  'HUMAN_MOUSE_JITTER_PX', 'HUMAN_MOUSE_STEPS',
+  // Browser contexts
+  'BROWSER_LAUNCH_EXTENDED_TIMEOUT_MS', 'BROWSER_CONTEXT_TIMEOUT_MS', 'BROWSER_CLOSE_TIMEOUT_MS',
+  // Log ring buffer
+  'LOG_RING_BUFFER_MAX',
 ]);
 
 // Config key metadata for the dashboard editor (grouped, with descriptions + type hints)
@@ -349,10 +359,39 @@ const CONFIG_KEY_META: Record<string, { group: string; label: string; type: 'num
   HEADLESS:                     { group: 'Misc', label: 'Headless', type: 'boolean', desc: 'Run browser headlessly' },
   MAX_CONSECUTIVE_FAILURES:     { group: 'Misc', label: 'Max Consecutive Failures', type: 'number', desc: 'Max failures before recovery' },
   AUTO_INSTALL_DEPENDENCIES:    { group: 'Misc', label: 'Auto Install Deps', type: 'boolean', desc: 'Auto-install missing packages' },
+  DEGRADED_MODE:               { group: 'Mode', label: 'Degraded Mode', type: 'boolean', desc: 'Run in reduced-capability mode' },
+  SELF_HEAL_ENABLED:           { group: 'Mode', label: 'Self-Heal', type: 'boolean', desc: 'Master switch for self-heal subsystems' },
+  ENABLE_STATUS_SERVER:         { group: 'Mode', label: 'Status Server', type: 'boolean', desc: 'Enable dashboard/status HTTP server' },
+  HUMAN_MOUSE_JITTER_PX:       { group: 'Browser', label: 'Mouse Jitter (px)', type: 'number', desc: 'Random mouse movement jitter' },
+  HUMAN_MOUSE_STEPS:           { group: 'Browser', label: 'Mouse Steps', type: 'number', desc: 'Steps for human-like mouse movement' },
+  BROWSER_LAUNCH_EXTENDED_TIMEOUT_MS: { group: 'Browser', label: 'Extended Launch Timeout', type: 'number', desc: 'Extended browser launch timeout' },
+  BROWSER_CONTEXT_TIMEOUT_MS:   { group: 'Browser', label: 'Context Timeout (ms)', type: 'number', desc: 'Browser context creation timeout' },
+  BROWSER_CLOSE_TIMEOUT_MS:    { group: 'Browser', label: 'Close Timeout (ms)', type: 'number', desc: 'Browser close timeout' },
 };
 
-// In-memory banned-states store (survives until process restart)
-const _bannedStates: Map<string, { reason: string; bannedAt: number }> = new Map();
+// In-memory banned-states store (backed by persistent-config for same-instance restarts)
+const _bannedStates: Map<string, { reason: string; bannedAt: number; bannedBy: string }> = new Map();
+
+// On module load, restore persisted banned states into memory
+try {
+  for (const entry of persistConfig.getAllBannedStates()) {
+    _bannedStates.set(entry.state, { reason: entry.reason, bannedAt: entry.bannedAt, bannedBy: entry.bannedBy });
+  }
+} catch { /* best-effort */ }
+
+// On module load, apply any persisted config overrides to the running config
+try {
+  const overrides = persistConfig.getAllConfigOverrides();
+  if (Object.keys(overrides).length > 0) {
+    const { updateConfig } = require('./get-config');
+    for (const [key, value] of Object.entries(overrides)) {
+      try {
+        updateConfig(key, value);
+        getLog()?.log?.(`Restored config override: ${key} = ${JSON.stringify(value)}`, 'INFO', 'dashboard');
+      } catch { /* skip invalid */ }
+    }
+  }
+} catch { /* best-effort */ }
 
 function serveStaticFile(res: any, filePath: any, contentType: any) {
   fs.readFile(filePath, (err: any, content: any) => {
@@ -776,7 +815,7 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
-  // ── Force state (via state-machine) ──
+  // ── Force state (via state-machine) — persisted so it survives restarts ──
   if (pathname === '/api/force-state' && req.method === 'POST') {
     authWrap(() => {
       readBody(req, res, (body) => {
@@ -786,9 +825,12 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
             jsonRes(res, { error: 'state is required' }, 400); return;
           }
           const { forceState } = require('./state-machine');
-          forceState(data.state, 'dashboard_admin');
-          log(`State forced via dashboard: ${data.state}`, 'WARN', 'dashboard');
-          jsonRes(res, { success: true, state: data.state });
+          const reason = data.reason || 'dashboard_admin';
+          forceState(data.state, reason);
+          // Persist the forced state so it's re-applied on restart
+          persistConfig.setForcedState(data.state, reason);
+          log(`State forced via dashboard: ${data.state} (persisted)`, 'WARN', 'dashboard');
+          jsonRes(res, { success: true, state: data.state, persisted: true });
         } catch (e: any) {
           jsonRes(res, { error: e.message }, 400);
         }
@@ -806,9 +848,11 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           if (!data.state || typeof data.state !== 'string') {
             jsonRes(res, { error: 'state is required' }, 400); return;
           }
-          _bannedStates.set(data.state, { reason: data.reason || 'Banned via dashboard', bannedAt: Date.now() });
+          _bannedStates.set(data.state, { reason: data.reason || 'Banned via dashboard', bannedAt: Date.now(), bannedBy: 'dashboard' });
+          // Persist to survive restarts
+          persistConfig.setBannedState(data.state, data.reason || 'Banned via dashboard', 'dashboard');
           log(`State banned via dashboard: ${data.state} (${data.reason || 'no reason'})`, 'WARN', 'dashboard');
-          jsonRes(res, { success: true, bannedState: data.state });
+          jsonRes(res, { success: true, bannedState: data.state, persisted: true });
         } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
       });
     });
@@ -823,8 +867,10 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           const data = JSON.parse(body);
           if (!data.state) { jsonRes(res, { error: 'state is required' }, 400); return; }
           _bannedStates.delete(data.state);
+          // Remove from persistent store
+          persistConfig.removeBannedState(data.state);
           log(`State unbanned via dashboard: ${data.state}`, 'INFO', 'dashboard');
-          jsonRes(res, { success: true, unbannedState: data.state });
+          jsonRes(res, { success: true, unbannedState: data.state, persisted: true });
         } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
       });
     });
@@ -899,8 +945,10 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           }
           const { updateConfig } = require('./get-config');
           updateConfig(data.key, value);
-          log(`Config changed via dashboard: ${data.key} = ${JSON.stringify(value)}`, 'INFO', 'dashboard');
-          jsonRes(res, { success: true, key: data.key, value });
+          // Persist config override to survive restarts
+          persistConfig.setConfigOverride(data.key, value);
+          log(`Config changed via dashboard: ${data.key} = ${JSON.stringify(value)} (persisted)`, 'INFO', 'dashboard');
+          jsonRes(res, { success: true, key: data.key, value, persisted: true });
         } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
       });
     });
@@ -931,12 +979,37 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
             }
             const { updateConfig } = require('./get-config');
             updateConfig(params.key, params.value);
-            jsonRes(res, { success: true });
+            persistConfig.setConfigOverride(params.key, params.value);
+            jsonRes(res, { success: true, persisted: true });
           } else {
             jsonRes(res, { error: 'Unknown command' }, 400);
           }
         } catch (e: any) { jsonRes(res, { error: 'Invalid JSON' }, 400); }
       });
+    });
+    return true;
+  }
+
+  // ── Persistence info ──
+  if (pathname === '/api/persist/info' && req.method === 'GET') {
+    authWrap(() => {
+      try {
+        jsonRes(res, { success: true, ...persistConfig.getStoreInfo() });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── Clear all persisted overrides (reset to defaults) ──
+  if (pathname === '/api/persist/clear' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        persistConfig.clearAllConfigOverrides();
+        persistConfig.clearAllBannedStates();
+        persistConfig.clearForcedState();
+        log('All persisted dashboard overrides cleared', 'WARN', 'dashboard');
+        jsonRes(res, { success: true, message: 'All persisted overrides cleared — restart to apply clean state' });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
     });
     return true;
   }
@@ -1145,8 +1218,9 @@ function getDashboardHTML(): string {
       <div id="stateAge" class="stat-row"><span class="stat-label">State Age</span><span class="stat-value">-</span></div>
       <div id="deadlock" class="stat-row"><span class="stat-label">Deadlock</span><span class="stat-value">-</span></div>
       <div style="margin-top:10px">
-        <div class="card-header" style="padding:6px 0;font-size:12px;color:var(--text2)">Banned States</div>
+        <div class="card-header" style="padding:6px 0;font-size:12px;color:var(--text2)">Banned States <span id="persistBadge" style="font-size:10px;padding:1px 6px;border-radius:9999px;background:#1e3a5f;color:#60a5fa;margin-left:6px">persisted</span></div>
         <div class="banned-list" id="bannedStatesList"><div class="empty">None banned</div></div>
+        <button class="btn sm" style="margin-top:6px;font-size:10px" onclick="clearPersistence()">Reset All Dashboard Overrides</button>
       </div>
     </div>
   </div>
@@ -1361,6 +1435,12 @@ async function refreshBannedStates() {
     '<button class="btn sm" onclick="unbanState(\\''+b.state+'\\')">Unban</button></div>'
   ).join('');
 }
+async function clearPersistence() {
+  if (!confirm('Clear ALL persisted dashboard overrides? Config changes, banned states, and forced state will be reset. Restart recommended after.')) return;
+  const r = await api('/api/persist/clear', { method: 'POST' });
+  toast(r?.success ? 'All overrides cleared — restart to apply' : 'Failed', r?.success ? 'success' : 'error');
+  refreshBannedStates();
+}
 
 // ── Actions Ban ──
 async function loadActions() {
@@ -1511,6 +1591,14 @@ async function refreshAll() {
   refreshBans();
   // Banned states
   refreshBannedStates();
+  // Persistence info
+  const pInfo = await api('/api/persist/info');
+  const badge = document.getElementById('persistBadge');
+  if (pInfo && badge) {
+    const total = (pInfo.configCount||0) + (pInfo.bannedStateCount||0) + (pInfo.hasForcedState?1:0);
+    badge.textContent = total > 0 ? total + ' persisted override' + (total>1?'s':'') : 'no overrides';
+    badge.style.background = total > 0 ? '#1e3a5f' : '#374151';
+  }
 }
 
 // ── Init ──
