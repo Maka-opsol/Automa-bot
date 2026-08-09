@@ -316,6 +316,9 @@ module.exports = {
   // Query
   getStatus,
 
+  // Lifecycle
+  init,
+
   // DI
   _injectDependencies,
 };
