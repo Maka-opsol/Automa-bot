@@ -379,6 +379,16 @@ try {
   }
 } catch { /* best-effort */ }
 
+// In-memory banned-actions store (backed by persistent-config for same-instance restarts)
+const _bannedActions: Map<string, { reason: string; bannedAt: number; bannedBy: string }> = new Map();
+
+// On module load, restore persisted banned actions into memory
+try {
+  for (const entry of persistConfig.getAllBannedActions()) {
+    _bannedActions.set(entry.action, { reason: entry.reason, bannedAt: entry.bannedAt, bannedBy: entry.bannedBy });
+  }
+} catch { /* best-effort */ }
+
 // On module load, apply any persisted config overrides to the running config
 try {
   const overrides = persistConfig.getAllConfigOverrides();
@@ -657,10 +667,11 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
   // ── Banned actions (GET) ──
   if (pathname === '/api/banned-actions' && req.method === 'GET') {
     authWrap(() => {
-      try {
-        const { listBannedActions } = require('./database');
-        jsonRes(res, listBannedActions());
-      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+      const banned: Array<{ action: string; reason: string; bannedAt: number }> = [];
+      for (const [action, info] of _bannedActions) {
+        banned.push({ action, reason: info.reason, bannedAt: info.bannedAt });
+      }
+      jsonRes(res, { bannedActions: banned });
     });
     return true;
   }
@@ -883,11 +894,14 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
       readBody(req, res, (body) => {
         try {
           const data = JSON.parse(body);
-          if (!data.action_type) { jsonRes(res, { error: 'action_type is required' }, 400); return; }
-          const { insertBannedAction } = require('./database');
-          insertBannedAction(data.action_type, 'dashboard', Date.now(), data.reason || 'Manual ban via dashboard');
+          if (!data.action_type || typeof data.action_type !== 'string') {
+            jsonRes(res, { error: 'action_type is required' }, 400); return;
+          }
+          _bannedActions.set(data.action_type, { reason: data.reason || 'Banned via dashboard', bannedAt: Date.now(), bannedBy: 'dashboard' });
+          // Persist to survive restarts
+          persistConfig.setBannedAction(data.action_type, data.reason || 'Banned via dashboard', 'dashboard');
           log(`Action banned via dashboard: ${data.action_type} (${data.reason || 'no reason'})`, 'WARN', 'dashboard');
-          jsonRes(res, { success: true, banned: data.action_type });
+          jsonRes(res, { success: true, bannedAction: data.action_type, persisted: true });
         } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
       });
     });
@@ -901,10 +915,11 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
         try {
           const data = JSON.parse(body);
           if (!data.action_type) { jsonRes(res, { error: 'action_type is required' }, 400); return; }
-          const { deleteBannedAction } = require('./database');
-          deleteBannedAction(data.action_type);
+          _bannedActions.delete(data.action_type);
+          // Remove from persistent store
+          persistConfig.removeBannedAction(data.action_type);
           log(`Action unbanned via dashboard: ${data.action_type}`, 'INFO', 'dashboard');
-          jsonRes(res, { success: true, unbanned: data.action_type });
+          jsonRes(res, { success: true, unbannedAction: data.action_type, persisted: true });
         } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
       });
     });
@@ -1006,7 +1021,11 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
       try {
         persistConfig.clearAllConfigOverrides();
         persistConfig.clearAllBannedStates();
+        persistConfig.clearAllBannedActions();
         persistConfig.clearForcedState();
+        // Also clear in-memory maps
+        _bannedStates.clear();
+        _bannedActions.clear();
         log('All persisted dashboard overrides cleared', 'WARN', 'dashboard');
         jsonRes(res, { success: true, message: 'All persisted overrides cleared — restart to apply clean state' });
       } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
@@ -1288,14 +1307,16 @@ function getDashboardHTML(): string {
 
   <!-- Ban Actions -->
   <div class="card">
-    <div class="card-header">Action Bans</div>
+    <div class="card-header">Action Control</div>
     <div class="card-body">
       <div class="config-row">
         <select id="banActionSelect"><option value="">Loading actions...</option></select>
-        <input type="text" id="banReason" placeholder="Reason (optional)" style="flex:1">
-        <button class="btn danger sm" onclick="banAction()">Ban</button>
+        <button class="btn danger sm" onclick="banAction()">Ban Action</button>
       </div>
-      <div class="banned-list" id="bannedList"><div class="empty">Loading...</div></div>
+      <div style="margin-top:10px">
+        <div class="card-header" style="padding:6px 0;font-size:12px;color:var(--text2)">Banned Actions <span style="font-size:10px;padding:1px 6px;border-radius:9999px;background:#1e3a5f;color:#60a5fa;margin-left:6px">persisted</span></div>
+        <div class="banned-list" id="bannedActionsList"><div class="empty">None banned</div></div>
+      </div>
     </div>
   </div>
 
@@ -1555,27 +1576,27 @@ async function loadActions() {
 }
 async function banAction() {
   const action = document.getElementById('banActionSelect').value;
-  const reason = document.getElementById('banReason').value;
-  if (!action) return;
+  if (!action) { toast('Select an action first', 'error'); return; }
+  const reason = prompt('Reason for banning action ' + action + ':') || '';
   const r = await api('/api/banned-actions', { method: 'POST', body: JSON.stringify({ action_type: action, reason }) });
-  toast(r?.success ? 'Banned: ' + action : 'Failed', r?.success ? 'success' : 'error');
-  refreshBans();
+  toast(r?.success ? 'Banned action: ' + action : 'Failed', r?.success ? 'success' : 'error');
+  refreshBannedActions();
 }
 async function unbanAction(actionType) {
   const r = await api('/api/banned-actions', { method: 'DELETE', body: JSON.stringify({ action_type: actionType }) });
   toast(r?.success ? 'Unbanned: ' + actionType : 'Failed', r?.success ? 'success' : 'error');
-  refreshBans();
+  refreshBannedActions();
 }
-async function refreshBans() {
+async function refreshBannedActions() {
   const r = await api('/api/banned-actions');
-  const el = document.getElementById('bannedList');
-  if (!r || !Array.isArray(r) || r.length === 0) {
-    el.innerHTML = '<div class="empty">No actions banned</div>';
+  const el = document.getElementById('bannedActionsList');
+  if (!r || !r.bannedActions || r.bannedActions.length === 0) {
+    el.innerHTML = '<div class="empty">None banned</div>';
     return;
   }
-  el.innerHTML = r.map(b =>
-    '<div class="banned-item"><span>'+b.action_type+' <span style="color:var(--text2);font-size:11px">'+(b.reason||'')+'</span></span>' +
-    '<button class="btn sm" onclick="unbanAction(\\''+b.action_type+'\\')">Unban</button></div>'
+  el.innerHTML = r.bannedActions.map(b =>
+    '<div class="banned-item"><span>'+b.action+' <span style="color:var(--text2);font-size:11px">'+b.reason+'</span></span>' +
+    '<button class="btn sm" onclick="unbanAction(\\''+b.action+'\\')">Unban</button></div>'
   ).join('');
 }
 
@@ -1692,7 +1713,7 @@ async function refreshAll() {
   // Screenshot
   refreshScreenshot();
   // Bans
-  refreshBans();
+  refreshBannedActions();
   // Banned states
   refreshBannedStates();
   // Mode
@@ -1701,7 +1722,7 @@ async function refreshAll() {
   const pInfo = await api('/api/persist/info');
   const badge = document.getElementById('persistBadge');
   if (pInfo && badge) {
-    const total = (pInfo.configCount||0) + (pInfo.bannedStateCount||0) + (pInfo.hasForcedState?1:0);
+    const total = (pInfo.configCount||0) + (pInfo.bannedStateCount||0) + (pInfo.bannedActionCount||0) + (pInfo.hasForcedState?1:0);
     badge.textContent = total > 0 ? total + ' persisted override' + (total>1?'s':'') : 'no overrides';
     badge.style.background = total > 0 ? '#1e3a5f' : '#374151';
   }
