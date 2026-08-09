@@ -272,6 +272,17 @@ try {
     log('API key vault failed to start: ' + (e as any).message, 'WARN', 'render-free-plan');
   }
 
+  // FIX: Provider diagnostic — log exactly which providers loaded and why some are unavailable
+  // This runs BEFORE the daemon loop starts, so any provider=0 issue is visible immediately
+  try {
+    const registry = require('./providers-registry');
+    if (typeof registry.logProviderDiagnostic === 'function') {
+      registry.logProviderDiagnostic();
+    }
+  } catch (e) {
+    log('Provider diagnostic failed: ' + (e as any).message, 'WARN', 'render-free-plan');
+  }
+
   // Contextual alert manager — proactive NTFY alerts based on state (Response 8)
   try {
     const alerts = container.get('contextualAlerts', { required: false });
@@ -813,7 +824,9 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
         };
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ providers: healthDetails, timestamp: Date.now() }));
+      // FIX: Include load failures in provider response for diagnostics
+      const loadFailures = registryMod.getLoadFailures ? registryMod.getLoadFailures() : [];
+      res.end(JSON.stringify({ providers: healthDetails, loadFailures, providerCount: healthDetails.length, timestamp: Date.now() }));
     } catch (e: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message }));
@@ -937,6 +950,9 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
         healthScore: p.healthScore,
         isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
       }));
+      // FIX: Include provider load failures and count in full status
+      const loadFailures = registryMod.getLoadFailures ? registryMod.getLoadFailures() : [];
+      const providerCount = registryMod.getAvailableProviderCount ? registryMod.getAvailableProviderCount() : 0;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ...stats,
@@ -945,6 +961,8 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
         platform: 'render-free-plan',
         screenshotAvailable: !!shot,
         providers: providerSummary,
+        providerLoadFailures: loadFailures,
+        providerCount,
         timestamp: Date.now(),
         degradation: degradationLadder?.getLastCalculation?.() ? {
           level: degradationLadder.getLastCalculation().level,
