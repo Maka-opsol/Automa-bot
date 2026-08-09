@@ -109,7 +109,7 @@ if (!process.env.MAX_MEMORY_MB) process.env.MAX_MEMORY_MB = '448';
 
 // Timing
 if (!process.env.MAX_UPTIME_HOURS)           process.env.MAX_UPTIME_HOURS = '0';      // never force restart
-if (!process.env.MAX_CYCLES_BEFORE_RESTART)  process.env.MAX_CYCLES_BEFORE_RESTART = '999999';;
+if (!process.env.MAX_CYCLES_BEFORE_RESTART) process.env.MAX_CYCLES_BEFORE_RESTART = '999999';
 
 // Logging \u2014 keep it reasonable (no persistent disk)
 if (!process.env.LOG_LEVEL)       process.env.LOG_LEVEL = 'info';
@@ -228,104 +228,6 @@ if (CONFIG.MAX_UPTIME_HOURS && CONFIG.MAX_UPTIME_HOURS > 0) {
   log('Render: Disabled MAX_UPTIME_HOURS forced restart', 'INFO', 'render-free-plan');
 }
 
-// HEALTH WATCHDOG - Self-ping with scoring + auto-restart (Response 2)
-try {
-  const healthWatchdog = container.get('healthWatchdog', { required: false });
-  if (healthWatchdog && typeof healthWatchdog.start === 'function') {
-    healthWatchdog.start({
-      onLevelChange: (from, to, state) => {
-        log('Health watchdog: ' + from + ' -> ' + to + ' (score: ' + state.score + '/12)', 'WARN', 'render-free-plan');
-        if (to === 'critical' || to === 'fatal') {
-          try { sendAlert('Health level ' + to + ': score=' + state.score + '/12'); } catch {}
-        }
-      },
-    });
-    log('Health watchdog started', 'INFO', 'render-free-plan');
-  }
-
-  // Start degradation ladder periodic evaluation (Response 3)
-  const degradationLadder = container.get('degradationLadder', { required: false });
-  if (degradationLadder && typeof degradationLadder.start === 'function') {
-    degradationLadder.start(60000); // evaluate every 60s
-    log('Degradation ladder started (periodic eval every 60s)', 'INFO', 'render-free-plan');
-  }
-
-  // Start work shift scheduler (Response 7)
-  try {
-    const workShifts = container.get('workShifts', { required: false });
-    if (workShifts && typeof workShifts.start === 'function') {
-      workShifts.start(60000); // evaluate every 60s (same cadence as degradation ladder)
-      log('Work shift scheduler started (eval every 60s)', 'INFO', 'render-free-plan');
-    }
-  } catch (e) {
-    log('Work shift scheduler failed to start: ' + (e as any).message, 'WARN', 'render-free-plan');
-  }
-
-  // API key vault — validate all keys on startup + every 6h (Response 8)
-  try {
-    const vault = container.get('apiKeyVault', { required: false });
-    if (vault && typeof vault.start === 'function') {
-      vault.start(6 * 60 * 60 * 1000); // validate every 6 hours
-      log('API key vault started (validate every 6h)', 'INFO', 'render-free-plan');
-    }
-  } catch (e) {
-    log('API key vault failed to start: ' + (e as any).message, 'WARN', 'render-free-plan');
-  }
-
-  // FIX: Provider diagnostic — log exactly which providers loaded and why some are unavailable
-  // This runs BEFORE the daemon loop starts, so any provider=0 issue is visible immediately
-  try {
-    const registry = require('./providers-registry');
-    if (typeof registry.logProviderDiagnostic === 'function') {
-      registry.logProviderDiagnostic();
-    }
-  } catch (e) {
-    log('Provider diagnostic failed: ' + (e as any).message, 'WARN', 'render-free-plan');
-  }
-
-  // Contextual alert manager — proactive NTFY alerts based on state (Response 8)
-  try {
-    const alerts = container.get('contextualAlerts', { required: false });
-    if (alerts && typeof alerts.start === 'function') {
-      alerts.start(120000); // evaluate every 2 min
-      log('Contextual alert manager started (eval every 2min)', 'INFO', 'render-free-plan');
-    }
-  } catch (e) {
-    log('Contextual alert manager failed to start: ' + (e as any).message, 'WARN', 'render-free-plan');
-  }
-
-  // Cold start detection (Response 6)
-  try {
-    const coldStart = container.get('coldStart', { required: false });
-    if (coldStart && typeof coldStart.detectColdStart === 'function') {
-      const csInfo = coldStart.detectColdStart();
-      if (csInfo.isColdStart) {
-        log(`Cold start detected: ${csInfo.reason}`, 'WARN', 'render-free-plan');
-        // Start last-seen updates so next cold start is detectable
-        coldStart.startLastSeenUpdates();
-      } else {
-        log(`Startup type: ${csInfo.startupType} — ${csInfo.reason}`, 'INFO', 'render-free-plan');
-        coldStart.startLastSeenUpdates();
-      }
-    }
-  } catch (e) {
-    log('Cold start detection failed: ' + (e as any).message, 'WARN', 'render-free-plan');
-  }
-
-  // /tmp disk guardian (Response 6)
-  try {
-    const tmpGuardian = container.get('tmpGuardian', { required: false });
-    if (tmpGuardian && typeof tmpGuardian.start === 'function') {
-      tmpGuardian.start();
-      log('/tmp disk guardian started', 'INFO', 'render-free-plan');
-    }
-  } catch (e) {
-    log('/tmp disk guardian start failed: ' + (e as any).message, 'WARN', 'render-free-plan');
-  }
-} catch (e) {
-  log('Health watchdog / degradation ladder start failed: ' + e.message, 'WARN', 'render-free-plan');
-}
-
 // \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
 // KEEPALIVE PINGER \u2014 Prevents Render 15-min spin-down
 // \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
@@ -347,26 +249,15 @@ const KEEPALIVE_ERROR_THRESHOLD = 5;
 
 let _keepaliveFailCount = 0;
 
-function selfPing() {
-  const port = process.env.PORT || '10000';
-  const req = http.get(`http://localhost:${port}/health`, (res: any) => {
-    // Consume response body to free the socket
-    res.resume();
-    res.on('end', () => {
-      _keepaliveFailCount = 0;
-    });
-  });
-  req.on('error', (err: any) => {
-    _keepaliveFailCount++;
-    const level = _keepaliveFailCount >= KEEPALIVE_ERROR_THRESHOLD ? 'ERROR' : 'WARN';
-    log(
-      `Keepalive ping failed (${_keepaliveFailCount}/${KEEPALIVE_ERROR_THRESHOLD}): ${err.message}`,
-      level,
-      'keepalive'
-    );
-  });
-  req.setTimeout(5000, () => { req.destroy(); });
-}
+// Removed dead code: selfPing() and keepaliveLoop() were replaced by
+// _selfPingWrapped below. externalPing() is now defined with res.resume().
+
+// BUG FIX (Response 18): First keepalive fires at 30s, but Render's
+// spin-down timer starts from the last HTTP request. During cold
+// start, the 30s gap is fine (Render gives 15 min). However, if
+// the daemon takes long to initialize, the first interval tick may
+// be delayed. We now log the first successful keepalive.
+let _firstKeepaliveLogged = false;
 
 function externalPing() {
   if (!EXTERNAL_PING_URL) return;
@@ -378,8 +269,9 @@ function externalPing() {
       port: url.port || (url.protocol === 'https:' ? 443 : 80),
       path: url.pathname + url.search,
       timeout: 10000,
-    }, () => {
-      // Consume response to free socket
+    }, (res: any) => {
+      // Consume response body to free socket
+      res.resume();
     });
     req.on('error', () => {});
     req.setTimeout(10000, () => { req.destroy(); });
@@ -387,19 +279,6 @@ function externalPing() {
     // URL parse failure \u2014 non-critical
   }
 }
-
-function keepaliveLoop() {
-  selfPing();
-  externalPing();
-}
-
-// BUG FIX (Response 18): First keepalive fires at 30s, but Render's
-// spin-down timer starts from the last HTTP request. During cold
-// start, the 30s gap is fine (Render gives 15 min). However, if
-// the daemon takes long to initialize, the first interval tick may
-// be delayed. We now log the first successful keepalive.
-let _firstKeepaliveLogged = false;
-const _origSelfPing = selfPing;
 // Wrap to log first success (only once, minimal overhead)
 const _selfPingWrapped = function() {
   const port = process.env.PORT || '10000';
@@ -488,16 +367,9 @@ registerShutdownHook(async () => {
   } catch { /* best effort */ }
 }, 1);
 registerShutdownHook(async () => {
-  log('Flushing pixel calibration data...', 'INFO', 'render-free-plan');
-  try {
-    const pixelCal = require('./pixel-calibration');
-    await pixelCal.flush();
-  } catch { /* best effort */ }
-}, 3);
-registerShutdownHook(async () => {
   log('Closing database...', 'INFO', 'render-free-plan');
   try { closeDatabase(); } catch { /* best effort */ }
-}, 4);
+}, 2);
 
 // \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
 // MEMORY MANAGEMENT \u2014 Tuned for 512 MB
@@ -626,7 +498,7 @@ function getMemoryInfo() {
   };
 }
 
-const server = http.createServer((req: any, res: any) => {
+const server = http.createServer(async (req: any, res: any) => {
   // BUG FIX (Response 18): Only set CORS for actual allowed origins
   // instead of blindly echoing req.headers.origin (which could be
   // anything). If DASHBOARD_ALLOWED_ORIGINS is ['*'], allow all.
@@ -634,134 +506,77 @@ const server = http.createServer((req: any, res: any) => {
   if (DASHBOARD_ALLOWED_ORIGINS.includes('*') || DASHBOARD_ALLOWED_ORIGINS.includes(requestOrigin)) {
     res.setHeader('Access-Control-Allow-Origin', requestOrigin || '*');
   }
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  // Wrap async handler to prevent unhandled rejections causing
-  // "Cannot write headers after they are sent" errors.
-  // When an async handler throws AFTER partial response, we must
-  // check res.headersSent before trying to send an error response.
-  ;(async () => {
-    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-    const pathname = url.pathname;
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const pathname = url.pathname;
 
-  // ── Root: full control dashboard (from dashboard-server module) ──
-  if (pathname === '/' || pathname === '/index.html') {
-    try {
-      const dashMod = require('./dashboard-server');
-      const html = dashMod._getDashboardHTML
-        ? dashMod._getDashboardHTML()
-        : null;
-      if (html && html.length > 100) {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(html);
-        return;
-      }
-    } catch { /* fall through to minimal fallback */ }
-    // Minimal fallback if dashboard-server not available
+  // \u2500\u2500 Root: status page \u2500\u2500
+  if (pathname === '/' && req.method === 'GET') {
     const stats = getStats();
     const memInfo = getMemoryInfo();
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>MathU Bot v6</title>
-<style>body{font-family:system-ui,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;color:#e5e7eb;background:#111827}
+    const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>MathU Bot v6 \u2014 Render Free</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;color:#e5e7eb;background:#111827}
+h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
 .stat{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1f2937}
 .stat-label{color:#9ca3af}.stat-value{color:#60a5fa;font-weight:600}
+.badge{display:inline-block;padding:2px 8px;border-radius:9999px;font-size:12px;font-weight:600}
+.badge-ok{background:#065f46;color:#6ee7b7}.badge-warn{background:#78350f;color:#fcd34d}.badge-err{background:#7f1d1d;color:#fca5a5}
+.footer{margin-top:40px;color:#6b7280;font-size:13px;text-align:center}
 </style></head><body>
-<h1>MathU Bot v6</h1>
-<div class="stat"><span class="stat-label">Status</span><span class="stat-value">${stats.currentStatus||'unknown'}</span></div>
-<div class="stat"><span class="stat-label">Cycles</span><span class="stat-value">${stats.cycleCount||0}</span></div>
-<div class="stat"><span class="stat-label">Heap</span><span class="stat-value">${memInfo.heapUsed}</span></div>
-<div class="stat"><span class="stat-label">RSS</span><span class="stat-value">${memInfo.rss}</span></div>
+<h1>MathU Bot v6 \u2014 Render Free Plan</h1>
+<p>All features enabled. 512 MB RAM. No worker threads (in-process). Single-process Chromium.</p>
+<h2>Status</h2>
+<div class="stat"><span class="stat-label">Status</span><span class="badge ${stats.currentStatus === 'running' ? 'badge-ok' : stats.currentStatus === 'idle' ? 'badge-warn' : 'badge-err'}">${stats.currentStatus || 'unknown'}</span></div>
+<div class="stat"><span class="stat-label">Questions Completed</span><span class="stat-value">${stats.questionsCompleted || 0}</span></div>
+<div class="stat"><span class="stat-label">Cycles Run</span><span class="stat-value">${stats.cycleCount || 0}</span></div>
 <div class="stat"><span class="stat-label">Uptime</span><span class="stat-value">${formatUptime(process.uptime())}</span></div>
-</body></html>`);
+<div class="stat"><span class="stat-label">Heap Used</span><span class="stat-value">${memInfo.heapUsed}</span></div>
+<div class="stat"><span class="stat-label">RSS</span><span class="stat-value">${memInfo.rss} (${memInfo.rssPercent})</span></div>
+<div class="stat"><span class="stat-label">Node.js</span><span class="stat-value">${process.version}</span></div>
+<div class="stat"><span class="stat-label">Workers</span><span class="stat-value">0 (in-process)</span></div>
+<div class="stat"><span class="stat-label">Platform</span><span class="stat-value">render-free-plan${IS_RENDER ? '' : ' (local)'}</span></div>
+<h2>API Endpoints</h2>
+<ul>
+<li><code>GET /health</code> \u2014 Health check</li>
+<li><code>GET /api/status</code> \u2014 Detailed status JSON</li>
+<li><code>GET /api/metrics</code> \u2014 Performance metrics</li>
+<li><code>GET /api/container</code> \u2014 Container module health</li>
+</ul>
+<div class="footer">MathU Bot v6 | Render Free Plan | All Features | ${formatUptime(process.uptime())} | ${new Date().toISOString()}</div>
+</body></html>`;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
     return;
   }
 
   // \u2500\u2500 Health \u2500\u2500
   if (pathname === '/health' || pathname === '/api/health') {
-    const stateMachine = container.get('stateMachine');
-    const stats = getStats();
-    const memInfo = getMemoryInfo();
-    // Include health watchdog score (Response 2)
-    const watchdog = container.get('healthWatchdog', { required: false });
-    const watchdogHealth = watchdog?.getHealth?.() || null;
-    // Include degradation level (Response 3)
-    const degradationLadder = container.get('degradationLadder', { required: false });
-    const degradationInfo = degradationLadder?.getLastCalculation?.() || null;
-    // Include /tmp guardian status (Response 6)
-    const tmpGuardian = container.get('tmpGuardian', { required: false });
-    const tmpGuardianStatus = tmpGuardian?.getStatus?.() || null;
-    // Include cold start info (Response 6)
-    const coldStart = container.get('coldStart', { required: false });
-    const coldStartStatus = coldStart?.getStatus?.() || null;
-    const health = {
-      status: watchdogHealth ? watchdogHealth.level : 'ok',
-      timestamp: new Date().toISOString(),
-      uptime: process.uptime(),
-      stats: { questionsCompleted: stats.questionsCompleted || 0, cycleCount: stats.cycleCount || 0 },
-      memory: memInfo,
-      state: { current: stateMachine?.stateMachine?.getCurrentState?.() || null },
-      platform: 'render-free-plan',
-      isRender: IS_RENDER,
-      features: 'all-enabled',
-      workers: 'in-process',
-      healthWatchdog: watchdogHealth ? {
-        score: watchdogHealth.score,
-        level: watchdogHealth.level,
-        checks: watchdogHealth.checks,
-        totalRestarts: watchdogHealth.totalRestarts,
-        inExtendedSleep: watchdogHealth.inExtendedSleep,
-      } : null,
-      degradation: degradationInfo ? {
-        level: degradationInfo.level,
-        name: degradationInfo.name,
-        providerCount: degradationInfo.providerCount,
-        visionProviderCount: degradationInfo.visionProviderCount,
-        orBudgetPct: degradationInfo.orBudgetPct,
-        reasons: degradationInfo.reasons,
-      } : null,
-      tmpGuardian: tmpGuardianStatus ? {
-        usagePct: Math.round(tmpGuardianStatus.usagePct * 100),
-        usedMB: tmpGuardianStatus.usedMB,
-        totalMB: tmpGuardianStatus.totalMB,
-        lastPruneLevel: tmpGuardianStatus.lastPruneLevel,
-        checks: tmpGuardianStatus.checks,
-        prunes: tmpGuardianStatus.prunes,
-      } : null,
-      coldStart: coldStartStatus ? {
-        startupType: coldStartStatus.startupType,
-        isColdStart: coldStartStatus.isColdStart,
-        gapMinutes: coldStartStatus.gapMinutes,
-        lastSeenAt: coldStartStatus.lastSeenAt,
-      } : null,
-      workShift: (() => {
-        try {
-          const ws = require('./services-work-shifts');
-          const shift = ws.getShift();
-          return {
-            current: shift.current,
-            reason: shift.reason,
-            fullCycle: ws.shouldRunFullCycle(),
-          };
-        } catch { return null; }
-      })(),
-    };
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(health));
-    return;
-  }
-
-  // ── Heartbeat (Response 8) — UptimeRobot-compatible external monitoring ──
-  if (pathname === '/api/health/heartbeat') {
     try {
-      const heartbeat = require('./services-heartbeat-endpoint');
-      const payload = await heartbeat.getHeartbeat();
+      const stateMachine = container.get('stateMachine');
+      const stats = getStats();
+      const memInfo = getMemoryInfo();
+      const health = {
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        stats: { questionsCompleted: stats.questionsCompleted || 0, cycleCount: stats.cycleCount || 0 },
+        memory: memInfo,
+        state: { current: stateMachine?.stateMachine?.getCurrentState?.() || null },
+        platform: 'render-free-plan',
+        isRender: IS_RENDER,
+        features: 'all-enabled',
+        workers: 'in-process',
+      };
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(payload));
+      res.end(JSON.stringify(health));
     } catch (e: any) {
-      res.writeHead(503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'error', error: e.message }));
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message || 'Health check failed' }));
     }
     return;
   }
@@ -820,9 +635,7 @@ const server = http.createServer((req: any, res: any) => {
         };
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      // FIX: Include load failures in provider response for diagnostics
-      const loadFailures = registryMod.getLoadFailures ? registryMod.getLoadFailures() : [];
-      res.end(JSON.stringify({ providers: healthDetails, loadFailures, providerCount: healthDetails.length, timestamp: Date.now() }));
+      res.end(JSON.stringify({ providers: healthDetails, timestamp: Date.now() }));
     } catch (e: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message }));
@@ -847,8 +660,22 @@ const server = http.createServer((req: any, res: any) => {
   if (pathname === '/api/banned-actions' && req.method === 'POST') {
     try {
       let body = '';
-      req.on('data', (chunk: any) => { body += chunk; });
+      const MAX_BODY_SIZE = 1 * 1024 * 1024;
+      let bodyTooLarge = false;
+      req.on('data', (chunk: any) => {
+        if (body.length > MAX_BODY_SIZE) {
+          if (!bodyTooLarge) {
+            bodyTooLarge = true;
+            if (!res.headersSent) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Request body too large' })); }
+            req.destroy();
+          }
+          return;
+        }
+        body += chunk;
+      });
+      req.on('error', () => { if (!res.headersSent) { res.writeHead(400); res.end('Bad request'); } });
       req.on('end', () => {
+        if (bodyTooLarge) return;
         try {
           const data = JSON.parse(body);
           if (!data.action_type) {
@@ -876,8 +703,22 @@ const server = http.createServer((req: any, res: any) => {
   if (pathname === '/api/banned-actions' && req.method === 'DELETE') {
     try {
       let body = '';
-      req.on('data', (chunk: any) => { body += chunk; });
+      const MAX_BODY_SIZE = 1 * 1024 * 1024;
+      let bodyTooLarge = false;
+      req.on('data', (chunk: any) => {
+        if (body.length > MAX_BODY_SIZE) {
+          if (!bodyTooLarge) {
+            bodyTooLarge = true;
+            if (!res.headersSent) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Request body too large' })); }
+            req.destroy();
+          }
+          return;
+        }
+        body += chunk;
+      });
+      req.on('error', () => { if (!res.headersSent) { res.writeHead(400); res.end('Bad request'); } });
       req.on('end', () => {
+        if (bodyTooLarge) return;
         try {
           const data = JSON.parse(body);
           if (!data.action_type) {
@@ -906,8 +747,22 @@ const server = http.createServer((req: any, res: any) => {
   if (pathname === '/api/set-state' && req.method === 'POST') {
     try {
       let body = '';
-      req.on('data', (chunk: any) => { body += chunk; });
+      const MAX_BODY_SIZE = 1 * 1024 * 1024;
+      let bodyTooLarge = false;
+      req.on('data', (chunk: any) => {
+        if (body.length > MAX_BODY_SIZE) {
+          if (!bodyTooLarge) {
+            bodyTooLarge = true;
+            if (!res.headersSent) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Request body too large' })); }
+            req.destroy();
+          }
+          return;
+        }
+        body += chunk;
+      });
+      req.on('error', () => { if (!res.headersSent) { res.writeHead(400); res.end('Bad request'); } });
       req.on('end', () => {
+        if (bodyTooLarge) return;
         try {
           const data = JSON.parse(body);
           if (!data.state || typeof data.state !== 'string') {
@@ -946,216 +801,25 @@ const server = http.createServer((req: any, res: any) => {
         healthScore: p.healthScore,
         isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
       }));
-      // FIX: Include provider load failures and count in full status
-      const loadFailures = registryMod.getLoadFailures ? registryMod.getLoadFailures() : [];
-      const providerCount = registryMod.getAvailableProviderCount ? registryMod.getAvailableProviderCount() : 0;
-      // Include daemon running state
-      let daemonState = { stopRequested: false };
-      try { const orch = require('./cycle-orchestrator'); daemonState = { stopRequested: !!orch._stopRequested }; } catch {}
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ...stats,
-        daemon: daemonState,
         memory: memInfo,
         uptime: process.uptime(),
         platform: 'render-free-plan',
         screenshotAvailable: !!shot,
         providers: providerSummary,
-        providerLoadFailures: loadFailures,
-        providerCount,
         timestamp: Date.now(),
-        degradation: degradationLadder?.getLastCalculation?.() ? {
-          level: degradationLadder.getLastCalculation().level,
-          name: degradationLadder.getLastCalculation().name,
-          providerCount: degradationLadder.getLastCalculation().providerCount,
-          visionProviderCount: degradationLadder.getLastCalculation().visionProviderCount,
-          orBudgetPct: degradationLadder.getLastCalculation().orBudgetPct,
-        } : null,
-        workShifts: (() => {
-          try {
-            const ws = require('./services-work-shifts');
-            const shift = ws.getShift();
-            return {
-              current: shift.current,
-              previous: shift.previous,
-              reason: shift.reason,
-              timeSignal: shift.timeSignal,
-              resourceSignal: shift.resourceSignal,
-              cyclesInCurrentShift: shift.cyclesInCurrentShift,
-              totalActiveHours: Math.round(shift.totalActiveMs / (1000 * 60 * 60) * 10) / 10,
-              totalCyclesActive: shift.totalCyclesActive,
-              lastEvalAt: shift.lastEvalAt,
-            };
-          } catch { return null; }
-        })(),
-        actionCache: (() => {
-          try {
-            const ac = require('./services-action-cache');
-            return ac.getStats();
-          } catch { return null; }
-        })(),
       }));
     } catch (e: any) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ...stats, memory: memInfo, uptime: process.uptime(), timestamp: Date.now() }));
-    }
-    return;
-  }
-
-
-  // ── Live screenshot (capture right now) ──
-  if (pathname === '/api/screenshot/live') {
-    try {
-      const browserMod = require('./browser');
-      const page = browserMod.browserManager?.getPage?.() || browserMod.browserManager?.pageInstance;
-      if (!page || page.isClosed()) {
-        res.writeHead(503, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ available: false, error: 'Browser not available' }));
-        return;
-      }
-      const buf = await page.screenshot({ type: 'jpeg', quality: 40 });
-      let jpeg = buf.toString('base64');
-      try { const compressed = await browserMod.compressScreenshot?.(jpeg, 800, 30); if (compressed) jpeg = compressed; } catch {}
-      if (jpeg.length > 300_000) jpeg = jpeg.substring(0, 300_000);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ available: true, timestamp: Date.now(), screenshot: jpeg }));
-    } catch (e: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ available: false, error: e.message }));
+      res.end(JSON.stringify({ error: e.message || 'Failed to get full status', ...stats, memory: memInfo, uptime: process.uptime(), timestamp: Date.now() }));
     }
-    return;
-  }
-
-  // ── Daemon state ──
-  if (pathname === '/api/daemon') {
-    let daemonState = { running: true, stopRequested: false };
-    try { const orch = require('./cycle-orchestrator'); daemonState = { running: true, stopRequested: !!orch._stopRequested }; } catch { daemonState = { running: false, stopRequested: false }; }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(daemonState));
-    return;
-  }
-
-  // ── Resume daemon ──
-  if (pathname === '/api/daemon/resume' && req.method === 'POST') {
-    try {
-      const { resumeDaemon } = require('./cycle-orchestrator');
-      resumeDaemon();
-      log('Daemon resumed via dashboard', 'INFO', 'dashboard');
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true, message: 'Daemon resumed' }));
-    } catch (e: any) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  // ── Force state (via state-machine) ──
-  if (pathname === '/api/force-state' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (chunk: any) => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        if (!data.state || typeof data.state !== 'string') {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'state is required' }));
-          return;
-        }
-        const { forceState } = require('./state-machine');
-        forceState(data.state, 'dashboard_admin');
-        log(`State forced via dashboard: ${data.state}`, 'WARN', 'dashboard');
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, state: data.state }));
-      } catch (e: any) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
-  // ── Available states list ──
-  if (pathname === '/api/states') {
-    try {
-      const sm = require('./state-machine');
-      const states = Object.values(sm.STATES || {});
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ states }));
-    } catch (e: any) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  // ── Available actions list ──
-  if (pathname === '/api/actions') {
-    try {
-      const sm = require('./state-machine');
-      const actions = Object.keys(sm.ACTIONS || {});
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ actions }));
-    } catch (e: any) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  // ── Clear action cache ──
-  if (pathname === '/api/action-cache/clear' && req.method === 'POST') {
-    try {
-      const ac = require('./services-action-cache');
-      ac.clear();
-      log('Action cache cleared via dashboard', 'INFO', 'dashboard');
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true }));
-    } catch (e: any) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  // ── Set config (safe keys only) ──
-  if (pathname === '/api/config' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (chunk: any) => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        const SAFE_KEYS = new Set(['SLEEP_MIN_HOURS','SLEEP_MAX_HOURS','MAX_CYCLES_BEFORE_RESTART','MAX_CONSECUTIVE_FAILURES','VISION_PRIORITY','ALERT_ON_ERROR','ALERT_ON_STAGNATION','OPENROUTER_TRIBUNAL_MODEL']);
-        if (!SAFE_KEYS.has(data.key)) {
-          res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Config key not allowed' }));
-          return;
-        }
-        const { updateConfig } = require('./get-config');
-        updateConfig(data.key, data.value);
-        log(`Config changed via dashboard: ${data.key} = ${data.value}`, 'INFO', 'dashboard');
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, key: data.key, value: data.value }));
-      } catch (e: any) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
     return;
   }
 
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('Not found');
-  }).catch((err: any) => {
-    // Prevent "Cannot write headers after they are sent" by checking
-    // whether the response was already partially sent.
-    if (!res.headersSent) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message || 'Internal server error' }));
-    } else {
-      log(`HTTP handler error (response already sent): ${err.message}`, 'WARN', 'http');
-    }
-  });
 });
 
 // \u2500\u2500 Start HTTP server FIRST (Render requirement) \u2500\u2500
@@ -1275,37 +939,7 @@ if (typeof pruneTemplateCache === 'function') {
   } catch { /* best-effort */ }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// R6: Turso PRIMARY — Must initialize BEFORE subsystems that depend on it.
-// Turso is now the authoritative data source. Pull from Turso populates
-// local DB with all critical data (modules, calibration, action cache,
-// provider registry, model registry, banned actions) before any subsystem
-// reads from the local DB.
-// ═══════════════════════════════════════════════════════════════════════════
-(async () => {
-  try {
-    const tursoSync = require('./database-turso');
-    const tursoModule = container.get('turso', { required: false });
-    if (tursoModule) {
-      log('Initializing Turso as PRIMARY data store (R6)...', 'INFO', 'render-free-plan');
-      await tursoModule.startTursoSync();
-      const status = tursoModule.getTursoStatus();
-      if (status.enabled) {
-        log(`Turso PRIMARY ready (client=${status.clientConnected}, lastPull=${status.lastPullTime > 0 ? 'yes' : 'no'})`, 'INFO', 'render-free-plan');
-      } else {
-        log('Turso not configured — operating in local-only mode', 'INFO', 'render-free-plan');
-      }
-    } else {
-      // Fallback: direct require if container doesn't have turso yet
-      await tursoSync.startTursoSync();
-      log('Turso sync started (direct require fallback)', 'INFO', 'render-free-plan');
-    }
-  } catch (err: any) {
-    log(`Turso init failed (non-fatal): ${err.message}`, 'WARN', 'render-free-plan');
-  }
-})();
-
-// Autonomous features (now Turso data is available in local DB)
+// Autonomous features
 container.get('reflection', { required: false })?.startReflectionScheduler?.();
 container.get('strategyVariants', { required: false })?.runExperimentScheduler?.();
 container.get('anomalyDetector', { required: false })?.start?.();
@@ -1318,6 +952,14 @@ container.get('failsafeCoordinator', { required: false })?.startHealthChecks?.(6
 
 // Remote config
 container.get('remoteConfig', { required: false })?.loadRemoteConfig?.().catch(() => {});
+
+// Turso cloud sync (graceful no-op if not configured)
+try {
+  const tursoSync = require('./database-turso');
+  tursoSync.startTursoSync().catch((err: any) => {
+    log(`Turso sync failed to start: ${err.message}`, 'WARN', 'render-free-plan');
+  });
+} catch { /* module not found — skip */ }
 
 // Startup smoke tests
 const smokeResult = runStartupSmokeTests();
