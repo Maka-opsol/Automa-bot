@@ -1,12 +1,13 @@
 'use strict';
 
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n// MathU Bot v6 \u2014 Render Free Plan Entry Point (FULL FEATURES)
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════════════
+// MathU Bot v6 — Render Free Plan Entry Point (FULL FEATURES)
+// ═══════════════════════════════════════════════════════════════════════════════
 // Designed for Render free tier: 512 MB RAM, ephemeral disk,
 // spins down after 15 min inactivity, cold starts ~30s.
 //
 // ALL features are kept enabled. Memory savings come from:
-//   1. No worker threads (saves ~90-150 MB \u2014 3 workers \u00d7 30-50 MB each)
+//   1. No worker threads (saves ~90-150 MB — 3 workers × 30-50 MB each)
 //      In-process modules are used instead (they're lightweight).
 //   2. Chromium in single-process mode (saves ~50-80 MB vs multi-process)
 //   3. Chromium V8 heap capped at 128 MB
@@ -33,7 +34,12 @@
 // Render detection:
 //   - RENDER_SERVICE_ID env var indicates we are on Render
 //   - Used by subsystems to skip heavy I/O, disk checks, etc.
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+//
+// Dashboard integration:
+//   - dashboard-server.ts is mounted via handleDashboardRequest()
+//   - Full dashboard UI at /dashboard
+//   - All management API routes (/api/*) handled by dashboard-server
+// ═══════════════════════════════════════════════════════════════════════════════
 
 require('./error-handler');
 const http = require('http');
@@ -42,16 +48,10 @@ const path = require('path');
 const os = require('os');
 const { PROJECT_ROOT } = require('./project-root');
 
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
 // RENDER DETECTION
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-// Expose RENDER_SERVICE_ID so downstream modules can detect Render
-// without duplicating the check. This is set once at startup before
-// any modules are loaded.
+// ═══════════════════════════════════════════════════════════════════════
 if (!process.env.RENDER_SERVICE_ID) {
-  // Best-effort detection: if running as render-free-plan.ts entry point,
-  // we ARE on Render. Some env vars may not be set on very first deploy
-  // so we also check RENDER (set by Render for all services).
   if (process.env.RENDER) {
     process.env.RENDER_SERVICE_ID = 'detected-free-plan';
   }
@@ -59,13 +59,13 @@ if (!process.env.RENDER_SERVICE_ID) {
 
 const IS_RENDER = !!(process.env.RENDER_SERVICE_ID || process.env.RENDER);
 
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
 // PRE-STARTUP: Set Render-friendly defaults BEFORE any module loads
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
 
 const DATA_DIR = os.tmpdir();
 
-// Paths \u2014 all under /tmp (ephemeral, but writable)
+// Paths — all under /tmp (ephemeral, but writable)
 if (!process.env.DB_PATH)          process.env.DB_PATH          = path.join(DATA_DIR, 'mathu-bot.db');
 if (!process.env.USER_DATA_DIR)    process.env.USER_DATA_DIR    = path.join(DATA_DIR, '.browser-data');
 if (!process.env.LOG_DIR)          process.env.LOG_DIR          = path.join(DATA_DIR, 'mathu-logs');
@@ -79,23 +79,14 @@ if (!process.env.SELF_HEAL_BACKUP_DIR)  process.env.SELF_HEAL_BACKUP_DIR  = path
 if (!process.env.SELF_HEAL_STAGING_DIR) process.env.SELF_HEAL_STAGING_DIR = path.join(DATA_DIR, 'mathu-staging');
 if (!process.env.REGRESSION_BANK_DIR)   process.env.REGRESSION_BANK_DIR   = path.join(DATA_DIR, 'mathu-regression');
 
-// Memory \u2014 only set MAX_MEMORY_MB if not already set.
-// WARNING_THRESHOLD and RESTART_THRESHOLD are NOT set here.
-// They have correct defaults in config.ts (350 and 360 for Render).
-// Setting them here risks conflicting with a user-overridden MAX_MEMORY_MB
-// in the Render dashboard, causing validation failure (Bug #6).
+// Memory — only set MAX_MEMORY_MB if not already set.
 if (!process.env.MAX_MEMORY_MB) process.env.MAX_MEMORY_MB = '448';
 
-// Post-set consistency guard: ensure thresholds are always valid
-// relative to whatever MAX_MEMORY_MB ends up being (Dockerfile, dashboard,
-// or default).  This prevents the config.ts validation from killing the
-// container if the user sets MAX_MEMORY_MB lower in the Render dashboard.
+// Post-set consistency guard
 (function ensureMemoryThresholdConsistency() {
   const maxMem = parseInt(process.env.MAX_MEMORY_MB || '448', 10);
   const restartThr = parseInt(process.env.MEMORY_RESTART_THRESHOLD_MB || '0', 10);
   const warnThr = parseInt(process.env.MEMORY_WARNING_THRESHOLD_MB || '0', 10);
-  // If thresholds aren't set, let config.ts defaults handle it.
-  // If they ARE set but violate the constraints, fix them here.
   if (restartThr > 0 && restartThr >= maxMem) {
     process.env.MEMORY_RESTART_THRESHOLD_MB = String(Math.floor(maxMem * 0.8));
   }
@@ -108,21 +99,15 @@ if (!process.env.MAX_MEMORY_MB) process.env.MAX_MEMORY_MB = '448';
 })();
 
 // Timing
-if (!process.env.MAX_UPTIME_HOURS)           process.env.MAX_UPTIME_HOURS = '0';      // never force restart
+if (!process.env.MAX_UPTIME_HOURS)           process.env.MAX_UPTIME_HOURS = '0';
 if (!process.env.MAX_CYCLES_BEFORE_RESTART) process.env.MAX_CYCLES_BEFORE_RESTART = '999999';
 
-// Logging \u2014 keep it reasonable (no persistent disk)
+// Logging
 if (!process.env.LOG_LEVEL)       process.env.LOG_LEVEL = 'info';
 if (!process.env.LOG_MAX_FILES)   process.env.LOG_MAX_FILES = '2';
 if (!process.env.LOG_MAX_SIZE_MB) process.env.LOG_MAX_SIZE_MB = '10';
 
-// Chromium \u2014 single-process saves 50-80 MB vs multi-process
-// BUG FIX (Response 18): CHROMIUM_FLAGS is now the authoritative source.
-// browser-chrome-flags.ts deduplicates against this prefix set, so we
-// must NOT include flags that browser-chrome-flags already handles
-// (like --no-sandbox, --disable-dev-shm-usage, --disable-gpu).
-// Only set Render-specific flags here that browser-chrome-flags would
-// not normally add (single-process, JS heap cap, optimize-for-size).
+// Chromium — single-process saves 50-80 MB vs multi-process
 if (!process.env.CHROMIUM_FLAGS) {
   process.env.CHROMIUM_FLAGS =
     '--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage '
@@ -145,9 +130,9 @@ for (const dir of [
   try { fs.mkdirSync(dir!, { recursive: true }); } catch { /* best-effort */ }
 }
 
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
 // LOAD MODULES
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
 
 const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilienceSubsystems, getContainerHealth, runStartupSmokeTests } = require('./container');
 
@@ -182,9 +167,16 @@ try { CONFIG.validateConfig(); } catch (validationErr: any) {
   process.exit(1);
 }
 
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
+// LOAD DASHBOARD SERVER (connected via container, same as this file)
+// ═══════════════════════════════════════════════════════════════════════
+// dashboard-server.ts resolves its own dependencies from container,
+// so no manual DI is needed. We just import its request handler.
+const { handleDashboardRequest } = require('./dashboard-server');
+
+// ═══════════════════════════════════════════════════════════════════════
 // SUBSYSTEMS: Start ALL of them (full feature set)
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
 
 // Longevity subsystems
 startSubsystemGroup('longevity');
@@ -203,19 +195,14 @@ startSelfHealV2Subsystems(CONFIG);
 // Resilience subsystems (survival, runtime, progress, economy, policy, auth, network)
 startResilienceSubsystems();
 
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
 // WORKER FALLBACK: Start rewardTracker in-process
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-// Workers are skipped on 512 MB (saves ~90-150 MB). The in-process
-// modules for metrics and diary are already active via the container.
-// rewardTracker is skipped by startSelfHealV2Subsystems (WORKER_BACKED
-// set), so we start it manually here.
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
 log('Render: Running all subsystems in-process (no worker threads, saves ~90-150 MB)', 'INFO', 'render-free-plan');
 try {
   const rtMod = container.get('rewardTracker', { required: false });
   if (rtMod && typeof rtMod.start === 'function') {
-    rtMod.start(60 * 60 * 1000); // 1-hour survival check interval
+    rtMod.start(60 * 60 * 1000);
     log('Reward tracker started in-process', 'INFO', 'render-free-plan');
   }
 } catch (e: any) {
@@ -228,35 +215,15 @@ if (CONFIG.MAX_UPTIME_HOURS && CONFIG.MAX_UPTIME_HOURS > 0) {
   log('Render: Disabled MAX_UPTIME_HOURS forced restart', 'INFO', 'render-free-plan');
 }
 
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-// KEEPALIVE PINGER \u2014 Prevents Render 15-min spin-down
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-// Render free plan spins down after 15 minutes of no HTTP traffic.
-// Self-ping every 4 minutes keeps the service permanently awake.
-// Optional: set KEEPALIVE_PING_URL to a UptimeRobot/cron-job.org URL
-// for an external backup ping.
-//
-// BUG FIX (Response 18): External ping now uses 'http' or 'https'
-// based on the URL protocol instead of always requiring 'https'.
-// This allows pinging HTTP-based cron monitors too.
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
+// KEEPALIVE PINGER — Prevents Render 15-min spin-down
+// ═══════════════════════════════════════════════════════════════════════
 
-const KEEPALIVE_INTERVAL_MS = 3.5 * 60 * 1000;  // 3.5 min (was 4 min) — tighter margin against 15-min spin-down
+const KEEPALIVE_INTERVAL_MS = 3.5 * 60 * 1000;
 const EXTERNAL_PING_URL = process.env.KEEPALIVE_PING_URL || '';
-// Maximum consecutive keepalive failures before logging at ERROR level
-// instead of WARN. Prevents log spam during network blips.
 const KEEPALIVE_ERROR_THRESHOLD = 5;
 
 let _keepaliveFailCount = 0;
-
-// Removed dead code: selfPing() and keepaliveLoop() were replaced by
-// _selfPingWrapped below. externalPing() is now defined with res.resume().
-
-// BUG FIX (Response 18): First keepalive fires at 30s, but Render's
-// spin-down timer starts from the last HTTP request. During cold
-// start, the 30s gap is fine (Render gives 15 min). However, if
-// the daemon takes long to initialize, the first interval tick may
-// be delayed. We now log the first successful keepalive.
 let _firstKeepaliveLogged = false;
 
 function externalPing() {
@@ -270,16 +237,15 @@ function externalPing() {
       path: url.pathname + url.search,
       timeout: 10000,
     }, (res: any) => {
-      // Consume response body to free socket
       res.resume();
     });
     req.on('error', () => {});
     req.setTimeout(10000, () => { req.destroy(); });
   } catch {
-    // URL parse failure \u2014 non-critical
+    // URL parse failure — non-critical
   }
 }
-// Wrap to log first success (only once, minimal overhead)
+
 const _selfPingWrapped = function() {
   const port = process.env.PORT || '10000';
   const req = http.get(`http://localhost:${port}/health`, (res: any) => {
@@ -288,7 +254,7 @@ const _selfPingWrapped = function() {
       _keepaliveFailCount = 0;
       if (!_firstKeepaliveLogged) {
         _firstKeepaliveLogged = true;
-        log('First keepalive ping succeeded \u2014 Render spin-down prevented', 'INFO', 'keepalive');
+        log('First keepalive ping succeeded — Render spin-down prevented', 'INFO', 'keepalive');
       }
     });
   });
@@ -311,7 +277,7 @@ setTimeout(() => {
     _selfPingWrapped();
     externalPing();
   }, KEEPALIVE_INTERVAL_MS).unref();
-}, 15000);  // 15s initial delay (was 30s) — health server is ready faster now
+}, 15000);
 
 log(
   `Keepalive system started (interval: ${KEEPALIVE_INTERVAL_MS / 1000}s, external: ${EXTERNAL_PING_URL ? 'enabled' : 'disabled'})`,
@@ -319,15 +285,15 @@ log(
   'render-free-plan'
 );
 
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-// SHUTDOWN HANDLING \u2014 Recovery, not exit
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
+// SHUTDOWN HANDLING — Recovery, not exit
+// ═══════════════════════════════════════════════════════════════════════
 
 let isShuttingDown = false;
 const originalExit = process.exit.bind(process);
 (process as any).exit = (code?: number) => {
   if (isShuttingDown) { originalExit(code || 0); return; }
-  log(`process.exit(${code}) intercepted \u2014 attempting recovery instead of dying`, 'WARN', 'render-free-plan');
+  log(`process.exit(${code}) intercepted — attempting recovery instead of dying`, 'WARN', 'render-free-plan');
   if (CONFIG.ALERT_ON_ERROR) {
     try { sendAlert(`process.exit(${code}) intercepted, recovering...`); } catch { /* non-critical */ }
   }
@@ -336,7 +302,7 @@ const originalExit = process.exit.bind(process);
 async function gracefulShutdown(signal: string) {
   if (isShuttingDown) return;
   isShuttingDown = true;
-  log(`Received ${signal} \u2014 shutting down gracefully...`, 'INFO', 'render-free-plan');
+  log(`Received ${signal} — shutting down gracefully...`, 'INFO', 'render-free-plan');
   requestStop();
   try {
     const { gracefulShutdown: runHooks } = require('./cycle-shutdown');
@@ -358,7 +324,6 @@ registerShutdownHook(async () => {
   try {
     const browserMod = container.get('browser', { required: false });
     if (browserMod?.closeBrowser) {
-      // Timeout browser close to prevent shutdown hanging on disconnected process
       await Promise.race([
         browserMod.closeBrowser(),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Browser close timed out')), 8000))
@@ -371,20 +336,15 @@ registerShutdownHook(async () => {
   try { closeDatabase(); } catch { /* best effort */ }
 }, 2);
 
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-// MEMORY MANAGEMENT \u2014 Tuned for 512 MB
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
+// MEMORY MANAGEMENT — Tuned for 512 MB
+// ═══════════════════════════════════════════════════════════════════════
 
 let _memoryWarningCount = 0;
-
-// BUG FIX (Response 18): RSS hard limit. On Render, if RSS exceeds
-// 470 MB the OOM killer will terminate the process without warning.
-// We now also track RSS trend (rising vs stable) to avoid closing
-// the browser when RSS is temporarily high due to page load.
 let _lastRss = 0;
 const RSS_HARD_LIMIT_MB = 470;
 
-// Scheduled GC every 3 minutes to keep heap lean
+// Scheduled GC every 3 minutes
 setInterval(() => {
   if (isShuttingDown) return;
   if (global.gc) {
@@ -400,8 +360,7 @@ setInterval(() => {
   const rss = mem.rss / 1024 / 1024;
 
   if (used > CONFIG.MEMORY_RESTART_THRESHOLD_MB || rss > RSS_HARD_LIMIT_MB) {
-    // Critical: close browser + force GC
-    log(`Memory critical: heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB \u2014 closing browser + GC`, 'WARN', 'render-free-plan');
+    log(`Memory critical: heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — closing browser + GC`, 'WARN', 'render-free-plan');
     try {
       const browserMod = container.get('browser', { required: false });
       if (browserMod?.browserManager?.pageInstance && !browserMod.browserManager.pageInstance.isClosed()) {
@@ -414,7 +373,7 @@ setInterval(() => {
   } else if (used > CONFIG.MEMORY_WARNING_THRESHOLD_MB) {
     _memoryWarningCount++;
     if (_memoryWarningCount >= 3) {
-      log(`Memory warning persistent (${_memoryWarningCount}/3): heap=${used.toFixed(0)}MB \u2014 closing browser`, 'WARN', 'render-free-plan');
+      log(`Memory warning persistent (${_memoryWarningCount}/3): heap=${used.toFixed(0)}MB — closing browser`, 'WARN', 'render-free-plan');
       try {
         const browserMod = container.get('browser', { required: false });
         if (browserMod?.browserManager?.pageInstance && !browserMod.browserManager.pageInstance.isClosed()) {
@@ -438,32 +397,38 @@ setInterval(() => {
   _lastRss = rss;
 }, 30000).unref();
 
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-// HTTP SERVER \u2014 Render requires listening on $PORT
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
+// HTTP SERVER — Render requires listening on $PORT
+// ═══════════════════════════════════════════════════════════════════════
+// Routes:
+//   /health            — Lightweight health check (keepalive target)
+//   /                  — Simple status page
+//   /dashboard         — Full dashboard UI (handled by dashboard-server)
+//   /api/*             — All API endpoints (handled by dashboard-server)
+// ═══════════════════════════════════════════════════════════════════════
 
 const DASHBOARD_ALLOWED_ORIGINS = process.env.DASHBOARD_ALLOWED_ORIGINS
   ? process.env.DASHBOARD_ALLOWED_ORIGINS.split(',')
   : ['*'];
 
 // ── Screenshot cache (for /api/screenshot endpoint) ──
+// NOTE: dashboard-server.ts shares this via globals. We set the globals
+// here first; dashboard-server checks and reuses them if already set.
 let _latestScreenshot: { screenshot: string; timestamp: number; action?: any } | null = null;
 
 function setLatestScreenshot(base64Jpeg: string, action?: any) {
-  // Cap at ~500KB to avoid memory bloat on 512MB instance
   if (base64Jpeg.length > 500_000) return;
   _latestScreenshot = { screenshot: base64Jpeg, timestamp: Date.now(), action };
 }
 
 function getLatestScreenshot() {
-  // Expire after 120 seconds
   if (_latestScreenshot && Date.now() - _latestScreenshot.timestamp > 120_000) {
     _latestScreenshot = null;
   }
   return _latestScreenshot;
 }
 
-// Expose globally so cycle manager can call it
+// Expose globally so cycle manager and dashboard-server can access
 (globalThis as any).__setLatestScreenshot = setLatestScreenshot;
 (globalThis as any).__getLatestScreenshot = getLatestScreenshot;
 
@@ -487,7 +452,6 @@ function formatUptime(seconds: number): string {
   return parts.join(' ');
 }
 
-// BUG FIX (Response 18): RSS memory on status page + Render detection flag
 function getMemoryInfo() {
   const mem = process.memoryUsage();
   return {
@@ -498,10 +462,13 @@ function getMemoryInfo() {
   };
 }
 
+// ── Dashboard link helper ──
+function getDashboardLink(port: number): string {
+  return `/dashboard`;
+}
+
 const server = http.createServer(async (req: any, res: any) => {
-  // BUG FIX (Response 18): Only set CORS for actual allowed origins
-  // instead of blindly echoing req.headers.origin (which could be
-  // anything). If DASHBOARD_ALLOWED_ORIGINS is ['*'], allow all.
+  // CORS
   const requestOrigin = req.headers.origin || '';
   if (DASHBOARD_ALLOWED_ORIGINS.includes('*') || DASHBOARD_ALLOWED_ORIGINS.includes(requestOrigin)) {
     res.setHeader('Access-Control-Allow-Origin', requestOrigin || '*');
@@ -513,12 +480,21 @@ const server = http.createServer(async (req: any, res: any) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;
 
-  // \u2500\u2500 Root: status page \u2500\u2500
+  // ── Try dashboard-server routes first (handles /dashboard and /api/*) ──
+  // Dashboard routes take priority for all /dashboard and /api paths.
+  if (pathname.startsWith('/dashboard') || pathname.startsWith('/api/')) {
+    const handled = await handleDashboardRequest(req, res);
+    if (handled) return;
+    // If dashboard-server didn't handle it, fall through to 404 below
+  }
+
+  // ── Root: status page with link to dashboard ──
   if (pathname === '/' && req.method === 'GET') {
     const stats = getStats();
     const memInfo = getMemoryInfo();
+    const port = parseInt(process.env.PORT || '10000', 10);
     const html = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>MathU Bot v6 \u2014 Render Free</title>
+<html><head><meta charset="utf-8"><title>MathU Bot v6 — Render Free</title>
 <style>
 body{font-family:system-ui,-apple-system,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;color:#e5e7eb;background:#111827}
 h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
@@ -527,8 +503,9 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
 .badge{display:inline-block;padding:2px 8px;border-radius:9999px;font-size:12px;font-weight:600}
 .badge-ok{background:#065f46;color:#6ee7b7}.badge-warn{background:#78350f;color:#fcd34d}.badge-err{background:#7f1d1d;color:#fca5a5}
 .footer{margin-top:40px;color:#6b7280;font-size:13px;text-align:center}
+a{color:#818cf8}a:hover{color:#a5b4fc}
 </style></head><body>
-<h1>MathU Bot v6 \u2014 Render Free Plan</h1>
+<h1>MathU Bot v6 — Render Free Plan</h1>
 <p>All features enabled. 512 MB RAM. No worker threads (in-process). Single-process Chromium.</p>
 <h2>Status</h2>
 <div class="stat"><span class="stat-label">Status</span><span class="badge ${stats.currentStatus === 'running' ? 'badge-ok' : stats.currentStatus === 'idle' ? 'badge-warn' : 'badge-err'}">${stats.currentStatus || 'unknown'}</span></div>
@@ -540,12 +517,17 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
 <div class="stat"><span class="stat-label">Node.js</span><span class="stat-value">${process.version}</span></div>
 <div class="stat"><span class="stat-label">Workers</span><span class="stat-value">0 (in-process)</span></div>
 <div class="stat"><span class="stat-label">Platform</span><span class="stat-value">render-free-plan${IS_RENDER ? '' : ' (local)'}</span></div>
+<h2>Links</h2>
+<div class="stat"><span class="stat-label">Dashboard</span><span class="stat-value"><a href="${getDashboardLink(port)}">Open Dashboard</a></span></div>
 <h2>API Endpoints</h2>
 <ul>
-<li><code>GET /health</code> \u2014 Health check</li>
-<li><code>GET /api/status</code> \u2014 Detailed status JSON</li>
-<li><code>GET /api/metrics</code> \u2014 Performance metrics</li>
-<li><code>GET /api/container</code> \u2014 Container module health</li>
+<li><code>GET /health</code> — Health check (keepalive)</li>
+<li><code>GET /dashboard</code> — Full dashboard UI</li>
+<li><code>GET /api/full-status</code> — Combined status JSON</li>
+<li><code>GET /api/health</code> — Deep health check</li>
+<li><code>GET /api/providers</code> — Provider health</li>
+<li><code>GET /api/metrics</code> — Performance metrics</li>
+<li><code>GET /api/container</code> — Container module health</li>
 </ul>
 <div class="footer">MathU Bot v6 | Render Free Plan | All Features | ${formatUptime(process.uptime())} | ${new Date().toISOString()}</div>
 </body></html>`;
@@ -554,8 +536,8 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
     return;
   }
 
-  // \u2500\u2500 Health \u2500\u2500
-  if (pathname === '/health' || pathname === '/api/health') {
+  // ── Health (lightweight, for keepalive ping) ──
+  if (pathname === '/health') {
     try {
       const stateMachine = container.get('stateMachine');
       const stats = getStats();
@@ -581,264 +563,29 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
     return;
   }
 
-  // \u2500\u2500 Status \u2500\u2500
-  if (pathname === '/api/status') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(getStats()));
-    return;
-  }
-
-  // \u2500\u2500 Metrics \u2500\u2500
-  if (pathname === '/api/metrics') {
-    const metricsMod = container.get('metrics', { required: false });
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(metricsMod?.metrics?.getSummary?.() || {}));
-    return;
-  }
-
-  // \u2500\u2500 Container health \u2500\u2500
-  if (pathname === '/api/container') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(getContainerHealth()));
-    return;
-  }
-
-  // ── Screenshot (live view for dashboard) ──
-  if (pathname === '/api/screenshot') {
-    const shot = getLatestScreenshot();
-    if (!shot) {
-      res.writeHead(204, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ available: false }));
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ available: true, timestamp: shot.timestamp, action: { actionType: shot.action?.actionType, currentState: shot.action?.currentState, reasoning: shot.action?.reasoning?.substring(0, 200) }, screenshot: shot.screenshot }));
-    return;
-  }
-
-  // ── Provider health details ──
-  if (pathname === '/api/providers') {
-    try {
-      const healthMod = require('./providers-health');
-      const registryMod = require('./providers-registry');
-      const providers = registryMod.getAvailableProviders ? await registryMod.getAvailableProviders() : [];
-      const healthDetails = providers.map((p: any) => {
-        const snapshot = healthMod.getHealthSnapshot?.(p.name) || {};
-        return {
-          name: p.name,
-          healthScore: p.healthScore,
-          totalCalls: snapshot.totalCalls || 0,
-          successRate: snapshot.successRate || 0,
-          avgLatencyMs: snapshot.avgLatencyMs || 0,
-          isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
-          circuitBreaker: snapshot.circuitBreakerState || 'closed',
-        };
-      });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ providers: healthDetails, timestamp: Date.now() }));
-    } catch (e: any) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  // ── Banned actions management ──
-  if (pathname === '/api/banned-actions' && req.method === 'GET') {
-    try {
-      const { listBannedActions } = require('./database');
-      const rows = listBannedActions();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(rows));
-    } catch (e: any) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  if (pathname === '/api/banned-actions' && req.method === 'POST') {
-    try {
-      let body = '';
-      const MAX_BODY_SIZE = 1 * 1024 * 1024;
-      let bodyTooLarge = false;
-      req.on('data', (chunk: any) => {
-        if (body.length > MAX_BODY_SIZE) {
-          if (!bodyTooLarge) {
-            bodyTooLarge = true;
-            if (!res.headersSent) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Request body too large' })); }
-            req.destroy();
-          }
-          return;
-        }
-        body += chunk;
-      });
-      req.on('error', () => { if (!res.headersSent) { res.writeHead(400); res.end('Bad request'); } });
-      req.on('end', () => {
-        if (bodyTooLarge) return;
-        try {
-          const data = JSON.parse(body);
-          if (!data.action_type) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'action_type is required' }));
-            return;
-          }
-          const { insertBannedAction } = require('./database');
-          insertBannedAction(data.action_type, 'dashboard', Date.now(), data.reason || 'Manual ban via dashboard');
-          log(`Action banned via dashboard: ${data.action_type} (${data.reason || 'no reason'})`, 'WARN', 'dashboard');
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true, banned: data.action_type }));
-        } catch (parseErr: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid JSON' }));
-        }
-      });
-    } catch (e: any) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  if (pathname === '/api/banned-actions' && req.method === 'DELETE') {
-    try {
-      let body = '';
-      const MAX_BODY_SIZE = 1 * 1024 * 1024;
-      let bodyTooLarge = false;
-      req.on('data', (chunk: any) => {
-        if (body.length > MAX_BODY_SIZE) {
-          if (!bodyTooLarge) {
-            bodyTooLarge = true;
-            if (!res.headersSent) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Request body too large' })); }
-            req.destroy();
-          }
-          return;
-        }
-        body += chunk;
-      });
-      req.on('error', () => { if (!res.headersSent) { res.writeHead(400); res.end('Bad request'); } });
-      req.on('end', () => {
-        if (bodyTooLarge) return;
-        try {
-          const data = JSON.parse(body);
-          if (!data.action_type) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'action_type is required' }));
-            return;
-          }
-          const { deleteBannedAction } = require('./database');
-          deleteBannedAction(data.action_type);
-          log(`Action unbanned via dashboard: ${data.action_type}`, 'INFO', 'dashboard');
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true, unbanned: data.action_type }));
-        } catch (parseErr: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid JSON' }));
-        }
-      });
-    } catch (e: any) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  // ── Set state manually ──
-  if (pathname === '/api/set-state' && req.method === 'POST') {
-    try {
-      let body = '';
-      const MAX_BODY_SIZE = 1 * 1024 * 1024;
-      let bodyTooLarge = false;
-      req.on('data', (chunk: any) => {
-        if (body.length > MAX_BODY_SIZE) {
-          if (!bodyTooLarge) {
-            bodyTooLarge = true;
-            if (!res.headersSent) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Request body too large' })); }
-            req.destroy();
-          }
-          return;
-        }
-        body += chunk;
-      });
-      req.on('error', () => { if (!res.headersSent) { res.writeHead(400); res.end('Bad request'); } });
-      req.on('end', () => {
-        if (bodyTooLarge) return;
-        try {
-          const data = JSON.parse(body);
-          if (!data.state || typeof data.state !== 'string') {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'state is required' }));
-            return;
-          }
-          const { upsertLastState } = require('./database');
-          upsertLastState('manual://dashboard', data.state.substring(0, 100), Date.now());
-          log(`State set via dashboard: ${data.state}`, 'INFO', 'dashboard');
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true, state: data.state }));
-        } catch (parseErr: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid JSON' }));
-        }
-      });
-    } catch (e: any) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  // ── Full status (for dashboard) ──
-  if (pathname === '/api/full-status') {
-    const stats = getStats();
-    const memInfo = getMemoryInfo();
-    const shot = getLatestScreenshot();
-    try {
-      const healthMod = require('./providers-health');
-      const registryMod = require('./providers-registry');
-      const providers = registryMod.getAvailableProviders ? await registryMod.getAvailableProviders() : [];
-      const providerSummary = providers.map((p: any) => ({
-        name: p.name,
-        healthScore: p.healthScore,
-        isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
-      }));
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        ...stats,
-        memory: memInfo,
-        uptime: process.uptime(),
-        platform: 'render-free-plan',
-        screenshotAvailable: !!shot,
-        providers: providerSummary,
-        timestamp: Date.now(),
-      }));
-    } catch (e: any) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message || 'Failed to get full status', ...stats, memory: memInfo, uptime: process.uptime(), timestamp: Date.now() }));
-    }
-    return;
-  }
-
+  // ── 404 ──
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('Not found');
 });
 
-// \u2500\u2500 Start HTTP server FIRST (Render requirement) \u2500\u2500
+// ── Start HTTP server FIRST (Render requirement) ──
 const PORT = parseInt(process.env.PORT || '10000', 10);
 server.listen(PORT, '0.0.0.0', () => {
-  log(`MathU Bot v6 \u2014 Render Free Plan (all features) listening on port ${PORT}`, 'INFO', 'render-free-plan');
+  log(`MathU Bot v6 — Render Free Plan (all features) listening on port ${PORT}`, 'INFO', 'render-free-plan');
+  log(`Dashboard available at http://localhost:${PORT}/dashboard`, 'INFO', 'render-free-plan');
   log(`Memory: warn=${CONFIG.MEMORY_WARNING_THRESHOLD_MB}MB, restart=${CONFIG.MEMORY_RESTART_THRESHOLD_MB}MB, rss_hard=${RSS_HARD_LIMIT_MB}MB, workers=in-process`, 'INFO', 'render-free-plan');
 });
 
-// \u2500\u2500 Heartbeat file \u2500\u2500
+// ── Heartbeat file ──
 setInterval(() => {
   if (CONFIG.HEARTBEAT_FILE) {
     try { fs.writeFileSync(CONFIG.HEARTBEAT_FILE, String(Date.now())); } catch { /* best-effort */ }
   }
 }, CONFIG.HEARTBEAT_INTERVAL_MS).unref();
 
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
 // BACKGROUND TASKS (all enabled)
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
 
 // IP check
 if (CONFIG.ENABLE_IP_CHECK) {
@@ -848,39 +595,27 @@ if (CONFIG.ENABLE_IP_CHECK) {
 // DB backup
 container.get('dbBackup', { required: false })?.startScheduledBackup?.();
 
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
 // MODEL EVOLUTION
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-// BUG FIX (Response 18): Model evolution now has a dedicated timeout
-// and mutex guard. On Render's slow CPU, the evolution process
-// (which calls multiple provider APIs) can easily exceed 5 minutes.
-// Without a timeout, it blocks the next check cycle indefinitely.
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
 
 const EVOLUTION_INTERVAL_DAYS = parseInt(process.env.EVOLUTION_INTERVAL_DAYS || '30', 10);
-// BUG FIX (Response 18): Cap evolution runtime to 4 minutes.
-// On Render's slow CPU, model discovery across multiple providers
-// can stall. This prevents the isEvolving mutex from being held forever.
 const EVOLUTION_TIMEOUT_MS = 4 * 60 * 1000;
 let isEvolving = false;
 let _evolutionStartTime = 0;
 
 async function checkAndRunEvolution() {
   if (isEvolving) {
-    // BUG FIX (Response 18): If evolution has been running for too long,
-    // forcibly release the mutex. This handles the case where the
-    // evolution promise never resolves (stalled network, unhandled
-    // rejection swallowed by .catch()).
     if (_evolutionStartTime > 0 && (Date.now() - _evolutionStartTime) > EVOLUTION_TIMEOUT_MS) {
       log(
-        `Model evolution stuck for ${Math.round((Date.now() - _evolutionStartTime) / 1000)}s \u2014 releasing mutex`,
+        `Model evolution stuck for ${Math.round((Date.now() - _evolutionStartTime) / 1000)}s — releasing mutex`,
         'ERROR',
         'render-free-plan'
       );
       isEvolving = false;
       _evolutionStartTime = 0;
       if (CONFIG.ALERT_ON_ERROR) {
-        try { sendAlert('Model evolution timed out \u2014 mutex released'); } catch { /* non-critical */ }
+        try { sendAlert('Model evolution timed out — mutex released'); } catch { /* non-critical */ }
       }
     } else {
       return;
@@ -897,8 +632,6 @@ async function checkAndRunEvolution() {
       try {
         const modelEvolution = container.get('modelEvolutionAdvanced', { required: false });
         if (modelEvolution) {
-          // BUG FIX (Response 18): Race evolution against timeout so it
-          // can't block forever even if evolveModelsAdvanced never resolves.
           const evolutionPromise = modelEvolution.evolveModelsAdvanced();
           const timeoutPromise = new Promise<null>(resolve =>
             setTimeout(() => resolve(null), EVOLUTION_TIMEOUT_MS)
@@ -921,16 +654,10 @@ async function checkAndRunEvolution() {
   } catch (err: any) { logError('Evolution check failed', err); }
 }
 
-// BUG FIX (Response 18): First evolution check delayed to 5 min to avoid
-// startup contention. Subsequent checks every 6 hours.
-// Both timers .unref()'d so they don't prevent clean shutdown.
 setTimeout(() => checkAndRunEvolution().catch(() => {}), 5 * 60 * 1000).unref();
 setInterval(() => checkAndRunEvolution().catch(() => {}), 6 * 60 * 60 * 1000).unref();
 
 // Template cache pruning
-// NOTE: 32-bit signed int max = 2_147_483_647 ms (~24.85 days).
-// 30 days = 2_592_000_000 ms which OVERFLOWS, causing the interval
-// to fire every 1ms (Node clamps the overflow to 1).  Cap at 7 days.
 const PRUNE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days (safe for 32-bit)
 if (typeof pruneTemplateCache === 'function') {
   try {
@@ -968,15 +695,15 @@ if (!smokeResult.passed && CONFIG.ALERT_ON_ERROR) {
   try { sendAlert(`Startup smoke tests failed: ${failed}`); } catch { /* non-critical */ }
 }
 
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-// START THE DAEMON (non-blocking \u2014 runs in background)
-// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// ═══════════════════════════════════════════════════════════════════════
+// START THE DAEMON (non-blocking — runs in background)
+// ═══════════════════════════════════════════════════════════════════════
 
 log('Starting daemon loop (background, all features)...', 'INFO', 'render-free-plan');
 startDaemon().catch(err => {
   logError('Fatal daemon error', err);
   if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Fatal daemon error: ${err.message}`); } catch { /* non-critical */ }
-  log('Daemon crashed \u2014 will restart on next cycle iteration', 'ERROR', 'render-free-plan');
+  log('Daemon crashed — will restart on next cycle iteration', 'ERROR', 'render-free-plan');
 });
 
-log('MathU Bot v6 \u2014 Render Free Plan fully started (all features, no workers)', 'INFO', 'render-free-plan');
+log('MathU Bot v6 — Render Free Plan fully started (all features, no workers)', 'INFO', 'render-free-plan');
