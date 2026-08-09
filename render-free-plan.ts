@@ -80,7 +80,11 @@ if (!process.env.SELF_HEAL_STAGING_DIR) process.env.SELF_HEAL_STAGING_DIR = path
 if (!process.env.REGRESSION_BANK_DIR)   process.env.REGRESSION_BANK_DIR   = path.join(DATA_DIR, 'mathu-regression');
 
 // Memory — only set MAX_MEMORY_MB if not already set.
-if (!process.env.MAX_MEMORY_MB) process.env.MAX_MEMORY_MB = '448';
+// Render free plan = 512 MB total. Aggressive threshold to prevent OOM kills.
+if (!process.env.MAX_MEMORY_MB) process.env.MAX_MEMORY_MB = '400';
+// Override warning and restart thresholds to be aggressive
+if (!process.env.MEMORY_WARNING_THRESHOLD_MB) process.env.MEMORY_WARNING_THRESHOLD_MB = '280';
+if (!process.env.MEMORY_RESTART_THRESHOLD_MB) process.env.MEMORY_RESTART_THRESHOLD_MB = '320';
 
 // Post-set consistency guard
 (function ensureMemoryThresholdConsistency() {
@@ -117,8 +121,8 @@ if (!process.env.CHROMIUM_FLAGS) {
     + '--disable-translate --disable-component-extensions-with-background-pages '
     + '--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,'
     + 'MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion '
-    + '--js-flags=--max-old-space-size=128 --optimize-for-size '
-    + '--single-process';
+    + '--js-flags=--max-old-space-size=96 --optimize-for-size '
+    + '--single-process --disable-logging --disable-notifications';
 }
 
 // Ensure directories exist
@@ -175,7 +179,20 @@ try { CONFIG.validateConfig(); } catch (validationErr: any) {
 const { handleDashboardRequest } = require('./dashboard-server');
 
 // ═══════════════════════════════════════════════════════════════════════
-// SUBSYSTEMS: Start ALL of them (full feature set)
+// MEMORY-SAVINGS: Memory Mode Manager
+// ═══════════════════════════════════════════════════════════════════════
+// Two modes: "full_power" (all features) and "memory_protection" (heavy
+// modules disabled, aggressive GC). Auto-switches to memory_protection
+// when memory is critically high or a recent OOM crash is detected.
+// Manual toggle via dashboard API.
+//
+// Must initialize BEFORE subsystems start so env vars are set correctly.
+const memoryMode = require('./memory-mode');
+memoryMode.init();
+log(`Operational mode: ${memoryMode.getMode()} (thresholds: warn=${memoryMode.getThresholds().warnHeapMB}MB, restart=${memoryMode.getThresholds().restartHeapMB}MB)`, 'INFO', 'render-free-plan');
+
+// ═══════════════════════════════════════════════════════════════════════
+// SUBSYSTEMS: Start ALL of them (respecting mode-specific env vars above)
 // ═══════════════════════════════════════════════════════════════════════
 
 // Longevity subsystems
@@ -189,7 +206,7 @@ if (!active) {
   upsertModel.run('openrouter', 'openrouter/free', 1, 1, 'active', Date.now(), Date.now(), 0);
 }
 
-// Self-Heal v2 subsystems (all enabled)
+// Self-Heal v2 subsystems (respecting CONFIG flags — many disabled above)
 startSelfHealV2Subsystems(CONFIG);
 
 // Resilience subsystems (survival, runtime, progress, economy, policy, auth, network)
@@ -304,6 +321,8 @@ async function gracefulShutdown(signal: string) {
   isShuttingDown = true;
   log(`Received ${signal} — shutting down gracefully...`, 'INFO', 'render-free-plan');
   requestStop();
+  // Flush persistent config to disk before dying
+  try { require('./persistent-config').flush(); } catch { /* best-effort */ }
   try {
     const { gracefulShutdown: runHooks } = require('./cycle-shutdown');
     await runHooks(signal);
@@ -337,30 +356,46 @@ registerShutdownHook(async () => {
 }, 2);
 
 // ═══════════════════════════════════════════════════════════════════════
-// MEMORY MANAGEMENT — Tuned for 512 MB
+// MEMORY MANAGEMENT — Mode-aware, dynamically tuned for 512 MB
+// ═══════════════════════════════════════════════════════════════════════
+// Thresholds come from memory-mode.ts based on current operational mode.
+// In full_power:  warn=350MB, restart=400MB, GC=90s, monitor=20s
+// In memory_protection: warn=250MB, restart=280MB, GC=60s, monitor=15s
 // ═══════════════════════════════════════════════════════════════════════
 
 let _memoryWarningCount = 0;
 let _lastRss = 0;
-const RSS_HARD_LIMIT_MB = 470;
+const persistConfigMod = require('./persistent-config');
 
-// Scheduled GC every 3 minutes
-setInterval(() => {
-  if (isShuttingDown) return;
-  if (global.gc) {
-    try { global.gc(); } catch { /* ignore */ }
-  }
-}, 3 * 60 * 1000).unref();
-
-// Reactive memory monitoring every 30 seconds
+// ── Mode-aware memory monitoring ──
+// Uses thresholds from the active mode. Auto-downgrades to memory_protection
+// if heap exceeds the global danger zone (320MB) or RSS > 440MB.
 setInterval(() => {
   if (isShuttingDown) return;
   const mem = process.memoryUsage();
   const used = mem.heapUsed / 1024 / 1024;
   const rss = mem.rss / 1024 / 1024;
+  const thresholds = memoryMode.getThresholds();
 
-  if (used > CONFIG.MEMORY_RESTART_THRESHOLD_MB || rss > RSS_HARD_LIMIT_MB) {
-    log(`Memory critical: heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — closing browser + GC`, 'WARN', 'render-free-plan');
+  // Record memory reading for history-based detection
+  persistConfigMod.pushMemoryReading(Math.round(used * 10) / 10, Math.round(rss * 10) / 10);
+
+  // Auto-downgrade check (before applying mode-specific thresholds)
+  if (memoryMode.checkAutoDowngrade(used, rss)) {
+    // Mode switched — get fresh thresholds
+    _memoryWarningCount = 0;
+    _lastRss = rss;
+    return;
+  }
+
+  const activeRestart = thresholds.restartHeapMB;
+  const activeWarn = thresholds.warnHeapMB;
+  const activeRssHard = thresholds.rssHardLimitMB;
+  const activeStreak = thresholds.warningStreak;
+
+  // Critical: immediate browser close + double GC
+  if (used > activeRestart || rss > activeRssHard) {
+    log(`Memory CRITICAL (${memoryMode.getMode()}): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — closing browser + double GC`, 'ERROR', 'render-free-plan');
     try {
       const browserMod = container.get('browser', { required: false });
       if (browserMod?.browserManager?.pageInstance && !browserMod.browserManager.pageInstance.isClosed()) {
@@ -368,12 +403,13 @@ setInterval(() => {
       }
     } catch { /* best effort */ }
     if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
+    setTimeout(() => { if (global.gc) try { global.gc(); } catch {} }, 5000).unref();
     _memoryWarningCount = 0;
     _lastRss = rss;
-  } else if (used > CONFIG.MEMORY_WARNING_THRESHOLD_MB) {
+  } else if (used > activeWarn) {
     _memoryWarningCount++;
-    if (_memoryWarningCount >= 3) {
-      log(`Memory warning persistent (${_memoryWarningCount}/3): heap=${used.toFixed(0)}MB — closing browser`, 'WARN', 'render-free-plan');
+    if (_memoryWarningCount >= activeStreak) {
+      log(`Memory warning persistent (${_memoryWarningCount}/${activeStreak}, mode=${memoryMode.getMode()}): heap=${used.toFixed(0)}MB — closing browser`, 'WARN', 'render-free-plan');
       try {
         const browserMod = container.get('browser', { required: false });
         if (browserMod?.browserManager?.pageInstance && !browserMod.browserManager.pageInstance.isClosed()) {
@@ -381,12 +417,13 @@ setInterval(() => {
         }
       } catch { /* best effort */ }
       if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
+      setTimeout(() => { if (global.gc) try { global.gc(); } catch {} }, 5000).unref();
       _memoryWarningCount = 0;
       _lastRss = rss;
     } else {
       const rssTrend = _lastRss > 0 ? (rss - _lastRss > 10 ? 'rising' : 'stable') : 'unknown';
       log(
-        `Memory warning: heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB [${_memoryWarningCount}/3] trend=${rssTrend}`,
+        `Memory warning: heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB [${_memoryWarningCount}/${activeStreak}] mode=${memoryMode.getMode()} trend=${rssTrend}`,
         'WARN',
         'render-free-plan'
       );
@@ -395,7 +432,7 @@ setInterval(() => {
     _memoryWarningCount = 0;
   }
   _lastRss = rss;
-}, 30000).unref();
+}, memoryMode.getThresholds().monitorIntervalMs).unref();
 
 // ═══════════════════════════════════════════════════════════════════════
 // HTTP SERVER — Render requires listening on $PORT
@@ -547,7 +584,7 @@ a{color:#818cf8}a:hover{color:#a5b4fc}
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
         stats: { questionsCompleted: stats.questionsCompleted || 0, cycleCount: stats.cycleCount || 0 },
-        memory: memInfo,
+        memory: { ...memInfo, mode: memoryMode.getMode() },
         state: { current: stateMachine?.stateMachine?.getCurrentState?.() || null },
         platform: 'render-free-plan',
         isRender: IS_RENDER,
@@ -571,9 +608,10 @@ a{color:#818cf8}a:hover{color:#a5b4fc}
 // ── Start HTTP server FIRST (Render requirement) ──
 const PORT = parseInt(process.env.PORT || '10000', 10);
 server.listen(PORT, '0.0.0.0', () => {
-  log(`MathU Bot v6 — Render Free Plan (all features) listening on port ${PORT}`, 'INFO', 'render-free-plan');
+  log(`MathU Bot v6 — Render Free Plan listening on port ${PORT}`, 'INFO', 'render-free-plan');
   log(`Dashboard available at http://localhost:${PORT}/dashboard`, 'INFO', 'render-free-plan');
-  log(`Memory: warn=${CONFIG.MEMORY_WARNING_THRESHOLD_MB}MB, restart=${CONFIG.MEMORY_RESTART_THRESHOLD_MB}MB, rss_hard=${RSS_HARD_LIMIT_MB}MB, workers=in-process`, 'INFO', 'render-free-plan');
+  const t = memoryMode.getThresholds();
+  log(`Mode: ${memoryMode.getMode()} | Memory: warn=${t.warnHeapMB}MB restart=${t.restartHeapMB}MB rss_hard=${t.rssHardLimitMB}MB gc=${t.gcIntervalMs / 1000}s`, 'INFO', 'render-free-plan');
 });
 
 // ── Heartbeat file ──
@@ -666,13 +704,13 @@ if (typeof pruneTemplateCache === 'function') {
   } catch { /* best-effort */ }
 }
 
-// Autonomous features
-container.get('reflection', { required: false })?.startReflectionScheduler?.();
-container.get('strategyVariants', { required: false })?.runExperimentScheduler?.();
+// Autonomous features — only start lightweight ones on free plan
+// container.get('reflection', { required: false })?.startReflectionScheduler?.();  // Heavy — disabled for memory
+// container.get('strategyVariants', { required: false })?.runExperimentScheduler?.(); // Heavy — disabled for memory
 container.get('anomalyDetector', { required: false })?.start?.();
-container.get('diary', { required: false })?.start?.();
-container.get('coordinator', { required: false })?.startCoordinator?.();
-container.get('resourceManager', { required: false })?.start?.();
+// container.get('diary', { required: false })?.start?.();  // Accumulates data — disabled for memory
+// container.get('coordinator', { required: false })?.startCoordinator?.();  // Heavy — disabled for memory
+// container.get('resourceManager', { required: false })?.start?.();  // Heavy — disabled for memory
 
 // Health checks
 container.get('failsafeCoordinator', { required: false })?.startHealthChecks?.(60000);
@@ -694,6 +732,19 @@ if (!smokeResult.passed && CONFIG.ALERT_ON_ERROR) {
   const failed = smokeResult.checks.filter((c: any) => !c.passed).map((c: any) => `${c.id}(${c.detail || '?'})`).join('; ');
   try { sendAlert(`Startup smoke tests failed: ${failed}`); } catch { /* non-critical */ }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// RE-APPLY PERSISTED FORCED STATE (if any)
+// ═══════════════════════════════════════════════════════════════════════
+try {
+  const persistConfig = require('./persistent-config');
+  const forced = persistConfig.getForcedState();
+  if (forced) {
+    const { forceState } = require('./state-machine');
+    forceState(forced.state, `restored_from_persist:${forced.reason}`);
+    log(`Restored persisted forced state: ${forced.state} (originally set: ${new Date(forced.forcedAt).toISOString()})`, 'WARN', 'render-free-plan');
+  }
+} catch { /* best-effort */ }
 
 // ═══════════════════════════════════════════════════════════════════════
 // START THE DAEMON (non-blocking — runs in background)
