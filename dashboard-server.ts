@@ -1524,20 +1524,20 @@ async function refreshMode() {
     const heap = r.currentMemory?.heapMB || '?';
     const rss = r.currentMemory?.rssMB || '?';
     const peak = r.recentPeak;
-    info.innerHTML = `Heap: ${heap}MB | RSS: ${rss}MB | Peak(30m): ${peak?.peakHeapMB || 0}MB heap, ${peak?.peakRssMB || 0}MB RSS`;
+    info.innerHTML = \`Heap: \${heap}MB | RSS: \${rss}MB | Peak(30m): \${peak?.peakHeapMB || 0}MB heap, \${peak?.peakRssMB || 0}MB RSS\`;
   }
   if (thresholds && r.thresholds) {
-    thresholds.textContent = `Warn: ${r.thresholds.warnHeapMB}MB | Restart: ${r.thresholds.restartHeapMB}MB | RSS hard: ${r.thresholds.rssHardLimitMB}MB | GC: ${r.thresholds.gcIntervalMs / 1000}s`;
+    thresholds.textContent = \`Warn: \${r.thresholds.warnHeapMB}MB | Restart: \${r.thresholds.restartHeapMB}MB | RSS hard: \${r.thresholds.rssHardLimitMB}MB | GC: \${r.thresholds.gcIntervalMs / 1000}s\`;
   }
   if (btnFP) btnFP.style.opacity = isMP ? '0.5' : '1';
   if (btnMP) btnMP.style.opacity = isMP ? '1' : '0.5';
 }
 async function switchMode(mode) {
   const action = mode === 'memory_protection' ? 'switch to Memory Protection' : 'switch to Full Power';
-  if (!confirm(`${action}? ${mode === 'full_power' ? 'Heavy modules will re-enable on restart.' : 'Heavy modules will be disabled immediately.'}`)) return;
+  if (!confirm(\`\${action}? \${mode === 'full_power' ? 'Heavy modules will re-enable on restart.' : 'Heavy modules will be disabled immediately.'}\`)) return;
   const r = await api('/api/mode', { method: 'POST', body: JSON.stringify({ mode, reason: 'dashboard_manual' }) });
   if (r?.success) {
-    toast(`Mode: ${r.previousMode} → ${r.currentMode}`, 'success');
+    toast(\`Mode: \${r.previousMode} → \${r.currentMode}\`, 'success');
     if (r.note) toast(r.note, 'info');
   } else {
     toast('Failed: ' + (r?.error || 'unknown'), 'error');
