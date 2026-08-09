@@ -67,21 +67,27 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
 
 // ── Screenshot cache (shared with render-free-plan.ts via globals) ──
 // render-free-plan.ts sets (globalThis).__setLatestScreenshot and
-// (globalThis).__getLatestScreenshot. We mirror them here so the
-// dashboard can serve screenshots even when loaded standalone.
+// (globalThis).__getLatestScreenshot FIRST (it starts before us).
+// We set them here as fallback for standalone use, but at runtime we
+// ALWAYS delegate to the globals so we read from the same cache the
+// cycle manager writes to.
 
-let _latestScreenshot: { screenshot: string; timestamp: number; action?: any } | null = null;
+let _standaloneScreenshot: { screenshot: string; timestamp: number; action?: any } | null = null;
 
 function setLatestScreenshot(base64Jpeg: string, action?: any) {
   if (base64Jpeg.length > 500_000) return;
-  _latestScreenshot = { screenshot: base64Jpeg, timestamp: Date.now(), action };
+  _standaloneScreenshot = { screenshot: base64Jpeg, timestamp: Date.now(), action };
 }
 
-function getLatestScreenshot() {
-  if (_latestScreenshot && Date.now() - _latestScreenshot.timestamp > 120_000) {
-    _latestScreenshot = null;
+function getLatestScreenshot(): { screenshot: string; timestamp: number; action?: any } | null {
+  // Always prefer the global (render-free-plan.ts cache), which is what
+  // the cycle manager writes to. Fall back to local only in standalone.
+  const globalGet = (globalThis as any).__getLatestScreenshot;
+  if (globalGet) return globalGet();
+  if (_standaloneScreenshot && Date.now() - _standaloneScreenshot.timestamp > 120_000) {
+    _standaloneScreenshot = null;
   }
-  return _latestScreenshot;
+  return _standaloneScreenshot;
 }
 
 // Expose globally so cycle manager can call it (same globals as render-free-plan)
@@ -145,12 +151,17 @@ async function captureLiveScreenshot(): Promise<string | null> {
     const page = browserMod.browserManager?.getPage?.() || browserMod.browserManager?.pageInstance;
     if (!page || page.isClosed()) return null;
     const buf = await page.screenshot({ type: 'jpeg', quality: 40 });
-    const base64 = buf.toString('base64');
+    let base64 = buf.toString('base64');
+    // Try sharp compression first (much smaller)
     try {
       const compressed = await browserMod.compressScreenshot?.(base64, 800, 30);
-      if (compressed) return compressed;
-    } catch { /* sharp not available, use raw */ }
-    if (base64.length > 300_000) return base64.substring(0, 300_000);
+      if (compressed && compressed.length < 500_000) return compressed;
+    } catch { /* sharp not available */ }
+    // Raw JPEG — if too large, skip rather than truncate (truncated base64 = corrupted image)
+    if (base64.length > 500_000) {
+      log(`Live screenshot too large (${Math.round(base64.length / 1024)}KB), skipping`, 'WARN', 'dashboard');
+      return null;
+    }
     return base64;
   } catch (e: any) {
     log(`Live screenshot capture failed: ${e.message}`, 'WARN', 'dashboard');
