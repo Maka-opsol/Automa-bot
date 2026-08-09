@@ -12,7 +12,7 @@ const _getLog = () => { try { return require('./logger'); } catch { return { log
  * visual-recovery + DOM selectors sequentially. Each can take 2-3s on Render's slow CPU.
  * 15s was too tight and caused the pipeline to time out before completing all stages.
  */
-const FALLBACK_TIMEOUT_MS = 25000;
+const FALLBACK_TIMEOUT_MS = 60000;
 
 /**
  * Per-selector timeout in ms. Each page.$() is raced against this.
