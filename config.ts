@@ -300,7 +300,7 @@ function isValidRemoteOverride(key: string, value: unknown): boolean {
     EXPECTED_IP_CITY: { type: 'string', maxLength: 100, regex: /^[a-zA-Z\s\-']+$/ },
     EXPECTED_IP_COUNTRY: { type: 'string', maxLength: 100, regex: /^[a-zA-Z\s\-']+$/ },
     AUTO_INSTALL_DEPENDENCIES: { type: 'boolean' },
-    SANDBOX_MODE: { type: 'boolean' },
+    // SANDBOX_MODE intentionally omitted from schema — it is in BLOCKED_KEYS
     WEB_SEARCH_ENABLED: { type: 'boolean' }
   };
   const schemaItem: OverrideSchemaItem | undefined = schema[key];
@@ -1037,13 +1037,18 @@ const CONFIG: Record<string, any> = new Proxy(_configStore, {
   },
 
   defineProperty(target: Record<string, any>, key: string | symbol, descriptor: PropertyDescriptor): boolean {
-    // Allow remote overrides and config-reconciler to use defineProperty
+    // FIX: Route through validation to prevent bypassing security checks
     if (typeof key !== 'string') return false;
     if (!(key in target)) {
       console.warn(`[CONFIG] defineProperty rejected: unknown key ${key}`);
       return false;
     }
     if (descriptor.value !== undefined) {
+      // FIX: Check BLOCKED_KEYS before allowing defineProperty to set value
+      if (typeof isValidRemoteOverride === 'function' && !isValidRemoteOverride(key as string, descriptor.value)) {
+        console.warn(`[CONFIG] defineProperty blocked for protected key: ${key}`);
+        return false;
+      }
       const oldValue = target[key];
       target[key] = descriptor.value;
       const entry: ConfigMutationEntry = { key, oldValue, newValue: descriptor.value, timestamp: Date.now(), source: 'defineProperty' };
