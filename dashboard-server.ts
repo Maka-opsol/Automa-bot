@@ -1100,4 +1100,4 @@ async function refreshAll() {
 </html>`;
 }
 
-module.exports = { startDashboard, createDashboardServer, _injectDependencies, getLatestScreenshot, setLatestScreenshot };
+module.exports = { startDashboard, createDashboardServer, _injectDependencies, getLatestScreenshot, setLatestScreenshot, _getDashboardHTML: getDashboardHTML };
