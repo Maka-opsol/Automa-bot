@@ -4,15 +4,11 @@
 const _getLog = () => { try { return require('./logger'); } catch { return { log: console.log, logError: console.error }; } };
 
 /**
- * Overall timeout for the entire fallback action pipeline.
- * On Render free plan (slow CPU), individual page.$() calls can hang.
- * This prevents the fallback from consuming the entire cycle budget.
- *
- * FIX: Increased from 15s to 25s. The pipeline runs pixel-fallback + pixel-explorer +
- * visual-recovery + DOM selectors sequentially. Each can take 2-3s on Render's slow CPU.
- * 15s was too tight and caused the pipeline to time out before completing all stages.
+ * NOTE: No overall pipeline timeout. The fallback chain is the last resort when all
+ * AI providers fail. It must be allowed to complete — timing out would leave the
+ * bot stuck with a 'wait' action and no way forward. Individual page.$() calls
+ * still have per-selector timeouts (SELECTOR_TIMEOUT_MS) to prevent hangs.
  */
-const FALLBACK_TIMEOUT_MS = 60000;
 
 /**
  * Per-selector timeout in ms. Each page.$() is raced against this.
@@ -124,26 +120,16 @@ const SIGNIN_SELECTORS = [
  *   4. Return wait action as last resort
  *
  * On Render free plan:
- *   - Overall timeout prevents hung page.$() from consuming cycle budget
  *   - Per-selector timeout (2s) prevents individual query hangs
  *   - Pixel fallback is first because it works when DOM is completely empty (Flutter canvas)
+ *   - No overall timeout: the fallback chain is the last resort and must complete
  */
-async function getFallbackAction(page: any) {
+async function getFallbackAction(page: any, currentState?: string) {
   const { log } = _getLog();
-  const { sleep } = require('./utils-sleep');
-
-  // Wrap entire pipeline in a timeout
-  const result = await Promise.race([
-    _getFallbackActionInner(page, log),
-    sleep(FALLBACK_TIMEOUT_MS).then(() => {
-      log('Fallback action pipeline timed out', 'WARN', 'fallback');
-      return { actionType: 'wait', currentState: 'error', targetX: 0, targetY: 0 };
-    }),
-  ]);
-  return result;
+  return _getFallbackActionInner(page, log, currentState);
 }
 
-async function _getFallbackActionInner(page: any, log: any): Promise<any> {
+async function _getFallbackActionInner(page: any, log: any, currentState?: string): Promise<any> {
   // ── Stage 0: Pixel-based analysis (works with NO DOM, NO AI, NO semantics) ──
   // Decodes the screenshot PNG to raw RGBA pixels and scans for:
   //   - White rectangles = input fields (email/password)
@@ -152,7 +138,7 @@ async function _getFallbackActionInner(page: any, log: any): Promise<any> {
   // This is the ultimate fallback when everything else is blind.
   try {
     const { generatePixelFallbackAction } = require('./pixel-fallback');
-    const pixelAction = await generatePixelFallbackAction(page);
+    const pixelAction = await generatePixelFallbackAction(page, currentState);
     if (pixelAction) {
       log(`Pixel fallback provided action: ${pixelAction.actionType} at (${pixelAction.targetX}, ${pixelAction.targetY})`, 'INFO', 'fallback');
       return pixelAction;
