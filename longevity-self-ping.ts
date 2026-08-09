@@ -82,23 +82,42 @@ interface HealthState {
 
 /**
  * Check 1: Browser connected?
- * 2 = connected, 1 = disconnected but recoverable, 0 = gone
+ * 2 = connected, 1 = not yet launched / disconnected but recoverable, 0 = gone after launch
+ *
+ * FIX: Distinguish "browser never launched yet" (normal at startup, 1 point)
+ * from "browser was launched but crashed/disconnected" (abnormal, 0 points).
+ * Previously, both cases could score 0, dragging health down unnecessarily.
  */
 function _checkBrowser(): HealthCheckResult {
   try {
     const browser = _deps.browser;
     if (!browser) return { points: 1, detail: 'Browser module not loaded' };
 
-    // Check if browser has an active page
-    const disconnected = browser.getBrowserDisconnected?.();
-    if (disconnected) return { points: 0, detail: 'Browser disconnected' };
-
-    // Check page instance
+    // Check page instance first (most reliable signal)
     const page = browser.browserManager?.pageInstance;
     if (page && !page.isClosed()) return { points: 2, detail: 'Browser connected' };
-    if (page && page.isClosed()) return { points: 0, detail: 'Browser page closed' };
 
-    return { points: 1, detail: 'Browser state uncertain' };
+    // Page exists but closed — browser was launched then died
+    if (page && page.isClosed()) {
+      const disconnected = browser.getBrowserDisconnected?.();
+      return { points: 0, detail: `Browser page closed${disconnected ? ' (disconnected)' : ''}` };
+    }
+
+    // No page instance yet — check if a launch was ever attempted
+    const launchCount = browser.getBrowserLaunchCount?.() ?? 0;
+    const disconnected = browser.getBrowserDisconnected?.();
+
+    if (launchCount === 0) {
+      // Browser never launched — this is normal before first cycle
+      return { points: 1, detail: 'Browser not yet launched (waiting for first cycle)' };
+    }
+
+    // Launch was attempted but no page — something went wrong
+    if (disconnected) {
+      return { points: 0, detail: `Browser disconnected after ${launchCount} launch(es)` };
+    }
+
+    return { points: 1, detail: `Browser state uncertain (${launchCount} launches, no page)` };
   } catch (e: any) {
     return { points: 1, detail: `Browser check error: ${e.message}` };
   }
@@ -199,12 +218,30 @@ function _checkTmpSpace(): HealthCheckResult {
 /**
  * Check 6: Any providers available?
  * 2 = 3+ providers, 1 = 1-2 providers, 0 = 0 providers
+ *
+ * Reads from providers-registry (the single source of truth for provider
+ * availability). Previously read from providersBase.getStats() which
+ * doesn't exist, causing this check to always return 0.
  */
 function _checkProviders(): HealthCheckResult {
   try {
-    const providersBase = _deps.providersBase;
-    const stats = providersBase?.getStats?.() || {};
-    const available = stats.availableProviders || 0;
+    // Use providers-registry — the actual source of provider availability
+    let available = 0;
+    try {
+      const registry = require('./providers-registry');
+      if (typeof registry.getAvailableProviderCount === 'function') {
+        available = registry.getAvailableProviderCount();
+      }
+    } catch {
+      // Registry not loaded — try DB fallback
+      try {
+        const db = _deps.database?.db;
+        if (db) {
+          const row = db.prepare("SELECT COUNT(*) as cnt FROM model_registry WHERE role = 'active' AND is_working = 1").get();
+          available = row?.cnt || 0;
+        }
+      } catch { /* give up */ }
+    }
 
     if (available >= 3) return { points: 2, detail: `${available} providers available` };
     if (available >= 1) return { points: 1, detail: `Only ${available} provider(s)` };
