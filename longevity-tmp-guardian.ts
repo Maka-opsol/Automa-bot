@@ -40,10 +40,10 @@ function logError(msg: string, err: Error, ctx?: any) { _deps.logger?.logError?.
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 const TMP_DIR = os.tmpdir();
-const CHECK_INTERVAL_MS = parseInt(process.env.TMP_GUARDIAN_INTERVAL_MS || '300000', 10); // 5 min
-const THRESHOLD_WARN = parseFloat(process.env.TMP_GUARDIAN_WARN || '0.70');     // 70%
-const THRESHOLD_AGGRESSIVE = parseFloat(process.env.TMP_GUARDIAN_AGGRESSIVE || '0.85'); // 85%
-const THRESHOLD_EMERGENCY = parseFloat(process.env.TMP_GUARDIAN_EMERGENCY || '0.95'); // 95%
+const CHECK_INTERVAL_MS = parseInt(process.env.TMP_GUARDIAN_INTERVAL_MS || '120000', 10); // 2 min (was 5 min)
+const THRESHOLD_WARN = parseFloat(process.env.TMP_GUARDIAN_WARN || '0.60');     // 60% (was 70%)
+const THRESHOLD_AGGRESSIVE = parseFloat(process.env.TMP_GUARDIAN_AGGRESSIVE || '0.75'); // 75% (was 85%)
+const THRESHOLD_EMERGENCY = parseFloat(process.env.TMP_GUARDIAN_EMERGENCY || '0.90'); // 90% (was 95%)
 
 // Protected file patterns (never deleted, even in emergency)
 const PROTECTED_PATTERNS = [
@@ -264,13 +264,14 @@ function prune(): PruneResult {
     const deletableFiles = _getDeletableFiles();
 
     if (level === 'warn') {
-      // Prune screenshots AND browser cache (oldest first) until below 60%
-      const targetPct = THRESHOLD_WARN - 0.10; // Target 60%
+      // Prune ALL non-protected files (oldest first) until below target
+      const targetPct = THRESHOLD_WARN - 0.10; // Target 50%
       let freedSoFar = 0;
 
       for (const file of deletableFiles) {
         if (before.usagePct - (freedSoFar + file.size) / before.totalBytes < targetPct) break;
-        if (!_isScreenshot(file.path) && !_isBrowserCache(file.path)) continue;
+        // Delete ANYTHING not protected (was: only screenshots + browser cache)
+        if (_isProtected(file.path)) continue;
 
         try {
           fs.unlinkSync(file.path);
@@ -284,7 +285,8 @@ function prune(): PruneResult {
       const userDataDir = path.join(TMP_DIR, '.browser-data');
       if (fs.existsSync(userDataDir)) {
         const cacheDirs = ['Default/Cache', 'Default/Code Cache', 'Default/Service Worker/CacheStorage',
-          'Default/GPUCache', 'GrShaderCache', 'ShaderCache', 'DawnGraphiteCache', 'DawnWebGPUCache'];
+          'Default/GPUCache', 'GrShaderCache', 'ShaderCache', 'DawnGraphiteCache', 'DawnWebGPUCache',
+          'Default/Session Storage', 'Default/Local Storage/leveldb', 'Default/IndexedDB'];
         for (const cacheDir of cacheDirs) {
           try {
             const cachePath = path.join(userDataDir, cacheDir);
@@ -300,7 +302,7 @@ function prune(): PruneResult {
         }
       }
 
-      log(`/tmp guardian WARN prune: ${filesDeleted} files freed ${_formatBytes(freedBytes)} (usage: ${(before.usagePct * 100).toFixed(1)}%)`, 'WARN', 'tmp-guardian');
+      log(`/tmp guardian WARN prune: ${filesDeleted} files freed ${_formatBytes(freedBytes)} (usage: ${(before.usagePct * 100).toFixed(1)}% -> target ${(targetPct * 100).toFixed(0)}%)`, 'WARN', 'tmp-guardian');
     } else if (level === 'aggressive') {
       // Delete ALL screenshots, logs, dumps — keep only state/DB
       for (const file of deletableFiles) {
