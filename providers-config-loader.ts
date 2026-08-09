@@ -33,7 +33,7 @@ function _logError(msg: string, err: Error) { if (_deps.logger?.logError) { _dep
 //   - Agnes: agnes-2.0-flash (free tier)
 //   - Cloudflare: @cf/meta/llama-4-scout-17b-16e-instruct (free Workers AI)
 
-interface ProviderDefault {
+export interface ProviderDefault {
   endpoint: string | null;
   model: string;
   disabled?: boolean;           // P9: if true, provider is skipped by default
@@ -91,15 +91,12 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'Cloudflare': {
     endpoint: null,  // built dynamically from CF_ACCOUNT_ID
-    model: '@cf/moondream/moondream3.1-9B-A2B',
+    model: '@cf/meta/llama-4-scout-17b-16e-instruct',
     envKeys: ['CF_API_KEY', 'CF_ACCOUNT_ID'],
     visionCapable: true,
     fallbackModels: [
-      '@cf/moonshotai/kimi-k2.7-code',
-      '@cf/moonshotai/kimi-k2.6',
-      '@cf/google/gemma-4-26b-a4b-it',
-      '@cf/meta/llama-4-scout-17b-16e-instruct',
-      '@cf/meta/llama-3.2-11b-vision-instruct',
+      '@cf/meta/llama-3.3-70b-instruct',
+      '@cf/meta/llama-3.1-8b-instruct',
     ],
   },
   'Cerebras': {
@@ -128,33 +125,17 @@ const DEFAULTS: Record<string, ProviderDefault> = {
     model: 'gemini-2.5-flash',
     envKeys: ['GEMINI_API_KEY'],
     visionCapable: true,
-    // Fallback chain ordered by: free RPM limits, capability, and recency.
-    // When primary model hits 429/rate-limit, the provider cycles through these.
-    // Gemini 2.5 Flash:    5 RPM, 250K TPM, 58 RPD  (current primary — best vision quality)
-    // Gemini 3 Flash:     5 RPM, 250K TPM, 20 RPD  (next-gen, same limits)
-    // Gemini 3.5 Flash:   5 RPM, 250K TPM, 20 RPD  (newer)
-    // Gemini 3.6 Flash:   5 RPM, 250K TPM, 20 RPD  (latest)
-    // Gemini 2.5 Flash Lite: 10 RPM, 250K TPM, 20 RPD (higher RPM, lighter)
-    // Gemini 3.1 Flash Lite: 15 RPM, 250K TPM, 500 RPD (highest RPM + RPD)
-    // Gemini 3.5 Flash Lite: 15 RPM, 250K TPM, 500 RPD (highest RPM + RPD)
-    fallbackModels: [
-      'gemini-3-flash',
-      'gemini-3.5-flash',
-      'gemini-3.6-flash',
-      'gemini-2.5-flash-lite',
-      'gemini-3.1-flash-lite',
-      'gemini-3.5-flash-lite',
-    ],
+    fallbackModels: ['gemini-2.0-flash', 'gemini-1.5-flash'],
   },
   'OpenRouter': {
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
-    model: 'openrouter/free',
+    model: 'google/gemma-3-27b-it',
     envKeys: ['OPENROUTER_API_KEY'],
     visionCapable: true,
     fallbackModels: [
-      'google/gemma-3-27b-it:free',
-      'google/gemma-3-12b-it:free',
-      'qwen/qwen3-0.6b:free',
+      'google/gemma-4-31b-it',
+      'nvidia/nemotron-nano-12b-2-vl',
+      'qwen/qwen3-0.6b',
     ],
   },
 };
@@ -217,18 +198,12 @@ async function autoDiscoverModels() {
     const { fetchJSON } = require('./utils-fetch');
     const data = await fetchJSON('https://openrouter.ai/api/v1/models', {}, 15000);
     if (data && data.data) {
-      // Filter: FREE pricing + supports image modality
-      // ── HARD COST GUARD ── Both prompt AND completion must be exactly '0'.
-      // OpenRouter uses string pricing. Spending $0.20 breaks everything.
+      // Filter: free pricing + supports image modality
       const visionFree = data.data.filter((m: any) => {
-        const promptCost = m.pricing?.prompt;
-        const completionCost = m.pricing?.completion;
-        // Strict check: must be exactly '0' string, not undefined, not '0.000001'
-        const isFree = promptCost === '0' && completionCost === '0';
+        const promptCost = parseFloat(m.pricing?.prompt || '1');
+        const completionCost = parseFloat(m.pricing?.completion || '1');
+        const isFree = (promptCost === 0 && completionCost === 0) || m.id.includes(':free');
         if (!isFree) return false;
-        // Also require :free in model ID as double-check
-        const hasFreeTag = m.id.includes(':free');
-        if (!hasFreeTag) return false;
         // Check modality for vision support
         const modality = m.architecture?.modality;
         const hasImage = Array.isArray(modality) && modality.includes('image');
@@ -371,10 +346,10 @@ function findReplacement(providerName: string): { endpoint: string | null; model
   }
 
   // 1. Try fallback models from DEFAULTS
+  // Returns the first fallback model. The caller is expected to call
+  // rollbackProvider() if this one also fails, which advances to the next.
   if (def.fallbackModels && def.fallbackModels.length > 0) {
-    for (const fbModel of def.fallbackModels) {
-      return { endpoint: def.endpoint, model: fbModel };
-    }
+    return { endpoint: def.endpoint, model: def.fallbackModels[0] };
   }
 
   // 2. Try verified dynamic models for the same provider
@@ -407,7 +382,7 @@ function registerReplacement(retiredName: string, replacement: { endpoint: strin
     source: `auto-replacement-for-${retiredName}`,
     verified: false,
     verifiedAt: null,
-    visionCapable: false,  // will be determined by first call
+    visionCapable: true,  // Assume vision-capable until proven otherwise
     providerName: retiredName,
   };
   saveDynamicModels();
