@@ -1212,6 +1212,18 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
 
       currentState = action.currentState;
+      // ── Dashboard state ban enforcement ──
+      // If the current state has been banned from the dashboard, skip
+      // it and force a page reload to escape the banned state.
+      try {
+        const persistConfig = require('./persistent-config');
+        if (persistConfig.isStateBanned(currentState)) {
+          log(`State '${currentState}' is banned via dashboard — forcing page reload to escape`, 'WARN', 'cycle');
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+          currentState = 'assignments_page'; // Reset to safe state
+          continue; // Re-evaluate on next iteration
+        }
+      } catch { /* non-critical: persistent-config not available */ }
       if (questionsCompleted > 0) lastProgressTime = Date.now();
       else if (Date.now() - lastProgressTime > CONFIG.PROGRESS_TIMEOUT_MS) { throw new Error('Progress timeout'); }
 
