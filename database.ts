@@ -1,7 +1,5 @@
 'use strict';
 
-import type { Deps } from './types/di-types';
-
 // ─── Node builtins + npm packages only — no project requires ───
 const Database = require('better-sqlite3');
 const path = require('path');
@@ -11,10 +9,10 @@ const os = require('os');
 // ─── Dependency Injection ───
 // Dependencies are injected via _injectDependencies() from the DI container.
 // No top-level require() for project modules.
-let _deps: Deps = {};
+let _deps: any = {};
 let _initialized = false;
 
-function _injectDependencies(deps: Deps) {
+function _injectDependencies(deps: any) {
   _deps = deps;
 }
 
@@ -95,7 +93,10 @@ function runMigrations() {
   const log = getLog();
   const logError = getLogError();
   let current = getCurrentVersion();
-  const target = 22;
+  // FIX: Bumped from 22 to 28 to include action_cache table (migration 27)
+  // and banned_actions table (migration 22). Without this, action_cache
+  // table is never created locally, causing "no such table" errors.
+  const target = 28;
   if (current === target) { log(`Database schema version ${target} ready.`, 'INFO', 'database'); return; }
   if (current > target) { log(`Database schema version ${current} is ahead of expected ${target}`, 'WARN', 'database'); return; }
   const backupPath = CONFIG.DB_PATH + '.backup.' + Date.now();
