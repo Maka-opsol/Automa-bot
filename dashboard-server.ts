@@ -25,6 +25,14 @@ function getLog() {
   try { return container.get('logger'); } catch { return require('./logger'); }
 }
 
+/**
+ * DI injection hook — called by container-modules.ts during initialization.
+ * This module resolves deps lazily via container.get(), so this is a no-op.
+ */
+function _injectDependencies(_deps: any) {
+  // No-op: dashboard resolves its dependencies lazily via container.get()
+}
+
 // ── In-memory log ring buffer ──
 // Captures logs from this module and from hooked pino instances
 // Reduced from 500 to 200 for memory savings on Render free plan
@@ -1769,4 +1777,5 @@ module.exports = {
   getLatestScreenshot,
   setLatestScreenshot,
   _getDashboardHTML: getDashboardHTML,
+  _injectDependencies,
 };
