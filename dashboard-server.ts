@@ -16,13 +16,123 @@ const fs = require('fs');
 const path = require('path');
 const { PROJECT_ROOT } = require('./project-root');
 const { log, logError } = require('./logger');
-// 3.8 FIX: Lazy config access — prefer DI deps, fall back to direct require.
 function getCONFIG(): Record<string, any> { return _deps.config || require('./get-config'); }
 const crypto = require('crypto');
 function _timingSafeEqual(a: any, b: any) { if (typeof a !== 'string' || typeof b !== 'string') return false; if (a.length !== b.length) return false; try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch { return false; } }
 
 const DASHBOARD_DIR = path.join(PROJECT_ROOT, 'public');
 const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
+
+// ── Screenshot cache (mirrors render-free-plan.ts) ──
+let _latestScreenshot: { screenshot: string; timestamp: number; action?: any } | null = null;
+
+function setLatestScreenshot(base64Jpeg: string, action?: any) {
+  if (base64Jpeg.length > 500_000) return;
+  _latestScreenshot = { screenshot: base64Jpeg, timestamp: Date.now(), action };
+}
+
+function getLatestScreenshot() {
+  if (_latestScreenshot && Date.now() - _latestScreenshot.timestamp > 120_000) {
+    _latestScreenshot = null;
+  }
+  return _latestScreenshot;
+}
+
+// Expose globally so cycle manager can call it
+(globalThis as any).__setLatestScreenshot = setLatestScreenshot;
+(globalThis as any).__getLatestScreenshot = getLatestScreenshot;
+
+// ── Helper: read JSON body from request ──
+function readBody(req: any, res: any, cb: (body: string) => void) {
+  let body = '';
+  const MAX = 1 * 1024 * 1024;
+  let tooLarge = false;
+  req.on('data', (chunk: any) => {
+    if (body.length > MAX) {
+      if (!tooLarge) { tooLarge = true; res.writeHead(413, { 'Content-Type': 'application/json' }); res.end('{"error":"Body too large"}'); req.destroy(); }
+      return;
+    }
+    body += chunk;
+  });
+  req.on('end', () => { if (!tooLarge) cb(body); });
+}
+
+// ── Helper: JSON response ──
+function jsonRes(res: any, data: any, status = 200) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(data));
+}
+
+// ── Helper: format uptime ──
+function formatUptime(seconds: number): string {
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  const parts: string[] = [];
+  if (d > 0) parts.push(`${d}d`);
+  if (h > 0) parts.push(`${h}h`);
+  if (m > 0) parts.push(`${m}m`);
+  parts.push(`${s}s`);
+  return parts.join(' ');
+}
+
+// ── Helper: get all known states from state-machine ──
+function getAllStates(): string[] {
+  try {
+    const sm = require('./state-machine');
+    return Object.values(sm.STATES || {});
+  } catch { return []; }
+}
+
+function getAllActions(): string[] {
+  try {
+    const sm = require('./state-machine');
+    return Object.keys(sm.ACTIONS || {});
+  } catch { return []; }
+}
+
+// ── Helper: capture a live screenshot right now ──
+async function captureLiveScreenshot(): Promise<string | null> {
+  try {
+    const browserMod = require('./browser');
+    const page = browserMod.browserManager?.getPage?.() || browserMod.browserManager?.pageInstance;
+    if (!page || page.isClosed()) return null;
+    const buf = await page.screenshot({ type: 'jpeg', quality: 40 });
+    const base64 = buf.toString('base64');
+    // Compress via sharp if available
+    try {
+      const compressed = await browserMod.compressScreenshot?.(base64, 800, 30);
+      if (compressed) return compressed;
+    } catch { /* sharp not available, use raw */ }
+    // Cap raw at 300KB
+    if (base64.length > 300_000) return base64.substring(0, 300_000);
+    return base64;
+  } catch (e: any) {
+    log(`Live screenshot capture failed: ${e.message}`, 'WARN', 'dashboard');
+    return null;
+  }
+}
+
+// ── Helper: get stop state ──
+function getDaemonState(): { running: boolean; stopRequested: boolean } {
+  try {
+    const orch = require('./cycle-orchestrator');
+    return {
+      running: !!orch.startDaemon,
+      stopRequested: !!orch._stopRequested,
+    };
+  } catch { return { running: false, stopRequested: false }; }
+}
+
+// ── Helper: get available config keys that can be changed ──
+const SAFE_CONFIG_KEYS = new Set([
+  'SLEEP_MIN_HOURS', 'SLEEP_MAX_HOURS', 'MAX_CYCLES_BEFORE_RESTART',
+  'MAX_CONSECUTIVE_FAILURES', 'CANARY_OBSERVATION_HOURS',
+  'PROMPT_EVOLUTION_MIN_ENTRIES', 'VISION_PRIORITY',
+  'ALERT_ON_ERROR', 'ALERT_ON_STAGNATION', 'ANOMALY_CHECK_INTERVAL_MS',
+  'OPENROUTER_TRIBUNAL_MODEL',
+]);
 
 function serveStaticFile(res: any, filePath: any, contentType: any) {
   fs.readFile(filePath, (err: any, content: any) => {
@@ -32,107 +142,84 @@ function serveStaticFile(res: any, filePath: any, contentType: any) {
   });
 }
 
-function createDashboardServer() { 
-  const server = http.createServer((req: any, res: any) => {
+function createDashboardServer() {
+  const server = http.createServer(async (req: any, res: any) => {
     const DASHBOARD_ALLOWED_ORIGINS = process.env.DASHBOARD_ALLOWED_ORIGINS
         ? process.env.DASHBOARD_ALLOWED_ORIGINS.split(',')
         : ['http://localhost:8080'];
-      const origin = req.headers.origin || '';
-      if (DASHBOARD_ALLOWED_ORIGINS.includes(origin)) {
-        res.setHeader('Access-Control-Allow-Origin', origin);
-      }
+    const origin = req.headers.origin || '';
+    if (DASHBOARD_ALLOWED_ORIGINS.includes(origin) || DASHBOARD_ALLOWED_ORIGINS.includes('*')) {
+      res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
+    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const pathname = url.pathname;
 
+    // ═══════════════════════════════════════════════════════════════
+    //  HTML DASHBOARD
+    // ═══════════════════════════════════════════════════════════════
     if (pathname === '/' || pathname === '/index.html') {
       const indexPath = path.join(DASHBOARD_DIR, 'index.html');
       if (fs.existsSync(indexPath)) {
         serveStaticFile(res, indexPath, 'text/html');
-      } else {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(`
-          <!DOCTYPE html>
-          <html><head><title>MathU Bot Dashboard</title>
-          <style>body{font-family:sans-serif;padding:20px;background:#1a1a2e;color:#eee}
-          .card{background:#16213e;padding:20px;border-radius:10px;margin:10px 0}
-          .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}
-          .stat{font-size:24px;font-weight:bold;color:#0f3460}
-          .label{color:#aaa;font-size:14px}
-          pre{background:#0d1b2a;padding:15px;border-radius:5px;overflow:auto;max-height:400px}
-          button{background:#0f3460;color:#fff;border:none;padding:10px 20px;border-radius:5px;cursor:pointer}
-          button:hover{background:#1a4a7a}
-          .danger{background:#e94560}
-          .danger:hover{background:#c73e54}
-          </style>
-          </head>
-          <body>
-          <h1>🤖 MathU Bot Dashboard</h1>
-          <div id="app">
-            <div class="grid" id="stats-grid"></div>
-            <div class="card"><h2>Actions</h2>
-              <button onclick="fetch('/api/self-heal/trigger',{method:'POST'})">Trigger Self-Heal</button>
-              <button onclick="fetch('/api/emergency/stop',{method:'POST'})" class="danger">Emergency Stop</button>
-              <button onclick="fetch('/api/gitops/rollback',{method:'POST'})">Rollback</button>
-            </div>
-            <div class="card"><h2>Logs</h2>
-              <pre id="logs">Loading...</pre>
-            </div>
-            <div class="card"><h2>State</h2>
-              <pre id="state">Loading...</pre>
-            </div>
-          </div>
-          <script>
-            async function fetchJSON(url) { 
-              const r = await fetch(url);
-              return r.json();
-            }
-            async function refreshDashboard() { 
-              try {
-                const stats = await fetchJSON('/api/status');
-                const state = await fetchJSON('/api/state');
-                const logs = await fetch('/api/logs').then(r => r.text());
-                document.getElementById('stats-grid').innerHTML = 
-                  Object.entries(stats).map(([k,v]) =>
-                    '<div class="card"><div class="stat">'+v+'</div><div class="label">'+k+'</div></div>'
-                  ).join('');
-                document.getElementById('state').textContent = JSON.stringify(state, null, 2);
-                document.getElementById('logs').textContent = logs.slice(-5000);
-              } catch (e: any) { console.error('Dashboard update error', e); }
-            }
-            refreshDashboard();
-            setInterval(refreshDashboard, 5000);
-          </script>
-          </body></html>
-        `);
+        return;
       }
+      // Embedded dashboard (when no public/index.html)
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(getDashboardHTML());
       return;
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  READ-ONLY API ENDPOINTS
+    // ═══════════════════════════════════════════════════════════════
+
+    // Status
     if (pathname === '/api/status') {
       getRequireAuth()(req, res, () => {
         const stats = getProviderStats()();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(stats));
+        jsonRes(res, stats);
       });
       return;
     }
 
+    // State diagnostics
     if (pathname === '/api/state') {
       getRequireAuth()(req, res, () => {
         const diagnostics = getStateDiagnostics ? getStateDiagnostics()() : {};
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(diagnostics));
+        jsonRes(res, diagnostics);
       });
       return;
     }
 
+    // Daemon state (running/paused)
+    if (pathname === '/api/daemon') {
+      getRequireAuth()(req, res, () => {
+        jsonRes(res, getDaemonState());
+      });
+      return;
+    }
+
+    // Available states list
+    if (pathname === '/api/states') {
+      getRequireAuth()(req, res, () => {
+        jsonRes(res, { states: getAllStates() });
+      });
+      return;
+    }
+
+    // Available actions list
+    if (pathname === '/api/actions') {
+      getRequireAuth()(req, res, () => {
+        jsonRes(res, { actions: getAllActions() });
+      });
+      return;
+    }
+
+    // Logs
     if (pathname === '/api/logs') {
       getRequireAuth()(req, res, () => {
         try {
@@ -155,136 +242,347 @@ function createDashboardServer() {
       return;
     }
 
+    // Health (deep)
     if (pathname === '/api/health' || pathname === '/api/health/deep') {
       getRequireAuth()(req, res, () => {
+        const mem = process.memoryUsage();
         const health = {
           status: 'healthy',
           timestamp: new Date().toISOString(),
           stats: getProviderStats()(),
           state: getStateDiagnostics ? getStateDiagnostics()() : {},
-          memory: process.memoryUsage(),
+          daemon: getDaemonState(),
+          memory: {
+            heapUsed: (mem.heapUsed / 1024 / 1024).toFixed(0) + 'MB',
+            heapTotal: (mem.heapTotal / 1024 / 1024).toFixed(0) + 'MB',
+            rss: (mem.rss / 1024 / 1024).toFixed(0) + 'MB',
+            rssPercent: ((mem.rss / (512 * 1024 * 1024)) * 100).toFixed(1) + '%',
+          },
           uptime: process.uptime(),
+          uptimeFormatted: formatUptime(process.uptime()),
           browser: getBrowserMetrics ? getBrowserMetrics()() : {},
           database: getDatabaseStats ? getDatabaseStats()() : {},
           cache: getCacheStats ? getCacheStats()() : {},
           failsafe: getFailsafeDiagnostics ? getFailsafeDiagnostics()() : {},
         };
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(health));
+        jsonRes(res, health);
       });
       return;
     }
 
+    // Metrics
     if (pathname === '/api/metrics') {
       getRequireAuth()(req, res, () => {
-        const { metrics } = require('./metrics');
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(metrics.getSummary ? metrics.getSummary() : {}));
+        try {
+          const { metrics } = require('./metrics');
+          jsonRes(res, metrics.getSummary ? metrics.getSummary() : {});
+        } catch { jsonRes(res, {}); }
       });
       return;
     }
 
-    if (pathname === '/api/admin/token' && req.method === 'GET') {
-      if (!ADMIN_SECRET) {
-        res.writeHead(503, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Admin secret not set' }));
-        return;
-      }
-      const authHeader = req.headers.authorization;
-      if (!authHeader || !authHeader.startsWith('Bearer ') || !_timingSafeEqual(authHeader.slice(7), ADMIN_SECRET)) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Unauthorized' }));
-        return;
-      }
-      const token = getGenerateToken()({ admin: true });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ token }));
-      return;
-    }
-
-    if (pathname === '/api/self-heal/trigger' && req.method === 'POST') {
+    // ── Cached screenshot (set by cycle manager) ──
+    if (pathname === '/api/screenshot') {
       getRequireAuth()(req, res, () => {
-        const { performSelfHeal } = require('./self-heal');
-        performSelfHeal().then((result: any) => { 
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: result }));
-        }).catch((err: any) => {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: err.message }));
+        const shot = getLatestScreenshot();
+        if (!shot) { jsonRes(res, { available: false }, 204); return; }
+        jsonRes(res, {
+          available: true,
+          timestamp: shot.timestamp,
+          age: Date.now() - shot.timestamp,
+          action: shot.action ? {
+            actionType: shot.action.actionType,
+            currentState: shot.action.currentState,
+            reasoning: shot.action.reasoning?.substring(0, 200),
+          } : null,
+          screenshot: shot.screenshot,
         });
       });
       return;
     }
 
-    if (pathname === '/api/emergency/stop' && req.method === 'POST') {
-      getRequireAuth()(req, res, () => {
-        const { requestStop } = require('./cycle-orchestrator');
-        requestStop();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, message: 'Emergency stop requested' }));
-      });
-      return;
-    }
-
-    if (pathname === '/api/gitops/rollback' && req.method === 'POST') {
-      getRequireAuth()(req, res, () => {
-        const gitOps = require('./self-heal-gitops');
+    // ── Live screenshot (capture right now) ──
+    if (pathname === '/api/screenshot/live') {
+      getRequireAuth()(req, res, async () => {
         try {
-          const result = gitOps.gitops?.rollbackToPrevious
-            ? gitOps.gitops.rollbackToPrevious()
-            : false;
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: result }));
-        } catch (err: any) {
-          logError('GitOps rollback failed', err);
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: false, error: err.message }));
+          const jpeg = await captureLiveScreenshot();
+          if (!jpeg) { jsonRes(res, { available: false, error: 'Browser not available' }, 503); return; }
+          jsonRes(res, { available: true, timestamp: Date.now(), screenshot: jpeg });
+        } catch (e: any) {
+          jsonRes(res, { available: false, error: e.message }, 500);
         }
       });
       return;
     }
 
+    // ── Provider health ──
+    if (pathname === '/api/providers') {
+      getRequireAuth()(req, res, async () => {
+        try {
+          const healthMod = require('./providers-health');
+          const registryMod = require('./providers-registry');
+          const providers = registryMod.getAvailableProviders ? await registryMod.getAvailableProviders() : [];
+          const healthDetails = providers.map((p: any) => {
+            const snapshot = healthMod.getHealthSnapshot?.(p.name) || {};
+            return {
+              name: p.name,
+              healthScore: p.healthScore,
+              totalCalls: snapshot.totalCalls || 0,
+              successRate: snapshot.successRate || 0,
+              avgLatencyMs: snapshot.avgLatencyMs || 0,
+              isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
+              circuitBreaker: snapshot.circuitBreakerState || 'closed',
+            };
+          });
+          const loadFailures = registryMod.getLoadFailures ? registryMod.getLoadFailures() : [];
+          jsonRes(res, { providers: healthDetails, loadFailures, providerCount: healthDetails.length, timestamp: Date.now() });
+        } catch (e: any) {
+          jsonRes(res, { error: e.message }, 500);
+        }
+      });
+      return;
+    }
+
+    // ── Banned actions (GET) ──
+    if (pathname === '/api/banned-actions' && req.method === 'GET') {
+      getRequireAuth()(req, res, () => {
+        try {
+          const { listBannedActions } = require('./database');
+          jsonRes(res, listBannedActions());
+        } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+      });
+      return;
+    }
+
+    // ── Full status (combined) ──
+    if (pathname === '/api/full-status') {
+      getRequireAuth()(req, res, async () => {
+        try {
+          const stats = getProviderStats()();
+          const mem = process.memoryUsage();
+          const shot = getLatestScreenshot();
+          const healthMod = require('./providers-health');
+          const registryMod = require('./providers-registry');
+          const providers = registryMod.getAvailableProviders ? await registryMod.getAvailableProviders() : [];
+          const providerSummary = providers.map((p: any) => ({
+            name: p.name, healthScore: p.healthScore,
+            isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
+          }));
+          const loadFailures = registryMod.getLoadFailures ? registryMod.getLoadFailures() : [];
+          const providerCount = registryMod.getAvailableProviderCount ? registryMod.getAvailableProviderCount() : 0;
+          jsonRes(res, {
+            ...stats,
+            daemon: getDaemonState(),
+            memory: {
+              heapUsed: (mem.heapUsed / 1024 / 1024).toFixed(0) + 'MB',
+              heapTotal: (mem.heapTotal / 1024 / 1024).toFixed(0) + 'MB',
+              rss: (mem.rss / 1024 / 1024).toFixed(0) + 'MB',
+            },
+            uptime: process.uptime(),
+            uptimeFormatted: formatUptime(process.uptime()),
+            screenshotAvailable: !!shot,
+            providers: providerSummary,
+            providerLoadFailures: loadFailures,
+            providerCount,
+            timestamp: Date.now(),
+            actionCache: (() => { try { return require('./services-action-cache').getStats(); } catch { return null; } })(),
+            workShifts: (() => { try { const ws = require('./services-work-shifts'); const s = ws.getShift(); return { current: s.current, reason: s.reason, fullCycle: ws.shouldRunFullCycle() }; } catch { return null; } })(),
+          });
+        } catch (e: any) {
+          jsonRes(res, { error: e.message, timestamp: Date.now() }, 500);
+        }
+      });
+      return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  CONTROL API ENDPOINTS (write operations)
+    // ═══════════════════════════════════════════════════════════════
+
+    // Admin token
+    if (pathname === '/api/admin/token' && req.method === 'GET') {
+      if (!ADMIN_SECRET) { jsonRes(res, { error: 'Admin secret not set' }, 503); return; }
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ') || !_timingSafeEqual(authHeader.slice(7), ADMIN_SECRET)) {
+        jsonRes(res, { error: 'Unauthorized' }, 401);
+        return;
+      }
+      jsonRes(res, { token: getGenerateToken()({ admin: true }) });
+      return;
+    }
+
+    // ── Emergency stop ──
+    if (pathname === '/api/emergency/stop' && req.method === 'POST') {
+      getRequireAuth()(req, res, () => {
+        try {
+          const { requestStop } = require('./cycle-orchestrator');
+          requestStop();
+          log('Emergency stop via dashboard', 'WARN', 'dashboard');
+          jsonRes(res, { success: true, message: 'Emergency stop requested' });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+      });
+      return;
+    }
+
+    // ── Resume daemon ──
+    if (pathname === '/api/daemon/resume' && req.method === 'POST') {
+      getRequireAuth()(req, res, () => {
+        try {
+          const { resumeDaemon } = require('./cycle-orchestrator');
+          resumeDaemon();
+          log('Daemon resumed via dashboard', 'INFO', 'dashboard');
+          jsonRes(res, { success: true, message: 'Daemon resumed' });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+      });
+      return;
+    }
+
+    // ── Self-heal trigger ──
+    if (pathname === '/api/self-heal/trigger' && req.method === 'POST') {
+      getRequireAuth()(req, res, () => {
+        try {
+          const { performSelfHeal } = require('./self-heal');
+          performSelfHeal().then((result: any) => {
+            jsonRes(res, { success: result });
+          }).catch((err: any) => {
+            jsonRes(res, { error: err.message }, 500);
+          });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+      });
+      return;
+    }
+
+    // ── GitOps rollback ──
+    if (pathname === '/api/gitops/rollback' && req.method === 'POST') {
+      getRequireAuth()(req, res, () => {
+        try {
+          const gitOps = require('./self-heal-gitops');
+          const result = gitOps.gitops?.rollbackToPrevious ? gitOps.gitops.rollbackToPrevious() : false;
+          jsonRes(res, { success: result });
+        } catch (err: any) {
+          logError('GitOps rollback failed', err);
+          jsonRes(res, { success: false, error: err.message }, 500);
+        }
+      });
+      return;
+    }
+
+    // ── Force state (via state-machine) ──
+    if (pathname === '/api/force-state' && req.method === 'POST') {
+      getRequireAuth()(req, res, () => {
+        readBody(req, res, (body) => {
+          try {
+            const data = JSON.parse(body);
+            if (!data.state || typeof data.state !== 'string') {
+              jsonRes(res, { error: 'state is required' }, 400); return;
+            }
+            const { forceState } = require('./state-machine');
+            forceState(data.state, 'dashboard_admin');
+            log(`State forced via dashboard: ${data.state}`, 'WARN', 'dashboard');
+            jsonRes(res, { success: true, state: data.state });
+          } catch (e: any) {
+            jsonRes(res, { error: e.message }, 400);
+          }
+        });
+      });
+      return;
+    }
+
+    // ── Ban action ──
+    if (pathname === '/api/banned-actions' && req.method === 'POST') {
+      getRequireAuth()(req, res, () => {
+        readBody(req, res, (body) => {
+          try {
+            const data = JSON.parse(body);
+            if (!data.action_type) { jsonRes(res, { error: 'action_type is required' }, 400); return; }
+            const { insertBannedAction } = require('./database');
+            insertBannedAction(data.action_type, 'dashboard', Date.now(), data.reason || 'Manual ban via dashboard');
+            log(`Action banned via dashboard: ${data.action_type} (${data.reason || 'no reason'})`, 'WARN', 'dashboard');
+            jsonRes(res, { success: true, banned: data.action_type });
+          } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+        });
+      });
+      return;
+    }
+
+    // ── Unban action ──
+    if (pathname === '/api/banned-actions' && req.method === 'DELETE') {
+      getRequireAuth()(req, res, () => {
+        readBody(req, res, (body) => {
+          try {
+            const data = JSON.parse(body);
+            if (!data.action_type) { jsonRes(res, { error: 'action_type is required' }, 400); return; }
+            const { deleteBannedAction } = require('./database');
+            deleteBannedAction(data.action_type);
+            log(`Action unbanned via dashboard: ${data.action_type}`, 'INFO', 'dashboard');
+            jsonRes(res, { success: true, unbanned: data.action_type });
+          } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+        });
+      });
+      return;
+    }
+
+    // ── Action cache management ──
+    if (pathname === '/api/action-cache/clear' && req.method === 'POST') {
+      getRequireAuth()(req, res, () => {
+        try {
+          const ac = require('./services-action-cache');
+          ac.clear();
+          log('Action cache cleared via dashboard', 'INFO', 'dashboard');
+          jsonRes(res, { success: true });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+      });
+      return;
+    }
+
+    // ── Set config ──
+    if (pathname === '/api/config' && req.method === 'POST') {
+      getRequireAuth()(req, res, () => {
+        readBody(req, res, (body) => {
+          try {
+            const data = JSON.parse(body);
+            if (!SAFE_CONFIG_KEYS.has(data.key)) {
+              jsonRes(res, { error: 'Config key not allowed. Allowed: ' + [...SAFE_CONFIG_KEYS].join(', ') }, 403); return;
+            }
+            const { updateConfig } = require('./get-config');
+            updateConfig(data.key, data.value);
+            log(`Config changed via dashboard: ${data.key} = ${data.value}`, 'INFO', 'dashboard');
+            jsonRes(res, { success: true, key: data.key, value: data.value });
+          } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+        });
+      });
+      return;
+    }
+
+    // ── Generic command endpoint (legacy compat) ──
     if (pathname === '/api/command' && req.method === 'POST') {
       getRequireAuth()(req, res, () => {
-        let body = ''; const MAX_BODY_SIZE = 1 * 1024 * 1024; let bodyTooLarge = false; req.on('data', (chunk: any) => { if (body.length > MAX_BODY_SIZE) { if (!bodyTooLarge) { bodyTooLarge = true; res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Request body too large' })); req.destroy(); } return; } body += chunk });
-        req.on('end', () => {
-          if (bodyTooLarge) return;
+        readBody(req, res, (body) => {
           try {
             const data = JSON.parse(body);
             const { action, params } = data;
-            if (action === 'force_state' && params.state) {
+            if (action === 'force_state' && params?.state) {
               const { forceState } = require('./state-machine');
               forceState(params.state, 'admin_command');
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: true, state: params.state }));
+              jsonRes(res, { success: true, state: params.state });
             } else if (action === 'restart') {
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: true, message: 'Restarting in 5 seconds...' }));
-              log('Restart requested via dashboard, shutting down in 5s', 'WARN', 'dashboard');
+              jsonRes(res, { success: true, message: 'Restarting in 5 seconds...' });
+              log('Restart requested via dashboard', 'WARN', 'dashboard');
               setTimeout(() => process.exit(0), 5000);
             } else if (action === 'gc') {
               if (global.gc) global.gc();
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: true }));
+              jsonRes(res, { success: true });
             } else if (action === 'set_config') {
-              const SAFE_CONFIG_KEYS = new Set(['SLEEP_MIN_HOURS', 'SLEEP_MAX_HOURS', 'MAX_CYCLES_BEFORE_RESTART', 'MAX_CONSECUTIVE_FAILURES', 'CANARY_OBSERVATION_HOURS', 'PROMPT_EVOLUTION_MIN_ENTRIES', 'VISION_PRIORITY', 'ALERT_ON_ERROR', 'ALERT_ON_STAGNATION', 'ANOMALY_CHECK_INTERVAL_MS']);
               if (!SAFE_CONFIG_KEYS.has(params.key)) {
-                res.writeHead(403, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Config key not allowed' }));
-                return;
+                jsonRes(res, { error: 'Config key not allowed' }, 403); return;
               }
               const { updateConfig } = require('./get-config');
               updateConfig(params.key, params.value);
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: true }));
+              jsonRes(res, { success: true });
             } else {
-              res.writeHead(400, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: 'Unknown command' }));
+              jsonRes(res, { error: 'Unknown command' }, 400);
             }
-          } catch (e: any) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Invalid JSON' }));
-          }
+          } catch (e: any) { jsonRes(res, { error: 'Invalid JSON' }, 400); }
         });
       });
       return;
@@ -297,14 +595,509 @@ function createDashboardServer() {
   return server;
 }
 
-function startDashboard() { 
+function startDashboard() {
   const server = createDashboardServer();
-  // Cloud platforms (Render, Railway, etc.) inject PORT — prefer it over config defaults
   const port = parseInt(process.env.PORT || process.env.DASHBOARD_PORT || getCONFIG().STATUS_PORT || 8080);
   server.listen(port, () => {
-    log(`📊 Dashboard listening on port ${port}`, 'INFO', 'dashboard');
+    log(`Dashboard listening on port ${port}`, 'INFO', 'dashboard');
   });
   return server;
 }
 
-module.exports = { startDashboard, createDashboardServer, _injectDependencies };
+// ═══════════════════════════════════════════════════════════════════════
+//  EMBEDDED DASHBOARD HTML
+// ═══════════════════════════════════════════════════════════════════════
+
+function getDashboardHTML(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MathU Bot Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --bg2: #161822;
+    --bg3: #1c1f2e;
+    --border: #2a2d3e;
+    --text: #e1e4ed;
+    --text2: #8b8fa3;
+    --accent: #6366f1;
+    --accent2: #818cf8;
+    --green: #22c55e;
+    --red: #ef4444;
+    --yellow: #eab308;
+    --orange: #f97316;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+  a { color: var(--accent2); }
+
+  .header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .header h1 { font-size: 18px; font-weight: 600; }
+  .header .status-badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: 600; }
+  .header .status-badge.ok { background: #052e16; color: var(--green); }
+  .header .status-badge.warn { background: #422006; color: var(--yellow); }
+  .header .status-badge.err { background: #450a0a; color: var(--red); }
+  .header .status-badge .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .header .meta { margin-left: auto; font-size: 13px; color: var(--text2); }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; padding: 16px 24px; }
+  .card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  .card-header { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; font-size: 14px; font-weight: 600; }
+  .card-body { padding: 12px 16px; }
+
+  .stat-row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-label { color: var(--text2); }
+  .stat-value { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat-value.green { color: var(--green); }
+  .stat-value.red { color: var(--red); }
+  .stat-value.yellow { color: var(--yellow); }
+  .stat-value.orange { color: var(--orange); }
+
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg3); color: var(--text); font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.15s; }
+  .btn:hover { background: var(--border); }
+  .btn:active { transform: scale(0.97); }
+  .btn.danger { border-color: #7f1d1d; color: var(--red); }
+  .btn.danger:hover { background: #450a0a; }
+  .btn.primary { border-color: #3730a3; color: var(--accent2); }
+  .btn.primary:hover { background: #312e81; }
+  .btn.success { border-color: #14532d; color: var(--green); }
+  .btn.success:hover { background: #052e16; }
+  .btn.sm { padding: 5px 10px; font-size: 12px; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .btn-group { display: flex; flex-wrap: wrap; gap: 8px; }
+
+  select, input[type="text"], input[type="number"] {
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+    color: var(--text); padding: 7px 12px; font-size: 13px; font-family: inherit;
+  }
+  select:focus, input:focus { outline: none; border-color: var(--accent); }
+  select { cursor: pointer; }
+
+  .screenshot-container { position: relative; background: #000; border-radius: var(--radius); overflow: hidden; }
+  .screenshot-container img { width: 100%; display: block; }
+  .screenshot-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text2); font-size: 14px; background: rgba(0,0,0,0.6); }
+  .screenshot-meta { padding: 8px; font-size: 11px; color: var(--text2); background: var(--bg); border-top: 1px solid var(--border); display: flex; justify-content: space-between; }
+
+  .banned-list { max-height: 200px; overflow-y: auto; }
+  .banned-item { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .banned-item:last-child { border-bottom: none; }
+
+  .provider-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .provider-row:last-child { border-bottom: none; }
+  .provider-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .provider-dot.online { background: var(--green); }
+  .provider-dot.offline { background: var(--red); }
+  .provider-dot.degraded { background: var(--yellow); }
+
+  .log-viewer { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px; font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace; font-size: 12px; max-height: 350px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.6; }
+
+  .toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 1000; display: flex; flex-direction: column; gap: 8px; }
+  .toast { padding: 10px 16px; border-radius: var(--radius); font-size: 13px; font-weight: 500; animation: slideIn 0.2s ease-out; }
+  .toast.success { background: #052e16; color: var(--green); border: 1px solid #14532d; }
+  .toast.error { background: #450a0a; color: var(--red); border: 1px solid #7f1d1d; }
+  .toast.info { background: #1e1b4b; color: var(--accent2); border: 1px solid #3730a3; }
+  @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+
+  .config-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+  .config-row select { flex: 1; }
+
+  .empty { color: var(--text2); font-size: 13px; padding: 12px; text-align: center; }
+  .full-width { grid-column: 1 / -1; }
+
+  .action-info { font-size: 11px; color: var(--text2); margin-top: 4px; }
+
+  @media (max-width: 640px) {
+    .grid { padding: 12px; gap: 12px; }
+    .header { padding: 12px 16px; }
+    .header h1 { font-size: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>MathU Bot</h1>
+  <span id="statusBadge" class="status-badge ok"><span class="dot"></span><span id="statusText">Loading...</span></span>
+  <span class="meta" id="metaInfo"></span>
+</div>
+
+<div class="grid" id="mainGrid">
+
+  <!-- Screenshot -->
+  <div class="card">
+    <div class="card-header">
+      <span>Screenshot</span>
+      <div class="btn-group">
+        <button class="btn sm primary" onclick="captureLive()">Capture Live</button>
+        <button class="btn sm" onclick="refreshScreenshot()">Refresh Cached</button>
+      </div>
+    </div>
+    <div class="card-body" style="padding:0">
+      <div class="screenshot-container" id="screenshotBox">
+        <div class="screenshot-overlay" id="screenshotOverlay">No screenshot available</div>
+      </div>
+      <div class="screenshot-meta">
+        <span id="screenshotAge">-</span>
+        <span id="screenshotAction">-</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Daemon Control -->
+  <div class="card">
+    <div class="card-header">Daemon Control</div>
+    <div class="card-body">
+      <div class="btn-group" style="margin-bottom: 12px;">
+        <button class="btn danger" onclick="emergencyStop()">Emergency Stop</button>
+        <button class="btn success" onclick="resumeDaemon()">Resume Daemon</button>
+        <button class="btn primary" onclick="triggerSelfHeal()">Self-Heal</button>
+      </div>
+      <div class="btn-group">
+        <button class="btn" onclick="gc()">Force GC</button>
+        <button class="btn" onclick="clearActionCache()">Clear Action Cache</button>
+        <button class="btn" onclick="rollback()">Rollback</button>
+      </div>
+      <div id="daemonState" class="action-info" style="margin-top:12px;">Loading...</div>
+    </div>
+  </div>
+
+  <!-- State Control -->
+  <div class="card">
+    <div class="card-header">State Control</div>
+    <div class="card-body">
+      <div class="config-row">
+        <select id="stateSelect"><option value="">Loading states...</option></select>
+        <button class="btn primary" onclick="forceState()">Force State</button>
+      </div>
+      <div id="currentState" class="stat-row"><span class="stat-label">Current State</span><span class="stat-value">-</span></div>
+      <div id="stateAge" class="stat-row"><span class="stat-label">State Age</span><span class="stat-value">-</span></div>
+      <div id="deadlock" class="stat-row"><span class="stat-label">Deadlock</span><span class="stat-value">-</span></div>
+    </div>
+  </div>
+
+  <!-- Ban Actions -->
+  <div class="card">
+    <div class="card-header">Action Bans</div>
+    <div class="card-body">
+      <div class="config-row">
+        <select id="banActionSelect"><option value="">Loading actions...</option></select>
+        <input type="text" id="banReason" placeholder="Reason (optional)" style="flex:1">
+        <button class="btn danger sm" onclick="banAction()">Ban</button>
+      </div>
+      <div class="banned-list" id="bannedList"><div class="empty">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Config -->
+  <div class="card">
+    <div class="card-header">Config</div>
+    <div class="card-body">
+      <div class="config-row">
+        <select id="configKeySelect">
+          <option value="SLEEP_MIN_HOURS">SLEEP_MIN_HOURS</option>
+          <option value="SLEEP_MAX_HOURS">SLEEP_MAX_HOURS</option>
+          <option value="MAX_CYCLES_BEFORE_RESTART">MAX_CYCLES_BEFORE_RESTART</option>
+          <option value="MAX_CONSECUTIVE_FAILURES">MAX_CONSECUTIVE_FAILURES</option>
+          <option value="VISION_PRIORITY">VISION_PRIORITY</option>
+          <option value="ALERT_ON_ERROR">ALERT_ON_ERROR</option>
+          <option value="ALERT_ON_STAGNATION">ALERT_ON_STAGNATION</option>
+          <option value="OPENROUTER_TRIBUNAL_MODEL">OPENROUTER_MODEL</option>
+        </select>
+        <input type="text" id="configValue" placeholder="Value" style="flex:1">
+        <button class="btn primary sm" onclick="setConfig()">Set</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Providers -->
+  <div class="card">
+    <div class="card-header">Providers</div>
+    <div class="card-body" id="providersList"><div class="empty">Loading...</div></div>
+  </div>
+
+  <!-- Memory & System -->
+  <div class="card">
+    <div class="card-header">System</div>
+    <div class="card-body" id="systemStats"></div>
+  </div>
+
+  <!-- Action Cache -->
+  <div class="card">
+    <div class="card-header">Action Cache</div>
+    <div class="card-body" id="actionCacheStats"><div class="empty">Loading...</div></div>
+  </div>
+
+  <!-- Logs -->
+  <div class="card full-width">
+    <div class="card-header">
+      <span>Logs</span>
+      <button class="btn sm" onclick="refreshLogs()">Refresh</button>
+    </div>
+    <div class="card-body" style="padding:0">
+      <div class="log-viewer" id="logViewer">Loading...</div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+const API = '';
+let authHeader = '';
+let autoRefresh = true;
+
+async function api(path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (authHeader) headers['Authorization'] = authHeader;
+  try {
+    const r = await fetch(API + path, { ...opts, headers });
+    if (r.status === 401) {
+      const token = prompt('Enter admin token (or ADMIN_SECRET):');
+      if (token) { authHeader = 'Bearer ' + token; return api(path, opts); }
+      throw new Error('Unauthorized');
+    }
+    const ct = r.headers.get('content-type') || '';
+    if (ct.includes('application/json')) return r.json();
+    return r.text();
+  } catch (e) {
+    console.error('API error:', path, e);
+    return null;
+  }
+}
+
+function toast(msg, type = 'info') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  document.getElementById('toastContainer').appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+function fmtUptime(s) {
+  if (!s) return '-';
+  const d = Math.floor(s/86400), h = Math.floor((s%86400)/3600), m = Math.floor((s%3600)/60), sec = Math.floor(s%60);
+  return [d>0?d+'d':'', h>0?h+'h':'', m>0?m+'m':'', sec+'s'].filter(Boolean).join(' ');
+}
+
+function fmtAge(ms) {
+  if (!ms || ms < 0) return '-';
+  if (ms < 60000) return Math.round(ms/1000) + 's ago';
+  return Math.round(ms/60000) + 'm ago';
+}
+
+// ── Screenshot ──
+async function refreshScreenshot() {
+  const data = await api('/api/screenshot');
+  if (!data) return;
+  if (!data.available) {
+    document.getElementById('screenshotOverlay').style.display = 'flex';
+    document.getElementById('screenshotOverlay').textContent = 'No screenshot available';
+    document.getElementById('screenshotAge').textContent = '-';
+    document.getElementById('screenshotAction').textContent = '-';
+    return;
+  }
+  const box = document.getElementById('screenshotBox');
+  let img = box.querySelector('img');
+  if (!img) { img = document.createElement('img'); box.appendChild(img); }
+  img.src = 'data:image/jpeg;base64,' + data.screenshot;
+  img.style.display = 'block';
+  document.getElementById('screenshotOverlay').style.display = 'none';
+  document.getElementById('screenshotAge').textContent = fmtAge(Date.now() - data.timestamp);
+  document.getElementById('screenshotAction').textContent = data.action ? data.action.actionType + ' | ' + (data.action.currentState || '') : '-';
+}
+
+async function captureLive() {
+  toast('Capturing live screenshot...', 'info');
+  const data = await api('/api/screenshot/live');
+  if (!data || !data.available) { toast('Failed to capture screenshot', 'error'); return; }
+  const box = document.getElementById('screenshotBox');
+  let img = box.querySelector('img');
+  if (!img) { img = document.createElement('img'); box.appendChild(img); }
+  img.src = 'data:image/jpeg;base64,' + data.screenshot;
+  img.style.display = 'block';
+  document.getElementById('screenshotOverlay').style.display = 'none';
+  document.getElementById('screenshotAge').textContent = 'Just now';
+  toast('Live screenshot captured', 'success');
+}
+
+// ── Daemon ──
+async function emergencyStop() {
+  if (!confirm('Stop the bot daemon? It will not run cycles until resumed.')) return;
+  const r = await api('/api/emergency/stop', { method: 'POST' });
+  if (r?.success) toast('Emergency stop activated', 'success');
+  else toast('Stop failed', 'error');
+  refreshAll();
+}
+async function resumeDaemon() {
+  const r = await api('/api/daemon/resume', { method: 'POST' });
+  if (r?.success) toast('Daemon resumed', 'success');
+  else toast('Resume failed', 'error');
+  refreshAll();
+}
+async function triggerSelfHeal() {
+  toast('Self-heal triggered...', 'info');
+  const r = await api('/api/self-heal/trigger', { method: 'POST' });
+  toast(r?.success ? 'Self-heal complete' : 'Self-heal failed', r?.success ? 'success' : 'error');
+}
+async function gc() {
+  const r = await api('/api/command', { method: 'POST', body: JSON.stringify({ action: 'gc' }) });
+  toast(r?.success ? 'GC triggered' : 'GC failed', r?.success ? 'success' : 'error');
+}
+async function clearActionCache() {
+  if (!confirm('Clear all cached actions?')) return;
+  const r = await api('/api/action-cache/clear', { method: 'POST' });
+  toast(r?.success ? 'Cache cleared' : 'Failed', r?.success ? 'success' : 'error');
+  refreshAll();
+}
+async function rollback() {
+  if (!confirm('Rollback to previous version?')) return;
+  const r = await api('/api/gitops/rollback', { method: 'POST' });
+  toast(r?.success ? 'Rollback initiated' : 'Rollback failed', r?.success ? 'success' : 'error');
+}
+
+// ── State ──
+async function loadStates() {
+  const r = await api('/api/states');
+  if (!r) return;
+  const sel = document.getElementById('stateSelect');
+  sel.innerHTML = '<option value="">Select state...</option>' + r.states.map(s => '<option value="'+s+'">'+s+'</option>').join('');
+}
+async function forceState() {
+  const s = document.getElementById('stateSelect').value;
+  if (!s) return;
+  if (!confirm('Force state to: ' + s + '?')) return;
+  const r = await api('/api/force-state', { method: 'POST', body: JSON.stringify({ state: s }) });
+  toast(r?.success ? 'State forced: ' + s : 'Failed: ' + (r?.error||''), r?.success ? 'success' : 'error');
+  refreshAll();
+}
+
+// ── Actions Ban ──
+async function loadActions() {
+  const r = await api('/api/actions');
+  if (!r) return;
+  const sel = document.getElementById('banActionSelect');
+  sel.innerHTML = '<option value="">Select action...</option>' + r.actions.map(a => '<option value="'+a+'">'+a+'</option>').join('');
+}
+async function banAction() {
+  const action = document.getElementById('banActionSelect').value;
+  const reason = document.getElementById('banReason').value;
+  if (!action) return;
+  const r = await api('/api/banned-actions', { method: 'POST', body: JSON.stringify({ action_type: action, reason }) });
+  toast(r?.success ? 'Banned: ' + action : 'Failed', r?.success ? 'success' : 'error');
+  refreshBans();
+}
+async function unbanAction(actionType) {
+  const r = await api('/api/banned-actions', { method: 'DELETE', body: JSON.stringify({ action_type: actionType }) });
+  toast(r?.success ? 'Unbanned: ' + actionType : 'Failed', r?.success ? 'success' : 'error');
+  refreshBans();
+}
+async function refreshBans() {
+  const rows = await api('/api/banned-actions');
+  const el = document.getElementById('bannedList');
+  if (!rows || rows.length === 0) { el.innerHTML = '<div class="empty">No banned actions</div>'; return; }
+  el.innerHTML = rows.map(r => '<div class="banned-item"><span>'+r.action_type+(r.reason ? ' <span style="color:var(--text2)">- '+r.reason+'</span>' : '')+'</span><button class="btn sm" onclick="unbanAction(\\''+r.action_type+'\\')">Unban</button></div>').join('');
+}
+
+// ── Config ──
+async function setConfig() {
+  const key = document.getElementById('configKeySelect').value;
+  const value = document.getElementById('configValue').value;
+  if (!key || !value) return;
+  const r = await api('/api/config', { method: 'POST', body: JSON.stringify({ key, value }) });
+  toast(r?.success ? key + ' = ' + value : 'Failed: ' + (r?.error||''), r?.success ? 'success' : 'error');
+}
+
+// ── Logs ──
+async function refreshLogs() {
+  const text = await api('/api/logs');
+  const el = document.getElementById('logViewer');
+  if (text) { el.textContent = typeof text === 'string' ? text : JSON.stringify(text); el.scrollTop = el.scrollHeight; }
+}
+
+// ── Refresh all data ──
+async function refreshAll() {
+  // Full status
+  const full = await api('/api/full-status');
+  if (full) {
+    // Status badge
+    const badge = document.getElementById('statusBadge');
+    const sText = document.getElementById('statusText');
+    const ds = full.daemon;
+    if (ds?.stopRequested) { badge.className = 'status-badge warn'; sText.textContent = 'Paused'; }
+    else { badge.className = 'status-badge ok'; sText.textContent = 'Running'; }
+
+    // Meta
+    document.getElementById('metaInfo').textContent = fmtUptime(full.uptime) + ' | ' + (full.memory?.rss || '-') + ' RSS';
+
+    // Daemon state
+    document.getElementById('daemonState').textContent = 'Stop: ' + (ds?.stopRequested ? 'YES' : 'no') + ' | Cycles: ' + (full.cycleCount || 0) + ' | Questions: ' + (full.questionsCompleted || 0);
+
+    // System
+    const sys = document.getElementById('systemStats');
+    sys.innerHTML =
+      '<div class="stat-row"><span class="stat-label">Uptime</span><span class="stat-value">' + fmtUptime(full.uptime) + '</span></div>' +
+      '<div class="stat-row"><span class="stat-label">Heap Used</span><span class="stat-value">' + (full.memory?.heapUsed||'-') + '</span></div>' +
+      '<div class="stat-row"><span class="stat-label">RSS</span><span class="stat-value">' + (full.memory?.rss||'-') + '</span></div>' +
+      '<div class="stat-row"><span class="stat-label">Providers</span><span class="stat-value">' + (full.providerCount||0) + '</span></div>' +
+      (full.workShifts ? '<div class="stat-row"><span class="stat-label">Work Shift</span><span class="stat-value ' + (full.workShifts.fullCycle ? 'green' : 'yellow') + '">' + full.workShifts.current + '</span></div>' : '');
+
+    // Action Cache
+    const ac = full.actionCache;
+    const acEl = document.getElementById('actionCacheStats');
+    if (ac) {
+      acEl.innerHTML =
+        '<div class="stat-row"><span class="stat-label">Hits</span><span class="stat-value green">' + (ac.hits||0) + '</span></div>' +
+        '<div class="stat-row"><span class="stat-label">Misses</span><span class="stat-value">' + (ac.misses||0) + '</span></div>' +
+        '<div class="stat-row"><span class="stat-label">Saves</span><span class="stat-value">' + (ac.saves||0) + '</span></div>' +
+        '<div class="stat-row"><span class="stat-label">Evictions</span><span class="stat-value red">' + (ac.evictions||0) + '</span></div>' +
+        '<div class="stat-row"><span class="stat-label">Active Entries</span><span class="stat-value">' + (ac.activeEntries||0) + '</span></div>' +
+        (ac.topActions?.length ? '<div style="margin-top:8px;font-size:11px;color:var(--text2)">Top: ' + ac.topActions.map(a=>a.action+' ('+a.count+')').join(', ') + '</div>' : '');
+    } else { acEl.innerHTML = '<div class="empty">No cache data</div>'; }
+
+    // Providers
+    const pList = document.getElementById('providersList');
+    if (full.providers?.length) {
+      pList.innerHTML = full.providers.map(p => {
+        const cls = p.isAvailable ? (p.healthScore > 70 ? 'online' : 'degraded') : 'offline';
+        return '<div class="provider-row"><span class="provider-dot ' + cls + '"></span><span style="flex:1">' + p.name + '</span><span class="stat-value">' + (p.healthScore||0) + '%</span></div>';
+      }).join('');
+    } else { pList.innerHTML = '<div class="empty">No providers</div>'; }
+  }
+
+  // State
+  const state = await api('/api/state');
+  if (state) {
+    document.querySelector('#currentState .stat-value').textContent = state.currentState || '-';
+    document.querySelector('#stateAge .stat-value').textContent = state.stateAge ? fmtUptime(state.stateAge / 1000) : '-';
+    const dl = document.querySelector('#deadlock .stat-value');
+    if (state.deadlockDetected) { dl.textContent = 'DETECTED'; dl.className = 'stat-value red'; }
+    else { dl.textContent = 'None'; dl.className = 'stat-value green'; }
+  }
+
+  // Screenshot
+  refreshScreenshot();
+  // Bans
+  refreshBans();
+}
+
+// ── Init ──
+(async function init() {
+  await loadStates();
+  await loadActions();
+  await refreshAll();
+  refreshLogs();
+  setInterval(() => { if (autoRefresh) refreshAll(); }, 5000);
+  setInterval(refreshLogs, 10000);
+})();
+</script>
+</body>
+</html>`;
+}
+
+module.exports = { startDashboard, createDashboardServer, _injectDependencies, getLatestScreenshot, setLatestScreenshot };
