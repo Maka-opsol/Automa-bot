@@ -1,9 +1,10 @@
 'use strict';
 
+import type { Deps } from './types/di-types';
 const EventEmitter = require('events');
-let _deps: any = {};
+let _deps: Deps = {};
 
-function _injectDependencies(deps: any) {
+function _injectDependencies(deps: Deps) {
   _deps = deps;
 }
 
@@ -38,11 +39,8 @@ type GuardFn = () => boolean | Promise<boolean>;
 const STATES: Readonly<Record<string, string>> = {
   MATHU_LOGIN: 'mathu_login',
   MICROSOFT_EMAIL_INPUT: 'microsoft_email_input',
-  MICROSOFT_PASSWORD_INPUT: 'microsoft_password_input',
-  MICROSOFT_STAY_SIGNED_IN: 'microsoft_stay_signed_in',
   ADVLEARN_LOGIN: 'advlearn_login',
   ASSIGNMENTS_PAGE: 'assignments_page',
-  MODULE_DOWNLOADING: 'module_downloading',
   VIDEO_PLAYER: 'video_player',
   EXERCISE_INFO: 'exercise_info',
   EXERCISE_MEMO: 'exercise_memo',
@@ -87,13 +85,10 @@ const ACTIONS_REQUIRING_COORDS: ReadonlySet<string> = new Set([
 
 // VALID_TRANSITIONS is intentionally mutable — `updateTransitions` and `addState` extend it at runtime
 const VALID_TRANSITIONS: Record<string, string[]> = {
-  [STATES.MATHU_LOGIN]: [STATES.MICROSOFT_EMAIL_INPUT, STATES.MICROSOFT_PASSWORD_INPUT, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.MICROSOFT_EMAIL_INPUT]: [STATES.MICROSOFT_PASSWORD_INPUT, STATES.ADVLEARN_LOGIN, STATES.MICROSOFT_STAY_SIGNED_IN, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.MICROSOFT_PASSWORD_INPUT]: [STATES.MICROSOFT_STAY_SIGNED_IN, STATES.ADVLEARN_LOGIN, STATES.ASSIGNMENTS_PAGE, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.MICROSOFT_STAY_SIGNED_IN]: [STATES.ADVLEARN_LOGIN, STATES.ASSIGNMENTS_PAGE, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.ADVLEARN_LOGIN]: [STATES.ASSIGNMENTS_PAGE, STATES.MICROSOFT_STAY_SIGNED_IN, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
-  [STATES.ASSIGNMENTS_PAGE]: [STATES.VIDEO_PLAYER, STATES.EXERCISE_INFO, STATES.ASSESSMENT, STATES.ASSIGNMENTS_PAGE, STATES.MODULE_DOWNLOADING, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR, STATES.UI_DISCOVERED, STATES.EXPLORATION],
-  [STATES.MODULE_DOWNLOADING]: [STATES.ASSIGNMENTS_PAGE, STATES.VIDEO_PLAYER, STATES.EXERCISE_INFO, STATES.ASSESSMENT, STATES.MODULE_DOWNLOADING, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
+  [STATES.MATHU_LOGIN]: [STATES.MICROSOFT_EMAIL_INPUT, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
+  [STATES.MICROSOFT_EMAIL_INPUT]: [STATES.ADVLEARN_LOGIN, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
+  [STATES.ADVLEARN_LOGIN]: [STATES.ASSIGNMENTS_PAGE, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
+  [STATES.ASSIGNMENTS_PAGE]: [STATES.VIDEO_PLAYER, STATES.EXERCISE_INFO, STATES.ASSESSMENT, STATES.ASSIGNMENTS_PAGE, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR, STATES.UI_DISCOVERED, STATES.EXPLORATION],
   [STATES.VIDEO_PLAYER]: [STATES.EXERCISE_INFO, STATES.ASSESSMENT, STATES.SCORE_SCREEN, STATES.ASSIGNMENTS_PAGE, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
   [STATES.EXERCISE_INFO]: [STATES.EXERCISE_MEMO, STATES.ASSIGNMENTS_PAGE, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
   [STATES.EXERCISE_MEMO]: [STATES.ASSESSMENT, STATES.ASSIGNMENTS_PAGE, STATES.SCORE_SCREEN, STATES.ANYWHERE_CLICK_RECOVERY, STATES.ERROR],
@@ -238,12 +233,14 @@ class StateMachine extends EventEmitter {
       const guardKey: string = `${this.currentState}->${newState}`;
       const guard: GuardFn | undefined = this.guards.get(guardKey);
       if (guard) {
+        // FIX: Save timer handle and clear after race resolves
+        let guardTimer: any = null;
         try {
           const guardResult: boolean = await Promise.race<boolean>([
             guard(),
-            new Promise<boolean>((_, reject) =>
-              setTimeout(() => reject(new Error('Guard timeout')), 5000),
-            ),
+            new Promise<boolean>((_, reject) => {
+              guardTimer = setTimeout(() => reject(new Error('Guard timeout')), 5000);
+            }),
           ]);
           if (!guardResult) {
             this.emit('guardRejected', { from: this.currentState, to: newState });
@@ -255,6 +252,8 @@ class StateMachine extends EventEmitter {
           log(`Guard error (${guardKey}): ${message}`, 'ERROR', 'state-machine');
           this.emit('guardError', { from: this.currentState, to: newState, error: message });
           return false;
+        } finally {
+          if (guardTimer) clearTimeout(guardTimer);
         }
       }
       await this._runHooks(this.currentState, 'exit');
@@ -291,15 +290,19 @@ class StateMachine extends EventEmitter {
   private async _runHooks(state: string, type: 'enter' | 'exit'): Promise<void> {
     const hooks: Hook[] = this.hooks.get(state)?.filter((h: Hook) => h.type === type) || [];
     for (const hook of hooks) {
+      // FIX: Save timer handle and clear after race resolves
+      let hookTimer: any = null;
       try {
         await Promise.race<void>([
           hook.fn(state) as Promise<void>,
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('Hook timeout')), 30000),
-          ),
+          new Promise<never>((_, reject) => {
+            hookTimer = setTimeout(() => reject(new Error('Hook timeout')), 30000);
+          }),
         ]);
       } catch (err: unknown) {
         logError(`Hook error (${type} ${state})`, err as Error);
+      } finally {
+        if (hookTimer) clearTimeout(hookTimer);
       }
     }
   }
@@ -431,6 +434,22 @@ class StateMachine extends EventEmitter {
     this.deadlockDetected = false;
     safeLog({ action: 'force_state', from: oldState, to: newState, reason }, 'WARN', 'state-machine');
     this._persistState(oldState, newState);
+    // FIX: Run hooks on forceState to prevent data loss.
+    // Hooks are fire-and-forget (sync) since forceState is sync.
+    try {
+      // Run exit hook for old state
+      const exitHooks = this.hooks.get(oldState || '')?.filter((h: Hook) => h.type === 'exit') || [];
+      for (const hook of exitHooks) {
+        try { hook.fn(newState); } catch (e: unknown) { logError(`forceState exit hook error`, e as Error); }
+      }
+      // Run enter hook for new state
+      const enterHooks = this.hooks.get(newState)?.filter((h: Hook) => h.type === 'enter') || [];
+      for (const hook of enterHooks) {
+        try { hook.fn(newState); } catch (e: unknown) { logError(`forceState enter hook error`, e as Error); }
+      }
+    } catch (e: unknown) {
+      logError(`forceState hook error`, e as Error);
+    }
     this.emit('forceState', { from: oldState, to: newState, reason });
   }
 }
@@ -467,4 +486,4 @@ module.exports = {
     historyLength: stateMachine.history.length,
     deadlockDetected: stateMachine.deadlockDetected,
   }),
-}
+};
