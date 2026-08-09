@@ -244,9 +244,14 @@ setInterval(() => {
     }
     log(`Memory critical: ${used.toFixed(0)}MB (external: ${external.toFixed(0)}MB, threshold ${CONFIG.MEMORY_RESTART_THRESHOLD_MB}MB) - restarting`, 'WARN', 'agent');
     if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Memory critical: ${used.toFixed(0)}MB, restarting`); } catch (e: any) {}
-    // HF Spaces: exit(1) triggers container restart (desired behavior)
-    // On Render, same behavior. This is intentional.
-    process.exit(1);
+    // FIX: Route through gracefulShutdown to ensure DB/browser cleanup
+    // instead of raw process.exit(1) which skips all shutdown hooks.
+    const { gracefulShutdown } = require('./render-free-plan') || {};
+    if (typeof gracefulShutdown === 'function') {
+      gracefulShutdown('memory-critical').catch(() => { process.exit(1); });
+    } else {
+      process.exit(1);
+    }
   } else if (used > CONFIG.MEMORY_WARNING_THRESHOLD_MB) {
     _memoryWarningCount++;
     // Suggest browser close on persistent memory pressure
