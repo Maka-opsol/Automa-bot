@@ -115,6 +115,10 @@ function _timingSafeEqual(a: any, b: any) {
 const DASHBOARD_DIR = path.join(PROJECT_ROOT, 'public');
 const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
 
+// ── Auto-capture throttle (max once per 30s) ──
+let _lastAutoCaptureTs = 0;
+const AUTO_CAPTURE_INTERVAL_MS = 30 * 1000;
+
 // ── Screenshot cache (shared with render-free-plan.ts via globals) ──
 // render-free-plan.ts sets (globalThis).__setLatestScreenshot and
 // (globalThis).__getLatestScreenshot FIRST (it starts before us).
@@ -134,7 +138,7 @@ function getLatestScreenshot(): { screenshot: string; timestamp: number; action?
   // the cycle manager writes to. Fall back to local only in standalone.
   const globalGet = (globalThis as any).__getLatestScreenshot;
   if (globalGet) return globalGet();
-  if (_standaloneScreenshot && Date.now() - _standaloneScreenshot.timestamp > 120_000) {
+  if (_standaloneScreenshot && Date.now() - _standaloneScreenshot.timestamp > 30 * 60 * 1000) {
     _standaloneScreenshot = null;
   }
   return _standaloneScreenshot;
@@ -602,22 +606,37 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
-  // ── Cached screenshot (set by cycle manager) ──
+  // ── Cached screenshot (set by cycle manager) — auto-captures if stale/missing ──
   if (pathname === '/api/screenshot') {
-    authWrap(() => {
-      const shot = getLatestScreenshot();
-      if (!shot) { jsonRes(res, { available: false }, 204); return; }
-      jsonRes(res, {
-        available: true,
-        timestamp: shot.timestamp,
-        age: Date.now() - shot.timestamp,
-        action: shot.action ? {
-          actionType: shot.action.actionType,
-          currentState: shot.action.currentState,
-          reasoning: shot.action.reasoning?.substring(0, 200),
-        } : null,
-        screenshot: shot.screenshot,
-      });
+    authWrap(async () => {
+      try {
+        let shot = getLatestScreenshot();
+        // Auto-capture if no screenshot or stale (>60s old), throttled to max once per 30s
+        const now = Date.now();
+        if ((!shot || (now - shot.timestamp > 60 * 1000)) && (now - _lastAutoCaptureTs > AUTO_CAPTURE_INTERVAL_MS)) {
+          _lastAutoCaptureTs = now;
+          const liveJpeg = await captureLiveScreenshot();
+          if (liveJpeg) {
+            const setShot = (globalThis as any).__setLatestScreenshot;
+            if (setShot) setShot(liveJpeg, shot?.action || null);
+            shot = getLatestScreenshot();
+          }
+        }
+        if (!shot) { jsonRes(res, { available: false }, 204); return; }
+        jsonRes(res, {
+          available: true,
+          timestamp: shot.timestamp,
+          age: Date.now() - shot.timestamp,
+          action: shot.action ? {
+            actionType: shot.action.actionType,
+            currentState: shot.action.currentState,
+            reasoning: shot.action.reasoning?.substring(0, 200),
+          } : null,
+          screenshot: shot.screenshot,
+        });
+      } catch (e: any) {
+        jsonRes(res, { available: false, error: e.message }, 500);
+      }
     });
     return true;
   }
