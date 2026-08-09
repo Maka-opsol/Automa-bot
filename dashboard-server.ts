@@ -14,6 +14,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { PROJECT_ROOT } = require('./project-root');
 const crypto = require('crypto');
 const { container } = require('./container');
@@ -22,6 +23,53 @@ const { container } = require('./container');
 function getLog() {
   try { return container.get('logger'); } catch { return require('./logger'); }
 }
+
+// ── In-memory log ring buffer ──
+// Captures logs from this module and from hooked pino instances
+const _logRingBuffer: string[] = [];
+const _LOG_RING_MAX = 500;
+function _pushLogRing(entry: string) {
+  if (_logRingBuffer.length >= _LOG_RING_MAX) _logRingBuffer.shift();
+  _logRingBuffer.push(entry);
+}
+
+// Try to hook into the pino logger to capture ALL logs to the ring buffer
+try {
+  const _loggerMod = require('./logger');
+  const _origLog = _loggerMod.log;
+  const _origLogError = _loggerMod.logError;
+  const _origSafeLog = _loggerMod.safeLog;
+  if (typeof _origLog === 'function') {
+    _loggerMod.log = (...args: any[]) => {
+      try {
+        const ts = new Date().toISOString();
+        const msg = args.map((a: any) => typeof a === 'object' && a !== null ? a.msg || JSON.stringify(a) : String(a)).join(' ');
+        const lvl = (args[1] === 'ERROR' || args[1] === 'error') ? 'ERROR' : 'INFO';
+        _pushLogRing(`[${ts}] [${lvl}] ${msg}`);
+      } catch { /* non-critical */ }
+      return _origLog(...args);
+    };
+  }
+  if (typeof _origLogError === 'function') {
+    _loggerMod.logError = (...args: any[]) => {
+      try {
+        const ts = new Date().toISOString();
+        const msg = args.map((a: any) => typeof a === 'object' && a !== null ? a.msg || JSON.stringify(a) : String(a)).join(' ');
+        _pushLogRing(`[${ts}] [ERROR] ${msg}`);
+      } catch { /* non-critical */ }
+      return _origLogError(...args);
+    };
+  }
+  if (typeof _origSafeLog === 'function') {
+    _loggerMod.safeLog = (...args: any[]) => {
+      try {
+        const ts = new Date().toISOString();
+        _pushLogRing(`[${ts}] ${JSON.stringify(args[0] || args)}`);
+      } catch { /* non-critical */ }
+      return _origSafeLog(...args);
+    };
+  }
+} catch { /* logger module not available — ring buffer stays empty */ }
 
 const log    = (...args: any[]) => getLog().log(...args);
 const logErr = (...args: any[]) => getLog().logError(...args);
@@ -302,20 +350,43 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
-  // Logs
+  // Logs — serve from in-memory ring buffer (always available),
+  // with log file as enrichment if accessible.
   if (pathname === '/api/logs') {
     authWrap(() => {
       try {
-        const logFile = path.join(getCONFIG().LOG_DIR, 'daemon.log');
-        if (fs.existsSync(logFile)) {
-          const data = fs.readFileSync(logFile, 'utf8');
-          const lines = data.split('\n').filter(Boolean);
-          const tail = lines.slice(-200);
+        // Primary: in-memory ring buffer (always has recent logs)
+        let lines: string[] = _logRingBuffer.length > 0
+          ? _logRingBuffer.slice(-200)
+          : [];
+
+        // Enrich from log file if available (append older entries)
+        const candidates = [
+          getCONFIG().LOG_DIR,          // config's LOG_DIR (may differ from logger's)
+          path.join(os.tmpdir(), 'mathu-logs'),           // render-free-plan default
+          path.join(os.tmpdir(), 'mathu-bot-logs'),       // logger.ts default
+        ].filter(Boolean);
+
+        for (const dir of candidates) {
+          try {
+            const logFile = path.join(dir, 'daemon.log');
+            if (fs.existsSync(logFile)) {
+              const data = fs.readFileSync(logFile, 'utf8');
+              const fileLines = data.split('\n').filter(Boolean).slice(-200);
+              if (fileLines.length > lines.length) {
+                lines = fileLines;
+              }
+              break;
+            }
+          } catch { /* try next candidate */ }
+        }
+
+        if (lines.length === 0) {
           res.writeHead(200, { 'Content-Type': 'text/plain' });
-          res.end(tail.join('\n'));
+          res.end('No logs available yet — waiting for first cycle...');
         } else {
           res.writeHead(200, { 'Content-Type': 'text/plain' });
-          res.end('No log file found');
+          res.end(lines.join('\n'));
         }
       } catch (e: any) {
         res.writeHead(500);
