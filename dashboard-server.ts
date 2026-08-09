@@ -1014,6 +1014,54 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
+  // ── Operational mode: GET current mode / POST switch mode ──
+  if (pathname === '/api/mode' && (req.method === 'GET' || req.method === 'POST')) {
+    if (req.method === 'GET') {
+      authWrap(() => {
+        try {
+          const memoryModeMod = require('./memory-mode');
+          const mode = memoryModeMod.getMode();
+          const thresholds = memoryModeMod.getThresholds();
+          const peak = persistConfig.getRecentPeak(30);
+          const mem = process.memoryUsage();
+          jsonRes(res, {
+            success: true,
+            currentMode: mode,
+            thresholds,
+            currentMemory: {
+              heapMB: Math.round(mem.heapUsed / 1024 / 1024 * 10) / 10,
+              rssMB: Math.round(mem.rss / 1024 / 1024 * 10) / 10,
+            },
+            recentPeak: peak,
+          });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+      });
+    } else {
+      authWrap(() => {
+        readBody(req, res, (body) => {
+          try {
+            const data = JSON.parse(body);
+            if (!data.mode || !['full_power', 'memory_protection'].includes(data.mode)) {
+              jsonRes(res, { error: 'mode must be "full_power" or "memory_protection"' }, 400); return;
+            }
+            const memoryModeMod = require('./memory-mode');
+            const prev = memoryModeMod.getMode();
+            memoryModeMod.switchMode(data.mode, data.reason || 'dashboard_manual');
+            log(`Mode switched via dashboard: ${prev} → ${data.mode} (${data.reason || 'manual'})`, 'WARN', 'dashboard');
+            jsonRes(res, {
+              success: true,
+              previousMode: prev,
+              currentMode: data.mode,
+              thresholds: memoryModeMod.getThresholds(),
+              note: data.mode === 'full_power' ? 'Full power mode active. Heavy modules will re-enable on restart.' : 'Memory protection active. Heavy modules disabled.',
+            });
+          } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+        });
+      });
+    }
+    return true;
+  }
+
   // ── Not a dashboard route ──
   return false;
 }
@@ -1184,6 +1232,19 @@ function getDashboardHTML(): string {
         <span id="screenshotAge">-</span>
         <span id="screenshotAction">-</span>
       </div>
+    </div>
+  </div>
+
+  <!-- Mode Control -->
+  <div class="card">
+    <div class="card-header">Operational Mode <span id="modeBadge" style="font-size:10px;padding:1px 8px;border-radius:9999px;margin-left:8px;font-weight:600">FULL POWER</span></div>
+    <div class="card-body">
+      <div id="modeInfo" style="font-size:12px;color:var(--text2);margin-bottom:10px">Loading mode info...</div>
+      <div class="btn-group">
+        <button class="btn primary" id="btnFullPower" onclick="switchMode('full_power')">Full Power</button>
+        <button class="btn warn" id="btnMemProtect" onclick="switchMode('memory_protection')">Memory Protection</button>
+      </div>
+      <div style="margin-top:10px;font-size:11px;color:var(--text2)" id="modeThresholds"></div>
     </div>
   </div>
 
@@ -1442,6 +1503,49 @@ async function clearPersistence() {
   refreshBannedStates();
 }
 
+// ── Mode Control ──
+async function refreshMode() {
+  const r = await api('/api/mode');
+  if (!r) return;
+  const badge = document.getElementById('modeBadge');
+  const info = document.getElementById('modeInfo');
+  const thresholds = document.getElementById('modeThresholds');
+  const btnFP = document.getElementById('btnFullPower');
+  const btnMP = document.getElementById('btnMemProtect');
+
+  const isMP = r.currentMode === 'memory_protection';
+  const label = isMP ? 'MEMORY PROTECTION' : 'FULL POWER';
+  if (badge) {
+    badge.textContent = label;
+    badge.style.background = isMP ? '#92400e' : '#065f46';
+    badge.style.color = isMP ? '#fcd34d' : '#6ee7b7';
+  }
+  if (info) {
+    const heap = r.currentMemory?.heapMB || '?';
+    const rss = r.currentMemory?.rssMB || '?';
+    const peak = r.recentPeak;
+    info.innerHTML = `Heap: ${heap}MB | RSS: ${rss}MB | Peak(30m): ${peak?.peakHeapMB || 0}MB heap, ${peak?.peakRssMB || 0}MB RSS`;
+  }
+  if (thresholds && r.thresholds) {
+    thresholds.textContent = `Warn: ${r.thresholds.warnHeapMB}MB | Restart: ${r.thresholds.restartHeapMB}MB | RSS hard: ${r.thresholds.rssHardLimitMB}MB | GC: ${r.thresholds.gcIntervalMs / 1000}s`;
+  }
+  if (btnFP) btnFP.style.opacity = isMP ? '0.5' : '1';
+  if (btnMP) btnMP.style.opacity = isMP ? '1' : '0.5';
+}
+async function switchMode(mode) {
+  const action = mode === 'memory_protection' ? 'switch to Memory Protection' : 'switch to Full Power';
+  if (!confirm(`${action}? ${mode === 'full_power' ? 'Heavy modules will re-enable on restart.' : 'Heavy modules will be disabled immediately.'}`)) return;
+  const r = await api('/api/mode', { method: 'POST', body: JSON.stringify({ mode, reason: 'dashboard_manual' }) });
+  if (r?.success) {
+    toast(`Mode: ${r.previousMode} → ${r.currentMode}`, 'success');
+    if (r.note) toast(r.note, 'info');
+  } else {
+    toast('Failed: ' + (r?.error || 'unknown'), 'error');
+  }
+  refreshMode();
+  refreshAll();
+}
+
 // ── Actions Ban ──
 async function loadActions() {
   const r = await api('/api/actions');
@@ -1591,6 +1695,8 @@ async function refreshAll() {
   refreshBans();
   // Banned states
   refreshBannedStates();
+  // Mode
+  refreshMode();
   // Persistence info
   const pInfo = await api('/api/persist/info');
   const badge = document.getElementById('persistBadge');
