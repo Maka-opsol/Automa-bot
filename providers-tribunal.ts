@@ -3,32 +3,32 @@
 // Lazy requires to avoid top-level circular dependency chain
 const { getAvailableProviders, addProviderFailure, recordProviderResult } = require('./providers-registry');
 
-// Lazy logger — loaded on first use
+// Lazy logger - loaded on first use
 let _logger: any = null;
 function _getLogger() { if (!_logger) _logger = require('./logger'); return _logger; }
 
-// Lazy providers-base — loaded on first use
+// Lazy providers-base - loaded on first use
 let _providersBase: any = null;
 function _getProvidersBase() { if (!_providersBase) _providersBase = require('./providers-base'); return _providersBase; }
 
-// Lazy providers-prompts — loaded on first use
+// Lazy providers-prompts - loaded on first use
 let _prompts: any = null;
 function _getPrompts() { if (!_prompts) _prompts = require('./providers-prompts'); return _prompts; }
 
-// Lazy health module — loaded on first use
+// Lazy health module - loaded on first use
 let _healthMod: any = null;
 function _getHealth() { if (!_healthMod) _healthMod = require('./providers-health'); return _healthMod; }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // WEIGHTED CONSENSUS ALGORITHM (P12)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 //
 // Each provider vote is weighted by three factors:
-//   1. Health score (0.0-1.0) — from providers-health, reflects success rate,
+//   1. Health score (0.0-1.0) - from providers-health, reflects success rate,
 //      latency, error diversity, recency
-//   2. Confidence (0.0-1.0) — extracted from the provider's response if it
+//   2. Confidence (0.0-1.0) - extracted from the provider's response if it
 //      includes a 'confidence' field, otherwise estimated from reasoning length
-//   3. Latency inverse (normalized) — faster responses get slightly higher
+//   3. Latency inverse (normalized) - faster responses get slightly higher
 //      weight (1 / normalizedLatency), capped to prevent extreme values
 //
 // Final weight = healthScore * confidence * latencyInverse
@@ -36,7 +36,7 @@ function _getHealth() { if (!_healthMod) _healthMod = require('./providers-healt
 // Consensus: the action with the highest TOTAL weight wins, provided it has
 // at least 30% of the total weight (prevents a single high-weight outlier
 // from dominating). If no action reaches 30%, the highest-weight action
-// still wins (fail-open — better than returning 'wait' and idling).
+// still wins (fail-open - better than returning 'wait' and idling).
 
 interface WeightedVote {
   action: any;
@@ -61,7 +61,7 @@ interface WeightedConsensus {
  * Estimate confidence from a provider response.
  * If the response includes a numeric 'confidence' field, use it.
  * Otherwise, estimate from reasoning length: longer reasoning = higher confidence.
- * Range: 0.0 – 1.0
+ * Range: 0.0 - 1.0
  */
 function extractConfidence(action: any): number {
   if (!action) return 0.5;
@@ -69,13 +69,10 @@ function extractConfidence(action: any): number {
   if (typeof action.confidence === 'number' && action.confidence >= 0 && action.confidence <= 1) {
     return action.confidence;
   }
-  // Estimate from reasoning length
-  const reasoning = action.reasoning || '';
-  if (reasoning.length > 200) return 0.8;
-  if (reasoning.length > 100) return 0.7;
-  if (reasoning.length > 50) return 0.6;
-  if (reasoning.length > 20) return 0.5;
-  return 0.4;  // very short or no reasoning
+  // FIX: Use neutral default instead of verbosity-based heuristic.
+  // Length of reasoning does not correlate with accuracy — verbose models
+  // get artificially high confidence. Return a flat neutral value.
+  return 0.5;
 }
 
 /**
@@ -100,7 +97,7 @@ function computeLatencyInverse(latencyMs: number, minLatency: number, maxLatency
 function findWeightedConsensus(votes: WeightedVote[]): WeightedConsensus | null {
   if (votes.length === 0) return null;
 
-  // Single voter — accept directly
+  // Single voter - accept directly
   if (votes.length === 1) {
     return {
       winningAction: votes[0].action,
@@ -160,23 +157,23 @@ function findWeightedConsensus(votes: WeightedVote[]): WeightedConsensus | null 
   };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // TRIBUNAL EXECUTION
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = null, signal: any = null) {
   const { log } = _getLogger();
   const { safeCall } = _getProvidersBase();
   const { getSystemPrompt, getUserInstruction } = _getPrompts();
 
-  // ─── Get health-weighted providers from registry ───
+  // --- Get health-weighted providers from registry ---
   const providers = await getAvailableProviders();
   if (providers.length === 0) {
     log('No providers available after health filtering.', 'ERROR', 'tribunal');
     return { actionType: 'wait', currentState: 'error', reasoning: 'No providers', targetX: 0, targetY: 0 };
   }
 
-  // ─── Build prompt ───
+  // --- Build prompt ---
   let mapHint = '';
   if (uiMap) { mapHint = `\nUI MAP (from exploration): ${JSON.stringify(uiMap).substring(0, 500)}\nUse this map to guide actions.\n`; }
   const urlHint = pageUrl ? `\nCURRENT PAGE URL: ${pageUrl}\nUse this URL as an additional hint for state detection.\n` : '';
@@ -185,7 +182,16 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   const providerNames = providers.map((p: any) => `${p.name}(${(p.healthScore || 0).toFixed(2)})`).join(', ');
   log(`Tribunal: consulting ${providers.length} provider(s) [${providerNames}]`, 'INFO', 'tribunal');
 
-  // ─── Consult all providers in parallel ───
+  // --- Consult all providers in parallel ---
+  // FIX: Add overall timeout so slow providers don't block the tribunal forever.
+  const TRIBUNAL_TIMEOUT_MS = 45000; // 45s total (3 providers × 15s max each)
+  const tribunalController = new AbortController();
+  const tribunalTimeout = setTimeout(() => tribunalController.abort(), TRIBUNAL_TIMEOUT_MS);
+  if (signal) {
+    if (signal.aborted) { tribunalController.abort(); }
+    else { signal.addEventListener('abort', () => tribunalController.abort(), { once: true }); }
+  }
+
   const results: PromiseSettledResult<any>[] = await Promise.allSettled(
     providers.map(async (provider: any) => {
       const start = Date.now();
@@ -193,7 +199,7 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
         const res = await safeCall(
           (sig: any) => provider.fn(base64Image, fullPrompt, sig || signal, { validate: true }),
           `Tribunal ${provider.name}`,
-          { url: provider.name, maxRetries: 2, baseDelay: 1000, signal }
+          { url: provider.name, maxRetries: 2, baseDelay: 1000, signal: tribunalController.signal }
         );
         const latency = Date.now() - start;
         // Note: safeCall already records to providers-health via recordCallResult internally.
@@ -210,8 +216,9 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
       }
     })
   );
+  clearTimeout(tribunalTimeout);
 
-  // ─── Filter valid results ───
+  // --- Filter valid results ---
   const fulfilled = results
     .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value !== null)
     .map(r => r.value);
@@ -223,10 +230,10 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
       log(`Tribunal: filtered malformed result from ${r._model || 'unknown'} (no actionType)`, 'WARN', 'tribunal');
       return false;
     }
-    // currentState is desirable but not required — validateActionResponse only
+    // currentState is desirable but not required - validateActionResponse only
     // mandates actionType. Default to 'unknown' so the vote still counts.
     if (!r.currentState || typeof r.currentState !== 'string' || r.currentState.trim().length === 0) {
-      log(`Tribunal: ${r._model || 'unknown'} returned valid action but no currentState — defaulting to 'unknown'`, 'DEBUG', 'tribunal');
+      log(`Tribunal: ${r._model || 'unknown'} returned valid action but no currentState - defaulting to 'unknown'`, 'DEBUG', 'tribunal');
       r.currentState = 'unknown';
     }
     return true;
@@ -237,14 +244,14 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
     return { actionType: 'wait', currentState: 'error', reasoning: 'No valid responses from any provider', targetX: 0, targetY: 0 };
   }
 
-  // Log success rate for observability — don't abort unless literally nobody responded
+  // Log success rate for observability - don't abort unless literally nobody responded
   const successRate = valid.length / providers.length;
   log(`Tribunal success: ${valid.length}/${providers.length} (${Math.round(successRate * 100)}%)`, 'INFO', 'tribunal');
   if (successRate < 0.25 && providers.length >= 3) {
-    log('Majority of providers unavailable — proceeding with surviving votes', 'WARN', 'tribunal');
+    log('Majority of providers unavailable - proceeding with surviving votes', 'WARN', 'tribunal');
   }
 
-  // ─── Compute vote weights (P12) ───
+  // --- Compute vote weights (P12) ---
   const latencies = valid.map(r => r._latency || 1000);
   const minLatency = Math.min(...latencies);
   const maxLatency = Math.max(...latencies);
@@ -264,7 +271,7 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
     };
   });
 
-  // ─── Run weighted consensus ───
+  // --- Run weighted consensus ---
   const consensus = findWeightedConsensus(votes);
   if (!consensus) {
     // Should never happen since we checked valid.length > 0
@@ -274,7 +281,7 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
 
   const rep = consensus.winningAction;
 
-  // ─── Log consensus details (P20) ───
+  // --- Log consensus details (P20) ---
   if (valid.length === 1) {
     log(`Tribunal (1 provider - ${valid[0]._model}, weight=${consensus.winnerWeight.toFixed(3)}): ${rep.currentState} / ${rep.actionType}`, 'INFO', 'tribunal');
   } else {
@@ -291,21 +298,23 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
     }
   }
 
-  // ─── Build and return the winning action ───
+  // --- Build and return the winning action ---
+  // FIX: Strip internal tracking metadata from the returned action
+  const { _model, _healthScore, _latency, ...cleanRep } = rep as any;
   const reasoningPrefix = valid.length === 1
     ? `Tribunal (1 model - ${valid[0]._model}, w=${consensus.winnerWeight.toFixed(2)})`
     : `Tribunal (${consensus.clusterSize}/${consensus.totalVoters} models, ${consensus.agreementPct}% agreement)`;
 
   return {
-    currentState: rep.currentState,
-    reasoning: `${reasoningPrefix}: ${rep.reasoning}`,
-    actionType: rep.actionType,
-    targetX: rep.targetX ?? 0,
-    targetY: rep.targetY ?? 0,
-    value: rep.value ?? '',
-    keypadSequence: rep.keypadSequence,
-    submitX: rep.submitX ?? 0,
-    submitY: rep.submitY ?? 0,
+    currentState: cleanRep.currentState,
+    reasoning: `${reasoningPrefix}: ${cleanRep.reasoning}`,
+    actionType: cleanRep.actionType,
+    targetX: cleanRep.targetX ?? 0,
+    targetY: cleanRep.targetY ?? 0,
+    value: cleanRep.value ?? '',
+    keypadSequence: cleanRep.keypadSequence,
+    submitX: cleanRep.submitX ?? 0,
+    submitY: cleanRep.submitY ?? 0,
   };
 }
 
