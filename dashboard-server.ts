@@ -228,14 +228,131 @@ function getDaemonState(): { running: boolean; stopRequested: boolean } {
   } catch { return { running: false, stopRequested: false }; }
 }
 
-// ── Helper: get available config keys that can be changed ──
+// ── Helper: get available config keys that can be changed from dashboard ──
+// Expanded set — all keys from config.ts override schema plus useful operational keys.
+// Secrets, paths, and security-critical flags are excluded.
 const SAFE_CONFIG_KEYS = new Set([
+  // Timing / scheduling
   'SLEEP_MIN_HOURS', 'SLEEP_MAX_HOURS', 'MAX_CYCLES_BEFORE_RESTART',
-  'MAX_CONSECUTIVE_FAILURES', 'CANARY_OBSERVATION_HOURS',
-  'PROMPT_EVOLUTION_MIN_ENTRIES', 'VISION_PRIORITY',
-  'ALERT_ON_ERROR', 'ALERT_ON_STAGNATION', 'ANOMALY_CHECK_INTERVAL_MS',
-  'OPENROUTER_TRIBUNAL_MODEL',
+  'MAX_CONSECUTIVE_FAILURES', 'MAX_QUESTIONS', 'CHECK_INTERVAL_HOURS',
+  'MAX_UPTIME_HOURS', 'MAX_RUNTIME_PER_CYCLE_MS', 'STARTUP_DELAY_MIN_MINUTES',
+  'STARTUP_DELAY_MAX_MINUTES', 'ALLOWED_ACTIVITY_START_HOUR', 'ALLOWED_ACTIVITY_END_HOUR',
+  // Browser / interaction
+  'POST_CLICK_MS', 'BETWEEN_STEPS_MS', 'SCROLL_AMOUNT', 'SCROLL_PAUSE_MS',
+  'VIDEO_SPEED', 'VIDEO_TIMEOUT_MS', 'WAIT_MULTIPLIER',
+  'BROWSER_LAUNCH_TIMEOUT_MS', 'BROWSER_PAGE_TIMEOUT_MS',
+  'MAX_CONSECUTIVE_SAME_ACTION', 'SCROLL_NO_CHANGE_THRESHOLD',
+  'SWIPE_DURATION_MS', 'LONG_PRESS_DELAY_MS',
+  // Memory / GC
+  'ENABLE_GC_ON_CYCLE', 'MAX_MEMORY_MB', 'MEMORY_WARNING_THRESHOLD_MB', 'MEMORY_RESTART_THRESHOLD_MB',
+  // Alerts
+  'ALERT_ON_ERROR', 'ALERT_ON_STAGNATION', 'ALERT_ON_AUTH_FAILURE',
+  // Providers / vision
+  'VISION_PRIORITY', 'PROVIDER_ORDER', 'OPENROUTER_TRIBUNAL_MODEL',
+  // Self-heal subsystems (toggleable)
+  'PREDICTIVE_HEAL_ENABLED', 'SELECTOR_DRIFT_HEAL_ENABLED', 'REGRESSION_BANK_ENABLED',
+  'CANARY_ROLLOUT_ENABLED', 'CANARY_OBSERVATION_HOURS',
+  'DIFF_MINIMIZER_ENABLED', 'PROMPT_EVOLUTION_ENABLED', 'PROMPT_EVOLUTION_MIN_ENTRIES',
+  'DB_HEALER_ENABLED', 'AUTH_HEALER_ENABLED', 'STATE_RECOVERY_ENABLED',
+  'DEPENDENCY_HEALER_ENABLED', 'CONFIG_RECONCILER_ENABLED',
+  'EXTENDED_CHECKPOINT_ENABLED', 'BLACKBOX_FULL_ENABLED',
+  'PATCH_MEMORY_ENABLED', 'HEAL_REWARD_TRACKER_ENABLED', 'SELF_HEAL_TIMELINE_ENABLED',
+  'HEALER_CIRCUIT_BREAKER_ENABLED', 'DEGRADATION_LADDER_ENABLED',
+  'ENABLE_BLACKBOX', 'ENABLE_EXPLORATION_PASS', 'ENABLE_ADAPTIVE_PERFORMANCE',
+  // Logging
+  'LOG_LEVEL', 'LOG_MAX_SIZE_MB', 'LOG_MAX_FILES',
+  // Misc operational
+  'SAVE_SCREENSHOTS', 'MAX_SCREENSHOTS', 'ENABLE_IP_CHECK',
+  'WEB_SEARCH_ENABLED', 'TEMPLATE_CACHE_ENABLED', 'TEMPLATE_MATCH_THRESHOLD',
+  'STATE_TIMEOUT_MS', 'STATE_HISTORY_MAX',
+  'HEADLESS', 'AUTO_INSTALL_DEPENDENCIES',
 ]);
+
+// Config key metadata for the dashboard editor (grouped, with descriptions + type hints)
+const CONFIG_KEY_META: Record<string, { group: string; label: string; type: 'number' | 'boolean' | 'string'; desc: string }> = {
+  // Timing
+  SLEEP_MIN_HOURS:             { group: 'Timing', label: 'Sleep Min (hours)', type: 'number', desc: 'Min sleep between cycles' },
+  SLEEP_MAX_HOURS:             { group: 'Timing', label: 'Sleep Max (hours)', type: 'number', desc: 'Max sleep between cycles' },
+  MAX_CYCLES_BEFORE_RESTART:   { group: 'Timing', label: 'Max Cycles', type: 'number', desc: 'Restart after N cycles' },
+  MAX_QUESTIONS:               { group: 'Timing', label: 'Max Questions', type: 'number', desc: 'Total questions before stopping' },
+  CHECK_INTERVAL_HOURS:        { group: 'Timing', label: 'Check Interval (hr)', type: 'number', desc: 'Hours between check-in cycles' },
+  MAX_UPTIME_HOURS:            { group: 'Timing', label: 'Max Uptime (hr)', type: 'number', desc: 'Force restart after N hours' },
+  MAX_RUNTIME_PER_CYCLE_MS:    { group: 'Timing', label: 'Cycle Timeout (ms)', type: 'number', desc: 'Max runtime per cycle' },
+  STARTUP_DELAY_MIN_MINUTES:   { group: 'Timing', label: 'Startup Delay Min (min)', type: 'number', desc: 'Min random delay before first cycle' },
+  STARTUP_DELAY_MAX_MINUTES:   { group: 'Timing', label: 'Startup Delay Max (min)', type: 'number', desc: 'Max random delay before first cycle' },
+  ALLOWED_ACTIVITY_START_HOUR: { group: 'Timing', label: 'Activity Start Hour', type: 'number', desc: 'Earliest hour bot can be active' },
+  ALLOWED_ACTIVITY_END_HOUR:   { group: 'Timing', label: 'Activity End Hour', type: 'number', desc: 'Latest hour bot can be active' },
+  // Browser
+  POST_CLICK_MS:               { group: 'Browser', label: 'Post-Click Delay (ms)', type: 'number', desc: 'Wait after clicking' },
+  BETWEEN_STEPS_MS:            { group: 'Browser', label: 'Between Steps (ms)', type: 'number', desc: 'Wait between action steps' },
+  SCROLL_AMOUNT:               { group: 'Browser', label: 'Scroll Amount (px)', type: 'number', desc: 'Pixels per scroll action' },
+  SCROLL_PAUSE_MS:             { group: 'Browser', label: 'Scroll Pause (ms)', type: 'number', desc: 'Pause after scrolling' },
+  VIDEO_SPEED:                 { group: 'Browser', label: 'Video Speed', type: 'number', desc: 'Playback speed multiplier' },
+  VIDEO_TIMEOUT_MS:            { group: 'Browser', label: 'Video Timeout (ms)', type: 'number', desc: 'Max wait for video' },
+  WAIT_MULTIPLIER:             { group: 'Browser', label: 'Wait Multiplier', type: 'number', desc: 'Global wait time multiplier' },
+  BROWSER_LAUNCH_TIMEOUT_MS:   { group: 'Browser', label: 'Browser Launch Timeout', type: 'number', desc: 'Max time to launch browser' },
+  BROWSER_PAGE_TIMEOUT_MS:     { group: 'Browser', label: 'Page Timeout (ms)', type: 'number', desc: 'Max time for page load' },
+  MAX_CONSECUTIVE_SAME_ACTION: { group: 'Browser', label: 'Max Same Action', type: 'number', desc: 'Max repeats of same action' },
+  SCROLL_NO_CHANGE_THRESHOLD:  { group: 'Browser', label: 'Scroll Stuck Threshold', type: 'number', desc: 'Scrolls with no change before recovery' },
+  SWIPE_DURATION_MS:           { group: 'Browser', label: 'Swipe Duration (ms)', type: 'number', desc: 'Duration of swipe gestures' },
+  LONG_PRESS_DELAY_MS:         { group: 'Browser', label: 'Long Press Delay (ms)', type: 'number', desc: 'Delay before long press activates' },
+  // Memory
+  ENABLE_GC_ON_CYCLE:          { group: 'Memory', label: 'GC On Cycle', type: 'boolean', desc: 'Run garbage collector after each cycle' },
+  MAX_MEMORY_MB:                { group: 'Memory', label: 'Max Memory (MB)', type: 'number', desc: 'Memory ceiling before restart' },
+  MEMORY_WARNING_THRESHOLD_MB: { group: 'Memory', label: 'Memory Warn (MB)', type: 'number', desc: 'Warning threshold for memory usage' },
+  MEMORY_RESTART_THRESHOLD_MB: { group: 'Memory', label: 'Memory Restart (MB)', type: 'number', desc: 'Restart threshold for memory usage' },
+  // Alerts
+  ALERT_ON_ERROR:              { group: 'Alerts', label: 'Alert on Error', type: 'boolean', desc: 'Send alert on errors' },
+  ALERT_ON_STAGNATION:         { group: 'Alerts', label: 'Alert on Stagnation', type: 'boolean', desc: 'Send alert when stuck' },
+  ALERT_ON_AUTH_FAILURE:        { group: 'Alerts', label: 'Alert on Auth Failure', type: 'boolean', desc: 'Send alert on auth failures' },
+  // Providers
+  VISION_PRIORITY:              { group: 'Providers', label: 'Vision Priority', type: 'string', desc: 'cloud, local, or hybrid' },
+  PROVIDER_ORDER:               { group: 'Providers', label: 'Provider Order', type: 'string', desc: 'Comma-separated provider priority' },
+  OPENROUTER_TRIBUNAL_MODEL:   { group: 'Providers', label: 'OR Tribunal Model', type: 'string', desc: 'Model for tribunal decisions' },
+  // Self-Heal
+  PREDICTIVE_HEAL_ENABLED:     { group: 'Self-Heal', label: 'Predictive Heal', type: 'boolean', desc: 'Predict and prevent failures' },
+  SELECTOR_DRIFT_HEAL_ENABLED:  { group: 'Self-Heal', label: 'Selector Drift Heal', type: 'boolean', desc: 'Auto-fix CSS selector drift' },
+  REGRESSION_BANK_ENABLED:      { group: 'Self-Heal', label: 'Regression Bank', type: 'boolean', desc: 'Store and replay regression tests' },
+  CANARY_ROLLOUT_ENABLED:       { group: 'Self-Heal', label: 'Canary Rollout', type: 'boolean', desc: 'Gradual feature rollout' },
+  CANARY_OBSERVATION_HOURS:     { group: 'Self-Heal', label: 'Canary Observation (hr)', type: 'number', desc: 'Hours to observe canary' },
+  DIFF_MINIMIZER_ENABLED:       { group: 'Self-Heal', label: 'Diff Minimizer', type: 'boolean', desc: 'Minimize failure-producing diffs' },
+  PROMPT_EVOLUTION_ENABLED:     { group: 'Self-Heal', label: 'Prompt Evolution', type: 'boolean', desc: 'Evolve prompts over time' },
+  PROMPT_EVOLUTION_MIN_ENTRIES: { group: 'Self-Heal', label: 'Prompt Evo Min Entries', type: 'number', desc: 'Min entries before evolution triggers' },
+  DB_HEALER_ENABLED:            { group: 'Self-Heal', label: 'DB Healer', type: 'boolean', desc: 'Auto-repair database issues' },
+  AUTH_HEALER_ENABLED:         { group: 'Self-Heal', label: 'Auth Healer', type: 'boolean', desc: 'Auto-refresh auth tokens' },
+  STATE_RECOVERY_ENABLED:      { group: 'Self-Heal', label: 'State Recovery', type: 'boolean', desc: 'Recover from bad states' },
+  DEPENDENCY_HEALER_ENABLED:   { group: 'Self-Heal', label: 'Dependency Healer', type: 'boolean', desc: 'Auto-fix missing deps' },
+  CONFIG_RECONCILER_ENABLED:    { group: 'Self-Heal', label: 'Config Reconciler', type: 'boolean', desc: 'Sync config across modules' },
+  EXTENDED_CHECKPOINT_ENABLED: { group: 'Self-Heal', label: 'Extended Checkpoint', type: 'boolean', desc: 'Detailed cycle checkpointing' },
+  BLACKBOX_FULL_ENABLED:       { group: 'Self-Heal', label: 'Blackbox Full', type: 'boolean', desc: 'Full blackbox replay testing' },
+  PATCH_MEMORY_ENABLED:         { group: 'Self-Heal', label: 'Patch Memory', type: 'boolean', desc: 'Remember successful patches' },
+  HEAL_REWARD_TRACKER_ENABLED: { group: 'Self-Heal', label: 'Heal Reward Tracker', type: 'boolean', desc: 'Track which heals worked' },
+  SELF_HEAL_TIMELINE_ENABLED:   { group: 'Self-Heal', label: 'Heal Timeline', type: 'boolean', desc: 'Log healing timeline events' },
+  HEALER_CIRCUIT_BREAKER_ENABLED: { group: 'Self-Heal', label: 'Healer Circuit Breaker', type: 'boolean', desc: 'Stop healing if failure rate too high' },
+  DEGRADATION_LADDER_ENABLED:  { group: 'Self-Heal', label: 'Degradation Ladder', type: 'boolean', desc: 'Gracefully degrade under load' },
+  ENABLE_BLACKBOX:              { group: 'Self-Heal', label: 'Blackbox', type: 'boolean', desc: 'Enable blackbox testing' },
+  ENABLE_EXPLORATION_PASS:      { group: 'Self-Heal', label: 'Exploration Pass', type: 'boolean', desc: 'Periodic UI exploration' },
+  ENABLE_ADAPTIVE_PERFORMANCE:  { group: 'Self-Heal', label: 'Adaptive Performance', type: 'boolean', desc: 'Adjust timing dynamically' },
+  // Logging
+  LOG_LEVEL:                    { group: 'Logging', label: 'Log Level', type: 'string', desc: 'debug, info, warn, error' },
+  LOG_MAX_SIZE_MB:             { group: 'Logging', label: 'Max Log Size (MB)', type: 'number', desc: 'Max size per log file' },
+  LOG_MAX_FILES:                { group: 'Logging', label: 'Max Log Files', type: 'number', desc: 'Max rotated log files' },
+  // Misc
+  SAVE_SCREENSHOTS:             { group: 'Misc', label: 'Save Screenshots', type: 'boolean', desc: 'Persist screenshots to disk' },
+  MAX_SCREENSHOTS:              { group: 'Misc', label: 'Max Screenshots', type: 'number', desc: 'Max screenshots to keep' },
+  ENABLE_IP_CHECK:              { group: 'Misc', label: 'IP Check', type: 'boolean', desc: 'Verify IP location' },
+  WEB_SEARCH_ENABLED:           { group: 'Misc', label: 'Web Search', type: 'boolean', desc: 'Enable web search capability' },
+  TEMPLATE_CACHE_ENABLED:       { group: 'Misc', label: 'Template Cache', type: 'boolean', desc: 'Cache action templates' },
+  TEMPLATE_MATCH_THRESHOLD:     { group: 'Misc', label: 'Template Match Threshold', type: 'number', desc: 'Min similarity for template match' },
+  STATE_TIMEOUT_MS:             { group: 'Misc', label: 'State Timeout (ms)', type: 'number', desc: 'Timeout for state transitions' },
+  STATE_HISTORY_MAX:            { group: 'Misc', label: 'State History Max', type: 'number', desc: 'Max state history entries' },
+  HEADLESS:                     { group: 'Misc', label: 'Headless', type: 'boolean', desc: 'Run browser headlessly' },
+  MAX_CONSECUTIVE_FAILURES:     { group: 'Misc', label: 'Max Consecutive Failures', type: 'number', desc: 'Max failures before recovery' },
+  AUTO_INSTALL_DEPENDENCIES:    { group: 'Misc', label: 'Auto Install Deps', type: 'boolean', desc: 'Auto-install missing packages' },
+};
+
+// In-memory banned-states store (survives until process restart)
+const _bannedStates: Map<string, { reason: string; bannedAt: number }> = new Map();
 
 function serveStaticFile(res: any, filePath: any, contentType: any) {
   fs.readFile(filePath, (err: any, content: any) => {
@@ -509,6 +626,42 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
+  // ── Banned states (GET) ──
+  if (pathname === '/api/banned-states' && req.method === 'GET') {
+    authWrap(() => {
+      const banned: Array<{ state: string; reason: string; bannedAt: number }> = [];
+      for (const [state, info] of _bannedStates) {
+        banned.push({ state, reason: info.reason, bannedAt: info.bannedAt });
+      }
+      jsonRes(res, { bannedStates: banned });
+    });
+    return true;
+  }
+
+  // ── Config keys (GET) — list all editable config keys with current values ──
+  if (pathname === '/api/config/keys' && req.method === 'GET') {
+    authWrap(() => {
+      try {
+        const cfg = getCONFIG();
+        const grouped: Record<string, Array<{ key: string; label: string; type: string; desc: string; value: any }>> = {};
+        for (const key of SAFE_CONFIG_KEYS) {
+          const meta = CONFIG_KEY_META[key];
+          if (!meta) continue;
+          if (!grouped[meta.group]) grouped[meta.group] = [];
+          grouped[meta.group].push({
+            key,
+            label: meta.label,
+            type: meta.type,
+            desc: meta.desc,
+            value: cfg[key] !== undefined ? cfg[key] : null,
+          });
+        }
+        jsonRes(res, { groups: grouped });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
   // ── Full status (combined) ──
   if (pathname === '/api/full-status') {
     authWrap(async () => {
@@ -644,6 +797,40 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
+  // ── Ban state (prevent bot from entering this state) ──
+  if (pathname === '/api/banned-states' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.state || typeof data.state !== 'string') {
+            jsonRes(res, { error: 'state is required' }, 400); return;
+          }
+          _bannedStates.set(data.state, { reason: data.reason || 'Banned via dashboard', bannedAt: Date.now() });
+          log(`State banned via dashboard: ${data.state} (${data.reason || 'no reason'})`, 'WARN', 'dashboard');
+          jsonRes(res, { success: true, bannedState: data.state });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+      });
+    });
+    return true;
+  }
+
+  // ── Unban state ──
+  if (pathname === '/api/banned-states' && req.method === 'DELETE') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.state) { jsonRes(res, { error: 'state is required' }, 400); return; }
+          _bannedStates.delete(data.state);
+          log(`State unbanned via dashboard: ${data.state}`, 'INFO', 'dashboard');
+          jsonRes(res, { success: true, unbannedState: data.state });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+      });
+    });
+    return true;
+  }
+
   // ── Ban action ──
   if (pathname === '/api/banned-actions' && req.method === 'POST') {
     authWrap(() => {
@@ -698,12 +885,22 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
         try {
           const data = JSON.parse(body);
           if (!SAFE_CONFIG_KEYS.has(data.key)) {
-            jsonRes(res, { error: 'Config key not allowed. Allowed: ' + [...SAFE_CONFIG_KEYS].join(', ') }, 403); return;
+            jsonRes(res, { error: 'Config key not allowed' }, 403); return;
+          }
+          // Auto-coerce value type based on config metadata
+          let value = data.value;
+          const meta = CONFIG_KEY_META[data.key];
+          if (meta) {
+            if (meta.type === 'number') value = Number(value);
+            else if (meta.type === 'boolean') {
+              if (typeof value === 'string') value = value === 'true' || value === '1';
+              else value = !!value;
+            }
           }
           const { updateConfig } = require('./get-config');
-          updateConfig(data.key, data.value);
-          log(`Config changed via dashboard: ${data.key} = ${data.value}`, 'INFO', 'dashboard');
-          jsonRes(res, { success: true, key: data.key, value: data.value });
+          updateConfig(data.key, value);
+          log(`Config changed via dashboard: ${data.key} = ${JSON.stringify(value)}`, 'INFO', 'dashboard');
+          jsonRes(res, { success: true, key: data.key, value });
         } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
       });
     });
@@ -942,10 +1139,15 @@ function getDashboardHTML(): string {
       <div class="config-row">
         <select id="stateSelect"><option value="">Loading states...</option></select>
         <button class="btn primary" onclick="forceState()">Force State</button>
+        <button class="btn danger sm" onclick="banState()">Ban State</button>
       </div>
       <div id="currentState" class="stat-row"><span class="stat-label">Current State</span><span class="stat-value">-</span></div>
       <div id="stateAge" class="stat-row"><span class="stat-label">State Age</span><span class="stat-value">-</span></div>
       <div id="deadlock" class="stat-row"><span class="stat-label">Deadlock</span><span class="stat-value">-</span></div>
+      <div style="margin-top:10px">
+        <div class="card-header" style="padding:6px 0;font-size:12px;color:var(--text2)">Banned States</div>
+        <div class="banned-list" id="bannedStatesList"><div class="empty">None banned</div></div>
+      </div>
     </div>
   </div>
 
@@ -962,25 +1164,15 @@ function getDashboardHTML(): string {
     </div>
   </div>
 
-  <!-- Config -->
-  <div class="card">
-    <div class="card-header">Config</div>
-    <div class="card-body">
-      <div class="config-row">
-        <select id="configKeySelect">
-          <option value="SLEEP_MIN_HOURS">SLEEP_MIN_HOURS</option>
-          <option value="SLEEP_MAX_HOURS">SLEEP_MAX_HOURS</option>
-          <option value="MAX_CYCLES_BEFORE_RESTART">MAX_CYCLES_BEFORE_RESTART</option>
-          <option value="MAX_CONSECUTIVE_FAILURES">MAX_CONSECUTIVE_FAILURES</option>
-          <option value="VISION_PRIORITY">VISION_PRIORITY</option>
-          <option value="ALERT_ON_ERROR">ALERT_ON_ERROR</option>
-          <option value="ALERT_ON_STAGNATION">ALERT_ON_STAGNATION</option>
-          <option value="OPENROUTER_TRIBUNAL_MODEL">OPENROUTER_MODEL</option>
-        </select>
-        <input type="text" id="configValue" placeholder="Value" style="flex:1">
-        <button class="btn primary sm" onclick="setConfig()">Set</button>
+  <!-- Config Editor -->
+  <div class="card full-width">
+    <div class="card-header">
+      <span>Configuration</span>
+      <div class="btn-group">
+        <button class="btn sm primary" onclick="loadConfigKeys()">Reload Values</button>
       </div>
     </div>
+    <div class="card-body" id="configEditor"><div class="empty">Loading configuration...</div></div>
   </div>
 
   <!-- Providers -->
@@ -1144,6 +1336,31 @@ async function forceState() {
   toast(r?.success ? 'State forced: ' + s : 'Failed: ' + (r?.error||''), r?.success ? 'success' : 'error');
   refreshAll();
 }
+async function banState() {
+  const s = document.getElementById('stateSelect').value;
+  if (!s) { toast('Select a state first', 'error'); return; }
+  const reason = prompt('Reason for banning state ' + s + ':') || '';
+  const r = await api('/api/banned-states', { method: 'POST', body: JSON.stringify({ state: s, reason }) });
+  toast(r?.success ? 'Banned state: ' + s : 'Failed', r?.success ? 'success' : 'error');
+  refreshBannedStates();
+}
+async function unbanState(state) {
+  const r = await api('/api/banned-states', { method: 'DELETE', body: JSON.stringify({ state }) });
+  toast(r?.success ? 'Unbanned: ' + state : 'Failed', r?.success ? 'success' : 'error');
+  refreshBannedStates();
+}
+async function refreshBannedStates() {
+  const r = await api('/api/banned-states');
+  const el = document.getElementById('bannedStatesList');
+  if (!r || !r.bannedStates || r.bannedStates.length === 0) {
+    el.innerHTML = '<div class="empty">None banned</div>';
+    return;
+  }
+  el.innerHTML = r.bannedStates.map(b =>
+    '<div class="banned-item"><span>'+b.state+' <span style="color:var(--text2);font-size:11px">'+b.reason+'</span></span>' +
+    '<button class="btn sm" onclick="unbanState(\\''+b.state+'\\')">Unban</button></div>'
+  ).join('');
+}
 
 // ── Actions Ban ──
 async function loadActions() {
@@ -1165,14 +1382,60 @@ async function unbanAction(actionType) {
   toast(r?.success ? 'Unbanned: ' + actionType : 'Failed', r?.success ? 'success' : 'error');
   refreshBans();
 }
+async function refreshBans() {
+  const r = await api('/api/banned-actions');
+  const el = document.getElementById('bannedList');
+  if (!r || !Array.isArray(r) || r.length === 0) {
+    el.innerHTML = '<div class="empty">No actions banned</div>';
+    return;
+  }
+  el.innerHTML = r.map(b =>
+    '<div class="banned-item"><span>'+b.action_type+' <span style="color:var(--text2);font-size:11px">'+(b.reason||'')+'</span></span>' +
+    '<button class="btn sm" onclick="unbanAction(\\''+b.action_type+'\\')">Unban</button></div>'
+  ).join('');
+}
 
-// ── Config ──
-async function setConfig() {
-  const key = document.getElementById('configKeySelect').value;
-  const value = document.getElementById('configValue').value;
-  if (!key || !value) return;
+// ── Config Editor ──
+async function loadConfigKeys() {
+  const r = await api('/api/config/keys');
+  if (!r || !r.groups) return;
+  const el = document.getElementById('configEditor');
+  let html = '';
+  for (const [group, keys] of Object.entries(r.groups)) {
+    html += '<div style="margin-bottom:16px"><div style="font-size:13px;font-weight:600;color:var(--accent2);margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">'+group+'</div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px">';
+    for (const item of keys) {
+      const isBool = item.type === 'boolean';
+      const val = item.value;
+      const displayVal = isBool ? '<span class="stat-value '+(val?'green':'red')+'">'+(val?'true':'false')+'</span>' : '<span class="stat-value">'+val+'</span>';
+      const inputHtml = isBool
+        ? '<button class="btn sm '+(val?'success':'danger')+'" onclick="toggleBoolConfig(\\''+item.key+'\\','+!val+')">'+(val?'ON':'OFF')+'</button>'
+        : '<input type="'+(item.type==='number'?'number':'text')+'" value="'+val+'" style="width:80px;font-size:12px;padding:4px 8px" id="cfg_'+item.key+'"> <button class="btn sm primary" onclick="saveConfig(\\''+item.key+'\\')">Set</button>';
+      html += '<div style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:8px 10px;display:flex;align-items:center;gap:8px">';
+      html += '<div style="flex:1"><div style="font-size:12px;font-weight:500">'+item.label+'</div><div style="font-size:11px;color:var(--text2)">'+item.desc+'</div></div>';
+      html += '<div style="display:flex;align-items:center;gap:6px">' + inputHtml + '</div>';
+      html += '</div>';
+    }
+    html += '</div></div>';
+  }
+  el.innerHTML = html || '<div class="empty">No configurable keys found</div>';
+}
+async function saveConfig(key) {
+  const input = document.getElementById('cfg_'+key);
+  if (!input) return;
+  let value = input.value;
+  // Try to parse as number if the field is numeric
+  if (input.type === 'number' || !isNaN(value)) value = Number(value);
+  else if (value === 'true') value = true;
+  else if (value === 'false') value = false;
   const r = await api('/api/config', { method: 'POST', body: JSON.stringify({ key, value }) });
   toast(r?.success ? key + ' = ' + value : 'Failed: ' + (r?.error||''), r?.success ? 'success' : 'error');
+  if (r?.success) loadConfigKeys(); // Refresh to show updated values
+}
+async function toggleBoolConfig(key, newValue) {
+  const r = await api('/api/config', { method: 'POST', body: JSON.stringify({ key, value: newValue }) });
+  toast(r?.success ? key + ' = ' + newValue : 'Failed: ' + (r?.error||''), r?.success ? 'success' : 'error');
+  if (r?.success) loadConfigKeys();
 }
 
 // ── Logs ──
@@ -1246,6 +1509,8 @@ async function refreshAll() {
   refreshScreenshot();
   // Bans
   refreshBans();
+  // Banned states
+  refreshBannedStates();
 }
 
 // ── Init ──
@@ -1253,6 +1518,7 @@ async function refreshAll() {
   await loadStates();
   await loadActions();
   await refreshAll();
+  await loadConfigKeys();
   refreshLogs();
   setInterval(() => { if (autoRefresh) refreshAll(); }, 5000);
   setInterval(refreshLogs, 10000);
