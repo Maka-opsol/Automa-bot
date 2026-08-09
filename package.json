@@ -28,6 +28,7 @@
     "@libsql/client": "^0.14.0",
     "@logtail/js": "^0.5.0",
     "better-sqlite3": "^9.0.0",
+    "groq-sdk": "^0.7.0",
     "tsx": "^4.0.0",
     "date-fns": "^3.6.0",
     "envalid": "^7.3.1",
@@ -47,7 +48,8 @@
   "author": "U.S.J Sibiya",
   "license": "MIT",
   "_dependencyNotes": {
-    "tsx": "Intentionally in production dependencies: worker threads use --import tsx in tsx-mode (start:tsx, watchdog, dashboard scripts). Not moved to devDependencies because compiled mode still requires tsx for development workflows."
+    "tsx": "Intentionally in production dependencies: worker threads use --import tsx in tsx-mode (start:tsx, watchdog, dashboard scripts). Not moved to devDependencies because compiled mode still requires tsx for development workflows.",
+    "groq-sdk": "Required for Groq provider (qwen/qwen3.6-27b vision model). Was missing from package.json causing 'Groq SDK not installed' warnings at runtime."
   },
   "optionalDependencies": {
     "@xenova/transformers": "^2.7.0",
