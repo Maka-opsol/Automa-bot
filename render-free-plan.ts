@@ -459,7 +459,8 @@ function setLatestScreenshot(base64Jpeg: string, action?: any) {
 }
 
 function getLatestScreenshot() {
-  if (_latestScreenshot && Date.now() - _latestScreenshot.timestamp > 120_000) {
+  // 30-minute TTL — screenshots should persist on dashboard between cycle iterations
+  if (_latestScreenshot && Date.now() - _latestScreenshot.timestamp > 30 * 60 * 1000) {
     _latestScreenshot = null;
   }
   return _latestScreenshot;
