@@ -1,6 +1,6 @@
 'use strict';
 
-// ─── Groq Provider (SDK-based) ────────────────────────────────────────────
+// --- Groq Provider (SDK-based) --------------------------------------------
 //
 // Uses groq-sdk instead of raw HTTP API. The SDK handles content formatting
 // including vision (image_url) automatically.
@@ -9,6 +9,7 @@
 //
 // P7: providerName passed to retryWithBackoff for health-aware retries.
 // P20: Structured error logging.
+// FIX: Signal (abortSignal) now passed to SDK. Stale closure fixed on rollback.
 
 const { extractJSON, validateActionResponse, getProviderConfig, retryWithBackoff } = require('./providers-base');
 
@@ -44,11 +45,13 @@ function GroqProvider() {
       throw new Error('Groq SDK not installed - run: npm install groq-sdk');
     }
 
-    const config = getProviderConfig('Groq');
     const log = _getLogger().log;
 
-    const makeRequest = async () => {
-      // Build user content - multipart with image if available, plain string otherwise
+    // FIX: Build request factory that reads config fresh each call.
+    // This prevents stale closure after rollbackProvider().
+    const buildRequest = () => {
+      const config = getProviderConfig('Groq');
+      const model = config.model || 'qwen/qwen3.6-27b';
       const userContent = base64Image
         ? [
             { type: 'text', text: prompt },
@@ -56,12 +59,24 @@ function GroqProvider() {
           ]
         : prompt;
 
-      const response = await client.chat.completions.create({
-        model: config.model || 'qwen/qwen3.6-27b',
+      return { model, userContent };
+    };
+
+    const makeRequest = async () => {
+      const { model, userContent } = buildRequest();
+
+      // FIX: Pass signal as abortSignal to the Groq SDK so requests are cancellable
+      const sdkOptions: any = {
+        model,
         messages: [{ role: 'user', content: userContent }],
         max_tokens: 4096,
         temperature: 0.1,
-      });
+      };
+      if (signal) {
+        sdkOptions.abortSignal = signal;
+      }
+
+      const response = await client.chat.completions.create(sdkOptions);
 
       if (!response?.choices?.[0]?.message?.content) {
         throw new Error('GROQ_EMPTY_RESPONSE');
@@ -87,9 +102,11 @@ function GroqProvider() {
           const rolledBack = rollbackProvider('Groq');
           if (rolledBack) {
             log('Rolled back Groq model config.', 'INFO', 'groq');
-            const rawContent = await retryWithBackoff(makeRequest, { providerName: 'Groq' });
-            if (options.validate === false) return rawContent;
-            return validateActionResponse(extractJSON(rawContent, 'Groq'), 'Groq');
+            // FIX: Rebuild makeRequest after rollback to pick up new config.
+            // buildRequest() reads config fresh, so the new model is used.
+            const retryContent = await retryWithBackoff(makeRequest, { providerName: 'Groq' });
+            if (options.validate === false) return retryContent;
+            return validateActionResponse(extractJSON(retryContent, 'Groq'), 'Groq');
           }
         } catch (rollbackErr: any) {
           log(`Groq rollback failed: ${rollbackErr.message || rollbackErr}`, 'WARN', 'groq');
