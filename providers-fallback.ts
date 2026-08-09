@@ -7,8 +7,12 @@ const _getLog = () => { try { return require('./logger'); } catch { return { log
  * Overall timeout for the entire fallback action pipeline.
  * On Render free plan (slow CPU), individual page.$() calls can hang.
  * This prevents the fallback from consuming the entire cycle budget.
+ *
+ * FIX: Increased from 15s to 25s. The pipeline runs pixel-fallback + pixel-explorer +
+ * visual-recovery + DOM selectors sequentially. Each can take 2-3s on Render's slow CPU.
+ * 15s was too tight and caused the pipeline to time out before completing all stages.
  */
-const FALLBACK_TIMEOUT_MS = 15000;
+const FALLBACK_TIMEOUT_MS = 25000;
 
 /**
  * Per-selector timeout in ms. Each page.$() is raced against this.
