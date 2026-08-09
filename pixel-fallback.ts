@@ -1547,7 +1547,41 @@ function _advanceLoginFlow(action: any): void {
  * Called by providers-fallback.ts as Stage 0 when AI is unavailable.
  * Also called directly by cycle-manager during stagnation recovery.
  */
-async function generatePixelFallbackAction(page: any): Promise<any> {
+/**
+ * Maps each pixel-fallback-detected currentState to the states in which
+ * that action actually makes sense. If the bot's real currentState is NOT
+ * in the allowed set, the action is rejected.
+ *
+ * This prevents pixel-fallback from suggesting login actions when on
+ * assignments_page, or assignment actions when in microsoft_email_input, etc.
+ */
+const STATE_COMPAT: Record<string, string[]> = {
+  // Login states — only valid when actually in login flow
+  'microsoft_email_input': ['mathu_login', 'microsoft_email_input', 'unknown', 'error', 'anywhere_click_recovery'],
+  'advlearn_login':         ['mathu_login', 'microsoft_email_input', 'advlearn_login', 'unknown', 'error', 'anywhere_click_recovery'],
+  'microsoft_stay_signed_in': ['mathu_login', 'microsoft_email_input', 'advlearn_login', 'unknown', 'error', 'anywhere_click_recovery'],
+  'signin_page':            ['mathu_login', 'microsoft_email_input', 'advlearn_login', 'unknown', 'error', 'anywhere_click_recovery'],
+  // App states — only valid when inside the MathU app
+  'assignments_page':      ['assignments_page', 'score_screen', 'pathway', 'pathway_feedback', 'assessment_correction', 'unknown', 'error', 'anywhere_click_recovery', 'ui_discovered', 'flutter_modal', 'flutter_bottom_sheet', 'exploration'],
+  'module_downloading':     ['assignments_page', 'unknown', 'error', 'anywhere_click_recovery'],
+  'exercise_info':         ['exercise_info', 'exercise_memo', 'unknown', 'error', 'anywhere_click_recovery'],
+  'assessment':             ['assessment', 'assessment_correction', 'unknown', 'error', 'anywhere_click_recovery'],
+  'video_player':           ['video_player', 'unknown', 'error', 'anywhere_click_recovery'],
+  'score_screen':           ['score_screen', 'pathway', 'pathway_feedback', 'unknown', 'error', 'anywhere_click_recovery'],
+};
+
+/**
+ * Check if an action returned by pixel analysis is compatible with the
+ * bot's actual current state. Prevents nonsensical actions.
+ */
+function _isActionStateCompatible(action: any, realCurrentState: string): boolean {
+  if (!action || !action.currentState) return true; // Can't filter without state info
+  const compat = STATE_COMPAT[action.currentState];
+  if (!compat) return true; // Unknown state — allow (better than blocking)
+  return compat.includes(realCurrentState);
+}
+
+async function generatePixelFallbackAction(page: any, currentState?: string): Promise<any> {
   try {
     const url = page?.url?.() || '';
 
@@ -1565,7 +1599,30 @@ async function generatePixelFallbackAction(page: any): Promise<any> {
     }
 
     const { width, height, rgba } = decoded;
-    log(`Pixel fallback: analyzing ${width}x${height} image (${(screenshotBuffer.length / 1024).toFixed(0)} KB)`, 'DEBUG', 'pixel-fallback');
+    log(`Pixel fallback: analyzing ${width}x${height} image (${(screenshotBuffer.length / 1024).toFixed(0)} KB)` +
+        (currentState ? ` [currentState=${currentState}]` : ''), 'DEBUG', 'pixel-fallback');
+
+    // Generate candidate action (state-independent pixel analysis)
+    const action = await _generatePixelAction(page, url, rgba, width, height);
+
+    // State-awareness filter: reject actions that don't make sense for current state
+    if (action && currentState) {
+      if (!_isActionStateCompatible(action, currentState)) {
+        log(`Pixel fallback: action ${action.actionType} (detected state=${action.currentState}) ` +
+            `is NOT compatible with actual currentState=${currentState} — rejected`, 'WARN', 'pixel-fallback');
+        return null;
+      }
+    }
+
+    return action;
+  } catch (e: any) {
+    log(`Pixel fallback error: ${e.message}`, 'DEBUG', 'pixel-fallback');
+    return null;
+  }
+}
+
+/** Inner action generation — pure pixel analysis, no state filtering */
+async function _generatePixelAction(page: any, url: string, rgba: Uint8ClampedArray, width: number, height: number): Promise<any> {
 
     // ── Microsoft login pages (URL-based — highest priority) ──
     if (_isMicrosoftLoginPage(url)) {
@@ -1641,10 +1698,6 @@ async function generatePixelFallbackAction(page: any): Promise<any> {
 
     log('Pixel fallback: no actionable elements found', 'DEBUG', 'pixel-fallback');
     return null;
-  } catch (e: any) {
-    log(`Pixel fallback error: ${e.message}`, 'DEBUG', 'pixel-fallback');
-    return null;
-  }
 }
 
 // ─── Visual page classifiers (pixel-only, no URL) ─────────────────────────
