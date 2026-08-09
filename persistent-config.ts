@@ -29,6 +29,7 @@ const VERSION = 1;
 interface PersistData {
   configs: Record<string, any>;
   bannedStates: Record<string, { reason: string; bannedAt: number; bannedBy: string }>;
+  bannedActions: Record<string, { reason: string; bannedAt: number; bannedBy: string }>;
   forcedState: { state: string; reason: string; forcedAt: number } | null;
   mode: {
     current: 'full_power' | 'memory_protection';
@@ -59,6 +60,7 @@ function _load(): PersistData {
   _data = {
     configs: {},
     bannedStates: {},
+    bannedActions: {},
     forcedState: null,
     mode: { current: 'full_power', switchedAt: Date.now(), reason: 'initial', autoSwitch: false },
     memoryReadings: [],
@@ -166,6 +168,41 @@ function clearAllBannedStates(): void {
   _scheduleWrite();
 }
 
+// ── Banned actions persistence ──
+
+function setBannedAction(action: string, reason: string, bannedBy: string = 'dashboard'): void {
+  const d = _load();
+  d.bannedActions[action] = { reason, bannedAt: Date.now(), bannedBy };
+  _scheduleWrite();
+}
+
+function removeBannedAction(action: string): void {
+  const d = _load();
+  delete d.bannedActions[action];
+  _scheduleWrite();
+}
+
+function isActionBanned(action: string): boolean {
+  const d = _load();
+  return action in d.bannedActions;
+}
+
+function getAllBannedActions(): Array<{ action: string; reason: string; bannedAt: number; bannedBy: string }> {
+  const d = _load();
+  return Object.entries(d.bannedActions).map(([action, info]) => ({
+    action,
+    reason: info.reason,
+    bannedAt: info.bannedAt,
+    bannedBy: info.bannedBy,
+  }));
+}
+
+function clearAllBannedActions(): void {
+  const d = _load();
+  d.bannedActions = {};
+  _scheduleWrite();
+}
+
 // ── Forced state persistence ──
 
 function setForcedState(state: string, reason: string): void {
@@ -187,7 +224,7 @@ function clearForcedState(): void {
 
 // ── Diagnostics ──
 
-function getStoreInfo(): { path: string; size: number; configCount: number; bannedStateCount: number; hasForcedState: boolean } {
+function getStoreInfo(): { path: string; size: number; configCount: number; bannedStateCount: number; bannedActionCount: number; hasForcedState: boolean } {
   try {
     const stat = fs.statSync(PERSIST_PATH);
     const d = _load();
@@ -196,6 +233,7 @@ function getStoreInfo(): { path: string; size: number; configCount: number; bann
       size: stat.size,
       configCount: Object.keys(d.configs).length,
       bannedStateCount: Object.keys(d.bannedStates).length,
+      bannedActionCount: Object.keys(d.bannedActions).length,
       hasForcedState: d.forcedState !== null,
     };
   } catch {
@@ -204,6 +242,7 @@ function getStoreInfo(): { path: string; size: number; configCount: number; bann
       size: 0,
       configCount: 0,
       bannedStateCount: 0,
+      bannedActionCount: 0,
       hasForcedState: false,
     };
   }
@@ -283,6 +322,12 @@ module.exports = {
   isStateBanned,
   getAllBannedStates,
   clearAllBannedStates,
+  // Banned actions
+  setBannedAction,
+  removeBannedAction,
+  isActionBanned,
+  getAllBannedActions,
+  clearAllBannedActions,
   // Forced state
   setForcedState,
   getForcedState,
