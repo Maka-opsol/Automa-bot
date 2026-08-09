@@ -1,427 +1,1732 @@
 'use strict';
 
-// ─── Node builtins + npm packages only — no project requires ───
-const Database = require('better-sqlite3');
-const path = require('path');
+// ═══════════════════════════════════════════════════════════════════════
+// Dashboard Server — Connected to render-free-plan.ts via container
+// ═══════════════════════════════════════════════════════════════════════
+// This module provides the full dashboard UI and all management API
+// endpoints. It exports handleDashboardRequest() for mounting into
+// an existing HTTP server (render-free-plan.ts), and also exports
+// createDashboardServer() / startDashboard() for standalone use.
+//
+// Dependencies come from the container module (same as render-free-plan.ts).
+// ═══════════════════════════════════════════════════════════════════════
+
+const http = require('http');
 const fs = require('fs');
+const path = require('path');
 const os = require('os');
+const { PROJECT_ROOT } = require('./project-root');
+const crypto = require('crypto');
+const { container } = require('./container');
+const persistConfig = require('./persistent-config');
 
-// ─── Dependency Injection ───
-// Dependencies are injected via _injectDependencies() from the DI container.
-// No top-level require() for project modules.
-let _deps: any = {};
-let _initialized = false;
-
-function _injectDependencies(deps: any) {
-  _deps = deps;
+// ── Resolve logger from container (with fallback) ──
+function getLog() {
+  try { return container.get('logger'); } catch { return require('./logger'); }
 }
 
-// ─── Lazy accessors with console fallbacks ───
-function getLog(): (msg: string, level?: string, _module?: string) => void {
-  return _deps.logger?.log || console.log;
-}
-function getLogError(): (msg: string, err: Error, ctx?: any) => void {
-  return _deps.logger?.logError || ((msg: string, err: Error) => console.error(msg, err));
-}
-function getCONFIG(): any {
-  return _deps.config || {};
-}
-
-let db: any;
-let dbRetries = 0;
-const MAX_DB_RETRIES = 3;
-
-function createDatabaseConnection() { 
-  const CONFIG = getCONFIG();
-  const log = getLog();
-  const dbPath = CONFIG.DB_PATH;
-  if (!dbPath || typeof dbPath !== 'string') throw new Error('Invalid database path');
-  const normalizedPath = path.normalize(dbPath);
-  if (normalizedPath.includes('..')) throw new Error('Path traversal detected in database path');
-  const dbDir = path.dirname(normalizedPath);
-  // Ensure database directory exists with fallback
-  if (!fs.existsSync(dbDir)) {
-    try { fs.mkdirSync(dbDir, { recursive: true, mode: 0o750 }); } catch (mkdirErr: any) {
-      // Fallback to /tmp if original path is not writable
-      const fallbackDir = path.join(os.tmpdir(), 'mathu-bot');
-      try { fs.mkdirSync(fallbackDir, { recursive: true, mode: 0o750 }); } catch (e2: any) { throw new Error(`Cannot create database directory: ${mkdirErr.message}`); }
-      log(`Could not create ${dbDir}, falling back to ${fallbackDir}`, 'WARN', 'database');
-      return createDatabaseConnectionAt(path.join(fallbackDir, 'mathu-bot.db'));
-    }
-  }
-  // Verify directory is writable
-  try { fs.accessSync(dbDir, fs.constants.W_OK); } catch (e: any) {
-    const fallbackDir = path.join(os.tmpdir(), 'mathu-bot');
-    try { fs.mkdirSync(fallbackDir, { recursive: true, mode: 0o750 }); } catch (e2: any) {}
-    log(`Database directory not writable: ${dbDir}, falling back to ${fallbackDir}`, 'WARN', 'database');
-    return createDatabaseConnectionAt(path.join(fallbackDir, 'mathu-bot.db'));
-  }
-  return createDatabaseConnectionAt(normalizedPath);
+// ── In-memory log ring buffer ──
+// Captures logs from this module and from hooked pino instances
+// Reduced from 500 to 200 for memory savings on Render free plan
+const _logRingBuffer: string[] = [];
+const _LOG_RING_MAX = 200;
+function _pushLogRing(entry: string) {
+  if (_logRingBuffer.length >= _LOG_RING_MAX) _logRingBuffer.shift();
+  _logRingBuffer.push(entry);
 }
 
-function createDatabaseConnectionAt(dbPath: string) { 
-  const connection = new Database(dbPath);
-  connection.pragma('journal_mode = WAL');
-  connection.pragma('synchronous = NORMAL');
-  connection.pragma('foreign_keys = ON');
-  connection.pragma('busy_timeout = 5000');
-  connection.pragma('cache_size = -8000');
-  connection.pragma('temp_store = MEMORY');
-  return connection;
-}
-
-function checkIntegrity() { 
-  const log = getLog();
-  const logError = getLogError();
-  try {
-    const result = db.pragma('integrity_check');
-    if (result[0]?.integrity_check !== 'ok') throw new Error(`Integrity check failed: ${JSON.stringify(result)}`);
-    log('Database integrity check passed', 'DEBUG', 'database');
-    return true;
-  } catch (err: any) {
-    logError('Database integrity check failed', err);
-    return false;
-  }
-}
-
-function getCurrentVersion() { 
-  try { const row = db.prepare('SELECT version FROM schema_version ORDER BY version DESC LIMIT 1').get(); return row ? row.version : 0; } catch (e: any) { return 0; }
-}
-
-function runMigrations() { 
-  const CONFIG = getCONFIG();
-  const log = getLog();
-  const logError = getLogError();
-  let current = getCurrentVersion();
-  // FIX: Bumped from 22 to 28 to include action_cache table (migration 27)
-  // and banned_actions table (migration 22). Without this, action_cache
-  // table is never created locally, causing "no such table" errors.
-  const target = 28;
-  if (current === target) { log(`Database schema version ${target} ready.`, 'INFO', 'database'); return; }
-  if (current > target) { log(`Database schema version ${current} is ahead of expected ${target}`, 'WARN', 'database'); return; }
-  const backupPath = CONFIG.DB_PATH + '.backup.' + Date.now();
-  try { fs.copyFileSync(CONFIG.DB_PATH, backupPath); fs.chmodSync(backupPath, 0o600); } catch (err: any) { logError('Failed to backup database before migration', err); throw new Error(`Database backup before migration failed: ${(err as Error).message}`); }
-  log(`Migrating database from version ${current} to ${target}...`, 'INFO', 'database');
-
-  const migrationSteps = [
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS schema_version ( version INTEGER PRIMARY KEY, applied_at INTEGER ); CREATE TABLE IF NOT EXISTS completed_modules ( name TEXT PRIMARY KEY, completed_at INTEGER, attempts INTEGER DEFAULT 0, completion_time_ms INTEGER, last_attempt INTEGER ); CREATE TABLE IF NOT EXISTS progress_log ( id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT, state TEXT, timestamp INTEGER, questions_completed INTEGER ); CREATE TABLE IF NOT EXISTS template_cache ( id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT UNIQUE, action_type TEXT, state TEXT, x_percent REAL, y_percent REAL, width_percent REAL, height_percent REAL, crop_data BLOB, created_at INTEGER, last_used INTEGER, hit_count INTEGER DEFAULT 0 ); CREATE TABLE IF NOT EXISTS provider_registry ( provider_name TEXT PRIMARY KEY, endpoint TEXT, model TEXT, last_verified INTEGER, history TEXT, success_count INTEGER DEFAULT 0, failure_count INTEGER DEFAULT 0, total_latency INTEGER DEFAULT 0, last_check INTEGER ); CREATE TABLE IF NOT EXISTS calibration ( key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER ); CREATE TABLE IF NOT EXISTS last_state ( url TEXT, state TEXT, timestamp INTEGER ); CREATE INDEX IF NOT EXISTS idx_progress_timestamp ON progress_log(timestamp); CREATE INDEX IF NOT EXISTS idx_template_last_used ON template_cache(last_used);`); },
-    () => {},
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS patch_history ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, description TEXT, file TEXT, patch TEXT, status TEXT, applied_at INTEGER, branch TEXT ); CREATE INDEX IF NOT EXISTS idx_patch_timestamp ON patch_history(timestamp);`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS model_registry ( provider TEXT, model_id TEXT PRIMARY KEY, is_free INTEGER DEFAULT 0, is_working INTEGER DEFAULT 0, role TEXT DEFAULT 'candidate', last_tested_at INTEGER, last_success_at INTEGER, failure_count INTEGER DEFAULT 0 ); CREATE INDEX IF NOT EXISTS idx_model_role ON model_registry(role);`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS state_history ( id INTEGER PRIMARY KEY AUTOINCREMENT, state TEXT NOT NULL, timestamp INTEGER NOT NULL, previous_state TEXT ); CREATE INDEX IF NOT EXISTS idx_state_history_timestamp ON state_history(timestamp);`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS ui_baselines ( state TEXT PRIMARY KEY, hash TEXT, map TEXT, updated_at INTEGER ); CREATE TABLE IF NOT EXISTS provider_quotas ( provider TEXT PRIMARY KEY, budget REAL, spent REAL, reset_at INTEGER ); CREATE TABLE IF NOT EXISTS session_pool ( id INTEGER PRIMARY KEY AUTOINCREMENT, session_data TEXT, created_at INTEGER ); CREATE TABLE IF NOT EXISTS blackbox ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, state TEXT, action TEXT, semantics_snapshot TEXT, screenshot_hash TEXT, success INTEGER, reasoning TEXT, latency INTEGER, provider_used TEXT ); CREATE TABLE IF NOT EXISTS semantics_snapshots ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, count INTEGER, data TEXT ); CREATE INDEX IF NOT EXISTS idx_blackbox_timestamp ON blackbox(timestamp); CREATE INDEX IF NOT EXISTS idx_semantics_timestamp ON semantics_snapshots(timestamp);`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS flutter_semantics_cache ( id INTEGER PRIMARY KEY AUTOINCREMENT, page_url TEXT, items TEXT, timestamp INTEGER ); CREATE INDEX IF NOT EXISTS idx_flutter_semantics_url ON flutter_semantics_cache(page_url);`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS network_intercept_log ( id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT, method TEXT, data TEXT, headers TEXT, timestamp INTEGER, replayed INTEGER DEFAULT 0 ); CREATE INDEX IF NOT EXISTS idx_network_timestamp ON network_intercept_log(timestamp);`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS performance_profile ( id INTEGER PRIMARY KEY AUTOINCREMENT, environment TEXT, slowdown_factor REAL, recorded_at INTEGER ); CREATE INDEX IF NOT EXISTS idx_performance_env ON performance_profile(environment);`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS gitops_rollback_chain ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, branch TEXT, description TEXT, applied INTEGER DEFAULT 0 ); CREATE INDEX IF NOT EXISTS idx_gitops_timestamp ON gitops_rollback_chain(timestamp);`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS provider_schemas ( provider TEXT PRIMARY KEY, schema TEXT, version TEXT, updated_at INTEGER ); CREATE TABLE IF NOT EXISTS exploration_maps ( id INTEGER PRIMARY KEY AUTOINCREMENT, state TEXT, map TEXT, created_at INTEGER ); CREATE INDEX IF NOT EXISTS idx_exploration_state ON exploration_maps(state);`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS runtime_versions ( id INTEGER PRIMARY KEY AUTOINCREMENT, component TEXT, version TEXT, updated_at INTEGER );`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS q_values ( state TEXT, action TEXT, value REAL, updated_at INTEGER, PRIMARY KEY (state, action) ); CREATE TABLE IF NOT EXISTS blocked_modules ( name TEXT PRIMARY KEY, blocked_at INTEGER, unblock_at INTEGER ); CREATE TABLE IF NOT EXISTS reflection_history ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, suggestion_type TEXT, description TEXT, file TEXT, success INTEGER );`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS coordinator_lock ( id TEXT PRIMARY KEY, holder TEXT, acquired_at INTEGER, expires_at INTEGER ); CREATE TABLE IF NOT EXISTS workers ( id TEXT PRIMARY KEY, last_heartbeat INTEGER, capabilities TEXT, status TEXT ); CREATE TABLE IF NOT EXISTS assigned_tasks ( task_id TEXT PRIMARY KEY, worker_id TEXT, assigned_at INTEGER, status TEXT, task_data TEXT, completed_at INTEGER, result TEXT, error TEXT );`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS experiment_results ( id INTEGER PRIMARY KEY AUTOINCREMENT, variant_id TEXT, promoted_at INTEGER, success_rate REAL, avg_latency REAL, attempts INTEGER, config TEXT );`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS critical_patch_audit ( id INTEGER PRIMARY KEY AUTOINCREMENT, requested_at INTEGER, target_file TEXT, description TEXT, status TEXT DEFAULT 'pending', phases_completed TEXT, provider_votes TEXT, resolution TEXT, resolved_at INTEGER ); CREATE INDEX IF NOT EXISTS idx_critical_audit_time ON critical_patch_audit(requested_at); CREATE INDEX IF NOT EXISTS idx_critical_audit_status ON critical_patch_audit(status);`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS self_heal_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, feature_id TEXT NOT NULL, phase TEXT NOT NULL, trigger_reason TEXT, investigation_result TEXT, patches_generated INTEGER DEFAULT 0, patches_safe INTEGER DEFAULT 0, patches_applied INTEGER DEFAULT 0, outcome TEXT, duration_ms INTEGER, error TEXT ); CREATE INDEX IF NOT EXISTS idx_self_heal_events_time ON self_heal_events(timestamp); CREATE INDEX IF NOT EXISTS idx_self_heal_events_feature ON self_heal_events(feature_id); CREATE TABLE IF NOT EXISTS selector_versions ( id INTEGER PRIMARY KEY AUTOINCREMENT, selector_file TEXT NOT NULL, version INTEGER DEFAULT 1, content TEXT NOT NULL, previous_content TEXT, created_at INTEGER NOT NULL, source TEXT DEFAULT 'auto', validated INTEGER DEFAULT 0 ); CREATE TABLE IF NOT EXISTS patch_canary ( id INTEGER PRIMARY KEY AUTOINCREMENT, patch_id INTEGER NOT NULL, mode TEXT NOT NULL DEFAULT 'canary', started_at INTEGER NOT NULL, observation_hours REAL DEFAULT 6, error_rate_baseline REAL DEFAULT 0, error_rate_observed REAL DEFAULT 0, cycles_run INTEGER DEFAULT 0, status TEXT DEFAULT 'canary', promoted_at INTEGER, rolled_back_at INTEGER, FOREIGN KEY (patch_id) REFERENCES patch_history(id) ); CREATE TABLE IF NOT EXISTS adversarial_test_results ( id INTEGER PRIMARY KEY AUTOINCREMENT, patch_id INTEGER NOT NULL, test_type TEXT NOT NULL, passed INTEGER DEFAULT 0, details TEXT, tested_at INTEGER NOT NULL, FOREIGN KEY (patch_id) REFERENCES patch_history(id) ); CREATE TABLE IF NOT EXISTS db_quarantine ( id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL, row_id INTEGER, original_data TEXT, reason TEXT, quarantined_at INTEGER NOT NULL, repair_attempted INTEGER DEFAULT 0, repaired INTEGER DEFAULT 0 ); CREATE TABLE IF NOT EXISTS discovered_states ( state TEXT PRIMARY KEY, added_at INTEGER NOT NULL, traverse_count INTEGER DEFAULT 0, last_traversed INTEGER, ttl_days INTEGER DEFAULT 7, promoted INTEGER DEFAULT 0, source_screenshot_hash TEXT, tribunal_reasoning TEXT ); CREATE TABLE IF NOT EXISTS dependency_health ( id INTEGER PRIMARY KEY AUTOINCREMENT, package TEXT NOT NULL, expected_hash TEXT, actual_hash TEXT, healthy INTEGER DEFAULT 1, last_checked INTEGER, repair_attempted INTEGER DEFAULT 0, repair_result TEXT ); CREATE TABLE IF NOT EXISTS config_reconciliation ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, source TEXT NOT NULL, key TEXT NOT NULL, local_value TEXT, remote_value TEXT, resolved_value TEXT, resolution TEXT ); CREATE TABLE IF NOT EXISTS blackbox_full ( id INTEGER PRIMARY KEY AUTOINCREMENT, blackbox_id INTEGER NOT NULL, screenshot BLOB, dom_html TEXT, network_log TEXT, tribunal_responses TEXT, captured_at INTEGER NOT NULL, FOREIGN KEY (blackbox_id) REFERENCES blackbox(id) ); CREATE INDEX IF NOT EXISTS idx_blackbox_full_bb ON blackbox_full(blackbox_id); CREATE TABLE IF NOT EXISTS patch_embeddings ( id INTEGER PRIMARY KEY AUTOINCREMENT, patch_id INTEGER NOT NULL, embedding TEXT, investigation_context TEXT, file TEXT, patch_text TEXT, status TEXT, created_at INTEGER NOT NULL, FOREIGN KEY (patch_id) REFERENCES patch_history(id) ); CREATE INDEX IF NOT EXISTS idx_patch_embeddings_time ON patch_embeddings(created_at); CREATE TABLE IF NOT EXISTS heal_model_metrics ( id INTEGER PRIMARY KEY AUTOINCREMENT, model_name TEXT NOT NULL, patch_id INTEGER, staging_passed INTEGER DEFAULT 0, prod_survived_24h INTEGER DEFAULT 0, prod_checked_at INTEGER, created_at INTEGER NOT NULL ); CREATE TABLE IF NOT EXISTS healer_circuit_state ( id INTEGER PRIMARY KEY CHECK (id = 1), state TEXT DEFAULT 'closed', failure_count INTEGER DEFAULT 0, success_count INTEGER DEFAULT 0, last_failure_time INTEGER, consecutive_opens INTEGER DEFAULT 0, updated_at INTEGER ); CREATE TABLE IF NOT EXISTS degradation_log ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, from_mode TEXT NOT NULL, to_mode TEXT NOT NULL, reason TEXT, resource_snapshot TEXT );`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS critical_consensus ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, phase TEXT NOT NULL, target_file TEXT, provider TEXT, approved INTEGER DEFAULT 0, confidence REAL DEFAULT 0, reasoning TEXT, patch_hash TEXT, details TEXT ); CREATE INDEX IF NOT EXISTS idx_critical_consensus_timestamp ON critical_consensus(timestamp); CREATE INDEX IF NOT EXISTS idx_critical_consensus_phase ON critical_consensus(phase); CREATE INDEX IF NOT EXISTS idx_critical_consensus_file ON critical_consensus(target_file); CREATE INDEX IF NOT EXISTS idx_critical_consensus_hash ON critical_consensus(patch_hash);`); },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS banned_actions ( action_type TEXT PRIMARY KEY, banned_by TEXT, banned_at INTEGER, reason TEXT );`); },
-    () => {},
-    () => {},
-    () => {},
-    () => { try { db.exec(`ALTER TABLE session_pool ADD COLUMN last_validated_at INTEGER;`); } catch (_e: any) { /* column may already exist */ } },
-    () => { db.exec(`CREATE TABLE IF NOT EXISTS action_cache ( context_sig TEXT PRIMARY KEY, action_type TEXT NOT NULL, target_x REAL NOT NULL, target_y REAL NOT NULL, value TEXT DEFAULT '', keypad_sequence TEXT, current_state TEXT NOT NULL, reasoning TEXT DEFAULT '', success_count INTEGER DEFAULT 0, failure_count INTEGER DEFAULT 0, hit_count INTEGER DEFAULT 0, created_at INTEGER NOT NULL, last_used INTEGER NOT NULL, evicted INTEGER DEFAULT 0 ); CREATE INDEX IF NOT EXISTS idx_action_cache_state ON action_cache(current_state); CREATE INDEX IF NOT EXISTS idx_action_cache_last_used ON action_cache(last_used);`); },
-  ];
-
-  const transaction = db.transaction(() => {
-    while (current < target) { current++; try { if (migrationSteps[current - 1]) { migrationSteps[current - 1](); log(`Applied migration ${current}`, 'DEBUG', 'database'); } } catch (err: any) { throw new Error(`Migration ${current} failed: ${err.message}`); } }
-    db.prepare('INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)').run(target, Date.now());
-  });
-
-  try {
-    transaction();
-    log(`Database migrated successfully to version ${target}`, 'INFO', 'database');
-    if (checkIntegrity()) { try { fs.unlinkSync(backupPath); } catch (e: any) {} } else { throw new Error('Post-migration integrity check failed'); }
-  } catch (err: any) {
-    logError('Migration failed, restoring backup', err);
-    try { db.close(); fs.copyFileSync(backupPath, CONFIG.DB_PATH); db = createDatabaseConnection(); } catch (restoreErr: any) { logError('Failed to restore backup', restoreErr); }
-    // v5-fix: Throw instead of process.exit(1) — allows caller (agent.ts) to
-    // perform cleanup (close browser, flush logs) before exiting gracefully.
-    throw new Error(`Database migration failed: ${(err as Error).message}. Backup restored from ${backupPath}`);
-  }
-}
-
-/**
- * Initialize the database: connect, check integrity, run migrations.
- * Must be called after _injectDependencies().
- */
-function initDatabase() {
-  if (_initialized) return;
-  const log = getLog();
-  const logError = getLogError();
-
-  while (dbRetries < MAX_DB_RETRIES) {
-    try { db = createDatabaseConnection(); break; } catch (err: any) {
-      dbRetries++;
-      logError(`Database connection attempt ${dbRetries} failed`, err);
-      if (dbRetries >= MAX_DB_RETRIES) { throw new Error('All database connection attempts failed'); }
-      const backoff = 1000 * Math.pow(2, dbRetries);
-      log(`Retrying database connection in ${backoff}ms...`, 'WARN', 'database');
-      // Synchronous sleep via child_process (initDatabase must remain sync for container factory).
-      // Only used during startup retries — at most MAX_DB_RETRIES times.
+// Try to hook into the pino logger to capture ALL logs to the ring buffer
+try {
+  const _loggerMod = require('./logger');
+  const _origLog = _loggerMod.log;
+  const _origLogError = _loggerMod.logError;
+  const _origSafeLog = _loggerMod.safeLog;
+  if (typeof _origLog === 'function') {
+    _loggerMod.log = (...args: any[]) => {
       try {
-        const { execSync } = require('child_process');
-        execSync(`sleep ${Math.min(backoff / 1000, 30)}`, { stdio: 'ignore', timeout: Math.min(backoff, 30000) + 1000 });
-      } catch { /* sleep interrupted or unavailable — retry immediately */ }
+        const ts = new Date().toISOString();
+        const msg = args.map((a: any) => typeof a === 'object' && a !== null ? a.msg || JSON.stringify(a) : String(a)).join(' ');
+        const lvl = (args[1] === 'ERROR' || args[1] === 'error') ? 'ERROR' : 'INFO';
+        _pushLogRing(`[${ts}] [${lvl}] ${msg}`);
+      } catch { /* non-critical */ }
+      return _origLog(...args);
+    };
+  }
+  if (typeof _origLogError === 'function') {
+    _loggerMod.logError = (...args: any[]) => {
+      try {
+        const ts = new Date().toISOString();
+        const msg = args.map((a: any) => typeof a === 'object' && a !== null ? a.msg || JSON.stringify(a) : String(a)).join(' ');
+        _pushLogRing(`[${ts}] [ERROR] ${msg}`);
+      } catch { /* non-critical */ }
+      return _origLogError(...args);
+    };
+  }
+  if (typeof _origSafeLog === 'function') {
+    _loggerMod.safeLog = (...args: any[]) => {
+      try {
+        const ts = new Date().toISOString();
+        _pushLogRing(`[${ts}] ${JSON.stringify(args[0] || args)}`);
+      } catch { /* non-critical */ }
+      return _origSafeLog(...args);
+    };
+  }
+} catch { /* logger module not available — ring buffer stays empty */ }
+
+const log    = (...args: any[]) => getLog().log(...args);
+const logErr = (...args: any[]) => getLog().logError(...args);
+
+function getCONFIG(): Record<string, any> {
+  try { return container.get('config'); } catch { return require('./get-config'); }
+}
+
+// ── Resolve dependencies from container ──
+function getProviderStats() {
+  try { return container.get('providersStats')?.getStats; } catch { return undefined; }
+}
+function getStateDiagnostics() {
+  try { return container.get('stateMachine')?.getStateDiagnostics; } catch { return undefined; }
+}
+function getCacheStats() {
+  try { return container.get('cache')?.getCacheStats; } catch { return undefined; }
+}
+function getDatabaseStats() {
+  try { return container.get('database')?.getDatabaseStats; } catch { return undefined; }
+}
+function getFailsafeDiagnostics() {
+  try { return container.get('failsafeCoordinator')?.getDiagnostics; } catch { return undefined; }
+}
+function getBrowserMetrics() {
+  try { return container.get('browser')?.getBrowserMetrics; } catch { return undefined; }
+}
+function getGenerateToken() {
+  try { return container.get('jwt')?.generateToken; } catch { return undefined; }
+}
+function getRequireAuth() {
+  try { return container.get('jwt')?.requireAuth; } catch { return undefined; }
+}
+
+function _timingSafeEqual(a: any, b: any) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch { return false; }
+}
+
+const DASHBOARD_DIR = path.join(PROJECT_ROOT, 'public');
+const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
+
+// ── Screenshot cache (shared with render-free-plan.ts via globals) ──
+// render-free-plan.ts sets (globalThis).__setLatestScreenshot and
+// (globalThis).__getLatestScreenshot FIRST (it starts before us).
+// We set them here as fallback for standalone use, but at runtime we
+// ALWAYS delegate to the globals so we read from the same cache the
+// cycle manager writes to.
+
+let _standaloneScreenshot: { screenshot: string; timestamp: number; action?: any } | null = null;
+
+function setLatestScreenshot(base64Jpeg: string, action?: any) {
+  if (base64Jpeg.length > 500_000) return;
+  _standaloneScreenshot = { screenshot: base64Jpeg, timestamp: Date.now(), action };
+}
+
+function getLatestScreenshot(): { screenshot: string; timestamp: number; action?: any } | null {
+  // Always prefer the global (render-free-plan.ts cache), which is what
+  // the cycle manager writes to. Fall back to local only in standalone.
+  const globalGet = (globalThis as any).__getLatestScreenshot;
+  if (globalGet) return globalGet();
+  if (_standaloneScreenshot && Date.now() - _standaloneScreenshot.timestamp > 120_000) {
+    _standaloneScreenshot = null;
+  }
+  return _standaloneScreenshot;
+}
+
+// Expose globally so cycle manager can call it (same globals as render-free-plan)
+if (!(globalThis as any).__setLatestScreenshot) (globalThis as any).__setLatestScreenshot = setLatestScreenshot;
+if (!(globalThis as any).__getLatestScreenshot) (globalThis as any).__getLatestScreenshot = getLatestScreenshot;
+
+// ── Helper: read JSON body from request ──
+function readBody(req: any, res: any, cb: (body: string) => void) {
+  let body = '';
+  const MAX = 1 * 1024 * 1024;
+  let tooLarge = false;
+  req.on('data', (chunk: any) => {
+    if (body.length > MAX) {
+      if (!tooLarge) { tooLarge = true; res.writeHead(413, { 'Content-Type': 'application/json' }); res.end('{"error":"Body too large"}'); req.destroy(); }
+      return;
+    }
+    body += chunk;
+  });
+  req.on('end', () => { if (!tooLarge) cb(body); });
+}
+
+// ── Helper: JSON response ──
+function jsonRes(res: any, data: any, status = 200) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(data));
+}
+
+// ── Helper: format uptime ──
+function formatUptime(seconds: number): string {
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  const parts: string[] = [];
+  if (d > 0) parts.push(`${d}d`);
+  if (h > 0) parts.push(`${h}h`);
+  if (m > 0) parts.push(`${m}m`);
+  parts.push(`${s}s`);
+  return parts.join(' ');
+}
+
+// ── Helper: get all known states from state-machine ──
+function getAllStates(): string[] {
+  try {
+    const sm = require('./state-machine');
+    return Object.values(sm.STATES || {});
+  } catch { return []; }
+}
+
+function getAllActions(): string[] {
+  try {
+    const sm = require('./state-machine');
+    return Object.keys(sm.ACTIONS || {});
+  } catch { return []; }
+}
+
+// ── Helper: capture a live screenshot right now ──
+async function captureLiveScreenshot(): Promise<string | null> {
+  try {
+    const browserMod = require('./browser');
+    const page = browserMod.browserManager?.getPage?.() || browserMod.browserManager?.pageInstance;
+    if (!page || page.isClosed()) return null;
+    const buf = await page.screenshot({ type: 'jpeg', quality: 40 });
+    let base64 = buf.toString('base64');
+    // Try sharp compression first (much smaller)
+    try {
+      const compressed = await browserMod.compressScreenshot?.(base64, 800, 30);
+      if (compressed && compressed.length < 500_000) return compressed;
+    } catch { /* sharp not available */ }
+    // Raw JPEG — if too large, skip rather than truncate (truncated base64 = corrupted image)
+    if (base64.length > 500_000) {
+      log(`Live screenshot too large (${Math.round(base64.length / 1024)}KB), skipping`, 'WARN', 'dashboard');
+      return null;
+    }
+    return base64;
+  } catch (e: any) {
+    log(`Live screenshot capture failed: ${e.message}`, 'WARN', 'dashboard');
+    return null;
+  }
+}
+
+// ── Helper: get stop state ──
+function getDaemonState(): { running: boolean; stopRequested: boolean } {
+  try {
+    const orch = require('./cycle-orchestrator');
+    return {
+      running: !!orch.startDaemon,
+      stopRequested: !!orch._stopRequested,
+    };
+  } catch { return { running: false, stopRequested: false }; }
+}
+
+// ── Helper: get available config keys that can be changed from dashboard ──
+// Expanded set — all keys from config.ts override schema plus useful operational keys.
+// Secrets, paths, and security-critical flags are excluded.
+const SAFE_CONFIG_KEYS = new Set([
+  // Timing / scheduling
+  'SLEEP_MIN_HOURS', 'SLEEP_MAX_HOURS', 'MAX_CYCLES_BEFORE_RESTART',
+  'MAX_CONSECUTIVE_FAILURES', 'MAX_QUESTIONS', 'CHECK_INTERVAL_HOURS',
+  'MAX_UPTIME_HOURS', 'MAX_RUNTIME_PER_CYCLE_MS', 'STARTUP_DELAY_MIN_MINUTES',
+  'STARTUP_DELAY_MAX_MINUTES', 'ALLOWED_ACTIVITY_START_HOUR', 'ALLOWED_ACTIVITY_END_HOUR',
+  // Browser / interaction
+  'POST_CLICK_MS', 'BETWEEN_STEPS_MS', 'SCROLL_AMOUNT', 'SCROLL_PAUSE_MS',
+  'VIDEO_SPEED', 'VIDEO_TIMEOUT_MS', 'WAIT_MULTIPLIER',
+  'BROWSER_LAUNCH_TIMEOUT_MS', 'BROWSER_PAGE_TIMEOUT_MS',
+  'MAX_CONSECUTIVE_SAME_ACTION', 'SCROLL_NO_CHANGE_THRESHOLD',
+  'SWIPE_DURATION_MS', 'LONG_PRESS_DELAY_MS',
+  // Memory / GC
+  'ENABLE_GC_ON_CYCLE', 'MAX_MEMORY_MB', 'MEMORY_WARNING_THRESHOLD_MB', 'MEMORY_RESTART_THRESHOLD_MB',
+  // Alerts
+  'ALERT_ON_ERROR', 'ALERT_ON_STAGNATION', 'ALERT_ON_AUTH_FAILURE',
+  // Providers / vision
+  'VISION_PRIORITY', 'PROVIDER_ORDER', 'OPENROUTER_TRIBUNAL_MODEL',
+  // Self-heal subsystems (toggleable)
+  'PREDICTIVE_HEAL_ENABLED', 'SELECTOR_DRIFT_HEAL_ENABLED', 'REGRESSION_BANK_ENABLED',
+  'CANARY_ROLLOUT_ENABLED', 'CANARY_OBSERVATION_HOURS',
+  'DIFF_MINIMIZER_ENABLED', 'PROMPT_EVOLUTION_ENABLED', 'PROMPT_EVOLUTION_MIN_ENTRIES',
+  'DB_HEALER_ENABLED', 'AUTH_HEALER_ENABLED', 'STATE_RECOVERY_ENABLED',
+  'DEPENDENCY_HEALER_ENABLED', 'CONFIG_RECONCILER_ENABLED',
+  'EXTENDED_CHECKPOINT_ENABLED', 'BLACKBOX_FULL_ENABLED',
+  'PATCH_MEMORY_ENABLED', 'HEAL_REWARD_TRACKER_ENABLED', 'SELF_HEAL_TIMELINE_ENABLED',
+  'HEALER_CIRCUIT_BREAKER_ENABLED', 'DEGRADATION_LADDER_ENABLED',
+  'ENABLE_BLACKBOX', 'ENABLE_EXPLORATION_PASS', 'ENABLE_ADAPTIVE_PERFORMANCE',
+  // Logging
+  'LOG_LEVEL', 'LOG_MAX_SIZE_MB', 'LOG_MAX_FILES',
+  // Misc operational
+  'SAVE_SCREENSHOTS', 'MAX_SCREENSHOTS', 'ENABLE_IP_CHECK',
+  'WEB_SEARCH_ENABLED', 'TEMPLATE_CACHE_ENABLED', 'TEMPLATE_MATCH_THRESHOLD',
+  'STATE_TIMEOUT_MS', 'STATE_HISTORY_MAX',
+  'HEADLESS', 'AUTO_INSTALL_DEPENDENCIES',
+  // Mode & feature flags (safe to toggle from dashboard)
+  'DEGRADED_MODE', 'SELF_HEAL_ENABLED', 'ENABLE_STATUS_SERVER',
+  // Human emulation
+  'HUMAN_MOUSE_JITTER_PX', 'HUMAN_MOUSE_STEPS',
+  // Browser contexts
+  'BROWSER_LAUNCH_EXTENDED_TIMEOUT_MS', 'BROWSER_CONTEXT_TIMEOUT_MS', 'BROWSER_CLOSE_TIMEOUT_MS',
+  // Log ring buffer
+  'LOG_RING_BUFFER_MAX',
+]);
+
+// Config key metadata for the dashboard editor (grouped, with descriptions + type hints)
+const CONFIG_KEY_META: Record<string, { group: string; label: string; type: 'number' | 'boolean' | 'string'; desc: string }> = {
+  // Timing
+  SLEEP_MIN_HOURS:             { group: 'Timing', label: 'Sleep Min (hours)', type: 'number', desc: 'Min sleep between cycles' },
+  SLEEP_MAX_HOURS:             { group: 'Timing', label: 'Sleep Max (hours)', type: 'number', desc: 'Max sleep between cycles' },
+  MAX_CYCLES_BEFORE_RESTART:   { group: 'Timing', label: 'Max Cycles', type: 'number', desc: 'Restart after N cycles' },
+  MAX_QUESTIONS:               { group: 'Timing', label: 'Max Questions', type: 'number', desc: 'Total questions before stopping' },
+  CHECK_INTERVAL_HOURS:        { group: 'Timing', label: 'Check Interval (hr)', type: 'number', desc: 'Hours between check-in cycles' },
+  MAX_UPTIME_HOURS:            { group: 'Timing', label: 'Max Uptime (hr)', type: 'number', desc: 'Force restart after N hours' },
+  MAX_RUNTIME_PER_CYCLE_MS:    { group: 'Timing', label: 'Cycle Timeout (ms)', type: 'number', desc: 'Max runtime per cycle' },
+  STARTUP_DELAY_MIN_MINUTES:   { group: 'Timing', label: 'Startup Delay Min (min)', type: 'number', desc: 'Min random delay before first cycle' },
+  STARTUP_DELAY_MAX_MINUTES:   { group: 'Timing', label: 'Startup Delay Max (min)', type: 'number', desc: 'Max random delay before first cycle' },
+  ALLOWED_ACTIVITY_START_HOUR: { group: 'Timing', label: 'Activity Start Hour', type: 'number', desc: 'Earliest hour bot can be active' },
+  ALLOWED_ACTIVITY_END_HOUR:   { group: 'Timing', label: 'Activity End Hour', type: 'number', desc: 'Latest hour bot can be active' },
+  // Browser
+  POST_CLICK_MS:               { group: 'Browser', label: 'Post-Click Delay (ms)', type: 'number', desc: 'Wait after clicking' },
+  BETWEEN_STEPS_MS:            { group: 'Browser', label: 'Between Steps (ms)', type: 'number', desc: 'Wait between action steps' },
+  SCROLL_AMOUNT:               { group: 'Browser', label: 'Scroll Amount (px)', type: 'number', desc: 'Pixels per scroll action' },
+  SCROLL_PAUSE_MS:             { group: 'Browser', label: 'Scroll Pause (ms)', type: 'number', desc: 'Pause after scrolling' },
+  VIDEO_SPEED:                 { group: 'Browser', label: 'Video Speed', type: 'number', desc: 'Playback speed multiplier' },
+  VIDEO_TIMEOUT_MS:            { group: 'Browser', label: 'Video Timeout (ms)', type: 'number', desc: 'Max wait for video' },
+  WAIT_MULTIPLIER:             { group: 'Browser', label: 'Wait Multiplier', type: 'number', desc: 'Global wait time multiplier' },
+  BROWSER_LAUNCH_TIMEOUT_MS:   { group: 'Browser', label: 'Browser Launch Timeout', type: 'number', desc: 'Max time to launch browser' },
+  BROWSER_PAGE_TIMEOUT_MS:     { group: 'Browser', label: 'Page Timeout (ms)', type: 'number', desc: 'Max time for page load' },
+  MAX_CONSECUTIVE_SAME_ACTION: { group: 'Browser', label: 'Max Same Action', type: 'number', desc: 'Max repeats of same action' },
+  SCROLL_NO_CHANGE_THRESHOLD:  { group: 'Browser', label: 'Scroll Stuck Threshold', type: 'number', desc: 'Scrolls with no change before recovery' },
+  SWIPE_DURATION_MS:           { group: 'Browser', label: 'Swipe Duration (ms)', type: 'number', desc: 'Duration of swipe gestures' },
+  LONG_PRESS_DELAY_MS:         { group: 'Browser', label: 'Long Press Delay (ms)', type: 'number', desc: 'Delay before long press activates' },
+  // Memory
+  ENABLE_GC_ON_CYCLE:          { group: 'Memory', label: 'GC On Cycle', type: 'boolean', desc: 'Run garbage collector after each cycle' },
+  MAX_MEMORY_MB:                { group: 'Memory', label: 'Max Memory (MB)', type: 'number', desc: 'Memory ceiling before restart' },
+  MEMORY_WARNING_THRESHOLD_MB: { group: 'Memory', label: 'Memory Warn (MB)', type: 'number', desc: 'Warning threshold for memory usage' },
+  MEMORY_RESTART_THRESHOLD_MB: { group: 'Memory', label: 'Memory Restart (MB)', type: 'number', desc: 'Restart threshold for memory usage' },
+  // Alerts
+  ALERT_ON_ERROR:              { group: 'Alerts', label: 'Alert on Error', type: 'boolean', desc: 'Send alert on errors' },
+  ALERT_ON_STAGNATION:         { group: 'Alerts', label: 'Alert on Stagnation', type: 'boolean', desc: 'Send alert when stuck' },
+  ALERT_ON_AUTH_FAILURE:        { group: 'Alerts', label: 'Alert on Auth Failure', type: 'boolean', desc: 'Send alert on auth failures' },
+  // Providers
+  VISION_PRIORITY:              { group: 'Providers', label: 'Vision Priority', type: 'string', desc: 'cloud, local, or hybrid' },
+  PROVIDER_ORDER:               { group: 'Providers', label: 'Provider Order', type: 'string', desc: 'Comma-separated provider priority' },
+  OPENROUTER_TRIBUNAL_MODEL:   { group: 'Providers', label: 'OR Tribunal Model', type: 'string', desc: 'Model for tribunal decisions' },
+  // Self-Heal
+  PREDICTIVE_HEAL_ENABLED:     { group: 'Self-Heal', label: 'Predictive Heal', type: 'boolean', desc: 'Predict and prevent failures' },
+  SELECTOR_DRIFT_HEAL_ENABLED:  { group: 'Self-Heal', label: 'Selector Drift Heal', type: 'boolean', desc: 'Auto-fix CSS selector drift' },
+  REGRESSION_BANK_ENABLED:      { group: 'Self-Heal', label: 'Regression Bank', type: 'boolean', desc: 'Store and replay regression tests' },
+  CANARY_ROLLOUT_ENABLED:       { group: 'Self-Heal', label: 'Canary Rollout', type: 'boolean', desc: 'Gradual feature rollout' },
+  CANARY_OBSERVATION_HOURS:     { group: 'Self-Heal', label: 'Canary Observation (hr)', type: 'number', desc: 'Hours to observe canary' },
+  DIFF_MINIMIZER_ENABLED:       { group: 'Self-Heal', label: 'Diff Minimizer', type: 'boolean', desc: 'Minimize failure-producing diffs' },
+  PROMPT_EVOLUTION_ENABLED:     { group: 'Self-Heal', label: 'Prompt Evolution', type: 'boolean', desc: 'Evolve prompts over time' },
+  PROMPT_EVOLUTION_MIN_ENTRIES: { group: 'Self-Heal', label: 'Prompt Evo Min Entries', type: 'number', desc: 'Min entries before evolution triggers' },
+  DB_HEALER_ENABLED:            { group: 'Self-Heal', label: 'DB Healer', type: 'boolean', desc: 'Auto-repair database issues' },
+  AUTH_HEALER_ENABLED:         { group: 'Self-Heal', label: 'Auth Healer', type: 'boolean', desc: 'Auto-refresh auth tokens' },
+  STATE_RECOVERY_ENABLED:      { group: 'Self-Heal', label: 'State Recovery', type: 'boolean', desc: 'Recover from bad states' },
+  DEPENDENCY_HEALER_ENABLED:   { group: 'Self-Heal', label: 'Dependency Healer', type: 'boolean', desc: 'Auto-fix missing deps' },
+  CONFIG_RECONCILER_ENABLED:    { group: 'Self-Heal', label: 'Config Reconciler', type: 'boolean', desc: 'Sync config across modules' },
+  EXTENDED_CHECKPOINT_ENABLED: { group: 'Self-Heal', label: 'Extended Checkpoint', type: 'boolean', desc: 'Detailed cycle checkpointing' },
+  BLACKBOX_FULL_ENABLED:       { group: 'Self-Heal', label: 'Blackbox Full', type: 'boolean', desc: 'Full blackbox replay testing' },
+  PATCH_MEMORY_ENABLED:         { group: 'Self-Heal', label: 'Patch Memory', type: 'boolean', desc: 'Remember successful patches' },
+  HEAL_REWARD_TRACKER_ENABLED: { group: 'Self-Heal', label: 'Heal Reward Tracker', type: 'boolean', desc: 'Track which heals worked' },
+  SELF_HEAL_TIMELINE_ENABLED:   { group: 'Self-Heal', label: 'Heal Timeline', type: 'boolean', desc: 'Log healing timeline events' },
+  HEALER_CIRCUIT_BREAKER_ENABLED: { group: 'Self-Heal', label: 'Healer Circuit Breaker', type: 'boolean', desc: 'Stop healing if failure rate too high' },
+  DEGRADATION_LADDER_ENABLED:  { group: 'Self-Heal', label: 'Degradation Ladder', type: 'boolean', desc: 'Gracefully degrade under load' },
+  ENABLE_BLACKBOX:              { group: 'Self-Heal', label: 'Blackbox', type: 'boolean', desc: 'Enable blackbox testing' },
+  ENABLE_EXPLORATION_PASS:      { group: 'Self-Heal', label: 'Exploration Pass', type: 'boolean', desc: 'Periodic UI exploration' },
+  ENABLE_ADAPTIVE_PERFORMANCE:  { group: 'Self-Heal', label: 'Adaptive Performance', type: 'boolean', desc: 'Adjust timing dynamically' },
+  // Logging
+  LOG_LEVEL:                    { group: 'Logging', label: 'Log Level', type: 'string', desc: 'debug, info, warn, error' },
+  LOG_MAX_SIZE_MB:             { group: 'Logging', label: 'Max Log Size (MB)', type: 'number', desc: 'Max size per log file' },
+  LOG_MAX_FILES:                { group: 'Logging', label: 'Max Log Files', type: 'number', desc: 'Max rotated log files' },
+  // Misc
+  SAVE_SCREENSHOTS:             { group: 'Misc', label: 'Save Screenshots', type: 'boolean', desc: 'Persist screenshots to disk' },
+  MAX_SCREENSHOTS:              { group: 'Misc', label: 'Max Screenshots', type: 'number', desc: 'Max screenshots to keep' },
+  ENABLE_IP_CHECK:              { group: 'Misc', label: 'IP Check', type: 'boolean', desc: 'Verify IP location' },
+  WEB_SEARCH_ENABLED:           { group: 'Misc', label: 'Web Search', type: 'boolean', desc: 'Enable web search capability' },
+  TEMPLATE_CACHE_ENABLED:       { group: 'Misc', label: 'Template Cache', type: 'boolean', desc: 'Cache action templates' },
+  TEMPLATE_MATCH_THRESHOLD:     { group: 'Misc', label: 'Template Match Threshold', type: 'number', desc: 'Min similarity for template match' },
+  STATE_TIMEOUT_MS:             { group: 'Misc', label: 'State Timeout (ms)', type: 'number', desc: 'Timeout for state transitions' },
+  STATE_HISTORY_MAX:            { group: 'Misc', label: 'State History Max', type: 'number', desc: 'Max state history entries' },
+  HEADLESS:                     { group: 'Misc', label: 'Headless', type: 'boolean', desc: 'Run browser headlessly' },
+  MAX_CONSECUTIVE_FAILURES:     { group: 'Misc', label: 'Max Consecutive Failures', type: 'number', desc: 'Max failures before recovery' },
+  AUTO_INSTALL_DEPENDENCIES:    { group: 'Misc', label: 'Auto Install Deps', type: 'boolean', desc: 'Auto-install missing packages' },
+  DEGRADED_MODE:               { group: 'Mode', label: 'Degraded Mode', type: 'boolean', desc: 'Run in reduced-capability mode' },
+  SELF_HEAL_ENABLED:           { group: 'Mode', label: 'Self-Heal', type: 'boolean', desc: 'Master switch for self-heal subsystems' },
+  ENABLE_STATUS_SERVER:         { group: 'Mode', label: 'Status Server', type: 'boolean', desc: 'Enable dashboard/status HTTP server' },
+  HUMAN_MOUSE_JITTER_PX:       { group: 'Browser', label: 'Mouse Jitter (px)', type: 'number', desc: 'Random mouse movement jitter' },
+  HUMAN_MOUSE_STEPS:           { group: 'Browser', label: 'Mouse Steps', type: 'number', desc: 'Steps for human-like mouse movement' },
+  BROWSER_LAUNCH_EXTENDED_TIMEOUT_MS: { group: 'Browser', label: 'Extended Launch Timeout', type: 'number', desc: 'Extended browser launch timeout' },
+  BROWSER_CONTEXT_TIMEOUT_MS:   { group: 'Browser', label: 'Context Timeout (ms)', type: 'number', desc: 'Browser context creation timeout' },
+  BROWSER_CLOSE_TIMEOUT_MS:    { group: 'Browser', label: 'Close Timeout (ms)', type: 'number', desc: 'Browser close timeout' },
+};
+
+// In-memory banned-states store (backed by persistent-config for same-instance restarts)
+const _bannedStates: Map<string, { reason: string; bannedAt: number; bannedBy: string }> = new Map();
+
+// On module load, restore persisted banned states into memory
+try {
+  for (const entry of persistConfig.getAllBannedStates()) {
+    _bannedStates.set(entry.state, { reason: entry.reason, bannedAt: entry.bannedAt, bannedBy: entry.bannedBy });
+  }
+} catch { /* best-effort */ }
+
+// On module load, apply any persisted config overrides to the running config
+try {
+  const overrides = persistConfig.getAllConfigOverrides();
+  if (Object.keys(overrides).length > 0) {
+    const { updateConfig } = require('./get-config');
+    for (const [key, value] of Object.entries(overrides)) {
+      try {
+        updateConfig(key, value);
+        getLog()?.log?.(`Restored config override: ${key} = ${JSON.stringify(value)}`, 'INFO', 'dashboard');
+      } catch { /* skip invalid */ }
     }
   }
+} catch { /* best-effort */ }
 
-  if (!checkIntegrity()) {
-    log('Attempting database recovery...', 'WARN', 'database');
-    try {
-      db.pragma('recovery');
-      if (!checkIntegrity()) { log('Database recovery failed, creating new database', 'ERROR', 'database'); try { fs.unlinkSync(db.name); } catch (e: any) { /* file may not exist */ } db = createDatabaseConnection(); }
-    } catch (err: any) { logError('Database recovery error', err); throw new Error('Database recovery failed: ' + (err as Error).message); }
+function serveStaticFile(res: any, filePath: any, contentType: any) {
+  fs.readFile(filePath, (err: any, content: any) => {
+    if (err) { res.writeHead(404); res.end('Not found'); return; }
+    res.writeHead(200, { 'Content-Type': contentType });
+    res.end(content);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  REQUEST HANDLER — Can be mounted into any HTTP server
+// ═══════════════════════════════════════════════════════════════════════
+// Returns true if the request was handled (caller should NOT send 404).
+// Returns false if the request didn't match any dashboard route.
+// ═══════════════════════════════════════════════════════════════════════
+
+async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
+  const DASHBOARD_ALLOWED_ORIGINS = process.env.DASHBOARD_ALLOWED_ORIGINS
+      ? process.env.DASHBOARD_ALLOWED_ORIGINS.split(',')
+      : ['*'];
+  const origin = req.headers.origin || '';
+  if (DASHBOARD_ALLOWED_ORIGINS.includes(origin) || DASHBOARD_ALLOWED_ORIGINS.includes('*')) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return true; }
+
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const pathname = url.pathname;
+
+  // Require auth for dashboard API routes (except /health)
+  // Accepts both raw ADMIN_SECRET and JWT tokens (via requireAuth)
+  const requireAuth = getRequireAuth();
+  const authWrap = (cb: () => void) => {
+    // First check: raw ADMIN_SECRET (timing-safe)
+    if (ADMIN_SECRET) {
+      const authHdr = req.headers.authorization || '';
+      if (authHdr.startsWith('Bearer ') && _timingSafeEqual(authHdr.slice(7), ADMIN_SECRET)) {
+        cb();
+        return;
+      }
+    }
+    // Second check: JWT via requireAuth (if available)
+    if (requireAuth) {
+      requireAuth(req, res, () => {
+        cb();
+      });
+      return;
+    }
+    // No auth configured — allow through
+    cb();
+  };
+
+  // ═══════════════════════════════════════════════════════════════
+  //  HTML DASHBOARD
+  // ═══════════════════════════════════════════════════════════════
+  if (pathname === '/dashboard' || pathname === '/dashboard/') {
+    const indexPath = path.join(DASHBOARD_DIR, 'index.html');
+    if (fs.existsSync(indexPath)) {
+      serveStaticFile(res, indexPath, 'text/html');
+      return true;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(getDashboardHTML());
+    return true;
   }
 
-  runMigrations();
-  createPreparedStatements();
-  _initialized = true;
+  // ═══════════════════════════════════════════════════════════════
+  //  READ-ONLY API ENDPOINTS
+  // ═══════════════════════════════════════════════════════════════
+
+  // Status
+  if (pathname === '/api/status') {
+    authWrap(() => {
+      const stats = getProviderStats();
+      jsonRes(res, stats ? stats() : {});
+    });
+    return true;
+  }
+
+  // State diagnostics
+  if (pathname === '/api/state') {
+    authWrap(() => {
+      const diagnostics = getStateDiagnostics();
+      jsonRes(res, diagnostics ? diagnostics() : {});
+    });
+    return true;
+  }
+
+  // Daemon state (running/paused)
+  if (pathname === '/api/daemon') {
+    authWrap(() => {
+      jsonRes(res, getDaemonState());
+    });
+    return true;
+  }
+
+  // Available states list
+  if (pathname === '/api/states') {
+    authWrap(() => {
+      jsonRes(res, { states: getAllStates() });
+    });
+    return true;
+  }
+
+  // Available actions list
+  if (pathname === '/api/actions') {
+    authWrap(() => {
+      jsonRes(res, { actions: getAllActions() });
+    });
+    return true;
+  }
+
+  // Logs — serve from in-memory ring buffer (always available),
+  // with log file as enrichment if accessible.
+  if (pathname === '/api/logs') {
+    authWrap(() => {
+      try {
+        // Primary: in-memory ring buffer (always has recent logs)
+        let lines: string[] = _logRingBuffer.length > 0
+          ? _logRingBuffer.slice(-200)
+          : [];
+
+        // Enrich from log file if available (append older entries)
+        const candidates = [
+          getCONFIG().LOG_DIR,          // config's LOG_DIR (may differ from logger's)
+          path.join(os.tmpdir(), 'mathu-logs'),           // render-free-plan default
+          path.join(os.tmpdir(), 'mathu-bot-logs'),       // logger.ts default
+        ].filter(Boolean);
+
+        for (const dir of candidates) {
+          try {
+            const logFile = path.join(dir, 'daemon.log');
+            if (fs.existsSync(logFile)) {
+              const data = fs.readFileSync(logFile, 'utf8');
+              const fileLines = data.split('\n').filter(Boolean).slice(-200);
+              if (fileLines.length > lines.length) {
+                lines = fileLines;
+              }
+              break;
+            }
+          } catch { /* try next candidate */ }
+        }
+
+        if (lines.length === 0) {
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.end('No logs available yet — waiting for first cycle...');
+        } else {
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.end(lines.join('\n'));
+        }
+      } catch (e: any) {
+        res.writeHead(500);
+        res.end('Error reading log file');
+      }
+    });
+    return true;
+  }
+
+  // Health (deep)
+  if (pathname === '/api/health' || pathname === '/api/health/deep') {
+    authWrap(() => {
+      const mem = process.memoryUsage();
+      const stats = getProviderStats();
+      const health = {
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        stats: stats ? stats() : {},
+        state: (() => { const d = getStateDiagnostics(); return d ? d() : {}; })(),
+        daemon: getDaemonState(),
+        memory: {
+          heapUsed: (mem.heapUsed / 1024 / 1024).toFixed(0) + 'MB',
+          heapTotal: (mem.heapTotal / 1024 / 1024).toFixed(0) + 'MB',
+          rss: (mem.rss / 1024 / 1024).toFixed(0) + 'MB',
+          rssPercent: ((mem.rss / (512 * 1024 * 1024)) * 100).toFixed(1) + '%',
+        },
+        uptime: process.uptime(),
+        uptimeFormatted: formatUptime(process.uptime()),
+        browser: (() => { const m = getBrowserMetrics(); return m ? m() : {}; })(),
+        database: (() => { const s = getDatabaseStats(); return s ? s() : {}; })(),
+        cache: (() => { const s = getCacheStats(); return s ? s() : {}; })(),
+        failsafe: (() => { const d = getFailsafeDiagnostics(); return d ? d() : {}; })(),
+      };
+      jsonRes(res, health);
+    });
+    return true;
+  }
+
+  // Metrics
+  if (pathname === '/api/metrics') {
+    authWrap(() => {
+      try {
+        const { metrics } = require('./metrics');
+        jsonRes(res, metrics.getSummary ? metrics.getSummary() : {});
+      } catch { jsonRes(res, {}); }
+    });
+    return true;
+  }
+
+  // ── Cached screenshot (set by cycle manager) ──
+  if (pathname === '/api/screenshot') {
+    authWrap(() => {
+      const shot = getLatestScreenshot();
+      if (!shot) { jsonRes(res, { available: false }, 204); return; }
+      jsonRes(res, {
+        available: true,
+        timestamp: shot.timestamp,
+        age: Date.now() - shot.timestamp,
+        action: shot.action ? {
+          actionType: shot.action.actionType,
+          currentState: shot.action.currentState,
+          reasoning: shot.action.reasoning?.substring(0, 200),
+        } : null,
+        screenshot: shot.screenshot,
+      });
+    });
+    return true;
+  }
+
+  // ── Live screenshot (capture right now) ──
+  if (pathname === '/api/screenshot/live') {
+    authWrap(async () => {
+      try {
+        const jpeg = await captureLiveScreenshot();
+        if (!jpeg) { jsonRes(res, { available: false, error: 'Browser not available' }, 503); return; }
+        jsonRes(res, { available: true, timestamp: Date.now(), screenshot: jpeg });
+      } catch (e: any) {
+        jsonRes(res, { available: false, error: e.message }, 500);
+      }
+    });
+    return true;
+  }
+
+  // ── Provider health ──
+  if (pathname === '/api/providers') {
+    authWrap(async () => {
+      try {
+        const healthMod = require('./providers-health');
+        const registryMod = require('./providers-registry');
+        const providers = registryMod.getAvailableProviders ? await registryMod.getAvailableProviders() : [];
+        const healthDetails = providers.map((p: any) => {
+          const snapshot = healthMod.getHealthSnapshot?.(p.name) || {};
+          return {
+            name: p.name,
+            healthScore: p.healthScore,
+            totalCalls: snapshot.totalCalls || 0,
+            successRate: snapshot.successRate || 0,
+            avgLatencyMs: snapshot.avgLatencyMs || 0,
+            isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
+            circuitBreaker: snapshot.circuitBreakerState || 'closed',
+          };
+        });
+        const loadFailures = registryMod.getLoadFailures ? registryMod.getLoadFailures() : [];
+        jsonRes(res, { providers: healthDetails, loadFailures, providerCount: healthDetails.length, timestamp: Date.now() });
+      } catch (e: any) {
+        jsonRes(res, { error: e.message }, 500);
+      }
+    });
+    return true;
+  }
+
+  // ── Banned actions (GET) ──
+  if (pathname === '/api/banned-actions' && req.method === 'GET') {
+    authWrap(() => {
+      try {
+        const { listBannedActions } = require('./database');
+        jsonRes(res, listBannedActions());
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── Banned states (GET) ──
+  if (pathname === '/api/banned-states' && req.method === 'GET') {
+    authWrap(() => {
+      const banned: Array<{ state: string; reason: string; bannedAt: number }> = [];
+      for (const [state, info] of _bannedStates) {
+        banned.push({ state, reason: info.reason, bannedAt: info.bannedAt });
+      }
+      jsonRes(res, { bannedStates: banned });
+    });
+    return true;
+  }
+
+  // ── Config keys (GET) — list all editable config keys with current values ──
+  if (pathname === '/api/config/keys' && req.method === 'GET') {
+    authWrap(() => {
+      try {
+        const cfg = getCONFIG();
+        const grouped: Record<string, Array<{ key: string; label: string; type: string; desc: string; value: any }>> = {};
+        for (const key of SAFE_CONFIG_KEYS) {
+          const meta = CONFIG_KEY_META[key];
+          if (!meta) continue;
+          if (!grouped[meta.group]) grouped[meta.group] = [];
+          grouped[meta.group].push({
+            key,
+            label: meta.label,
+            type: meta.type,
+            desc: meta.desc,
+            value: cfg[key] !== undefined ? cfg[key] : null,
+          });
+        }
+        jsonRes(res, { groups: grouped });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── Full status (combined) ──
+  if (pathname === '/api/full-status') {
+    authWrap(async () => {
+      try {
+        const stats = getProviderStats();
+        const mem = process.memoryUsage();
+        const shot = getLatestScreenshot();
+        const healthMod = require('./providers-health');
+        const registryMod = require('./providers-registry');
+        const providers = registryMod.getAvailableProviders ? await registryMod.getAvailableProviders() : [];
+        const providerSummary = providers.map((p: any) => ({
+          name: p.name, healthScore: p.healthScore,
+          isAvailable: healthMod.isProviderAvailable?.(p.name) ?? true,
+        }));
+        const loadFailures = registryMod.getLoadFailures ? registryMod.getLoadFailures() : [];
+        const providerCount = registryMod.getAvailableProviderCount ? registryMod.getAvailableProviderCount() : 0;
+        jsonRes(res, {
+          ...(stats ? stats() : {}),
+          daemon: getDaemonState(),
+          memory: {
+            heapUsed: (mem.heapUsed / 1024 / 1024).toFixed(0) + 'MB',
+            heapTotal: (mem.heapTotal / 1024 / 1024).toFixed(0) + 'MB',
+            rss: (mem.rss / 1024 / 1024).toFixed(0) + 'MB',
+          },
+          uptime: process.uptime(),
+          uptimeFormatted: formatUptime(process.uptime()),
+          screenshotAvailable: !!shot,
+          providers: providerSummary,
+          providerLoadFailures: loadFailures,
+          providerCount,
+          timestamp: Date.now(),
+          actionCache: (() => { try { return require('./services-action-cache').getStats(); } catch { return null; } })(),
+          workShifts: (() => { try { const ws = require('./services-work-shifts'); const s = ws.getShift(); return { current: s.current, reason: s.reason, fullCycle: ws.shouldRunFullCycle() }; } catch { return null; } })(),
+        });
+      } catch (e: any) {
+        jsonRes(res, { error: e.message, timestamp: Date.now() }, 500);
+      }
+    });
+    return true;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  CONTROL API ENDPOINTS (write operations)
+  // ═══════════════════════════════════════════════════════════════
+
+  // Admin token
+  if (pathname === '/api/admin/token' && req.method === 'GET') {
+    if (!ADMIN_SECRET) { jsonRes(res, { error: 'Admin secret not set' }, 503); return true; }
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ') || !_timingSafeEqual(authHeader.slice(7), ADMIN_SECRET)) {
+      jsonRes(res, { error: 'Unauthorized' }, 401);
+      return true;
+    }
+    const gen = getGenerateToken();
+    jsonRes(res, { token: gen ? gen({ admin: true }) : null });
+    return true;
+  }
+
+  // ── Emergency stop ──
+  if (pathname === '/api/emergency/stop' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        const { requestStop } = require('./cycle-orchestrator');
+        requestStop();
+        log('Emergency stop via dashboard', 'WARN', 'dashboard');
+        jsonRes(res, { success: true, message: 'Emergency stop requested' });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── Resume daemon ──
+  if (pathname === '/api/daemon/resume' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        const { resumeDaemon } = require('./cycle-orchestrator');
+        resumeDaemon();
+        log('Daemon resumed via dashboard', 'INFO', 'dashboard');
+        jsonRes(res, { success: true, message: 'Daemon resumed' });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── Self-heal trigger ──
+  if (pathname === '/api/self-heal/trigger' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        const { performSelfHeal } = require('./self-heal');
+        performSelfHeal().then((result: any) => {
+          jsonRes(res, { success: result });
+        }).catch((err: any) => {
+          jsonRes(res, { error: err.message }, 500);
+        });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── GitOps rollback ──
+  if (pathname === '/api/gitops/rollback' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        const gitOps = require('./self-heal-gitops');
+        const result = gitOps.gitops?.rollbackToPrevious ? gitOps.gitops.rollbackToPrevious() : false;
+        jsonRes(res, { success: result });
+      } catch (err: any) {
+        logErr('GitOps rollback failed', err);
+        jsonRes(res, { success: false, error: err.message }, 500);
+      }
+    });
+    return true;
+  }
+
+  // ── Force state (via state-machine) — persisted so it survives restarts ──
+  if (pathname === '/api/force-state' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.state || typeof data.state !== 'string') {
+            jsonRes(res, { error: 'state is required' }, 400); return;
+          }
+          const { forceState } = require('./state-machine');
+          const reason = data.reason || 'dashboard_admin';
+          forceState(data.state, reason);
+          // Persist the forced state so it's re-applied on restart
+          persistConfig.setForcedState(data.state, reason);
+          log(`State forced via dashboard: ${data.state} (persisted)`, 'WARN', 'dashboard');
+          jsonRes(res, { success: true, state: data.state, persisted: true });
+        } catch (e: any) {
+          jsonRes(res, { error: e.message }, 400);
+        }
+      });
+    });
+    return true;
+  }
+
+  // ── Ban state (prevent bot from entering this state) ──
+  if (pathname === '/api/banned-states' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.state || typeof data.state !== 'string') {
+            jsonRes(res, { error: 'state is required' }, 400); return;
+          }
+          _bannedStates.set(data.state, { reason: data.reason || 'Banned via dashboard', bannedAt: Date.now(), bannedBy: 'dashboard' });
+          // Persist to survive restarts
+          persistConfig.setBannedState(data.state, data.reason || 'Banned via dashboard', 'dashboard');
+          log(`State banned via dashboard: ${data.state} (${data.reason || 'no reason'})`, 'WARN', 'dashboard');
+          jsonRes(res, { success: true, bannedState: data.state, persisted: true });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+      });
+    });
+    return true;
+  }
+
+  // ── Unban state ──
+  if (pathname === '/api/banned-states' && req.method === 'DELETE') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.state) { jsonRes(res, { error: 'state is required' }, 400); return; }
+          _bannedStates.delete(data.state);
+          // Remove from persistent store
+          persistConfig.removeBannedState(data.state);
+          log(`State unbanned via dashboard: ${data.state}`, 'INFO', 'dashboard');
+          jsonRes(res, { success: true, unbannedState: data.state, persisted: true });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+      });
+    });
+    return true;
+  }
+
+  // ── Ban action ──
+  if (pathname === '/api/banned-actions' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.action_type) { jsonRes(res, { error: 'action_type is required' }, 400); return; }
+          const { insertBannedAction } = require('./database');
+          insertBannedAction(data.action_type, 'dashboard', Date.now(), data.reason || 'Manual ban via dashboard');
+          log(`Action banned via dashboard: ${data.action_type} (${data.reason || 'no reason'})`, 'WARN', 'dashboard');
+          jsonRes(res, { success: true, banned: data.action_type });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+      });
+    });
+    return true;
+  }
+
+  // ── Unban action ──
+  if (pathname === '/api/banned-actions' && req.method === 'DELETE') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.action_type) { jsonRes(res, { error: 'action_type is required' }, 400); return; }
+          const { deleteBannedAction } = require('./database');
+          deleteBannedAction(data.action_type);
+          log(`Action unbanned via dashboard: ${data.action_type}`, 'INFO', 'dashboard');
+          jsonRes(res, { success: true, unbanned: data.action_type });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+      });
+    });
+    return true;
+  }
+
+  // ── Action cache management ──
+  if (pathname === '/api/action-cache/clear' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        const ac = require('./services-action-cache');
+        ac.clear();
+        log('Action cache cleared via dashboard', 'INFO', 'dashboard');
+        jsonRes(res, { success: true });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── Set config ──
+  if (pathname === '/api/config' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          if (!SAFE_CONFIG_KEYS.has(data.key)) {
+            jsonRes(res, { error: 'Config key not allowed' }, 403); return;
+          }
+          // Auto-coerce value type based on config metadata
+          let value = data.value;
+          const meta = CONFIG_KEY_META[data.key];
+          if (meta) {
+            if (meta.type === 'number') value = Number(value);
+            else if (meta.type === 'boolean') {
+              if (typeof value === 'string') value = value === 'true' || value === '1';
+              else value = !!value;
+            }
+          }
+          const { updateConfig } = require('./get-config');
+          updateConfig(data.key, value);
+          // Persist config override to survive restarts
+          persistConfig.setConfigOverride(data.key, value);
+          log(`Config changed via dashboard: ${data.key} = ${JSON.stringify(value)} (persisted)`, 'INFO', 'dashboard');
+          jsonRes(res, { success: true, key: data.key, value, persisted: true });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+      });
+    });
+    return true;
+  }
+
+  // ── Generic command endpoint (legacy compat) ──
+  if (pathname === '/api/command' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          const { action, params } = data;
+          if (action === 'force_state' && params?.state) {
+            const { forceState } = require('./state-machine');
+            forceState(params.state, 'admin_command');
+            jsonRes(res, { success: true, state: params.state });
+          } else if (action === 'restart') {
+            jsonRes(res, { success: true, message: 'Restarting in 5 seconds...' });
+            log('Restart requested via dashboard', 'WARN', 'dashboard');
+            setTimeout(() => process.exit(0), 5000);
+          } else if (action === 'gc') {
+            if (global.gc) global.gc();
+            jsonRes(res, { success: true });
+          } else if (action === 'set_config') {
+            if (!SAFE_CONFIG_KEYS.has(params.key)) {
+              jsonRes(res, { error: 'Config key not allowed' }, 403); return;
+            }
+            const { updateConfig } = require('./get-config');
+            updateConfig(params.key, params.value);
+            persistConfig.setConfigOverride(params.key, params.value);
+            jsonRes(res, { success: true, persisted: true });
+          } else {
+            jsonRes(res, { error: 'Unknown command' }, 400);
+          }
+        } catch (e: any) { jsonRes(res, { error: 'Invalid JSON' }, 400); }
+      });
+    });
+    return true;
+  }
+
+  // ── Persistence info ──
+  if (pathname === '/api/persist/info' && req.method === 'GET') {
+    authWrap(() => {
+      try {
+        jsonRes(res, { success: true, ...persistConfig.getStoreInfo() });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── Clear all persisted overrides (reset to defaults) ──
+  if (pathname === '/api/persist/clear' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        persistConfig.clearAllConfigOverrides();
+        persistConfig.clearAllBannedStates();
+        persistConfig.clearForcedState();
+        log('All persisted dashboard overrides cleared', 'WARN', 'dashboard');
+        jsonRes(res, { success: true, message: 'All persisted overrides cleared — restart to apply clean state' });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── Operational mode: GET current mode / POST switch mode ──
+  if (pathname === '/api/mode' && (req.method === 'GET' || req.method === 'POST')) {
+    if (req.method === 'GET') {
+      authWrap(() => {
+        try {
+          const memoryModeMod = require('./memory-mode');
+          const mode = memoryModeMod.getMode();
+          const thresholds = memoryModeMod.getThresholds();
+          const peak = persistConfig.getRecentPeak(30);
+          const mem = process.memoryUsage();
+          jsonRes(res, {
+            success: true,
+            currentMode: mode,
+            thresholds,
+            currentMemory: {
+              heapMB: Math.round(mem.heapUsed / 1024 / 1024 * 10) / 10,
+              rssMB: Math.round(mem.rss / 1024 / 1024 * 10) / 10,
+            },
+            recentPeak: peak,
+          });
+        } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+      });
+    } else {
+      authWrap(() => {
+        readBody(req, res, (body) => {
+          try {
+            const data = JSON.parse(body);
+            if (!data.mode || !['full_power', 'memory_protection'].includes(data.mode)) {
+              jsonRes(res, { error: 'mode must be "full_power" or "memory_protection"' }, 400); return;
+            }
+            const memoryModeMod = require('./memory-mode');
+            const prev = memoryModeMod.getMode();
+            memoryModeMod.switchMode(data.mode, data.reason || 'dashboard_manual');
+            log(`Mode switched via dashboard: ${prev} → ${data.mode} (${data.reason || 'manual'})`, 'WARN', 'dashboard');
+            jsonRes(res, {
+              success: true,
+              previousMode: prev,
+              currentMode: data.mode,
+              thresholds: memoryModeMod.getThresholds(),
+              note: data.mode === 'full_power' ? 'Full power mode active. Heavy modules will re-enable on restart.' : 'Memory protection active. Heavy modules disabled.',
+            });
+          } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+        });
+      });
+    }
+    return true;
+  }
+
+  // ── Not a dashboard route ──
+  return false;
 }
 
-function createSafeStatement(sql: string, paramValidator: ((...args: any[]) => string | null) | null = null) { 
-  const stmt = db.prepare(sql);
-  return {
-    run: (...args: any[]) => { if (paramValidator) { const validationError = paramValidator(...args); if (validationError) { throw new Error(`Parameter validation failed: ${validationError}`); } } return stmt.run(...args); },
-    get: (...args: any[]) => { if (paramValidator) { const validationError = paramValidator(...args); if (validationError) { throw new Error(`Parameter validation failed: ${validationError}`); } } return stmt.get(...args); },
-    all: (...args: any[]) => { if (paramValidator) { const validationError = paramValidator(...args); if (validationError) { throw new Error(`Parameter validation failed: ${validationError}`); } } return stmt.all(...args); }
-  };
+// ═══════════════════════════════════════════════════════════════════════
+//  STANDALONE SERVER CREATION (for non-render-free-plan use)
+// ═══════════════════════════════════════════════════════════════════════
+
+function createDashboardServer() {
+  const server = http.createServer(async (req: any, res: any) => {
+    const handled = await handleDashboardRequest(req, res);
+    if (!handled) {
+      res.writeHead(404);
+      res.end('Not found');
+    }
+  });
+  return server;
 }
 
-const positiveInt = (val: any) => (typeof val !== 'number' || val <= 0 || !Number.isInteger(val)) ? 'must be positive integer' : null;
-const nonEmptyString = (val: any) => (typeof val !== 'string' || val.length === 0) ? 'must be non-empty string' : null;
-const validState = (val: any) => (typeof val !== 'string' || val.length === 0 || val.length > 100) ? 'invalid state' : null;
-
-// NOTE: Prepared statements are created lazily on first call to initDatabase().
-// Before initDatabase() is called, these will be undefined.
-// We define them as null and populate them in initDatabase().
-let insertModule: any, selectModule: any, getAllModules: any;
-let insertProgress: any, getRecentProgress: any, insertTemplate: any;
-let selectTemplate: any, listTemplates: any, updateTemplateHit: any;
-let upsertProvider: any, selectProvider: any, listProviders: any;
-let upsertCalibration: any, selectCalibration: any;
-let upsertLastState: any, selectLastState: any;
-let insertPatch: any, getRecentPatches: any, updateProviderStats: any;
-let upsertModel: any, getActiveModel: any, getFallbackModel: any, setModelRole: any;
-let upsertUiBaseline: any, selectUiBaseline: any;
-let insertBlackbox: any, getBlackbox: any;
-let insertSemanticsSnapshot: any;
-let insertNetworkLog: any, getNetworkLogs: any;
-let upsertPerformanceProfile: any, selectPerformanceProfile: any;
-let insertGitopsChain: any, getGitopsChain: any, updateGitopsApplied: any;
-let insertFlutterSemantics: any, getFlutterSemantics: any;
-let upsertProviderSchema: any, selectProviderSchema: any;
-let insertExplorationMap: any, getExplorationMaps: any;
-let upsertRuntimeVersion: any, selectRuntimeVersion: any;
-let insertSelfHealEvent: any, getSelfHealTimeline: any;
-let insertSelectorVersion: any, getLatestSelectorVersion: any;
-let insertPatchCanary: any, updatePatchCanary: any, getActiveCanary: any;
-let insertAdversarialResult: any;
-let insertDbQuarantine: any, getQuarantinedRows: any;
-let upsertDiscoveredState: any, getDiscoveredStates: any, pruneExpiredStates: any;
-let insertDependencyHealth: any, getDependencyHealth: any;
-let insertConfigReconciliation: any;
-let insertBlackboxFull: any, getBlackboxFull: any;
-let insertPatchEmbedding: any, searchPatchEmbeddings: any;
-let insertHealModelMetric: any, getHealModelMetrics: any;
-let getOrCreateHealerCircuitState: any, updateHealerCircuitState: any, getHealerCircuitState: any;
-let insertDegradationLog: any, getDegradationLog: any;
-let insertBannedAction: any, deleteBannedAction: any, listBannedActions: any, selectBannedAction: any;
-
-function createPreparedStatements() {
-  insertModule = createSafeStatement('INSERT OR IGNORE INTO completed_modules (name, completed_at) VALUES (?, ?)', nonEmptyString);
-  selectModule = createSafeStatement('SELECT 1 FROM completed_modules WHERE name = ?', nonEmptyString);
-  getAllModules = db.prepare('SELECT name, completed_at, attempts, completion_time_ms FROM completed_modules');
-  insertProgress = createSafeStatement('INSERT INTO progress_log (action, state, timestamp, questions_completed) VALUES (?, ?, ?, ?)', (action, state, timestamp, questions) => { if (nonEmptyString(action)) return `invalid action: ${action}`; if (validState(state)) return `invalid state: ${state}`; if (positiveInt(timestamp)) return `invalid timestamp: ${timestamp}`; if (questions !== undefined && questions !== null && positiveInt(questions)) return `invalid questions: ${questions}`; return null; });
-  getRecentProgress = createSafeStatement('SELECT * FROM progress_log ORDER BY timestamp DESC LIMIT ?', positiveInt);
-  insertTemplate = db.prepare(`INSERT OR REPLACE INTO template_cache (hash, action_type, state, x_percent, y_percent, width_percent, height_percent, crop_data, created_at, last_used, hit_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  selectTemplate = db.prepare('SELECT * FROM template_cache WHERE hash = ?');
-  listTemplates = db.prepare('SELECT * FROM template_cache ORDER BY hit_count DESC LIMIT ?');
-  updateTemplateHit = db.prepare('UPDATE template_cache SET last_used = ?, hit_count = hit_count + 1 WHERE id = ?');
-  upsertProvider = db.prepare(`INSERT OR REPLACE INTO provider_registry (provider_name, endpoint, model, last_verified, history, success_count, failure_count, total_latency, last_check) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  selectProvider = db.prepare('SELECT * FROM provider_registry WHERE provider_name = ?');
-  listProviders = db.prepare('SELECT * FROM provider_registry');
-  upsertCalibration = db.prepare('INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (?, ?, ?)');
-  selectCalibration = db.prepare('SELECT value FROM calibration WHERE key = ?');
-  upsertLastState = db.prepare('INSERT OR REPLACE INTO last_state (url, state, timestamp) VALUES (?, ?, ?)');
-  selectLastState = db.prepare('SELECT url, state FROM last_state ORDER BY timestamp DESC LIMIT 1');
-  insertPatch = db.prepare('INSERT INTO patch_history (timestamp, description, file, patch, status, applied_at, branch) VALUES (?, ?, ?, ?, ?, ?, ?)');
-  getRecentPatches = db.prepare('SELECT * FROM patch_history ORDER BY timestamp DESC LIMIT ?');
-  updateProviderStats = db.prepare('UPDATE provider_registry SET success_count = ?, failure_count = ?, total_latency = ?, last_check = ? WHERE provider_name = ?');
-  upsertModel = db.prepare(`INSERT OR REPLACE INTO model_registry (provider, model_id, is_free, is_working, role, last_tested_at, last_success_at, failure_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
-  getActiveModel = db.prepare("SELECT model_id, provider FROM model_registry WHERE role = 'active' LIMIT 1");
-  getFallbackModel = db.prepare("SELECT model_id, provider FROM model_registry WHERE role = 'fallback' LIMIT 1");
-  setModelRole = db.prepare("UPDATE model_registry SET role = ? WHERE model_id = ?");
-  upsertUiBaseline = db.prepare(`INSERT OR REPLACE INTO ui_baselines (state, hash, map, updated_at) VALUES (?, ?, ?, ?)`);
-  selectUiBaseline = db.prepare('SELECT * FROM ui_baselines WHERE state = ?');
-  insertBlackbox = db.prepare(`INSERT INTO blackbox (timestamp, state, action, semantics_snapshot, screenshot_hash, success, reasoning, latency, provider_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  getBlackbox = db.prepare('SELECT * FROM blackbox ORDER BY timestamp DESC LIMIT ?');
-  insertSemanticsSnapshot = db.prepare(`INSERT INTO semantics_snapshots (timestamp, count, data) VALUES (?, ?, ?)`);
-  insertNetworkLog = db.prepare(`INSERT INTO network_intercept_log (url, method, data, headers, timestamp, replayed) VALUES (?, ?, ?, ?, ?, ?)`);
-  getNetworkLogs = db.prepare('SELECT * FROM network_intercept_log ORDER BY timestamp DESC LIMIT ?');
-  upsertPerformanceProfile = db.prepare(`INSERT OR REPLACE INTO performance_profile (environment, slowdown_factor, recorded_at) VALUES (?, ?, ?)`);
-  selectPerformanceProfile = db.prepare('SELECT * FROM performance_profile ORDER BY recorded_at DESC LIMIT 1');
-  insertGitopsChain = db.prepare(`INSERT INTO gitops_rollback_chain (timestamp, branch, description, applied) VALUES (?, ?, ?, ?)`);
-  getGitopsChain = db.prepare('SELECT * FROM gitops_rollback_chain ORDER BY timestamp DESC LIMIT ?');
-  updateGitopsApplied = db.prepare('UPDATE gitops_rollback_chain SET applied = ? WHERE timestamp = ?');
-  insertFlutterSemantics = db.prepare(`INSERT OR REPLACE INTO flutter_semantics_cache (page_url, items, timestamp) VALUES (?, ?, ?)`);
-  getFlutterSemantics = db.prepare('SELECT * FROM flutter_semantics_cache WHERE page_url = ? ORDER BY timestamp DESC LIMIT 1');
-  upsertProviderSchema = db.prepare(`INSERT OR REPLACE INTO provider_schemas (provider, schema, version, updated_at) VALUES (?, ?, ?, ?)`);
-  selectProviderSchema = db.prepare('SELECT * FROM provider_schemas WHERE provider = ?');
-  insertExplorationMap = db.prepare(`INSERT INTO exploration_maps (state, map, created_at) VALUES (?, ?, ?)`);
-  getExplorationMaps = db.prepare('SELECT * FROM exploration_maps ORDER BY created_at DESC LIMIT ?');
-  upsertRuntimeVersion = db.prepare(`INSERT OR REPLACE INTO runtime_versions (component, version, updated_at) VALUES (?, ?, ?)`);
-  selectRuntimeVersion = db.prepare('SELECT * FROM runtime_versions WHERE component = ?');
-  // Self-heal statements
-  insertSelfHealEvent = db.prepare(`INSERT INTO self_heal_events (timestamp, feature_id, phase, trigger_reason, investigation_result, patches_generated, patches_safe, patches_applied, outcome, duration_ms, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  getSelfHealTimeline = db.prepare('SELECT * FROM self_heal_events ORDER BY timestamp DESC LIMIT ?');
-  insertSelectorVersion = db.prepare(`INSERT INTO selector_versions (selector_file, version, content, previous_content, created_at, source, validated) VALUES (?, ?, ?, ?, ?, ?, ?)`);
-  getLatestSelectorVersion = db.prepare('SELECT * FROM selector_versions WHERE selector_file = ? ORDER BY version DESC LIMIT 1');
-  insertPatchCanary = db.prepare(`INSERT INTO patch_canary (patch_id, mode, started_at, observation_hours, error_rate_baseline) VALUES (?, ?, ?, ?, ?)`);
-  updatePatchCanary = db.prepare('UPDATE patch_canary SET mode = ?, error_rate_observed = ?, cycles_run = ?, status = ?, promoted_at = ?, rolled_back_at = ? WHERE id = ?');
-  getActiveCanary = db.prepare("SELECT * FROM patch_canary WHERE status = 'canary' ORDER BY started_at DESC LIMIT 1");
-  insertAdversarialResult = db.prepare(`INSERT INTO adversarial_test_results (patch_id, test_type, passed, details, tested_at) VALUES (?, ?, ?, ?, ?)`);
-  insertDbQuarantine = db.prepare(`INSERT INTO db_quarantine (table_name, row_id, original_data, reason, quarantined_at) VALUES (?, ?, ?, ?, ?)`);
-  getQuarantinedRows = db.prepare('SELECT * FROM db_quarantine WHERE repaired = 0 ORDER BY quarantined_at DESC LIMIT ?');
-  upsertDiscoveredState = db.prepare(`INSERT OR REPLACE INTO discovered_states (state, added_at, traverse_count, last_traversed, ttl_days, promoted, source_screenshot_hash, tribunal_reasoning) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
-  getDiscoveredStates = db.prepare('SELECT * FROM discovered_states WHERE promoted = 1');
-  pruneExpiredStates = db.prepare("DELETE FROM discovered_states WHERE promoted = 0 AND last_traversed < ?");
-  insertDependencyHealth = db.prepare(`INSERT OR REPLACE INTO dependency_health (package, expected_hash, actual_hash, healthy, last_checked) VALUES (?, ?, ?, ?, ?)`);
-  getDependencyHealth = db.prepare('SELECT * FROM dependency_health ORDER BY last_checked DESC');
-  insertConfigReconciliation = db.prepare(`INSERT INTO config_reconciliation (timestamp, source, key, local_value, remote_value, resolved_value, resolution) VALUES (?, ?, ?, ?, ?, ?, ?)`);
-  insertBlackboxFull = db.prepare(`INSERT INTO blackbox_full (blackbox_id, screenshot, dom_html, network_log, tribunal_responses, captured_at) VALUES (?, ?, ?, ?, ?, ?)`);
-  getBlackboxFull = db.prepare('SELECT * FROM blackbox_full WHERE blackbox_id = ?');
-  insertPatchEmbedding = db.prepare(`INSERT INTO patch_embeddings (patch_id, embedding, investigation_context, file, patch_text, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
-  searchPatchEmbeddings = db.prepare('SELECT * FROM patch_embeddings ORDER BY created_at DESC LIMIT ?');
-  insertHealModelMetric = db.prepare(`INSERT INTO heal_model_metrics (model_name, patch_id, staging_passed, prod_survived_24h, created_at) VALUES (?, ?, ?, ?, ?)`);
-  getHealModelMetrics = db.prepare("SELECT model_name, COUNT(*) as total, SUM(staging_passed) as staging_passes, SUM(prod_survived_24h) as prod_survived FROM heal_model_metrics GROUP BY model_name");
-  getOrCreateHealerCircuitState = db.prepare("INSERT OR IGNORE INTO healer_circuit_state (id, state, updated_at) VALUES (1, 'closed', ?)");
-  updateHealerCircuitState = db.prepare("UPDATE healer_circuit_state SET state = ?, failure_count = ?, success_count = ?, last_failure_time = ?, consecutive_opens = ?, updated_at = ? WHERE id = 1");
-  getHealerCircuitState = db.prepare("SELECT * FROM healer_circuit_state WHERE id = 1");
-  insertDegradationLog = db.prepare(`INSERT INTO degradation_log (timestamp, from_mode, to_mode, reason, resource_snapshot) VALUES (?, ?, ?, ?, ?)`);
-  getDegradationLog = db.prepare('SELECT * FROM degradation_log ORDER BY timestamp DESC LIMIT ?');
-  // Dashboard control: banned actions
-  insertBannedAction = db.prepare(`INSERT OR REPLACE INTO banned_actions (action_type, banned_by, banned_at, reason) VALUES (?, ?, ?, ?)`);
-  deleteBannedAction = db.prepare('DELETE FROM banned_actions WHERE action_type = ?');
-  listBannedActions = db.prepare('SELECT * FROM banned_actions ORDER BY banned_at DESC');
-  selectBannedAction = db.prepare('SELECT 1 FROM banned_actions WHERE action_type = ?');
+function startDashboard() {
+  const server = createDashboardServer();
+  const port = parseInt(process.env.PORT || process.env.DASHBOARD_PORT || getCONFIG().STATUS_PORT || 8080);
+  server.listen(port, () => {
+    log(`Dashboard listening on port ${port}`, 'INFO', 'dashboard');
+  });
+  return server;
 }
 
-function safeInsertModule(name: string) {  if (!name || typeof name !== 'string' || name.length > 500) { getLog()(`Invalid module name: ${typeof name}`, 'WARN', 'database'); return; } try { insertModule.run(name, Date.now()); } catch (err: any) { getLogError()('Failed to insert module', err, { moduleName: name.substring(0, 50) }); } }
-function safeSelectModule(name: string) {  if (!name || typeof name !== 'string') return null; try { return selectModule.get(name); } catch (err: any) { getLogError()('Failed to select module', err); return null; } }
-function safeGetAllModules() {  try { return getAllModules.all().map((r: any) => r.name); } catch (err: any) { getLogError()('Failed to get all modules', err); return []; } }
-function safeInsertProgress(action: string, state: string, questionsCompleted = 0) {  if (!action || typeof action !== 'string') return; if (!state || typeof state !== 'string') return; try { insertProgress.run(action.substring(0, 100), state.substring(0, 100), Date.now(), Math.max(0, Math.min(999999, Math.floor(questionsCompleted)))); } catch (err: any) { getLogError()('Failed to insert progress', err, { action, state }); } }
-function safeGetRecentProgress(limit = 100) {  const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit))); try { return getRecentProgress.all(safeLimit); } catch (err: any) { getLogError()('Failed to get recent progress', err); return []; } }
-function safeInsertTemplate(hash: string, actionType: string, state: string, xPercent: number, yPercent: number, widthPercent: number, heightPercent: number, cropData: Buffer | null) {  if (!hash || typeof hash !== 'string' || hash.length > 64) return; if (!actionType || typeof actionType !== 'string' || actionType.length > 50) return; if (!state || typeof state !== 'string' || state.length > 100) return; const validatePercent = (val: number, name: string) => { if (typeof val !== 'number' || val < 0 || val > 100) { getLog()(`Invalid ${name}: ${val}`, 'WARN', 'database'); return false; } return true; }; if (!validatePercent(xPercent, 'xPercent')) return; if (!validatePercent(yPercent, 'yPercent')) return; if (!validatePercent(widthPercent, 'widthPercent')) return; if (!validatePercent(heightPercent, 'heightPercent')) return; try { insertTemplate.run(hash, actionType, state, xPercent, yPercent, widthPercent, heightPercent, cropData || null, Date.now(), Date.now(), 0); } catch (err: any) { getLogError()('Failed to insert template', err, { hash: hash.substring(0, 10) }); } }
+// ═══════════════════════════════════════════════════════════════════════
+//  EMBEDDED DASHBOARD HTML
+// ═══════════════════════════════════════════════════════════════════════
 
-function closeDatabase() { 
-  try { db.pragma('wal_checkpoint(TRUNCATE)'); db.close(); getLog()('Database closed successfully', 'INFO', 'database'); } catch (err: any) { getLogError()('Error closing database', err); }
+function getDashboardHTML(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MathU Bot Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --bg2: #161822;
+    --bg3: #1c1f2e;
+    --border: #2a2d3e;
+    --text: #e1e4ed;
+    --text2: #8b8fa3;
+    --accent: #6366f1;
+    --accent2: #818cf8;
+    --green: #22c55e;
+    --red: #ef4444;
+    --yellow: #eab308;
+    --orange: #f97316;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+  a { color: var(--accent2); }
+
+  .header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .header h1 { font-size: 18px; font-weight: 600; }
+  .header .status-badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: 600; }
+  .header .status-badge.ok { background: #052e16; color: var(--green); }
+  .header .status-badge.warn { background: #422006; color: var(--yellow); }
+  .header .status-badge.err { background: #450a0a; color: var(--red); }
+  .header .status-badge .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .header .meta { margin-left: auto; font-size: 13px; color: var(--text2); }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; padding: 16px 24px; }
+  .card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  .card-header { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; font-size: 14px; font-weight: 600; }
+  .card-body { padding: 12px 16px; }
+
+  .stat-row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-label { color: var(--text2); }
+  .stat-value { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat-value.green { color: var(--green); }
+  .stat-value.red { color: var(--red); }
+  .stat-value.yellow { color: var(--yellow); }
+  .stat-value.orange { color: var(--orange); }
+
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg3); color: var(--text); font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.15s; }
+  .btn:hover { background: var(--border); }
+  .btn:active { transform: scale(0.97); }
+  .btn.danger { border-color: #7f1d1d; color: var(--red); }
+  .btn.danger:hover { background: #450a0a; }
+  .btn.primary { border-color: #3730a3; color: var(--accent2); }
+  .btn.primary:hover { background: #312e81; }
+  .btn.success { border-color: #14532d; color: var(--green); }
+  .btn.success:hover { background: #052e16; }
+  .btn.sm { padding: 5px 10px; font-size: 12px; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .btn-group { display: flex; flex-wrap: wrap; gap: 8px; }
+
+  select, input[type="text"], input[type="number"] {
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+    color: var(--text); padding: 7px 12px; font-size: 13px; font-family: inherit;
+  }
+  select:focus, input:focus { outline: none; border-color: var(--accent); }
+  select { cursor: pointer; }
+
+  .screenshot-container { position: relative; background: #000; border-radius: var(--radius); overflow: hidden; }
+  .screenshot-container img { width: 100%; display: block; }
+  .screenshot-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text2); font-size: 14px; background: rgba(0,0,0,0.6); }
+  .screenshot-meta { padding: 8px; font-size: 11px; color: var(--text2); background: var(--bg); border-top: 1px solid var(--border); display: flex; justify-content: space-between; }
+
+  .banned-list { max-height: 200px; overflow-y: auto; }
+  .banned-item { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .banned-item:last-child { border-bottom: none; }
+
+  .provider-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .provider-row:last-child { border-bottom: none; }
+  .provider-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .provider-dot.online { background: var(--green); }
+  .provider-dot.offline { background: var(--red); }
+  .provider-dot.degraded { background: var(--yellow); }
+
+  .log-viewer { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px; font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace; font-size: 12px; max-height: 350px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.6; }
+
+  .toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 1000; display: flex; flex-direction: column; gap: 8px; }
+  .toast { padding: 10px 16px; border-radius: var(--radius); font-size: 13px; font-weight: 500; animation: slideIn 0.2s ease-out; }
+  .toast.success { background: #052e16; color: var(--green); border: 1px solid #14532d; }
+  .toast.error { background: #450a0a; color: var(--red); border: 1px solid #7f1d1d; }
+  .toast.info { background: #1e1b4b; color: var(--accent2); border: 1px solid #3730a3; }
+  @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+
+  .config-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+  .config-row select { flex: 1; }
+
+  .empty { color: var(--text2); font-size: 13px; padding: 12px; text-align: center; }
+  .full-width { grid-column: 1 / -1; }
+
+  .action-info { font-size: 11px; color: var(--text2); margin-top: 4px; }
+
+  @media (max-width: 640px) {
+    .grid { padding: 12px; gap: 12px; }
+    .header { padding: 12px 16px; }
+    .header h1 { font-size: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>MathU Bot</h1>
+  <span id="statusBadge" class="status-badge ok"><span class="dot"></span><span id="statusText">Loading...</span></span>
+  <span class="meta" id="metaInfo"></span>
+</div>
+
+<div class="grid" id="mainGrid">
+
+  <!-- Screenshot -->
+  <div class="card">
+    <div class="card-header">
+      <span>Screenshot</span>
+      <div class="btn-group">
+        <button class="btn sm primary" onclick="captureLive()">Capture Live</button>
+        <button class="btn sm" onclick="refreshScreenshot()">Refresh Cached</button>
+      </div>
+    </div>
+    <div class="card-body" style="padding:0">
+      <div class="screenshot-container" id="screenshotBox">
+        <div class="screenshot-overlay" id="screenshotOverlay">No screenshot available</div>
+      </div>
+      <div class="screenshot-meta">
+        <span id="screenshotAge">-</span>
+        <span id="screenshotAction">-</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Mode Control -->
+  <div class="card">
+    <div class="card-header">Operational Mode <span id="modeBadge" style="font-size:10px;padding:1px 8px;border-radius:9999px;margin-left:8px;font-weight:600">FULL POWER</span></div>
+    <div class="card-body">
+      <div id="modeInfo" style="font-size:12px;color:var(--text2);margin-bottom:10px">Loading mode info...</div>
+      <div class="btn-group">
+        <button class="btn primary" id="btnFullPower" onclick="switchMode('full_power')">Full Power</button>
+        <button class="btn warn" id="btnMemProtect" onclick="switchMode('memory_protection')">Memory Protection</button>
+      </div>
+      <div style="margin-top:10px;font-size:11px;color:var(--text2)" id="modeThresholds"></div>
+    </div>
+  </div>
+
+  <!-- Daemon Control -->
+  <div class="card">
+    <div class="card-header">Daemon Control</div>
+    <div class="card-body">
+      <div class="btn-group" style="margin-bottom: 12px;">
+        <button class="btn danger" onclick="emergencyStop()">Emergency Stop</button>
+        <button class="btn success" onclick="resumeDaemon()">Resume Daemon</button>
+        <button class="btn primary" onclick="triggerSelfHeal()">Self-Heal</button>
+      </div>
+      <div class="btn-group">
+        <button class="btn" onclick="gc()">Force GC</button>
+        <button class="btn" onclick="clearActionCache()">Clear Action Cache</button>
+        <button class="btn" onclick="rollback()">Rollback</button>
+      </div>
+      <div id="daemonState" class="action-info" style="margin-top:12px;">Loading...</div>
+    </div>
+  </div>
+
+  <!-- State Control -->
+  <div class="card">
+    <div class="card-header">State Control</div>
+    <div class="card-body">
+      <div class="config-row">
+        <select id="stateSelect"><option value="">Loading states...</option></select>
+        <button class="btn primary" onclick="forceState()">Force State</button>
+        <button class="btn danger sm" onclick="banState()">Ban State</button>
+      </div>
+      <div id="currentState" class="stat-row"><span class="stat-label">Current State</span><span class="stat-value">-</span></div>
+      <div id="stateAge" class="stat-row"><span class="stat-label">State Age</span><span class="stat-value">-</span></div>
+      <div id="deadlock" class="stat-row"><span class="stat-label">Deadlock</span><span class="stat-value">-</span></div>
+      <div style="margin-top:10px">
+        <div class="card-header" style="padding:6px 0;font-size:12px;color:var(--text2)">Banned States <span id="persistBadge" style="font-size:10px;padding:1px 6px;border-radius:9999px;background:#1e3a5f;color:#60a5fa;margin-left:6px">persisted</span></div>
+        <div class="banned-list" id="bannedStatesList"><div class="empty">None banned</div></div>
+        <button class="btn sm" style="margin-top:6px;font-size:10px" onclick="clearPersistence()">Reset All Dashboard Overrides</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Ban Actions -->
+  <div class="card">
+    <div class="card-header">Action Bans</div>
+    <div class="card-body">
+      <div class="config-row">
+        <select id="banActionSelect"><option value="">Loading actions...</option></select>
+        <input type="text" id="banReason" placeholder="Reason (optional)" style="flex:1">
+        <button class="btn danger sm" onclick="banAction()">Ban</button>
+      </div>
+      <div class="banned-list" id="bannedList"><div class="empty">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Config Editor -->
+  <div class="card full-width">
+    <div class="card-header">
+      <span>Configuration</span>
+      <div class="btn-group">
+        <button class="btn sm primary" onclick="loadConfigKeys()">Reload Values</button>
+      </div>
+    </div>
+    <div class="card-body" id="configEditor"><div class="empty">Loading configuration...</div></div>
+  </div>
+
+  <!-- Providers -->
+  <div class="card">
+    <div class="card-header">Providers</div>
+    <div class="card-body" id="providersList"><div class="empty">Loading...</div></div>
+  </div>
+
+  <!-- Memory & System -->
+  <div class="card">
+    <div class="card-header">System</div>
+    <div class="card-body" id="systemStats"></div>
+  </div>
+
+  <!-- Action Cache -->
+  <div class="card">
+    <div class="card-header">Action Cache</div>
+    <div class="card-body" id="actionCacheStats"><div class="empty">Loading...</div></div>
+  </div>
+
+  <!-- Logs -->
+  <div class="card full-width">
+    <div class="card-header">
+      <span>Logs</span>
+      <button class="btn sm" onclick="refreshLogs()">Refresh</button>
+    </div>
+    <div class="card-body" style="padding:0">
+      <div class="log-viewer" id="logViewer">Loading...</div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+const API = '';
+let authHeader = '';
+let autoRefresh = true;
+
+async function api(path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (authHeader) headers['Authorization'] = authHeader;
+  try {
+    const r = await fetch(API + path, { ...opts, headers });
+    if (r.status === 401) {
+      const token = prompt('Enter admin token (or ADMIN_SECRET):');
+      if (token) { authHeader = 'Bearer ' + token; return api(path, opts); }
+      throw new Error('Unauthorized');
+    }
+    const ct = r.headers.get('content-type') || '';
+    if (ct.includes('application/json')) return r.json();
+    return r.text();
+  } catch (e) {
+    console.error('API error:', path, e);
+    return null;
+  }
 }
 
-function pruneTemplateCache() { 
-  try { const cutoff = Date.now() - (30 * 24 * 60 * 60 * 1000); const info = db.prepare("DELETE FROM template_cache WHERE last_used < ?").run(cutoff); if (info.changes > 0) { getLog()(`Pruned ${info.changes} stale template cache entries`, 'INFO', 'database'); const vacuumStart = Date.now(); db.prepare('VACUUM').run(); getLog()(`VACUUM completed in ${Date.now() - vacuumStart}ms`, 'DEBUG', 'database'); } } catch (err: any) { getLogError()('Failed to prune template cache', err); }
+function toast(msg, type = 'info') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  document.getElementById('toastContainer').appendChild(el);
+  setTimeout(() => el.remove(), 4000);
 }
 
-function vacuumIfNeeded() { 
-  try { const pageCount = db.pragma('page_count')[0]?.page_count || 0; const freelistCount = db.pragma('freelist_count')[0]?.freelist_count || 0; if (pageCount > 0 && (freelistCount / pageCount) > 0.1) { getLog()(`Running VACUUM (freelist: ${freelistCount}/${pageCount} pages)`, 'INFO', 'database'); db.prepare('VACUUM').run(); } } catch (err: any) { getLogError()('VACUUM check failed', err); }
+function fmtUptime(s) {
+  if (!s) return '-';
+  const d = Math.floor(s/86400), h = Math.floor((s%86400)/3600), m = Math.floor((s%3600)/60), sec = Math.floor(s%60);
+  return [d>0?d+'d':'', h>0?h+'h':'', m>0?m+'m':'', sec+'s'].filter(Boolean).join(' ');
 }
 
-function getDatabaseStats() { 
-  try { const pageCount = db.pragma('page_count')[0]?.page_count || 0; const pageSize = db.pragma('page_size')[0]?.page_size || 4096; const freelistCount = db.pragma('freelist_count')[0]?.freelist_count || 0; return { totalSizeBytes: pageCount * pageSize, freePages: freelistCount, totalPages: pageCount, utilizationPercent: pageCount > 0 ? ((pageCount - freelistCount) / pageCount * 100).toFixed(1) : 0 }; } catch (err: any) { getLogError()('Failed to get database stats', err); return null; }
+function fmtAge(ms) {
+  if (!ms || ms < 0) return '-';
+  if (ms < 60000) return Math.round(ms/1000) + 's ago';
+  return Math.round(ms/60000) + 'm ago';
+}
+
+// ── Screenshot ──
+async function refreshScreenshot() {
+  const data = await api('/api/screenshot');
+  if (!data) return;
+  if (!data.available) {
+    document.getElementById('screenshotOverlay').style.display = 'flex';
+    document.getElementById('screenshotOverlay').textContent = 'No screenshot available';
+    document.getElementById('screenshotAge').textContent = '-';
+    document.getElementById('screenshotAction').textContent = '-';
+    return;
+  }
+  const box = document.getElementById('screenshotBox');
+  let img = box.querySelector('img');
+  if (!img) { img = document.createElement('img'); box.appendChild(img); }
+  img.src = 'data:image/jpeg;base64,' + data.screenshot;
+  img.style.display = 'block';
+  document.getElementById('screenshotOverlay').style.display = 'none';
+  document.getElementById('screenshotAge').textContent = fmtAge(Date.now() - data.timestamp);
+  document.getElementById('screenshotAction').textContent = data.action ? data.action.actionType + ' | ' + (data.action.currentState || '') : '-';
+}
+
+async function captureLive() {
+  toast('Capturing live screenshot...', 'info');
+  const data = await api('/api/screenshot/live');
+  if (!data || !data.available) { toast('Failed to capture screenshot', 'error'); return; }
+  const box = document.getElementById('screenshotBox');
+  let img = box.querySelector('img');
+  if (!img) { img = document.createElement('img'); box.appendChild(img); }
+  img.src = 'data:image/jpeg;base64,' + data.screenshot;
+  img.style.display = 'block';
+  document.getElementById('screenshotOverlay').style.display = 'none';
+  document.getElementById('screenshotAge').textContent = 'Just now';
+  toast('Live screenshot captured', 'success');
+}
+
+// ── Daemon ──
+async function emergencyStop() {
+  if (!confirm('Stop the bot daemon? It will not run cycles until resumed.')) return;
+  const r = await api('/api/emergency/stop', { method: 'POST' });
+  if (r?.success) toast('Emergency stop activated', 'success');
+  else toast('Stop failed', 'error');
+  refreshAll();
+}
+async function resumeDaemon() {
+  const r = await api('/api/daemon/resume', { method: 'POST' });
+  if (r?.success) toast('Daemon resumed', 'success');
+  else toast('Resume failed', 'error');
+  refreshAll();
+}
+async function triggerSelfHeal() {
+  toast('Self-heal triggered...', 'info');
+  const r = await api('/api/self-heal/trigger', { method: 'POST' });
+  toast(r?.success ? 'Self-heal complete' : 'Self-heal failed', r?.success ? 'success' : 'error');
+}
+async function gc() {
+  const r = await api('/api/command', { method: 'POST', body: JSON.stringify({ action: 'gc' }) });
+  toast(r?.success ? 'GC triggered' : 'GC failed', r?.success ? 'success' : 'error');
+}
+async function clearActionCache() {
+  if (!confirm('Clear all cached actions?')) return;
+  const r = await api('/api/action-cache/clear', { method: 'POST' });
+  toast(r?.success ? 'Cache cleared' : 'Failed', r?.success ? 'success' : 'error');
+  refreshAll();
+}
+async function rollback() {
+  if (!confirm('Rollback to previous version?')) return;
+  const r = await api('/api/gitops/rollback', { method: 'POST' });
+  toast(r?.success ? 'Rollback initiated' : 'Rollback failed', r?.success ? 'success' : 'error');
+}
+
+// ── State ──
+async function loadStates() {
+  const r = await api('/api/states');
+  if (!r) return;
+  const sel = document.getElementById('stateSelect');
+  sel.innerHTML = '<option value="">Select state...</option>' + r.states.map(s => '<option value="'+s+'">'+s+'</option>').join('');
+}
+async function forceState() {
+  const s = document.getElementById('stateSelect').value;
+  if (!s) return;
+  if (!confirm('Force state to: ' + s + '?')) return;
+  const r = await api('/api/force-state', { method: 'POST', body: JSON.stringify({ state: s }) });
+  toast(r?.success ? 'State forced: ' + s : 'Failed: ' + (r?.error||''), r?.success ? 'success' : 'error');
+  refreshAll();
+}
+async function banState() {
+  const s = document.getElementById('stateSelect').value;
+  if (!s) { toast('Select a state first', 'error'); return; }
+  const reason = prompt('Reason for banning state ' + s + ':') || '';
+  const r = await api('/api/banned-states', { method: 'POST', body: JSON.stringify({ state: s, reason }) });
+  toast(r?.success ? 'Banned state: ' + s : 'Failed', r?.success ? 'success' : 'error');
+  refreshBannedStates();
+}
+async function unbanState(state) {
+  const r = await api('/api/banned-states', { method: 'DELETE', body: JSON.stringify({ state }) });
+  toast(r?.success ? 'Unbanned: ' + state : 'Failed', r?.success ? 'success' : 'error');
+  refreshBannedStates();
+}
+async function refreshBannedStates() {
+  const r = await api('/api/banned-states');
+  const el = document.getElementById('bannedStatesList');
+  if (!r || !r.bannedStates || r.bannedStates.length === 0) {
+    el.innerHTML = '<div class="empty">None banned</div>';
+    return;
+  }
+  el.innerHTML = r.bannedStates.map(b =>
+    '<div class="banned-item"><span>'+b.state+' <span style="color:var(--text2);font-size:11px">'+b.reason+'</span></span>' +
+    '<button class="btn sm" onclick="unbanState(\\''+b.state+'\\')">Unban</button></div>'
+  ).join('');
+}
+async function clearPersistence() {
+  if (!confirm('Clear ALL persisted dashboard overrides? Config changes, banned states, and forced state will be reset. Restart recommended after.')) return;
+  const r = await api('/api/persist/clear', { method: 'POST' });
+  toast(r?.success ? 'All overrides cleared — restart to apply' : 'Failed', r?.success ? 'success' : 'error');
+  refreshBannedStates();
+}
+
+// ── Mode Control ──
+async function refreshMode() {
+  const r = await api('/api/mode');
+  if (!r) return;
+  const badge = document.getElementById('modeBadge');
+  const info = document.getElementById('modeInfo');
+  const thresholds = document.getElementById('modeThresholds');
+  const btnFP = document.getElementById('btnFullPower');
+  const btnMP = document.getElementById('btnMemProtect');
+
+  const isMP = r.currentMode === 'memory_protection';
+  const label = isMP ? 'MEMORY PROTECTION' : 'FULL POWER';
+  if (badge) {
+    badge.textContent = label;
+    badge.style.background = isMP ? '#92400e' : '#065f46';
+    badge.style.color = isMP ? '#fcd34d' : '#6ee7b7';
+  }
+  if (info) {
+    const heap = r.currentMemory?.heapMB || '?';
+    const rss = r.currentMemory?.rssMB || '?';
+    const peak = r.recentPeak;
+    info.innerHTML = `Heap: ${heap}MB | RSS: ${rss}MB | Peak(30m): ${peak?.peakHeapMB || 0}MB heap, ${peak?.peakRssMB || 0}MB RSS`;
+  }
+  if (thresholds && r.thresholds) {
+    thresholds.textContent = `Warn: ${r.thresholds.warnHeapMB}MB | Restart: ${r.thresholds.restartHeapMB}MB | RSS hard: ${r.thresholds.rssHardLimitMB}MB | GC: ${r.thresholds.gcIntervalMs / 1000}s`;
+  }
+  if (btnFP) btnFP.style.opacity = isMP ? '0.5' : '1';
+  if (btnMP) btnMP.style.opacity = isMP ? '1' : '0.5';
+}
+async function switchMode(mode) {
+  const action = mode === 'memory_protection' ? 'switch to Memory Protection' : 'switch to Full Power';
+  if (!confirm(`${action}? ${mode === 'full_power' ? 'Heavy modules will re-enable on restart.' : 'Heavy modules will be disabled immediately.'}`)) return;
+  const r = await api('/api/mode', { method: 'POST', body: JSON.stringify({ mode, reason: 'dashboard_manual' }) });
+  if (r?.success) {
+    toast(`Mode: ${r.previousMode} → ${r.currentMode}`, 'success');
+    if (r.note) toast(r.note, 'info');
+  } else {
+    toast('Failed: ' + (r?.error || 'unknown'), 'error');
+  }
+  refreshMode();
+  refreshAll();
+}
+
+// ── Actions Ban ──
+async function loadActions() {
+  const r = await api('/api/actions');
+  if (!r) return;
+  const sel = document.getElementById('banActionSelect');
+  sel.innerHTML = '<option value="">Select action...</option>' + r.actions.map(a => '<option value="'+a+'">'+a+'</option>').join('');
+}
+async function banAction() {
+  const action = document.getElementById('banActionSelect').value;
+  const reason = document.getElementById('banReason').value;
+  if (!action) return;
+  const r = await api('/api/banned-actions', { method: 'POST', body: JSON.stringify({ action_type: action, reason }) });
+  toast(r?.success ? 'Banned: ' + action : 'Failed', r?.success ? 'success' : 'error');
+  refreshBans();
+}
+async function unbanAction(actionType) {
+  const r = await api('/api/banned-actions', { method: 'DELETE', body: JSON.stringify({ action_type: actionType }) });
+  toast(r?.success ? 'Unbanned: ' + actionType : 'Failed', r?.success ? 'success' : 'error');
+  refreshBans();
+}
+async function refreshBans() {
+  const r = await api('/api/banned-actions');
+  const el = document.getElementById('bannedList');
+  if (!r || !Array.isArray(r) || r.length === 0) {
+    el.innerHTML = '<div class="empty">No actions banned</div>';
+    return;
+  }
+  el.innerHTML = r.map(b =>
+    '<div class="banned-item"><span>'+b.action_type+' <span style="color:var(--text2);font-size:11px">'+(b.reason||'')+'</span></span>' +
+    '<button class="btn sm" onclick="unbanAction(\\''+b.action_type+'\\')">Unban</button></div>'
+  ).join('');
+}
+
+// ── Config Editor ──
+async function loadConfigKeys() {
+  const r = await api('/api/config/keys');
+  if (!r || !r.groups) return;
+  const el = document.getElementById('configEditor');
+  let html = '';
+  for (const [group, keys] of Object.entries(r.groups)) {
+    html += '<div style="margin-bottom:16px"><div style="font-size:13px;font-weight:600;color:var(--accent2);margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">'+group+'</div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px">';
+    for (const item of keys) {
+      const isBool = item.type === 'boolean';
+      const val = item.value;
+      const displayVal = isBool ? '<span class="stat-value '+(val?'green':'red')+'">'+(val?'true':'false')+'</span>' : '<span class="stat-value">'+val+'</span>';
+      const inputHtml = isBool
+        ? '<button class="btn sm '+(val?'success':'danger')+'" onclick="toggleBoolConfig(\\''+item.key+'\\','+!val+')">'+(val?'ON':'OFF')+'</button>'
+        : '<input type="'+(item.type==='number'?'number':'text')+'" value="'+val+'" style="width:80px;font-size:12px;padding:4px 8px" id="cfg_'+item.key+'"> <button class="btn sm primary" onclick="saveConfig(\\''+item.key+'\\')">Set</button>';
+      html += '<div style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:8px 10px;display:flex;align-items:center;gap:8px">';
+      html += '<div style="flex:1"><div style="font-size:12px;font-weight:500">'+item.label+'</div><div style="font-size:11px;color:var(--text2)">'+item.desc+'</div></div>';
+      html += '<div style="display:flex;align-items:center;gap:6px">' + inputHtml + '</div>';
+      html += '</div>';
+    }
+    html += '</div></div>';
+  }
+  el.innerHTML = html || '<div class="empty">No configurable keys found</div>';
+}
+async function saveConfig(key) {
+  const input = document.getElementById('cfg_'+key);
+  if (!input) return;
+  let value = input.value;
+  // Try to parse as number if the field is numeric
+  if (input.type === 'number' || !isNaN(value)) value = Number(value);
+  else if (value === 'true') value = true;
+  else if (value === 'false') value = false;
+  const r = await api('/api/config', { method: 'POST', body: JSON.stringify({ key, value }) });
+  toast(r?.success ? key + ' = ' + value : 'Failed: ' + (r?.error||''), r?.success ? 'success' : 'error');
+  if (r?.success) loadConfigKeys(); // Refresh to show updated values
+}
+async function toggleBoolConfig(key, newValue) {
+  const r = await api('/api/config', { method: 'POST', body: JSON.stringify({ key, value: newValue }) });
+  toast(r?.success ? key + ' = ' + newValue : 'Failed: ' + (r?.error||''), r?.success ? 'success' : 'error');
+  if (r?.success) loadConfigKeys();
+}
+
+// ── Logs ──
+async function refreshLogs() {
+  const text = await api('/api/logs');
+  const el = document.getElementById('logViewer');
+  if (text) { el.textContent = typeof text === 'string' ? text : JSON.stringify(text); el.scrollTop = el.scrollHeight; }
+}
+
+// ── Refresh all data ──
+async function refreshAll() {
+  // Full status
+  const full = await api('/api/full-status');
+  if (full) {
+    // Status badge
+    const badge = document.getElementById('statusBadge');
+    const sText = document.getElementById('statusText');
+    const ds = full.daemon;
+    if (ds?.stopRequested) { badge.className = 'status-badge warn'; sText.textContent = 'Paused'; }
+    else { badge.className = 'status-badge ok'; sText.textContent = 'Running'; }
+
+    // Meta
+    document.getElementById('metaInfo').textContent = fmtUptime(full.uptime) + ' | ' + (full.memory?.rss || '-') + ' RSS';
+
+    // Daemon state
+    document.getElementById('daemonState').textContent = 'Stop: ' + (ds?.stopRequested ? 'YES' : 'no') + ' | Cycles: ' + (full.cycleCount || 0) + ' | Questions: ' + (full.questionsCompleted || 0);
+
+    // System
+    const sys = document.getElementById('systemStats');
+    sys.innerHTML =
+      '<div class="stat-row"><span class="stat-label">Uptime</span><span class="stat-value">' + fmtUptime(full.uptime) + '</span></div>' +
+      '<div class="stat-row"><span class="stat-label">Heap Used</span><span class="stat-value">' + (full.memory?.heapUsed||'-') + '</span></div>' +
+      '<div class="stat-row"><span class="stat-label">RSS</span><span class="stat-value">' + (full.memory?.rss||'-') + '</span></div>' +
+      '<div class="stat-row"><span class="stat-label">Providers</span><span class="stat-value">' + (full.providerCount||0) + '</span></div>' +
+      (full.workShifts ? '<div class="stat-row"><span class="stat-label">Work Shift</span><span class="stat-value ' + (full.workShifts.fullCycle ? 'green' : 'yellow') + '">' + full.workShifts.current + '</span></div>' : '');
+
+    // Action Cache
+    const ac = full.actionCache;
+    const acEl = document.getElementById('actionCacheStats');
+    if (ac) {
+      acEl.innerHTML =
+        '<div class="stat-row"><span class="stat-label">Hits</span><span class="stat-value green">' + (ac.hits||0) + '</span></div>' +
+        '<div class="stat-row"><span class="stat-label">Misses</span><span class="stat-value">' + (ac.misses||0) + '</span></div>' +
+        '<div class="stat-row"><span class="stat-label">Saves</span><span class="stat-value">' + (ac.saves||0) + '</span></div>' +
+        '<div class="stat-row"><span class="stat-label">Evictions</span><span class="stat-value red">' + (ac.evictions||0) + '</span></div>' +
+        '<div class="stat-row"><span class="stat-label">Active Entries</span><span class="stat-value">' + (ac.activeEntries||0) + '</span></div>' +
+        (ac.topActions?.length ? '<div style="margin-top:8px;font-size:11px;color:var(--text2)">Top: ' + ac.topActions.map(a=>a.action+' ('+a.count+')').join(', ') + '</div>' : '');
+    } else { acEl.innerHTML = '<div class="empty">No cache data</div>'; }
+
+    // Providers
+    const pList = document.getElementById('providersList');
+    if (full.providers?.length) {
+      pList.innerHTML = full.providers.map(p => {
+        const cls = p.isAvailable ? (p.healthScore > 70 ? 'online' : 'degraded') : 'offline';
+        return '<div class="provider-row"><span class="provider-dot ' + cls + '"></span><span style="flex:1">' + p.name + '</span><span class="stat-value">' + (p.healthScore||0) + '%</span></div>';
+      }).join('');
+    } else { pList.innerHTML = '<div class="empty">No providers</div>'; }
+  }
+
+  // State
+  const state = await api('/api/state');
+  if (state) {
+    document.querySelector('#currentState .stat-value').textContent = state.currentState || '-';
+    document.querySelector('#stateAge .stat-value').textContent = state.stateAge ? fmtUptime(state.stateAge / 1000) : '-';
+    const dl = document.querySelector('#deadlock .stat-value');
+    if (state.deadlockDetected) { dl.textContent = 'DETECTED'; dl.className = 'stat-value red'; }
+    else { dl.textContent = 'None'; dl.className = 'stat-value green'; }
+  }
+
+  // Screenshot
+  refreshScreenshot();
+  // Bans
+  refreshBans();
+  // Banned states
+  refreshBannedStates();
+  // Mode
+  refreshMode();
+  // Persistence info
+  const pInfo = await api('/api/persist/info');
+  const badge = document.getElementById('persistBadge');
+  if (pInfo && badge) {
+    const total = (pInfo.configCount||0) + (pInfo.bannedStateCount||0) + (pInfo.hasForcedState?1:0);
+    badge.textContent = total > 0 ? total + ' persisted override' + (total>1?'s':'') : 'no overrides';
+    badge.style.background = total > 0 ? '#1e3a5f' : '#374151';
+  }
+}
+
+// ── Init ──
+(async function init() {
+  await loadStates();
+  await loadActions();
+  await refreshAll();
+  await loadConfigKeys();
+  refreshLogs();
+  setInterval(() => { if (autoRefresh) refreshAll(); }, 5000);
+  setInterval(refreshLogs, 10000);
+})();
+</script>
+</body>
+</html>`;
 }
 
 module.exports = {
-  get db() { return db; },
-  insertModule: safeInsertModule,
-  selectModule: safeSelectModule,
-  getAllModules: safeGetAllModules,
-  insertProgress: safeInsertProgress,
-  getRecentProgress: safeGetRecentProgress,
-  insertTemplate: safeInsertTemplate,
-  get _rawInsertTemplate() { return insertTemplate; },
-  get selectTemplate() { return selectTemplate; },
-  get listTemplates() { return listTemplates; },
-  get updateTemplateHit() { return updateTemplateHit; },
-  get upsertProvider() { return upsertProvider; },
-  get selectProvider() { return selectProvider; },
-  get listProviders() { return listProviders; },
-  get upsertCalibration() { return upsertCalibration; },
-  get selectCalibration() { return selectCalibration; },
-  get upsertLastState() { return upsertLastState; },
-  get selectLastState() { return selectLastState; },
-  get insertPatch() { return insertPatch; },
-  get getRecentPatches() { return getRecentPatches; },
-  get updateProviderStats() { return updateProviderStats; },
-  get upsertModel() { return upsertModel; },
-  get getActiveModel() { return getActiveModel; },
-  get getFallbackModel() { return getFallbackModel; },
-  get setModelRole() { return setModelRole; },
-  closeDatabase,
-  pruneTemplateCache,
-  vacuumIfNeeded,
-  getDatabaseStats,
-  checkIntegrity,
-  get upsertUiBaseline() { return upsertUiBaseline; },
-  get selectUiBaseline() { return selectUiBaseline; },
-  get insertBlackbox() { return insertBlackbox; },
-  get getBlackbox() { return getBlackbox; },
-  get insertSemanticsSnapshot() { return insertSemanticsSnapshot; },
-  get insertNetworkLog() { return insertNetworkLog; },
-  get getNetworkLogs() { return getNetworkLogs; },
-  get upsertPerformanceProfile() { return upsertPerformanceProfile; },
-  get selectPerformanceProfile() { return selectPerformanceProfile; },
-  get insertGitopsChain() { return insertGitopsChain; },
-  get getGitopsChain() { return getGitopsChain; },
-  get updateGitopsApplied() { return updateGitopsApplied; },
-  get insertFlutterSemantics() { return insertFlutterSemantics; },
-  get getFlutterSemantics() { return getFlutterSemantics; },
-  get upsertProviderSchema() { return upsertProviderSchema; },
-  get selectProviderSchema() { return selectProviderSchema; },
-  get insertExplorationMap() { return insertExplorationMap; },
-  get getExplorationMaps() { return getExplorationMaps; },
-  get upsertRuntimeVersion() { return upsertRuntimeVersion; },
-  get selectRuntimeVersion() { return selectRuntimeVersion; },
-  // Self-heal statements (getters since they're initialized in initDatabase)
-  get insertSelfHealEvent() { return insertSelfHealEvent; },
-  get getSelfHealTimeline() { return getSelfHealTimeline; },
-  get insertSelectorVersion() { return insertSelectorVersion; },
-  get getLatestSelectorVersion() { return getLatestSelectorVersion; },
-  get insertPatchCanary() { return insertPatchCanary; },
-  get updatePatchCanary() { return updatePatchCanary; },
-  get getActiveCanary() { return getActiveCanary; },
-  get insertAdversarialResult() { return insertAdversarialResult; },
-  get insertDbQuarantine() { return insertDbQuarantine; },
-  get getQuarantinedRows() { return getQuarantinedRows; },
-  get upsertDiscoveredState() { return upsertDiscoveredState; },
-  get getDiscoveredStates() { return getDiscoveredStates; },
-  get pruneExpiredStates() { return pruneExpiredStates; },
-  get insertDependencyHealth() { return insertDependencyHealth; },
-  get getDependencyHealth() { return getDependencyHealth; },
-  get insertConfigReconciliation() { return insertConfigReconciliation; },
-  get insertBlackboxFull() { return insertBlackboxFull; },
-  get getBlackboxFull() { return getBlackboxFull; },
-  get insertPatchEmbedding() { return insertPatchEmbedding; },
-  get searchPatchEmbeddings() { return searchPatchEmbeddings; },
-  get insertHealModelMetric() { return insertHealModelMetric; },
-  get getHealModelMetrics() { return getHealModelMetrics; },
-  get getOrCreateHealerCircuitState() { return getOrCreateHealerCircuitState; },
-  get updateHealerCircuitState() { return updateHealerCircuitState; },
-  get getHealerCircuitState() { return getHealerCircuitState; },
-  get insertDegradationLog() { return insertDegradationLog; },
-  get getDegradationLog() { return getDegradationLog; },
-  // Dashboard control
-  get insertBannedAction() { return insertBannedAction; },
-  get deleteBannedAction() { return deleteBannedAction; },
-  get listBannedActions() { return listBannedActions; },
-  get selectBannedAction() { return selectBannedAction; },
-  // DI support
-  _injectDependencies,
-  initDatabase,
+  handleDashboardRequest,
+  createDashboardServer,
+  startDashboard,
+  getLatestScreenshot,
+  setLatestScreenshot,
+  _getDashboardHTML: getDashboardHTML,
 };
