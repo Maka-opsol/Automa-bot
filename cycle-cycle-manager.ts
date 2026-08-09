@@ -80,7 +80,7 @@ function _getTmpGuardian() { if (!_tmpGuardian) { try { _tmpGuardian = require('
 let _coldStart: any = null;
 function _getColdStart() { if (!_coldStart) { try { _coldStart = require('./render-cold-start'); } catch { _coldStart = null; } } return _coldStart; }
 
-async function runCycle() { 
+async function runCycle(options?: { pixelOnly?: boolean }) { 
   // ─── Resolve all dependencies at cycle start ───
   // This ensures we always use the latest container state
   const CONFIG = getCONFIG();
@@ -199,10 +199,12 @@ async function runCycle() {
           log(`Degradation level ${degradationLevelName}: sleeping ${cycleSleepMs}ms between cycles`, 'INFO', 'cycle');
           await sleep(cycleSleepMs);
         }
-        // DORMANT level: skip the entire cycle (just wake check)
-        if (degradationLevel >= 4) {
-          log('Degradation level DORMANT: skipping cycle (zero providers/budget)', 'WARN', 'cycle');
-          return;
+        // DORMANT level: skip AI-dependent parts but still run pixel-only
+        // Pixel fallback and explorer cost no API quota and can make progress
+        if (degradationLevel >= 4 && !options?.pixelOnly) {
+          log('Degradation level DORMANT: switching to pixel-only cycle (zero providers/budget)', 'WARN', 'cycle');
+          options = { pixelOnly: true }; // Force pixel-only mode
+          // Don't return — fall through to pixel-only path below
         }
       }
     }
@@ -228,8 +230,8 @@ async function runCycle() {
   await stateMachine.initialize();
   const stats = getStats();
   updateStats({ cycleCount: (stats.cycleCount || 0) + 1, lastCycleStart: new Date().toISOString(), currentStatus: 'running' });
-  log(`Starting cycle #${getStats().cycleCount}`, 'INFO', 'cycle');
-  resetCycleProviderState();
+  log(`Starting cycle #${getStats().cycleCount}${options?.pixelOnly ? ' (pixel-only)' : ''}`, 'INFO', 'cycle');
+  if (!options?.pixelOnly) resetCycleProviderState();
 
   let page: any;
   let clickAttempts = 0;
@@ -457,11 +459,24 @@ async function runCycle() {
 
       // Vision tribunal
       if (!action) {
-        try {
-          action = await safeCall((_sig: any) => determineNextAction(base64, page.url(), explorationMode ? explorationMap : null), 'Tribunal', { timeoutMs: CONFIG.TRIBUNAL_TIMEOUT_MS, url: 'tribunal' });
-        } catch (err: any) {
-          logError('Tribunal failed, using fallback', err);
-          action = await getFallbackAction(page);
+        // Pixel-only mode: skip AI providers entirely, go straight to fallback chain
+        if (options?.pixelOnly) {
+          log('Pixel-only mode: skipping tribunal, using fallback chain directly', 'INFO', 'cycle');
+          try {
+            action = await getFallbackAction(page);
+            if (action && action.actionType && action.actionType !== 'wait') {
+              log(`Pixel-only fallback: ${action.actionType} at (${action.targetX}, ${action.targetY})`, 'INFO', 'cycle');
+            }
+          } catch (fbErr: any) {
+            log(`Pixel-only fallback failed: ${fbErr.message || fbErr}`, 'WARN', 'cycle');
+          }
+        } else {
+          try {
+            action = await safeCall((_sig: any) => determineNextAction(base64, page.url(), explorationMode ? explorationMap : null), 'Tribunal', { timeoutMs: CONFIG.TRIBUNAL_TIMEOUT_MS, url: 'tribunal' });
+          } catch (err: any) {
+            logError('Tribunal failed, using fallback', err);
+            action = await getFallbackAction(page);
+          }
         }
       }
       if (!action || !action.actionType) {
