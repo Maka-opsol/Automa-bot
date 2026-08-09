@@ -578,27 +578,6 @@ function getLoadFailures(): Array<{ name: string; error: string }> {
 }
 
 // ===============================================================================
-// PROVIDER DIAGNOSTIC (for startup health check)
-// ===============================================================================
-
-let _diagnosticLogged = false;
-
-/** Log full provider diagnostic summary. Call once at startup. */
-function logProviderDiagnostic(): void {
-  _diagnosticLogged = false; // Force re-log
-  getAvailableProviderCount();   // This now logs the diagnostic
-  getLog()(`Provider modules loaded: ${PROVIDER_TABLE.filter(e => e.factory !== null).map(e => e.name).join(', ') || 'NONE'}`, _loadFailures.length > 0 ? 'WARN' : 'INFO', 'registry');
-  if (_loadFailures.length > 0) {
-    getLog()(`Provider modules FAILED: ${_loadFailures.map(f => `${f.name}(${f.error})`).join(', ')}`, 'ERROR', 'registry');
-  }
-}
-
-/** Get load failures for external reporting (health endpoint, etc.) */
-function getLoadFailures(): Array<{ name: string; error: string }> {
-  return [..._loadFailures];
-}
-
-// ===============================================================================
 // LEGACY COMPATIBILITY
 // ===============================================================================
 
