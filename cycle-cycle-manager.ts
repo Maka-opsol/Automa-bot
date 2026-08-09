@@ -107,9 +107,9 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   const safeCall = _baseDep.safeCall || ((fn: any) => fn());
   // providers-fallback is not in the container — lazy load with caching
   let _fallbackMod: any = null;
-  const getFallbackAction = async (page: any) => {
+  const getFallbackAction = async (page: any, currentState?: string) => {
     if (!_fallbackMod) { try { _fallbackMod = require('./providers-fallback'); } catch { _fallbackMod = { getFallbackAction: async () => ({ actionType: 'wait', currentState: 'error', targetX: 0, targetY: 0 }) }; } }
-    return _fallbackMod.getFallbackAction(page);
+    return _fallbackMod.getFallbackAction(page, currentState);
   };
   const { saveCheckpoint, loadCheckpoint } = getDep('statePersist') || {};
   const { getNextModule, recordModuleCompletion } = getDep('moduleSelector') || {};
@@ -476,7 +476,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         if (options?.pixelOnly) {
           log('Pixel-only mode: skipping tribunal, using fallback chain directly', 'INFO', 'cycle');
           try {
-            action = await getFallbackAction(page);
+            action = await getFallbackAction(page, currentState || undefined);
             if (action && action.actionType && action.actionType !== 'wait') {
               log(`Pixel-only fallback: ${action.actionType} at (${action.targetX}, ${action.targetY})`, 'INFO', 'cycle');
             }
@@ -488,7 +488,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             action = await safeCall((_sig: any) => determineNextAction(base64, page.url(), explorationMode ? explorationMap : null), 'Tribunal', { timeoutMs: CONFIG.TRIBUNAL_TIMEOUT_MS, url: 'tribunal' });
           } catch (err: any) {
             logError('Tribunal failed, using fallback', err);
-            action = await getFallbackAction(page);
+            action = await getFallbackAction(page, currentState || undefined);
           }
         }
       }
@@ -504,7 +504,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       if (action && action.actionType === 'wait' && (action.currentState === 'unknown' || action.currentState === 'error')) {
         log('Tribunal returned wait for unknown state — running fallback chain', 'INFO', 'cycle');
         try {
-          const fallbackAction = await getFallbackAction(page);
+          const fallbackAction = await getFallbackAction(page, currentState || undefined);
           if (fallbackAction && fallbackAction.actionType && fallbackAction.actionType !== 'wait') {
             log(`Fallback chain provided action: ${fallbackAction.actionType} at (${fallbackAction.targetX}, ${fallbackAction.targetY}) state=${fallbackAction.currentState}`, 'INFO', 'cycle');
             action = fallbackAction;
@@ -1124,7 +1124,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           // and other pages even when AI, DOM, and semantics are all unavailable
           try {
             const pixelFallback = require('./pixel-fallback');
-            const pixelAction = await pixelFallback.generatePixelFallbackAction(page);
+            const pixelAction = await pixelFallback.generatePixelFallbackAction(page, currentState || undefined);
             if (pixelAction && pixelAction.actionType && pixelAction.actionType !== 'wait') {
               log(`Pixel fallback saved us: ${pixelAction.actionType} at (${pixelAction.targetX}, ${pixelAction.targetY}) state=${pixelAction.currentState}`, 'INFO', 'cycle');
               if (executeAction) await executeAction(page, pixelAction);
