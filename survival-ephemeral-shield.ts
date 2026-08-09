@@ -169,7 +169,7 @@ function copyFileSafe(src: string, dest: string, maxSizeBytes: number = 50 * 102
     return true;
   } catch (e: any) {
     // Don't spam logs for expected failures (file not found during wipe)
-    if (e.code !== 'ENOENT' && e.code !== 'ENOENT') {
+    if (e.code !== 'ENOENT' && e.code !== 'EACCES') {
       logError(`Failed to copy ${src} → ${dest}`, e);
     }
     return false;
@@ -558,16 +558,10 @@ function getDiskUsagePercent(checkPath: string): number {
     // statfsSync may not be available in all Node.js builds
   }
 
-  // Fallback: estimate from process memory (not disk, but better than nothing)
-  try {
-    const mem = process.memoryUsage();
-    // Rough heuristic: assume 512MB disk on Render free plan
-    const assumedDiskMB = 512;
-    const usedMB = mem.rss / 1024 / 1024;
-    return (usedMB / assumedDiskMB) * 100;
-  } catch {
-    return -1;
-  }
+  // Fallback: statfsSync not available — return -1 (unknown)
+  // Previously used process RSS memory to estimate disk, which was
+  // wildly inaccurate and could trigger unnecessary emergency cleanup.
+  return -1;
 }
 
 /**
