@@ -20,12 +20,17 @@ const OPTIONAL_DEPS = new Set([
   'nodemailer',
 ]);
 
+// Type-only packages (prefixed with @types/) are never needed at runtime.
+// They provide TypeScript definitions only — skip require.resolve() for these.
+const isTypesOnly = (dep: string) => dep.startsWith('@types/');
+
 function checkDependencies() { 
   const pkg = require('./package.json');
   const deps = { ...pkg.dependencies, ...(pkg.devDependencies || {}), ...(pkg.optionalDependencies || {}) };
   const missing = [];
   const missingOptional = [];
   for (const dep of Object.keys(deps)) {
+    if (isTypesOnly(dep)) continue; // Skip @types/* packages (type definitions only, never needed at runtime)
     try { require.resolve(dep); } catch (e: any) {
       if (OPTIONAL_DEPS.has(dep)) {
         missingOptional.push(dep);
