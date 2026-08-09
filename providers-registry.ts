@@ -3,16 +3,26 @@
 
 // Provider implementations - internal sub-modules, not container-registered
 // Each require is wrapped in try/catch so one broken provider doesn't kill the entire registry.
-let GitHubGPTProvider: any = null; try { ({ GitHubGPTProvider } = require('./providers-github-gpt')); } catch (e: any) { console.error(`[registry] Failed to load providers-github-gpt: ${e.message}`); }
-let GroqProvider: any = null; try { ({ GroqProvider } = require('./providers-groq')); } catch (e: any) { console.error(`[registry] Failed to load providers-groq: ${e.message}`); }
-let ZAIProvider: any = null; try { ({ ZAIProvider } = require('./providers-zai')); } catch (e: any) { console.error(`[registry] Failed to load providers-zai: ${e.message}`); }
-let AgnesProvider: any = null; try { ({ AgnesProvider } = require('./providers-agnes')); } catch (e: any) { console.error(`[registry] Failed to load providers-agnes: ${e.message}`); }
-let NvidiaProvider: any = null; try { ({ NvidiaProvider } = require('./providers-nvidia')); } catch (e: any) { console.error(`[registry] Failed to load providers-nvidia: ${e.message}`); }
-let CloudflareProvider: any = null; try { ({ CloudflareProvider } = require('./providers-cloudflare')); } catch (e: any) { console.error(`[registry] Failed to load providers-cloudflare: ${e.message}`); }
-let CerebrasProvider: any = null; try { ({ CerebrasProvider } = require('./providers-cerebras')); } catch (e: any) { console.error(`[registry] Failed to load providers-cerebras: ${e.message}`); }
-let GeminiProvider: any = null; try { ({ GeminiProvider } = require('./providers-gemini')); } catch (e: any) { console.error(`[registry] Failed to load providers-gemini: ${e.message}`); }
-let OpenRouterTribunalProvider: any = null; try { ({ OpenRouterTribunalProvider } = require('./providers-openrouter-tribunal')); } catch (e: any) { console.error(`[registry] Failed to load providers-openrouter-tribunal: ${e.message}`); }
-let DeepInfraProvider: any = null; try { ({ DeepInfraProvider } = require('./providers-deepinfra')); } catch (e: any) { console.error(`[registry] Failed to load providers-deepinfra: ${e.message}`); }
+// ===============================================================================
+// PROVIDER DIAGNOSTIC (for startup health check)
+// ===============================================================================
+
+// FIX: Declared BEFORE getAvailableProviderCount() which uses it.
+// Tracks whether the initial diagnostic has been logged.
+let _diagnosticLogged = false;
+
+// FIX: Track which modules failed to load and WHY, for diagnostic logging.
+const _loadFailures: Array<{ name: string; error: string }> = [];
+let GitHubGPTProvider: any = null; try { ({ GitHubGPTProvider } = require('./providers-github-gpt')); } catch (e: any) { _loadFailures.push({ name: 'GitHub GPT', error: e.message }); console.error(`[registry] Failed to load providers-github-gpt: ${e.message}`); }
+let GroqProvider: any = null; try { ({ GroqProvider } = require('./providers-groq')); } catch (e: any) { _loadFailures.push({ name: 'Groq', error: e.message }); console.error(`[registry] Failed to load providers-groq: ${e.message}`); }
+let ZAIProvider: any = null; try { ({ ZAIProvider } = require('./providers-zai')); } catch (e: any) { _loadFailures.push({ name: 'z.ai', error: e.message }); console.error(`[registry] Failed to load providers-zai: ${e.message}`); }
+let AgnesProvider: any = null; try { ({ AgnesProvider } = require('./providers-agnes')); } catch (e: any) { _loadFailures.push({ name: 'Agnes', error: e.message }); console.error(`[registry] Failed to load providers-agnes: ${e.message}`); }
+let NvidiaProvider: any = null; try { ({ NvidiaProvider } = require('./providers-nvidia')); } catch (e: any) { _loadFailures.push({ name: 'NVIDIA', error: e.message }); console.error(`[registry] Failed to load providers-nvidia: ${e.message}`); }
+let CloudflareProvider: any = null; try { ({ CloudflareProvider } = require('./providers-cloudflare')); } catch (e: any) { _loadFailures.push({ name: 'Cloudflare', error: e.message }); console.error(`[registry] Failed to load providers-cloudflare: ${e.message}`); }
+let CerebrasProvider: any = null; try { ({ CerebrasProvider } = require('./providers-cerebras')); } catch (e: any) { _loadFailures.push({ name: 'Cerebras', error: e.message }); console.error(`[registry] Failed to load providers-cerebras: ${e.message}`); }
+let GeminiProvider: any = null; try { ({ GeminiProvider } = require('./providers-gemini')); } catch (e: any) { _loadFailures.push({ name: 'Gemini', error: e.message }); console.error(`[registry] Failed to load providers-gemini: ${e.message}`); }
+let OpenRouterTribunalProvider: any = null; try { ({ OpenRouterTribunalProvider } = require('./providers-openrouter-tribunal')); } catch (e: any) { _loadFailures.push({ name: 'OpenRouter', error: e.message }); console.error(`[registry] Failed to load providers-openrouter-tribunal: ${e.message}`); }
+let DeepInfraProvider: any = null; try { ({ DeepInfraProvider } = require('./providers-deepinfra')); } catch (e: any) { _loadFailures.push({ name: 'DeepInfra', error: e.message }); console.error(`[registry] Failed to load providers-deepinfra: ${e.message}`); }
 
 // --- Dependency Injection ---------------------------------------------------
 let _deps: Record<string, any> = {};
@@ -463,25 +473,54 @@ async function getAvailableProviders(options?: { visionOnly?: boolean }) {
 function getAvailableProviderCount(options?: { visionOnly?: boolean }): number {
   let count = 0;
   const configLoader = _getConfigLoader();
+  const skipReasons: Array<{ name: string; reason: string }> = [];
 
   for (const entry of PROVIDER_TABLE) {
-    if (configLoader.isProviderDisabledByDefault(entry.name)) continue;
-    if (!entry.factory) continue;
-    try {
-      const fn = entry.factory();
-      if (!fn) continue;
-    } catch {
+    if (configLoader.isProviderDisabledByDefault(entry.name)) {
+      skipReasons.push({ name: entry.name, reason: 'disabled by default' });
       continue;
     }
-    if (isProviderBlacklisted(entry.name) || isProviderRetired(entry.name)) continue;
-    if (entry.name === 'Gemini' && isGeminiOnCooldown()) continue;
+    if (!entry.factory) {
+      skipReasons.push({ name: entry.name, reason: 'module failed to load' });
+      continue;
+    }
+    try {
+      const fn = entry.factory();
+      if (!fn) {
+        const envKeys = configLoader.getEnvKeys?.(entry.name) || [];
+        const missingKeys = envKeys.filter((k: string) => !process.env[k]);
+        const reason = missingKeys.length > 0
+          ? `missing env: ${missingKeys.join(', ')}`
+          : 'factory returned null (unknown)';
+        skipReasons.push({ name: entry.name, reason });
+        continue;
+      }
+    } catch (e: any) {
+      skipReasons.push({ name: entry.name, reason: `factory threw: ${e.message}` });
+      continue;
+    }
+    if (isProviderBlacklisted(entry.name)) {
+      skipReasons.push({ name: entry.name, reason: 'blacklisted' });
+      continue;
+    }
+    if (isProviderRetired(entry.name)) {
+      skipReasons.push({ name: entry.name, reason: 'retired' });
+      continue;
+    }
+    if (entry.name === 'Gemini' && isGeminiOnCooldown()) {
+      skipReasons.push({ name: entry.name, reason: 'Gemini 429 cooldown' });
+      continue;
+    }
 
     // Vision-only filtering
     if (options?.visionOnly) {
       try {
         const serializers = _getSerializers();
         const caps = serializers.getProviderCapabilities?.(entry.name);
-        if (caps && !caps.supportsVision) continue;
+        if (caps && !caps.supportsVision) {
+          skipReasons.push({ name: entry.name, reason: 'text-only (vision requested)' });
+          continue;
+        }
       } catch {}
     }
 
@@ -501,7 +540,62 @@ function getAvailableProviderCount(options?: { visionOnly?: boolean }): number {
     count++;
   }
 
+  // FIX: Always log diagnostic info when count is 0 (or on first call)
+  // This tells us EXACTLY why no providers are available
+  if (count === 0 || !_diagnosticLogged) {
+    _diagnosticLogged = true;
+    const log = getLog();
+    const loadedCount = PROVIDER_TABLE.filter(e => e.factory !== null).length;
+    log(`Provider diagnostic: ${count}/${PROVIDER_TABLE.length} available (${loadedCount} modules loaded, ${_loadFailures.length} load failures)`, count === 0 ? 'ERROR' : 'INFO', 'registry');
+    for (const s of skipReasons) {
+      log(`  SKIP ${s.name}: ${s.reason}`, 'DEBUG', 'registry');
+    }
+    for (const f of _loadFailures) {
+      log(`  FAIL ${f.name}: ${f.error}`, 'ERROR', 'registry');
+    }
+  }
+
   return count;
+}
+
+// ===============================================================================
+// PROVIDER DIAGNOSTIC EXPORTS (for startup health check)
+// ===============================================================================
+
+/** Log full provider diagnostic summary. Call once at startup. */
+function logProviderDiagnostic(): void {
+  _diagnosticLogged = false; // Force re-log
+  getAvailableProviderCount();   // This now logs the diagnostic
+  getLog()(`Provider modules loaded: ${PROVIDER_TABLE.filter(e => e.factory !== null).map(e => e.name).join(', ') || 'NONE'}`, _loadFailures.length > 0 ? 'WARN' : 'INFO', 'registry');
+  if (_loadFailures.length > 0) {
+    getLog()(`Provider modules FAILED: ${_loadFailures.map(f => `${f.name}(${f.error})`).join(', ')}`, 'ERROR', 'registry');
+  }
+}
+
+/** Get load failures for external reporting (health endpoint, etc.) */
+function getLoadFailures(): Array<{ name: string; error: string }> {
+  return [..._loadFailures];
+}
+
+// ===============================================================================
+// PROVIDER DIAGNOSTIC (for startup health check)
+// ===============================================================================
+
+let _diagnosticLogged = false;
+
+/** Log full provider diagnostic summary. Call once at startup. */
+function logProviderDiagnostic(): void {
+  _diagnosticLogged = false; // Force re-log
+  getAvailableProviderCount();   // This now logs the diagnostic
+  getLog()(`Provider modules loaded: ${PROVIDER_TABLE.filter(e => e.factory !== null).map(e => e.name).join(', ') || 'NONE'}`, _loadFailures.length > 0 ? 'WARN' : 'INFO', 'registry');
+  if (_loadFailures.length > 0) {
+    getLog()(`Provider modules FAILED: ${_loadFailures.map(f => `${f.name}(${f.error})`).join(', ')}`, 'ERROR', 'registry');
+  }
+}
+
+/** Get load failures for external reporting (health endpoint, etc.) */
+function getLoadFailures(): Array<{ name: string; error: string }> {
+  return [..._loadFailures];
 }
 
 // ===============================================================================
@@ -525,6 +619,9 @@ module.exports = {
   // Gemini-specific (exposed for monitoring)
   getGeminiCooldownRemainingMs,
   isGeminiOnCooldown,
+  // Diagnostic (for startup health check)
+  logProviderDiagnostic,
+  getLoadFailures,
   // DI
   _injectDependencies,
 };
