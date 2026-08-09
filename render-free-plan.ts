@@ -634,51 +634,42 @@ const server = http.createServer(async (req: any, res: any) => {
   if (DASHBOARD_ALLOWED_ORIGINS.includes('*') || DASHBOARD_ALLOWED_ORIGINS.includes(requestOrigin)) {
     res.setHeader('Access-Control-Allow-Origin', requestOrigin || '*');
   }
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;
 
-  // \u2500\u2500 Root: status page \u2500\u2500
-  if (pathname === '/' && req.method === 'GET') {
+  // ── Root: full control dashboard (from dashboard-server module) ──
+  if (pathname === '/' || pathname === '/index.html') {
+    try {
+      const dashMod = require('./dashboard-server');
+      const html = dashMod._getDashboardHTML
+        ? dashMod._getDashboardHTML()
+        : null;
+      if (html && html.length > 100) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+        return;
+      }
+    } catch { /* fall through to minimal fallback */ }
+    // Minimal fallback if dashboard-server not available
     const stats = getStats();
     const memInfo = getMemoryInfo();
-    const html = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>MathU Bot v6 \u2014 Render Free</title>
-<style>
-body{font-family:system-ui,-apple-system,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;color:#e5e7eb;background:#111827}
-h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>MathU Bot v6</title>
+<style>body{font-family:system-ui,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;color:#e5e7eb;background:#111827}
 .stat{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1f2937}
 .stat-label{color:#9ca3af}.stat-value{color:#60a5fa;font-weight:600}
-.badge{display:inline-block;padding:2px 8px;border-radius:9999px;font-size:12px;font-weight:600}
-.badge-ok{background:#065f46;color:#6ee7b7}.badge-warn{background:#78350f;color:#fcd34d}.badge-err{background:#7f1d1d;color:#fca5a5}
-.footer{margin-top:40px;color:#6b7280;font-size:13px;text-align:center}
 </style></head><body>
-<h1>MathU Bot v6 \u2014 Render Free Plan</h1>
-<p>All features enabled. 512 MB RAM. No worker threads (in-process). Single-process Chromium.</p>
-<h2>Status</h2>
-<div class="stat"><span class="stat-label">Status</span><span class="badge ${stats.currentStatus === 'running' ? 'badge-ok' : stats.currentStatus === 'idle' ? 'badge-warn' : 'badge-err'}">${stats.currentStatus || 'unknown'}</span></div>
-<div class="stat"><span class="stat-label">Questions Completed</span><span class="stat-value">${stats.questionsCompleted || 0}</span></div>
-<div class="stat"><span class="stat-label">Cycles Run</span><span class="stat-value">${stats.cycleCount || 0}</span></div>
+<h1>MathU Bot v6</h1>
+<div class="stat"><span class="stat-label">Status</span><span class="stat-value">${stats.currentStatus||'unknown'}</span></div>
+<div class="stat"><span class="stat-label">Cycles</span><span class="stat-value">${stats.cycleCount||0}</span></div>
+<div class="stat"><span class="stat-label">Heap</span><span class="stat-value">${memInfo.heapUsed}</span></div>
+<div class="stat"><span class="stat-label">RSS</span><span class="stat-value">${memInfo.rss}</span></div>
 <div class="stat"><span class="stat-label">Uptime</span><span class="stat-value">${formatUptime(process.uptime())}</span></div>
-<div class="stat"><span class="stat-label">Heap Used</span><span class="stat-value">${memInfo.heapUsed}</span></div>
-<div class="stat"><span class="stat-label">RSS</span><span class="stat-value">${memInfo.rss} (${memInfo.rssPercent})</span></div>
-<div class="stat"><span class="stat-label">Node.js</span><span class="stat-value">${process.version}</span></div>
-<div class="stat"><span class="stat-label">Workers</span><span class="stat-value">0 (in-process)</span></div>
-<div class="stat"><span class="stat-label">Platform</span><span class="stat-value">render-free-plan${IS_RENDER ? '' : ' (local)'}</span></div>
-<h2>API Endpoints</h2>
-<ul>
-<li><code>GET /health</code> \u2014 Health check</li>
-<li><code>GET /api/status</code> \u2014 Detailed status JSON</li>
-<li><code>GET /api/metrics</code> \u2014 Performance metrics</li>
-<li><code>GET /api/container</code> \u2014 Container module health</li>
-</ul>
-<div class="footer">MathU Bot v6 | Render Free Plan | All Features | ${formatUptime(process.uptime())} | ${new Date().toISOString()}</div>
-</body></html>`;
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(html);
+</body></html>`);
     return;
   }
 
@@ -953,9 +944,13 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
       // FIX: Include provider load failures and count in full status
       const loadFailures = registryMod.getLoadFailures ? registryMod.getLoadFailures() : [];
       const providerCount = registryMod.getAvailableProviderCount ? registryMod.getAvailableProviderCount() : 0;
+      // Include daemon running state
+      let daemonState = { stopRequested: false };
+      try { const orch = require('./cycle-orchestrator'); daemonState = { stopRequested: !!orch._stopRequested }; } catch {}
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ...stats,
+        daemon: daemonState,
         memory: memInfo,
         uptime: process.uptime(),
         platform: 'render-free-plan',
@@ -999,6 +994,148 @@ h1{color:#f9fafb;border-bottom:1px solid #374151;padding-bottom:12px}
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ...stats, memory: memInfo, uptime: process.uptime(), timestamp: Date.now() }));
     }
+    return;
+  }
+
+
+  // ── Live screenshot (capture right now) ──
+  if (pathname === '/api/screenshot/live') {
+    try {
+      const browserMod = require('./browser');
+      const page = browserMod.browserManager?.getPage?.() || browserMod.browserManager?.pageInstance;
+      if (!page || page.isClosed()) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ available: false, error: 'Browser not available' }));
+        return;
+      }
+      const buf = await page.screenshot({ type: 'jpeg', quality: 40 });
+      let jpeg = buf.toString('base64');
+      try { const compressed = await browserMod.compressScreenshot?.(jpeg, 800, 30); if (compressed) jpeg = compressed; } catch {}
+      if (jpeg.length > 300_000) jpeg = jpeg.substring(0, 300_000);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ available: true, timestamp: Date.now(), screenshot: jpeg }));
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ available: false, error: e.message }));
+    }
+    return;
+  }
+
+  // ── Daemon state ──
+  if (pathname === '/api/daemon') {
+    let daemonState = { running: true, stopRequested: false };
+    try { const orch = require('./cycle-orchestrator'); daemonState = { running: true, stopRequested: !!orch._stopRequested }; } catch { daemonState = { running: false, stopRequested: false }; }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(daemonState));
+    return;
+  }
+
+  // ── Resume daemon ──
+  if (pathname === '/api/daemon/resume' && req.method === 'POST') {
+    try {
+      const { resumeDaemon } = require('./cycle-orchestrator');
+      resumeDaemon();
+      log('Daemon resumed via dashboard', 'INFO', 'dashboard');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, message: 'Daemon resumed' }));
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // ── Force state (via state-machine) ──
+  if (pathname === '/api/force-state' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk: any) => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        if (!data.state || typeof data.state !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'state is required' }));
+          return;
+        }
+        const { forceState } = require('./state-machine');
+        forceState(data.state, 'dashboard_admin');
+        log(`State forced via dashboard: ${data.state}`, 'WARN', 'dashboard');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, state: data.state }));
+      } catch (e: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // ── Available states list ──
+  if (pathname === '/api/states') {
+    try {
+      const sm = require('./state-machine');
+      const states = Object.values(sm.STATES || {});
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ states }));
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // ── Available actions list ──
+  if (pathname === '/api/actions') {
+    try {
+      const sm = require('./state-machine');
+      const actions = Object.keys(sm.ACTIONS || {});
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ actions }));
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // ── Clear action cache ──
+  if (pathname === '/api/action-cache/clear' && req.method === 'POST') {
+    try {
+      const ac = require('./services-action-cache');
+      ac.clear();
+      log('Action cache cleared via dashboard', 'INFO', 'dashboard');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // ── Set config (safe keys only) ──
+  if (pathname === '/api/config' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk: any) => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        const SAFE_KEYS = new Set(['SLEEP_MIN_HOURS','SLEEP_MAX_HOURS','MAX_CYCLES_BEFORE_RESTART','MAX_CONSECUTIVE_FAILURES','VISION_PRIORITY','ALERT_ON_ERROR','ALERT_ON_STAGNATION','OPENROUTER_TRIBUNAL_MODEL']);
+        if (!SAFE_KEYS.has(data.key)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Config key not allowed' }));
+          return;
+        }
+        const { updateConfig } = require('./get-config');
+        updateConfig(data.key, data.value);
+        log(`Config changed via dashboard: ${data.key} = ${data.value}`, 'INFO', 'dashboard');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, key: data.key, value: data.value }));
+      } catch (e: any) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
     return;
   }
 
