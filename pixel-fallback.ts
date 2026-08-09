@@ -1557,17 +1557,21 @@ function _advanceLoginFlow(action: any): void {
  */
 const STATE_COMPAT: Record<string, string[]> = {
   // Login states — only valid when actually in login flow
+  // NOTE: 'unknown' and 'error' are included here because when the bot doesn't know
+  // where it is, trying a login action (click email field) is safer than trying
+  // an assignment action (click Watch button that doesn't exist on login page).
   'microsoft_email_input': ['mathu_login', 'microsoft_email_input', 'unknown', 'error', 'anywhere_click_recovery'],
   'advlearn_login':         ['mathu_login', 'microsoft_email_input', 'advlearn_login', 'unknown', 'error', 'anywhere_click_recovery'],
   'microsoft_stay_signed_in': ['mathu_login', 'microsoft_email_input', 'advlearn_login', 'unknown', 'error', 'anywhere_click_recovery'],
   'signin_page':            ['mathu_login', 'microsoft_email_input', 'advlearn_login', 'unknown', 'error', 'anywhere_click_recovery'],
-  // App states — only valid when inside the MathU app
-  'assignments_page':      ['assignments_page', 'score_screen', 'pathway', 'pathway_feedback', 'assessment_correction', 'unknown', 'error', 'anywhere_click_recovery', 'ui_discovered', 'flutter_modal', 'flutter_bottom_sheet', 'exploration'],
-  'module_downloading':     ['assignments_page', 'unknown', 'error', 'anywhere_click_recovery'],
-  'exercise_info':         ['exercise_info', 'exercise_memo', 'unknown', 'error', 'anywhere_click_recovery'],
-  'assessment':             ['assessment', 'assessment_correction', 'unknown', 'error', 'anywhere_click_recovery'],
-  'video_player':           ['video_player', 'unknown', 'error', 'anywhere_click_recovery'],
-  'score_screen':           ['score_screen', 'pathway', 'pathway_feedback', 'unknown', 'error', 'anywhere_click_recovery'],
+  // App states — ONLY valid when actually inside the MathU app (known state)
+  // REMOVED 'unknown' and 'error': prevents assignment actions during login flow
+  'assignments_page':      ['assignments_page', 'score_screen', 'pathway', 'pathway_feedback', 'assessment_correction', 'anywhere_click_recovery', 'ui_discovered', 'flutter_modal', 'flutter_bottom_sheet', 'exploration'],
+  'module_downloading':     ['assignments_page', 'anywhere_click_recovery'],
+  'exercise_info':         ['exercise_info', 'exercise_memo', 'anywhere_click_recovery'],
+  'assessment':             ['assessment', 'assessment_correction', 'anywhere_click_recovery'],
+  'video_player':           ['video_player', 'anywhere_click_recovery'],
+  'score_screen':           ['score_screen', 'pathway', 'pathway_feedback', 'anywhere_click_recovery'],
 };
 
 /**
@@ -1584,6 +1588,44 @@ function _isActionStateCompatible(action: any, realCurrentState: string): boolea
 async function generatePixelFallbackAction(page: any, currentState?: string): Promise<any> {
   try {
     const url = page?.url?.() || '';
+
+    // ── Login flow guard ──
+    // If we're on a Microsoft login page, ALWAYS prefer login actions.
+    // This prevents the bot from trying assignment actions on login pages.
+    if (_isMicrosoftLoginPage(url) || url.includes('login') || url.includes('signin') || url.includes('auth')) {
+      log('Pixel fallback: on login page — forcing login-only mode', 'DEBUG', 'pixel-fallback');
+      // Take screenshot for login-specific analysis
+      const screenshotBuffer = await page.screenshot({ type: 'png', fullPage: false });
+      if (!screenshotBuffer || screenshotBuffer.length < 100) return null;
+      const decoded = _decodePNG(screenshotBuffer);
+      if (!decoded) return null;
+      const { width, height, rgba } = decoded;
+      _resetLoginFlowIfNeeded(url);
+      const loginAction = _microsoftLoginAction(url, rgba, width, height);
+      if (loginAction) {
+        _advanceLoginFlow(loginAction);
+        return loginAction;
+      }
+      return null; // Don't fall through to app actions on login pages
+    }
+
+    // ── Unknown state guard ──
+    // If currentState is unknown/null AND we're not on a known MathU app URL,
+    // don't try app-specific actions. Only allow login or generic button clicks.
+    const isAppUrl = _isMathUAppPage(url);
+    if (!currentState && !isAppUrl) {
+      log('Pixel fallback: unknown state + non-app URL — skipping app actions', 'DEBUG', 'pixel-fallback');
+      // Still try a generic button click (could be a login button)
+      const screenshotBuffer = await page.screenshot({ type: 'png', fullPage: false });
+      if (!screenshotBuffer || screenshotBuffer.length < 100) return null;
+      const decoded = _decodePNG(screenshotBuffer);
+      if (!decoded) return null;
+      const button = _findActionButton(decoded.rgba, decoded.width, decoded.height);
+      if (button) {
+        return { actionType: 'click', targetX: button.cx, targetY: button.cy, currentState: 'unknown', reasoning: 'Pixel fallback: generic button (unknown state)' };
+      }
+      return null;
+    }
 
     // Take a fresh screenshot for pixel analysis
     const screenshotBuffer = await page.screenshot({ type: 'png', fullPage: false });
