@@ -14,6 +14,14 @@
 
 const _getLog = () => { try { return require('./logger'); } catch { return { log: console.log, logError: console.error }; } };
 
+/**
+ * DI injection hook — called by container-modules.ts during initialization.
+ * providers-base uses lazy require() internally, so this is a no-op.
+ */
+function _injectDependencies(_deps: any) {
+  // No-op: this module uses lazy require('./logger') and require('./get-config')
+}
+
 // ─── extractJSON ─────────────────────────────────────────────────────────
 // Extracts ALL JSON objects from a response, ignoring non-JSON text.
 // Returns the FIRST valid action object (has actionType), or null.
@@ -302,4 +310,5 @@ module.exports = {
   retryWithBackoff,
   classifyError,
   safeCall,
+  _injectDependencies,
 };
