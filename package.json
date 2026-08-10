@@ -37,7 +37,8 @@
     "nerdamer": "^1.1.13",
     "pino": "^8.17.2",
     "pino-roll": "^3.0.0",
-    "playwright": "^1.40.0"
+    "playwright": "^1.40.0",
+    "cloudinary": "^2.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
