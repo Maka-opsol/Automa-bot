@@ -167,7 +167,7 @@ class PatchMemory {
    * @param {string} investigationContext
    * @param {string} file
    * @param {string} patchText
-   * @param {string} status - 'pending' | 'applied' | 'rejected' | 'rolled_back'
+   * @param {string} status - 'pending' | 'applied' | 'rejected' | 'rolled_back' | 'superseded'
    */
   async storePatch(patchId: any, investigationContext: any, file: any, patchText: any, status = 'pending') { 
     try {
@@ -359,7 +359,7 @@ class PatchMemory {
   /**
    * Records the outcome of a patch after it has been evaluated.
    * @param {string} patchId
-   * @param {string} outcome - 'applied' | 'rejected' | 'rolled_back'
+   * @param {string} outcome - 'applied' | 'rejected' | 'rolled_back' | 'superseded'
    */
   recordOutcome(patchId: any, outcome: any) { 
     try {
@@ -368,7 +368,7 @@ class PatchMemory {
         return false;
       }
 
-      const validOutcomes = new Set(['applied', 'rejected', 'rolled_back']);
+      const validOutcomes = new Set(['applied', 'rejected', 'rolled_back', 'superseded']);
       if (!validOutcomes.has(outcome)) {
         log(`recordOutcome: invalid outcome "${outcome}"`, 'WARN', 'patch-memory');
         return false;
@@ -394,18 +394,19 @@ class PatchMemory {
   }
 
   /**
-   * Prunes old rejected patches beyond maxAge.
+   * Prunes old non-applied patch embeddings beyond maxAge.
+   * Now handles 'rejected', 'rolled_back', AND 'superseded' statuses.
    * @param {number} maxAge - Maximum age in ms (default 90 days)
    */
   pruneOld(maxAge = PRUNE_MAX_AGE_MS) { 
     try {
       const cutoff = Date.now() - maxAge;
       const result = getDb()?.prepare(
-        'DELETE FROM patch_embeddings WHERE status = ? AND timestamp < ?'
-      ).run('rejected', cutoff);
+        `DELETE FROM patch_embeddings WHERE status IN ('rejected', 'rolled_back', 'superseded') AND timestamp < ?`
+      ).run(cutoff);
 
       if (result.changes > 0) {
-        log(`Pruned ${result.changes} rejected patch embeddings older than ${Math.round(maxAge / (24 * 60 * 60 * 1000))} days`, 'INFO', 'patch-memory');
+        log(`Pruned ${result.changes} non-applied patch embeddings older than ${Math.round(maxAge / (24 * 60 * 60 * 1000))} days`, 'INFO', 'patch-memory');
       }
       return result.changes;
     } catch (err: any) {
