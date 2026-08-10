@@ -114,6 +114,29 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
   const CONFIG = getCONFIG();
   const log = getLog();
   const logError = getLogError();
+
+  // ── Blank image guard ──
+  // Don't waste cloud provider calls on a blank/white screenshot.
+  // Check byte entropy: blank images have very few unique byte values.
+  if (base64Image && typeof base64Image === 'string') {
+    try {
+      const buf = Buffer.from(base64Image, 'base64');
+      if (buf.length >= 200) {
+        const isJpeg = buf[0] === 0xFF && buf[1] === 0xD8;
+        const sampleStart = isJpeg ? Math.min(200, buf.length - 1) : 8;
+        const sampleLen = Math.min(4096, buf.length - sampleStart);
+        if (sampleLen > 0) {
+          const seen = new Set<number>();
+          for (let i = sampleStart; i < sampleStart + sampleLen; i++) { seen.add(buf[i]); }
+          if (seen.size < 40) {
+            log('Vision pipeline: screenshot is blank/white — skipping providers', 'WARN', 'vision');
+            return null;
+          }
+        }
+      }
+    } catch { /* not blank */ }
+  }
+
   const cache = _deps.cache || {};
   const browser = _deps.browser || {};
   const providersRegistry = _deps.providerRegistry;
