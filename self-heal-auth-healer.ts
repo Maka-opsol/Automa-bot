@@ -96,10 +96,10 @@ class AuthHealer {
         await closeBrowser();
         page = null;
         log(`MFA detected during auth heal: ${mfaCheck.detail}. Alerting and entering DORMANT.`, 'ERROR', 'auth-healer');
-        try { (_deps.alerting?.sendAlert || (() => {}))(\`MFA detected during auth heal: ${mfaCheck.detail}. Human intervention needed.\`, 1); } catch {}
+        try { (_deps.alerting?.sendAlert || (() => {}))('MFA detected during auth heal: ' + mfaCheck.detail + '. Human intervention needed.', 1); } catch {}
         try {
           const { degradationLadder } = require('./self-heal-degradation-ladder');
-          degradationLadder.setLevel(4, \`MFA_DETECTED: ${mfaCheck.detail}\`);
+          degradationLadder.setLevel(4, 'MFA_DETECTED: ' + mfaCheck.detail);
         } catch {}
         logAudit(`MFA detected, entering DORMANT: ${mfaCheck.detail}`, 'auth-healer');
         return false;
@@ -131,9 +131,9 @@ class AuthHealer {
         targetFile: 'auth-strategies-microsoft-v2.ts',
       };
 
-      const prompt = \`The Microsoft login flow appears to have changed. Analyze the current login page and identify what has changed from the expected flow. \` +
-        \`Current URL: ${currentUrl}\n\n\` +
-        \`Generate a patch for auth-strategies-microsoft-v2.ts to adapt to the new login page structure.\`;
+      const prompt = 'The Microsoft login flow appears to have changed. Analyze the current login page and identify what has changed from the expected flow. ' +
+        'Current URL: ' + currentUrl + '\n\n' +
+        'Generate a patch for auth-strategies-microsoft-v2.ts to adapt to the new login page structure.';
 
       let fixes: any[] = [];
       try {
