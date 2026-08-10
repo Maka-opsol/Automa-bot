@@ -11,6 +11,19 @@
 // circular dependency crash. Always use the CONFIG() accessor instead.
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════
+// FATAL FIX: Cache native Array.isArray at module load time.
+// Under memory pressure on Render, the global Array object can be
+// shadowed or corrupted (e.g. by polyfills, vm sandbox leaks, or
+// native module corruption). This causes every Array.isArray call
+// to crash with "TypeError: Array.isArray is not a function",
+// which then cascades through the error handler → safeLog → deepRedact
+// → another Array.isArray crash → _fatalException → process.exit.
+// By caching the native reference here, deepRedact survives even if
+// the global gets corrupted later.
+// ═══════════════════════════════════════════════════════════════
+const _isArray: (arg: any) => arg is any[] = Array.isArray;
+
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -134,7 +147,8 @@ function deepRedact(obj: any, depth = 0, maxDepth = 5) {
     'privatekey', 'private_key', 'credential', 'authorization'
   ]);
   if (typeof obj === 'string') return redactSensitive(obj);
-  if (Array.isArray(obj)) return obj.map(item => deepRedact(item, depth + 1, maxDepth));
+  // FIX: Use cached _isArray instead of Array.isArray to survive global corruption
+  if (_isArray(obj)) return obj.map(item => deepRedact(item, depth + 1, maxDepth));
   if (typeof obj === 'object') {
     const redacted = {};
     for (const [key, value] of Object.entries(obj)) {
