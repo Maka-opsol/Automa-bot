@@ -546,6 +546,7 @@ function start(): void {
 module.exports = {
   _injectDependencies,
   phoenixBrowserLaunch,
+  phoenixBrowserRetry: phoenixBrowserLaunch,  // Alias — cycle-manager expects this name
   resetFailures,
   isUnrecoverable,
   isCoolingDown,
