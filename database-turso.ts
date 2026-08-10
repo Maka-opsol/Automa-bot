@@ -40,6 +40,10 @@ let _consecutiveErrors = 0;
 const MAX_CONSECUTIVE_ERRORS = 5; // Auto-disable after 5 consecutive failures
 const SYNC_INTERVAL_MS_DEFAULT = 30000; // 30s — push local → Turso
 
+// FIX: Retry transient write failures (1 retry with 1s backoff)
+const WRITE_RETRY_DELAY_MS = 1000;
+const WRITE_RETRY_COUNT = 1;
+
 let _deps: Record<string, any> = {};
 
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
@@ -151,10 +155,23 @@ async function _query(sql: string, params: any[] = []): Promise<any | null> {
 
 /**
  * Execute a SQL statement on Turso. Returns true on success.
+ * FIX: Added retry for transient failures on write operations.
  */
 async function _exec(sql: string, params: any[] = []): Promise<boolean> {
   const result = await _query(sql, params);
-  return result !== null;
+  if (result !== null) return true;
+
+  // Retry once for transient failures (unless already auto-disabled)
+  if (_consecutiveErrors >= MAX_CONSECUTIVE_ERRORS - 1) return false;
+
+  _getLog()(`Turso write retry in ${WRITE_RETRY_DELAY_MS}ms for: ${sql.substring(0, 80)}...`, 'DEBUG');
+  await new Promise(r => setTimeout(r, WRITE_RETRY_DELAY_MS));
+  const retry = await _query(sql, params);
+  if (retry !== null) {
+    _getLog()(`Turso write retry succeeded`, 'DEBUG');
+    return true;
+  }
+  return false;
 }
 
 // ─── Schema Initialization ──────────────────────────────────────────────────
@@ -398,18 +415,29 @@ async function tursoRecordActionCacheFailure(contextSig: string): Promise<boolea
 
 /**
  * Evict expired action cache entries in Turso.
+ * FIX: libsql returns { rows: [...] } not { rows: { affectedRowCount } }.
+ * Use a count query instead.
  */
 async function tursoEvictExpiredActionCache(cutoffTimestamp: number): Promise<number> {
-  const result = await _query(
+  // First count how many will be evicted
+  const countResult = await _query(
+    'SELECT COUNT(*) as cnt FROM action_cache WHERE last_used < ? AND evicted = 0',
+    [cutoffTimestamp]
+  );
+  const willEvict = countResult?.rows?.[0]?.cnt || 0;
+  if (willEvict === 0) return 0;
+
+  // Then evict
+  await _exec(
     'UPDATE action_cache SET evicted = 1 WHERE last_used < ? AND evicted = 0',
     [cutoffTimestamp]
   );
-  // libsql returns changes count differently
-  return (result as any)?.rows?.affectedRowCount || 0;
+  return willEvict;
 }
 
 /**
  * Run action cache capacity eviction in Turso (evict oldest 10%).
+ * FIX: Also use count-then-evict pattern for accurate return value.
  */
 async function tursoActionCacheCapacityEvict(maxEntries: number): Promise<number> {
   // Get current count
@@ -418,14 +446,22 @@ async function tursoActionCacheCapacityEvict(maxEntries: number): Promise<number
   if (count <= maxEntries) return 0;
 
   const toEvict = Math.max(1, Math.floor(maxEntries * 0.1));
-  const result = await _query(
+  // FIX: Count how many the subquery will actually match
+  const matchResult = await _query(
+    `SELECT COUNT(*) as cnt FROM action_cache WHERE evicted = 0 ORDER BY last_used ASC LIMIT ?`,
+    [toEvict]
+  );
+  const willEvict = matchResult?.rows?.[0]?.cnt || 0;
+  if (willEvict === 0) return 0;
+
+  await _exec(
     `UPDATE action_cache SET evicted = 1 WHERE context_sig IN (
       SELECT context_sig FROM action_cache WHERE evicted = 0
       ORDER BY last_used ASC LIMIT ?
     )`,
     [toEvict]
   );
-  return (result as any)?.rows?.affectedRowCount || 0;
+  return willEvict;
 }
 
 /**
