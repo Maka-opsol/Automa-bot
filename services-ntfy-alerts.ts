@@ -13,7 +13,7 @@
 //   WARN:    OR budget exhausted before 6pm UTC
 //   WARN:    /tmp usage > 80%
 //   WARN:    WolframAlpha daily limit approaching (>= 18/20)
-//   WARN:    Mathpix daily limit approaching (>= 4/5)
+//   WARN:    Pix2Tex OCR unavailable (p2t not found)
 //   INFO:    Daily summary at midnight (problems solved, accuracy, budget)
 //   INFO:    Work shift transitions (ACTIVE ↔ CONSERVING ↔ REST)
 //
@@ -163,7 +163,7 @@ async function evaluateTriggers(): Promise<void> {
     await checkOrBudgetExhausted();
     await checkTmpUsage();
     await checkWolframLimit();
-    await checkMathpixLimit();
+    await checkPix2texAvailability();
   } catch (e: any) {
     logError('Contextual alert eval error', e);
   }
@@ -274,22 +274,19 @@ async function checkWolframLimit(): Promise<void> {
   } catch { /* non-critical */ }
 }
 
-async function checkMathpixLimit(): Promise<void> {
+async function checkPix2texAvailability(): Promise<void> {
   try {
-    const db = _deps.database;
-    if (!db?.getCalibration) return;
-    const used = parseInt(db.getCalibration('mathpix_daily_count') || '0', 10);
-    const limit = parseInt(db.getCalibration('mathpix_daily_limit') || '5', 10);
-
-    if (limit > 0 && used >= limit - 1 && used < limit) {
+    const pix2tex = require('./services-pix2tex');
+    const available = pix2tex.isAvailable?.();
+    if (!available) {
       await sendContextualAlert(
-        'mathpix_limit_approaching',
-        `Mathpix daily limit approaching: ${used}/${limit} used\n${limit - used} call remaining today\nTime: ${new Date().toISOString()}`,
+        'pix2tex_unavailable',
+        `Pix2Tex OCR is unavailable \u2014 p2t CLI not found\nInstall: pip install pix2text\nMath OCR fallback chain is degraded\nTime: ${new Date().toISOString()}`,
         'warn',
-        60 * 60 * 1000
+        6 * 60 * 60 * 1000 // 6 hour cooldown (persistence issue)
       );
     }
-  } catch { /* non-critical */ }
+  } catch { /* non-critical \u2014 pix2tex module not found */ }
 }
 
 // ─── Daily Summary ──────────────────────────────────────────────────────────
