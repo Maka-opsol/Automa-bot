@@ -1,9 +1,9 @@
 // Resilience R1: Pre-OOM Euthanasia — mathu-bot-resilience-worklog.md
 'use strict';
 
-// ═══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
 // runtime-heap-guardian.ts — P0 Pre-OOM Euthanasia
-// ═══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
 // On Render free tier (512MB RAM), a runaway heap means SIGKILL
 // with no recovery. This module monitors heap usage and performs
 // graceful euthanasia BEFORE the OOM killer strikes.
@@ -16,9 +16,8 @@
 // Integration:
 //   - Started via container-subsystem-runner.ts (survival subsystem)
 //   - survival-tombstone.pushTombstone() called before exit (if available)
-//   - survival-restart-guardian.preserveBeforeExit() called for ALL methods
 //   - cycle-cycle-manager.ts calls checkMemory() each loop iteration
-// ═══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
 
 let _deps: Record<string, any> = {};
 
@@ -78,7 +77,7 @@ function getMemorySnapshot(): string {
 
 /**
  * Attempt to free memory: GC, close browser, clear caches.
- * Returns true if memory dropped below soft threshold.
+ * Returns bytes freed estimate (always 0 — we can't measure before/after easily).
  */
 function attemptMemoryRecovery(): boolean {
   const beforeMB = getHeapUsedMB();
@@ -98,6 +97,7 @@ function attemptMemoryRecovery(): boolean {
   try {
     const browser = (_deps as any).browser;
     if (browser?.closeBrowser) {
+      // Must await — browser holds ~100-200MB of shared memory
       browser.closeBrowser().catch((e: any) => logError('Browser close during recovery failed', e));
       log('Browser close initiated for memory recovery', 'WARN');
     }
@@ -140,27 +140,6 @@ async function pushTombstoneBeforeDeath(): Promise<void> {
 }
 
 /**
- * Activate ALL memory preservation methods via restart guardian.
- * This is the nuclear option — used when the process is about to die
- * from OOM and has had multiple unexpected restarts.
- */
-async function _preserveWithAllMethods(triggerReason: string): Promise<void> {
-  try {
-    // Try the DI-injected dep first, then lazy-load
-    const restartGuardian = (_deps as any).survivalRestartGuardian || require('./survival-restart-guardian');
-    if (restartGuardian?.preserveBeforeExit) {
-      await restartGuardian.preserveBeforeExit(triggerReason);
-      log('ALL memory preservation methods activated via restart guardian', 'WARN');
-      return;
-    }
-  } catch (e: any) {
-    logError('Restart guardian preservation failed, falling back to tombstone only', e);
-  }
-  // Fallback to tombstone-only
-  await pushTombstoneBeforeDeath();
-}
-
-/**
  * Check memory and take action. Called by interval monitor AND cycle loop.
  * Returns true if hard threshold was hit (caller should abort).
  */
@@ -177,8 +156,14 @@ function checkMemory(): boolean {
 
     if (_hardTriggerCount >= MAX_HARD_TRIGGERS) {
       log(`Hard threshold hit ${MAX_HARD_TRIGGERS} times. Permanent shutdown.`, 'FATAL');
-      // Don't restart — something is fundamentally broken
-      process.exit(137); // SIGKILL equivalent
+      // Record OOM event before permanent shutdown
+      try {
+        const memoryMode = require('./memory-mode');
+        const mem = process.memoryUsage();
+        memoryMode.recordOOMExit(mem.heapUsed / 1024 / 1024, mem.rss / 1024 / 1024);
+      } catch { /* best-effort */ }
+      const origExit = (process as any)._originalExit || process.exit.bind(process);
+      origExit(137); // SIGKILL equivalent
     }
 
     attemptMemoryRecovery();
@@ -187,12 +172,20 @@ function checkMemory(): boolean {
     const afterRecoveryMB = getHeapUsedMB();
     if (afterRecoveryMB >= hardThreshold) {
       log(`Memory still critical after recovery: ${afterRecoveryMB.toFixed(1)}MB. Exiting for Render restart.`, 'FATAL');
-      // FIX: Use _preserveWithAllMethods instead of just tombstone.
-      // This activates ALL memory preservation (tombstone + checkpoint +
-      // compressed dump + Turso sync + cache clear) when OOM kills are
-      // happening repeatedly, maximizing state survival across restarts.
-      _preserveWithAllMethods('OOM_HARD_THRESHOLD').finally(() => {
-        process.exit(1);
+      // Record OOM event to DB + Turso BEFORE exiting (survives restart)
+      try {
+        const memoryMode = require('./memory-mode');
+        const mem = process.memoryUsage();
+        memoryMode.recordOOMExit(mem.heapUsed / 1024 / 1024, mem.rss / 1024 / 1024);
+      } catch { /* best-effort */ }
+      // Do NOT return — pushTombstoneBeforeDeath will call process.exit(1)
+      // Returning true would let the caller continue while we're dying
+      pushTombstoneBeforeDeath().finally(() => {
+        // Use the original process.exit to bypass render-free-plan's interceptor
+        // The interceptor prevents graceful OOM exits, causing the process to
+        // keep running until Render SIGKILLs it (losing all state).
+        const origExit = (process as any)._originalExit || process.exit.bind(process);
+        origExit(1);
       });
       // Block the caller — we are about to die
       return true;
