@@ -4,12 +4,17 @@
  * providers-base.ts — Shared utilities for all AI providers.
  *
  * Key functions:
- *   extractJSON()       — Extract ALL JSON objects from a response string
- *   validateActionResponse() — Validate the extracted action has required fields
- *   getProviderConfig() — Get config for a named provider
- *   retryWithBackoff()  — Retry with exponential backoff + circuit-aware delays
- *   classifyError()     — Classify errors for circuit breaker / health tracking
- *   safeCall()          — Timeout-wrapped call for tribunal etc.
+ *   extractJSON()               — Extract ALL JSON objects from a response string
+ *   validateActionResponse()     — Validate the extracted action has required fields
+ *   getProviderConfig()          — Get config for a named provider
+ *   retryWithBackoff()           — Retry with exponential backoff + circuit-aware delays
+ *   classifyError()              — Classify errors for circuit breaker / health tracking
+ *   safeCall()                   — Timeout-wrapped call for tribunal etc.
+ *   callChatCompletionWithRollback() — OpenAI-compatible chat completion with rollback
+ *   fetchWithTimeout()           — Timeout-wrapped fetch
+ *   sanitizeErrorText()          — Redact sensitive info from error text
+ *   getFallbackModels()          — Get fallback models for a provider
+ *   _getOrLimiter()              — Get OpenRouter rate limiter
  */
 
 const _getLog = () => { try { return require('./logger'); } catch { return { log: console.log, logError: console.error }; } };
@@ -20,6 +25,193 @@ const _getLog = () => { try { return require('./logger'); } catch { return { log
  */
 function _injectDependencies(_deps: any) {
   // No-op: this module uses lazy require('./logger') and require('./get-config')
+}
+
+// ─── fetchWithTimeout ──────────────────────────────────────────────────
+// Re-exported here so providers that require('./providers-base') don't
+// need a separate require('./utils-fetch') (which can cause circular deps).
+
+const _nativeFetch: any = globalThis.fetch;
+
+async function fetchWithTimeout(url: any, options: any = {}, timeoutMs?: number) {
+  try {
+    const { fetchWithTimeout: _fwt } = require('./utils-fetch');
+    return _fwt(url, options, timeoutMs);
+  } catch {
+    // Inline fallback if utils-fetch unavailable
+    const config = require('./get-config');
+    const effectiveTimeout = timeoutMs ?? config.REQUEST_TIMEOUT_MS ?? 30000;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
+    let externalAbortHandler;
+    if (options.signal) {
+      externalAbortHandler = () => controller.abort();
+      options.signal.addEventListener('abort', externalAbortHandler, { once: true });
+      if (options.signal.aborted) { controller.abort(); }
+    }
+    try {
+      const response = await _nativeFetch(url, { ...options, signal: controller.signal });
+      return response;
+    } finally {
+      clearTimeout(timeoutId);
+      if (options.signal && externalAbortHandler) { options.signal.removeEventListener('abort', externalAbortHandler); }
+    }
+  }
+}
+
+// ─── sanitizeErrorText ──────────────────────────────────────────────────
+
+function sanitizeErrorText(errorText: string): string {
+  if (typeof errorText !== 'string') return String(errorText);
+  return errorText
+    .replace(/(?:^|[\s:="'])[a-fA-F0-9]{32,}(?:[\s"'])/g, (match) => {
+      return match.slice(0, -1) + '[REDACTED]';
+    })
+    .replace(/[A-Za-z0-9+/=]{40,}/g, '[REDACTED_BASE64]');
+}
+
+// ─── callChatCompletionWithRollback ─────────────────────────────────────
+
+/**
+ * Call an OpenAI-compatible chat completion endpoint.
+ * Supports config rollback on 404/401 errors via providers-config-loader.
+ * Handles protocol chameleon 422 recovery.
+ */
+async function callChatCompletionWithRollback(
+  endpoint: string,
+  apiKey: string,
+  model: string,
+  base64Image: any,
+  prompt: any,
+  providerName: string,
+  options: { signal?: any; maxTokens?: number; temperature?: number; responseFormat?: any } = {}
+): Promise<string> {
+  const log = _getLog().log;
+
+  // Build user content — flatten image + text into content array or string
+  let userContent: any;
+  if (base64Image && typeof base64Image === 'string' && base64Image.length > 0) {
+    userContent = [
+      { type: 'text', text: typeof prompt === 'string' ? prompt : String(prompt) },
+      { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
+    ];
+  } else {
+    userContent = typeof prompt === 'string' ? prompt : String(prompt);
+  }
+
+  const payload: any = {
+    model,
+    messages: [{ role: 'user', content: userContent }],
+    max_tokens: options.maxTokens || 4096,
+    temperature: options.temperature ?? 0.1,
+  };
+
+  if (options.responseFormat) {
+    payload.response_format = options.responseFormat;
+  }
+
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+  };
+
+  // OpenRouter requires additional headers
+  if (providerName === 'OpenRouter' || endpoint.includes('openrouter.ai')) {
+    const config = require('./get-config');
+    headers['HTTP-Referer'] = config.APP_URL || 'https://mathu-bot.local';
+    headers['X-Title'] = 'MathU Bot';
+  }
+
+  const response = await fetchWithTimeout(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+    signal: options.signal,
+  });
+
+  // Handle 422 — protocol chameleon: try without response_format
+  if (response.status === 422 && payload.response_format) {
+    log(`${providerName} 422 — retrying without response_format`, 'WARN', 'base');
+    delete payload.response_format;
+    const retryResponse = await fetchWithTimeout(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      signal: options.signal,
+    });
+    if (retryResponse.ok) {
+      const data = await retryResponse.json();
+      return data.choices?.[0]?.message?.content || '';
+    }
+    const errText = sanitizeErrorText(await retryResponse.text().catch(() => 'Unknown error'));
+    throw new Error(`HTTP_ERROR_${retryResponse.status}: ${errText}`);
+  }
+
+  // Handle 404 — model not found, attempt config rollback
+  if (response.status === 404) {
+    try {
+      const { rollbackProvider } = require('./providers-config-loader');
+      const rolledBack = rollbackProvider(providerName);
+      if (rolledBack) {
+        log(`${providerName} 404 — config rolled back, retrying with new model`, 'WARN', 'base');
+        const newConfig = require('./get-config');
+        const newModel = newConfig.PROVIDERS?.[providerName]?.model;
+        if (newModel && newModel !== model) {
+          payload.model = newModel;
+          const retryResponse = await fetchWithTimeout(endpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(payload),
+            signal: options.signal,
+          });
+          if (retryResponse.ok) {
+            const data = await retryResponse.json();
+            return data.choices?.[0]?.message?.content || '';
+          }
+          const errText = sanitizeErrorText(await retryResponse.text().catch(() => 'Unknown error'));
+          throw new Error(`HTTP_ERROR_${retryResponse.status}: ${errText}`);
+        }
+      }
+    } catch (rollbackErr: any) {
+      if (rollbackErr.message?.includes('HTTP_ERROR_')) throw rollbackErr;
+      log(`${providerName} rollback failed: ${rollbackErr.message}`, 'WARN', 'base');
+    }
+  }
+
+  if (!response.ok) {
+    const errorText = sanitizeErrorText(await response.text().catch(() => 'Unknown error'));
+    throw new Error(`HTTP_ERROR_${response.status}: ${errorText}`);
+  }
+
+  const data = await response.json();
+  return data.choices?.[0]?.message?.content || '';
+}
+
+// ─── getFallbackModels ──────────────────────────────────────────────────
+
+/**
+ * Get fallback models for a provider. Delegates to providers-config-loader.
+ */
+function getFallbackModels(providerName: string): string[] {
+  try {
+    const configLoader = require('./providers-config-loader');
+    return configLoader.getFallbackModels(providerName) || [];
+  } catch {
+    return [];
+  }
+}
+
+// ─── _getOrLimiter ──────────────────────────────────────────────────────
+
+/**
+ * Get the OpenRouter rate limiter module.
+ */
+function _getOrLimiter() {
+  try {
+    return require('./openrouter-rate-limiter');
+  } catch {
+    return { checkBudget: () => {}, waitForBudget: async () => {} };
+  }
 }
 
 // ─── extractJSON ─────────────────────────────────────────────────────────
@@ -376,5 +568,12 @@ module.exports = {
   classifyError,
   safeCall,
   coalescer,
+  // FIX: These were imported by providers but never exported,
+  // causing "X is not a function" crashes for 6/7 tribunal providers.
+  callChatCompletionWithRollback,
+  fetchWithTimeout,
+  sanitizeErrorText,
+  getFallbackModels,
+  _getOrLimiter,
   _injectDependencies,
 };
