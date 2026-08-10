@@ -18,25 +18,27 @@ const pino = require('pino');
 const pinoRoll = require('pino-roll');
 
 // ═══════════════════════════════════════════════════════════════
-// BetterStack Logtail — ships all logs to BetterStack
-// ═══════════════════════════════════════════════════════════════
-let logtail: any = null;
+// BetterStack Logtail — ships logs to BetterStack via logging-betterstack.ts
+// FIX: Replaced @logtail/js SDK with direct logging-betterstack.ts usage.
+// The @logtail/js Node SDK internally echoes output to console/stdout,
+// which caused every log line to appear twice (once from pino stdout,
+// once from the SDK's internal console output). logging-betterstack.ts uses
+// raw HTTPS POST with in-memory buffering — no stdout side-effects.
+let _betterstack: any = null;
+let _betterstackAvailable = false;
 try {
-  const { Node: Logtail } = require('@logtail/js');
-  logtail = new Logtail('NHp5ngRUznwzrAZBsi2NZYpZ', {
-    endpoint: 'https://s2663647.eu-central-1a.betterstackdata.com',
-  });
-} catch (e: any) {
-  console.error(`[logger] BetterStack Logtail not available: ${e.message}`);
-}
+  _betterstack = require('./logging-betterstack');
+  _betterstackAvailable = !!_betterstack && !!process.env.BETTERSTACK_SOURCE_TOKEN;
+} catch { /* logging-betterstack not available */ }
 
-// pino destination that forwards to BetterStack
-const logtailDestination = logtail ? pino.destination({
+// pino destination that forwards to BetterStack via logging-betterstack.ts (direct HTTPS)
+const logtailDestination = _betterstackAvailable ? pino.destination({
   write: (data: string) => {
     try {
       const parsed = JSON.parse(data);
-      logtail.log(parsed.message || data, {
+      _betterstack.send({
         level: parsed.level || 'info',
+        message: parsed.msg || parsed.message || data,
         module: parsed.module || 'main',
         timestamp: parsed.timestamp || new Date().toISOString(),
         pid: parsed.pid,
@@ -74,6 +76,9 @@ let LOG_DIR = path.join(os.tmpdir(), 'mathu-bot-logs');
 let logStream = process.stdout;
 let _logInitDone = false;
 
+// FIX: Track whether file stream was successfully initialized
+let _fileStreamReady = false;
+
 function _initLogStream() { 
   if (_logInitDone) return;
   _logInitDone = true;
@@ -96,9 +101,28 @@ function _initLogStream() {
       max: cfg.LOG_MAX_FILES || 5,
     });
     if (rollDest && typeof rollDest.then === 'function') {
-      rollDest.then((dest: any) => { logStream = dest; }).catch(() => {});
+      rollDest.then((dest: any) => {
+        logStream = dest;
+        _fileStreamReady = true;
+        // When both BetterStack and file are ready, wrap the logtail
+        // destination to also forward to the file stream.
+        if (logtailDestination) {
+          const fileDest = dest;
+          const origLogtailWrite = logtailDestination.write.bind(logtailDestination);
+          logtailDestination.write = function(chunk: string, enc: string, cb: Function) {
+            origLogtailWrite(chunk, enc, cb);
+            // Also write to file
+            try { fileDest.write(chunk, enc, cb); } catch {}
+          };
+        }
+      }).catch(() => {});
     } else if (rollDest && typeof rollDest.write === 'function') {
       logStream = rollDest;
+      _fileStreamReady = true;
+    }
+    // Also ensure CONFIG.LOG_DIR exists (failsafe health check needs it)
+    if (cfg.LOG_DIR && cfg.LOG_DIR !== LOG_DIR && !fs.existsSync(cfg.LOG_DIR)) {
+      try { fs.mkdirSync(cfg.LOG_DIR, { recursive: true, mode: 0o750 }); } catch {}
     }
   } catch (err: any) {
     console.error(`Log file init failed, using stdout: ${err.message}`);
@@ -194,8 +218,19 @@ function _dedupWrite(originalWrite: any) {
   };
 }
 
-const streams = [logStream];
-if (logtailDestination) streams.push(logtailDestination);
+// FIX: When BetterStack is active, do NOT include stdout in the multistream.
+// Previously [stdout, logtailDestination] was used, and @logtail/js echoed back
+// to stdout — every line appeared twice. Now only BetterStack stream is in
+// multistream; stdout gets a single copy via the file path or is excluded.
+// When BetterStack is absent, stdout is the sole destination (normal).
+const streams: any[] = [];
+if (logtailDestination) {
+  // BetterStack-only mode: no stdout (avoids duplication)
+  streams.push(logtailDestination);
+} else {
+  // Fallback: write to stdout (or file once _initLogStream swaps logStream)
+  streams.push(logStream);
+}
 
 // Wrap each stream with dedup to prevent double-output
 const dedupStreams = streams.map((s: any) => {
@@ -310,5 +345,6 @@ module.exports = {
   redactSensitive,
   deepRedact,
   initFileLogging: _initLogStream,
-  logtail,
+  // logtail removed: replaced by logging-betterstack.ts (no stdout side-effects)
+  _betterstackAvailable,
 };
