@@ -73,6 +73,7 @@ const MAX_LOG_FILES = 3;                          // FIX: 3 (was 5) — keep few
 const MAX_LOG_AGE_MS = 30 * 60 * 1000;           // FIX: 30min (was 2h) — age out logs faster
 const MAX_SCREENSHOT_AGE_MS = 10 * 60 * 1000;    // FIX: 10min (was 30min) — age out screenshots faster
 const SHADOW_DIR = '/tmp/mathu-shield';           // Shadow copies directory
+const SELF_HEAL_OVERLAY_DIR = process.env.SELF_HEAL_OVERLAY_DIR || '/tmp/self-heal-overlay'; // Self-heal patched modules
 const MANIFEST_FILE = '/tmp/mathu-shield/manifest.json';
 const SHIELD_VERSION = 1;
 
@@ -808,7 +809,7 @@ function _nukeAllDeletable(): { freedBytes: number; filesDeleted: number } {
 
   // Protected patterns (never delete these)
   const PROTECTED_BASENAMES = new Set([
-    'openrouter-rate-limit.json', 'mathpix-rate-limit.json', 'render-last-seen.json',
+    'openrouter-rate-limit.json', 'render-last-seen.json',
     'checkpoint.json', 'last-state.json', 'state.json', 'manifest.json',
     'mathu-persist.json', '.heartbeat',
   ]);
@@ -819,6 +820,9 @@ function _nukeAllDeletable(): { freedBytes: number; filesDeleted: number } {
     if (basename.endsWith('.db') || basename.endsWith('.db-wal') || basename.endsWith('.db-shm')) return true;
     if (basename.endsWith('.lock')) return true;
     if (filePath.startsWith(SHADOW_DIR)) return true; // Never delete shadow copies
+    if (filePath.startsWith(SELF_HEAL_OVERLAY_DIR)) return true; // Never delete self-heal overlay patches
+    // Protect Pix2Tex temp files while p2t is running (defense-in-depth; p2t cleans up its own files)
+    if (basename.startsWith('p2t_') && basename.endsWith('.png')) return true;
     return false;
   }
 
