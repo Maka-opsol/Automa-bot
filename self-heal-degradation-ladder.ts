@@ -129,6 +129,7 @@ class DegradationLadder {
   _evalTimer: any;
   _levelEnterTime: number;      // when we entered the current level
   _escalationTriggered: boolean;
+  _escalationTriggeredAt: number;  // FIX: Track when escalation was triggered, persist to DB
   _lastCalculation: LevelCalculation | null;
 
   constructor() {
@@ -138,6 +139,7 @@ class DegradationLadder {
     this._onLevelChange = null;
     this._levelEnterTime = Date.now();
     this._escalationTriggered = false;
+    this._escalationTriggeredAt = 0;
     this._lastCalculation = null;
     this._ensureTables();
     this._loadCurrentLevel();
@@ -185,6 +187,17 @@ class DegradationLadder {
       logError('Failed to load current degradation level', err);
       this._currentLevel = 0;
     }
+    // FIX: Load escalation trigger time from DB
+    try {
+      const escRow = getDb()?.prepare("SELECT value FROM calibration WHERE key = 'escalation_triggered_at'").get();
+      if (escRow && escRow.value) {
+        this._escalationTriggeredAt = parseInt(escRow.value, 10) || 0;
+        // If escalation was triggered less than 6 hours ago, keep the flag set
+        if (this._escalationTriggeredAt > 0 && Date.now() - this._escalationTriggeredAt < 6 * 60 * 60 * 1000) {
+          this._escalationTriggered = true;
+        }
+      }
+    } catch {}
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -461,6 +474,12 @@ class DegradationLadder {
 
   _checkAutoEscalation() {
     const ESCALATION_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+    // FIX: Allow re-escalation after restart (process uptime < 5 min = fresh process)
+    const processUptimeMs = Date.now() - (process.uptime() * 1000);
+    const isFreshProcess = processUptimeMs < 5 * 60 * 1000;
+    // Also allow re-escalation if previous one was > 6 hours ago
+    const escalationCooldownMs = 6 * 60 * 60 * 1000;
+    const escalationExpired = this._escalationTriggeredAt > 0 && (Date.now() - this._escalationTriggeredAt > escalationCooldownMs);
 
     if (this._currentLevel < 3) {
       // Not in a critical level — reset
@@ -468,17 +487,24 @@ class DegradationLadder {
       return;
     }
 
-    if (this._escalationTriggered) {
-      // Already escalated — don't repeat
+    if (this._escalationTriggered && !isFreshProcess && !escalationExpired) {
+      // Already escalated — don't repeat (unless fresh process or cooldown expired)
       return;
     }
 
     const timeInLevel = Date.now() - this._levelEnterTime;
     if (timeInLevel > ESCALATION_THRESHOLD_MS) {
       this._escalationTriggered = true;
+      this._escalationTriggeredAt = Date.now();
+      // FIX: Persist escalation trigger time to DB (survives restarts)
+      try {
+        getDb()?.prepare('INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (?, ?, ?)')
+          .run('escalation_triggered_at', String(Date.now()), Date.now());
+      } catch (e: any) { /* non-critical */ }
+
       const levelName = LEVEL_NAMES[this._currentLevel];
       log(
-        `AUTO-ESCALATION: Stuck at ${levelName} (${this._currentLevel}) for ${Math.round(timeInLevel / 60000)}min. Triggering emergency actions.`,
+        `AUTO-ESCALATION: Stuck at ${levelName} (${this._currentLevel}) for ${Math.round(timeInLevel / 60000)}min. Triggering emergency actions.${isFreshProcess ? ' (fresh process — re-escalating)' : ''}`,
         'ERROR',
         'degradation-ladder'
       );
