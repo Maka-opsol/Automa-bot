@@ -110,8 +110,8 @@ function init(): { enabled: boolean; backend: string } {
   const apiSecret = process.env.CLOUDINARY_API_SECRET || '';
 
   if (!apiKey || !apiSecret) {
-    _log('CLOUDINARY_API_KEY and/or CLOUDINARY_API_SECRET not set. Screenshots will NOT be uploaded.', 'WARN');
-    _log('Set CLOUDINARY_API_SECRET in Render dashboard (sensitive).', 'WARN');
+    _log('CLOUDINARY_API_KEY and/or CLOUDINARY_API_SECRET not set. Screenshots will NOT be uploaded.', 'DEBUG');
+    _log('Set CLOUDINARY_API_SECRET in Render dashboard (sensitive).', 'DEBUG');
     _initialized = true;
     return { enabled: false, backend: 'none' };
   }
