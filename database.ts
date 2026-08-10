@@ -195,17 +195,18 @@ function createSafeStatement(sql: string, paramValidator: ((...args: any[]) => s
   };
 }
 
-// FIX: Wrap a prepared statement so its .run() marks Turso dirty.
-// This ensures database-turso.ts re-pushes to Turso only when local data actually changes.
-// Without this, the sync skips every push (dirty=false) and never syncs writes.
-function _wrapForTursoSync(stmt: any): any {
+// Wrap a prepared statement so its .run() marks the corresponding Turso
+// table as dirty. This ensures database-turso.ts re-pushes to Turso only when
+// local data actually changes. Without this, the sync skips every push
+// (dirty=false) and never syncs writes.
+function _wrapForTursoSync(stmt: any, tableName: string): any {
   if (!stmt || typeof stmt.run !== 'function') return stmt;
   const originalRun = stmt.run.bind(stmt);
   return {
     ...stmt,
     run: (...args: any[]) => {
       const result = originalRun(...args);
-      try { require('./database-turso').markDirty(); } catch { /* turso not loaded yet */ }
+      try { require('./database-turso').markTableDirty(tableName); } catch { /* turso not loaded yet */ }
       return result;
     },
   };
@@ -329,19 +330,17 @@ function createPreparedStatements() {
   listBannedActions = db.prepare('SELECT * FROM banned_actions ORDER BY banned_at DESC');
   selectBannedAction = db.prepare('SELECT 1 FROM banned_actions WHERE action_type = ?');
 
-  // FIX: Wrap all statements that write to Turso-synced tables.
-  // This makes their .run() call markDirty() so Turso re-pushes changed data.
-  // Tables synced: calibration, completed_modules, last_state, banned_actions,
-  //   provider_registry, model_registry. (action_cache is managed directly by Turso.)
-  upsertCalibration = _wrapForTursoSync(upsertCalibration);
-  insertModule = _wrapForTursoSync(insertModule);
-  upsertLastState = _wrapForTursoSync(upsertLastState);
-  upsertProvider = _wrapForTursoSync(upsertProvider);
-  updateProviderStats = _wrapForTursoSync(updateProviderStats);
-  upsertModel = _wrapForTursoSync(upsertModel);
-  setModelRole = _wrapForTursoSync(setModelRole);
-  insertBannedAction = _wrapForTursoSync(insertBannedAction);
-  deleteBannedAction = _wrapForTursoSync(deleteBannedAction);
+  // Wrap all statements that write to Turso-synced tables.
+  // Each .run() call marks the specific table dirty so Turso re-pushes.
+  upsertCalibration = _wrapForTursoSync(upsertCalibration, 'calibration');
+  insertModule = _wrapForTursoSync(insertModule, 'completed_modules');
+  upsertLastState = _wrapForTursoSync(upsertLastState, 'last_state');
+  upsertProvider = _wrapForTursoSync(upsertProvider, 'provider_registry');
+  updateProviderStats = _wrapForTursoSync(updateProviderStats, 'provider_registry');
+  upsertModel = _wrapForTursoSync(upsertModel, 'model_registry');
+  setModelRole = _wrapForTursoSync(setModelRole, 'model_registry');
+  insertBannedAction = _wrapForTursoSync(insertBannedAction, 'banned_actions');
+  deleteBannedAction = _wrapForTursoSync(deleteBannedAction, 'banned_actions');
 }
 
 function safeInsertModule(name: string) {  if (!name || typeof name !== 'string' || name.length > 500) { getLog()(`Invalid module name: ${typeof name}`, 'WARN', 'database'); return; } try { insertModule.run(name, Date.now()); } catch (err: any) { getLogError()('Failed to insert module', err, { moduleName: name.substring(0, 50) }); } }
