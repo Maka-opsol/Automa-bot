@@ -116,7 +116,7 @@ async function callChatCompletionWithRollback(
   };
 
   // OpenRouter requires additional headers
-  if (providerName === 'OpenRouter' || endpoint.includes('openrouter.ai')) {
+  if (providerName === 'OpenRouter' || (endpoint && typeof endpoint === 'string' && endpoint.includes('openrouter.ai'))) {
     const config = require('./get-config');
     headers['HTTP-Referer'] = config.APP_URL || 'https://mathu-bot.local';
     headers['X-Title'] = 'MathU Bot';
@@ -363,13 +363,26 @@ function validateActionResponse(action: any, providerName?: string): any {
 
 // ─── getProviderConfig ───────────────────────────────────────────────────
 
+/**
+ * Get provider config (endpoint, model, etc.).
+ * Delegates to providers-config-loader which checks DB first,
+ * then falls back to DEFAULTS (which have endpoints).
+ * The old get-config frozen config doesn't have provider endpoints,
+ * which caused `undefined.includes()` crashes in callChatCompletionWithRollback.
+ */
 function getProviderConfig(providerName: string): Record<string, any> {
   try {
-    const config = require('./get-config');
-    const providers = config.PROVIDERS || {};
-    return providers[providerName] || {};
+    const configLoader = require('./providers-config-loader');
+    return configLoader.getProviderConfig(providerName) || {};
   } catch {
-    return {};
+    // Fallback to frozen config if config-loader unavailable
+    try {
+      const config = require('./get-config');
+      const providers = config.PROVIDERS || {};
+      return providers[providerName] || {};
+    } catch {
+      return {};
+    }
   }
 }
 
