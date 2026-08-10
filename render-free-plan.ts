@@ -77,6 +77,7 @@ if (!process.env.PROGRESS_LOG_PATH) process.env.PROGRESS_LOG_PATH = path.join(DA
 if (!process.env.LAST_STATE_PATH)  process.env.LAST_STATE_PATH  = path.join(DATA_DIR, 'last-state.json');
 if (!process.env.SELF_HEAL_BACKUP_DIR)  process.env.SELF_HEAL_BACKUP_DIR  = path.join(DATA_DIR, 'mathu-backups');
 if (!process.env.SELF_HEAL_STAGING_DIR) process.env.SELF_HEAL_STAGING_DIR = path.join(DATA_DIR, 'mathu-staging');
+if (!process.env.SELF_HEAL_OVERLAY_DIR) process.env.SELF_HEAL_OVERLAY_DIR = path.join(DATA_DIR, 'self-heal-overlay');
 if (!process.env.REGRESSION_BANK_DIR)   process.env.REGRESSION_BANK_DIR   = path.join(DATA_DIR, 'mathu-regression');
 
 // Memory — only set MAX_MEMORY_MB if not already set.
@@ -129,6 +130,7 @@ if (!process.env.CHROMIUM_FLAGS) {
 for (const dir of [
   process.env.LOG_DIR, process.env.USER_DATA_DIR,
   process.env.SELF_HEAL_BACKUP_DIR, process.env.SELF_HEAL_STAGING_DIR,
+  process.env.SELF_HEAL_OVERLAY_DIR,
   process.env.REGRESSION_BANK_DIR, process.env.SCREENSHOT_DIR,
 ]) {
   try { fs.mkdirSync(dir!, { recursive: true }); } catch { /* best-effort */ }
