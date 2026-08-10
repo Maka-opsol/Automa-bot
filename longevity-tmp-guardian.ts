@@ -15,7 +15,6 @@
 //
 // Protected files (never deleted):
 //   - openrouter-rate-limit.json (rate limiter state)
-//   - mathpix-rate-limit.json (Mathpix budget state)
 //   - render-last-seen.json (cold start detection)
 //   - checkpoint.json (cycle progress)
 //   - *.db (SQLite databases)
@@ -40,15 +39,14 @@ function logError(msg: string, err: Error, ctx?: any) { _deps.logger?.logError?.
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 const TMP_DIR = os.tmpdir();
-const CHECK_INTERVAL_MS = parseInt(process.env.TMP_GUARDIAN_INTERVAL_MS || '120000', 10); // 2 min (was 5 min)
-const THRESHOLD_WARN = parseFloat(process.env.TMP_GUARDIAN_WARN || '0.60');     // 60% (was 70%)
-const THRESHOLD_AGGRESSIVE = parseFloat(process.env.TMP_GUARDIAN_AGGRESSIVE || '0.75'); // 75% (was 85%)
-const THRESHOLD_EMERGENCY = parseFloat(process.env.TMP_GUARDIAN_EMERGENCY || '0.90'); // 90% (was 95%)
+const CHECK_INTERVAL_MS = parseInt(process.env.TMP_GUARDIAN_INTERVAL_MS || '90000', 10); // 90s (was 2 min)
+const THRESHOLD_WARN = parseFloat(process.env.TMP_GUARDIAN_WARN || '0.45');     // 45% (was 60%)
+const THRESHOLD_AGGRESSIVE = parseFloat(process.env.TMP_GUARDIAN_AGGRESSIVE || '0.60'); // 60% (was 75%)
+const THRESHOLD_EMERGENCY = parseFloat(process.env.TMP_GUARDIAN_EMERGENCY || '0.80'); // 80% (was 90%)
 
 // Protected file patterns (never deleted, even in emergency)
 const PROTECTED_PATTERNS = [
   'openrouter-rate-limit.json',
-  'mathpix-rate-limit.json',
   'render-last-seen.json',
   'checkpoint.json',
   'last-state.json',
@@ -323,6 +321,11 @@ function prune(): PruneResult {
         } catch { /* skip */ }
       }
 
+      // Always clean browser cache at aggressive level too
+      const aggrCache = _cleanBrowserCache();
+      freedBytes += aggrCache.freedBytes;
+      filesDeleted += aggrCache.dirsDeleted;
+
       log(`/tmp guardian AGGRESSIVE prune: ${filesDeleted} files freed ${_formatBytes(freedBytes)} (usage: ${(before.usagePct * 100).toFixed(1)}%)`, 'ERROR', 'tmp-guardian');
     } else {
       // EMERGENCY: delete everything except protected files
@@ -333,6 +336,11 @@ function prune(): PruneResult {
           filesDeleted++;
         } catch { /* skip */ }
       }
+
+      // Always clean browser cache at emergency level
+      const emrgCache = _cleanBrowserCache();
+      freedBytes += emrgCache.freedBytes;
+      filesDeleted += emrgCache.dirsDeleted;
 
       // Also try to clean up empty directories
       try {
@@ -400,7 +408,7 @@ function _rmrf(dir: string): void {
   } catch { /* skip */ }
 }
 
-function _cleanEmptyDirs(dir: string) {
+/**\n * Clean Chromium/Playwright browser cache directories.\n * Extracted so it can run at ALL prune levels — browser cache is the\n * biggest space hog and grows continuously during operation.\n */\nfunction _cleanBrowserCache(): { freedBytes: number; dirsDeleted: number } {\n  let freedBytes = 0;\n  let dirsDeleted = 0;\n  const userDataDir = path.join(TMP_DIR, '.browser-data');\n  if (!fs.existsSync(userDataDir)) return { freedBytes: 0, dirsDeleted: 0 };\n  const cacheDirs = ['Default/Cache', 'Default/Code Cache', 'Default/Service Worker/CacheStorage',\n    'Default/GPUCache', 'GrShaderCache', 'ShaderCache', 'DawnGraphiteCache', 'DawnWebGPUCache',\n    'Default/Session Storage', 'Default/Local Storage/leveldb', 'Default/IndexedDB'];\n  for (const cacheDir of cacheDirs) {\n    try {\n      const cachePath = path.join(userDataDir, cacheDir);\n      if (fs.existsSync(cachePath)) {\n        const size = _dirSize(cachePath);\n        if (size > 0) { _rmrf(cachePath); freedBytes += size; dirsDeleted++; }\n      }\n    } catch { /* skip */ }\n  }\n  return { freedBytes, dirsDeleted };\n}\n\nfunction _cleanEmptyDirs(dir: string) {
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   for (const entry of entries) {
     const fullPath = path.join(dir, entry.name);
