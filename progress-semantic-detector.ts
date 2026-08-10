@@ -253,23 +253,6 @@ async function getSemanticState(page: any): Promise<SemanticState | null> {
       timestamp: Date.now(),
     };
 
-    
-    const state: SemanticState = {
-      questionNumber: question,
-      totalQuestions: total,
-      module,
-      score,
-      maxScore,
-      isScoreScreen: screenType.isScoreScreen,
-      isCompletionScreen: screenType.isCompletionScreen,
-      isErrorScreen: screenType.isErrorScreen,
-      isAuthScreen: screenType.isAuthScreen,
-      isAssignmentsScreen: screenType.isAssignmentsScreen,
-      rawText: rawText.substring(0, 500),
-      textHash,
-      timestamp: Date.now(),
-    };
-
     // Update internal state
     _lastState = state;
     _stateHistory.push(state);
