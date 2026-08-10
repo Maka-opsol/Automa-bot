@@ -74,7 +74,9 @@ try {
     _loggerMod.safeLog = (...args: any[]) => {
       try {
         const ts = new Date().toISOString();
-        _pushLogRing(`[${ts}] ${JSON.stringify(args[0] || args)}`);
+        let serialized: string;
+        try { serialized = JSON.stringify(args[0] || args); } catch { serialized = String(args[0] || args); }
+        _pushLogRing(`[${ts}] ${serialized}`);
       } catch { /* non-critical */ }
       return _origSafeLog(...args);
     };
