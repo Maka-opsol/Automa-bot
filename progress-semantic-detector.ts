@@ -252,3 +252,111 @@ async function getSemanticState(page: any): Promise<SemanticState | null> {
       textHash,
       timestamp: Date.now(),
     };
+
+    
+    const state: SemanticState = {
+      questionNumber: question,
+      totalQuestions: total,
+      module,
+      score,
+      maxScore,
+      isScoreScreen: screenType.isScoreScreen,
+      isCompletionScreen: screenType.isCompletionScreen,
+      isErrorScreen: screenType.isErrorScreen,
+      isAuthScreen: screenType.isAuthScreen,
+      isAssignmentsScreen: screenType.isAssignmentsScreen,
+      rawText: rawText.substring(0, 500),
+      textHash,
+      timestamp: Date.now(),
+    };
+
+    // Update internal state
+    _lastState = state;
+    _stateHistory.push(state);
+    if (_stateHistory.length > 20) _stateHistory.shift();
+
+    // Check for state change and update stagnation record
+    if (state.textHash !== _stagnationRecord.lastStateHash) {
+      _stagnationRecord = {
+        actionCount: 0,
+        lastStateHash: state.textHash,
+        lastChangeTime: Date.now(),
+        declaredStagnant: false,
+      };
+    }
+
+    return state;
+  } catch (err: any) {
+    log(`getSemanticState failed: ${err?.message || err}`, 'WARN', 'semantic-detector');
+    return null;
+  }
+}
+
+/**
+ * Record that an action was taken. Updates stagnation counter.
+ * Returns true if stagnation has been declared.
+ */
+function recordAction(): boolean {
+  _stagnationRecord.actionCount++;
+  const threshold = _getStagnationThreshold();
+
+  if (
+    !_stagnationRecord.declaredStagnant &&
+    _stagnationRecord.actionCount >= threshold
+  ) {
+    _stagnationRecord.declaredStagnant = true;
+    log(
+      `Semantic stagnation declared after ${_stagnationRecord.actionCount} actions without change (threshold: ${threshold})`,
+      'WARN', 'semantic-detector'
+    );
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Check whether semantic progress has been made since the last call.
+ * Compares current lastState hash against the previous one.
+ */
+function hasProgress(): boolean {
+  if (_stateHistory.length < 2) return true; // Not enough data to declare stagnation
+  const prev = _stateHistory[_stateHistory.length - 2];
+  const curr = _stateHistory[_stateHistory.length - 1];
+  return prev.textHash !== curr.textHash;
+}
+
+/**
+ * Reset internal state (e.g., on new session or module change).
+ */
+function reset(): void {
+  _lastState = null;
+  _stateHistory = [];
+  _stagnationRecord = {
+    actionCount: 0,
+    lastStateHash: '',
+    lastChangeTime: Date.now(),
+    declaredStagnant: false,
+  };
+  _started = false;
+}
+
+/**
+ * Start the detector (mark as active). No-op if already started.
+ */
+function start(): void {
+  if (!_started) {
+    _started = true;
+    log('Semantic progress detector started', 'INFO', 'semantic-detector');
+  }
+}
+
+// ─── Module Exports ───
+export {
+  _injectDependencies,
+  getSemanticState,
+  recordAction,
+  hasProgress,
+  reset,
+  start,
+};
