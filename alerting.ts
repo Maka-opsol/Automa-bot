@@ -62,17 +62,23 @@ async function sendEmailAlert(message: any) {
   const transporter = getMailTransporter();
   if (!transporter) return;
   try {
-    await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to,
-      subject: 'MathU Bot Alert',
-      text: message,
-    });
+    // FIX: Wrap in timeout to prevent ETIMEDOUT hanging the alert pipeline.
+    // Render free tier blocks outbound SMTP — fail fast instead of hanging.
+    await Promise.race([
+      transporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to,
+        subject: 'MathU Bot Alert',
+        text: message,
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('EMAIL_TIMEOUT')), 8000)),
+    ]);
     log(`Sent email alert to ${to}`, 'DEBUG', 'alerting');
   } catch (e: any) {
     // Render free tier blocks outbound SMTP (ports 25/587/465).
-    // Log at WARN, not ERROR, to avoid triggering alert cascades.
-    log(`Email alert skipped: ${e.code || e.message}`, 'WARN', 'alerting');
+    // Log at DEBUG (was WARN) to avoid triggering alert cascades.
+    // The ETIMEDOUT in logs was generating secondary alerts.
+    log(`Email alert skipped: ${e.code || e.message}`, 'DEBUG', 'alerting');
   }
 }
 
@@ -112,6 +118,12 @@ async function sendTelegramAlert(message: any) {
     logError('Failed to send Telegram alert', e);
   }
 }
+
+// FIX: Track recently sent alert hashes to suppress exact duplicates.
+// The logs show the same alert firing twice (e.g. auth failure logged twice
+// from parallel workers). Dedup by message hash.
+const _recentAlertHashes = new Map<string, number>(); // hash -> timestamp
+const ALERT_DEDUP_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 
 let alertRateLimiter = {
   lastAlertTime: 0,
@@ -155,7 +167,29 @@ function _rotateAlertLog(alertLog: string) {
   } catch {}
 }
 
+function _alertHash(msg: string): string {
+  // Simple hash: take first 100 chars (enough to identify alert type)
+  const key = String(msg).substring(0, 100);
+  let hash = 0;
+  for (let i = 0; i < key.length; i++) { hash = ((hash << 5) - hash + key.charCodeAt(i)) | 0; }
+  return String(hash);
+}
+
 async function sendAlert(message: any, priority = 3) { 
+  // FIX: Deduplicate alerts — suppress if identical alert sent recently
+  const hash = _alertHash(String(message));
+  const lastSent = _recentAlertHashes.get(hash);
+  if (lastSent && (Date.now() - lastSent) < ALERT_DEDUP_WINDOW_MS) {
+    log(`Alert deduplicated: ${message}`, 'DEBUG', 'alerting');
+    return;
+  }
+  _recentAlertHashes.set(hash, Date.now());
+  // Prune old entries
+  if (_recentAlertHashes.size > 100) {
+    const cutoff = Date.now() - ALERT_DEDUP_WINDOW_MS;
+    for (const [k, v] of _recentAlertHashes) { if (v < cutoff) _recentAlertHashes.delete(k); }
+  }
+
   if (!canSendAlert()) {
     log(`Alert suppressed due to rate limiting: ${message}`, 'DEBUG', 'alerting');
     return;
