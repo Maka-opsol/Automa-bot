@@ -9,7 +9,24 @@ class MicrosoftAuthV2 extends BaseAuthStrategy {
   selectors: any = null;
   constructor() { super('microsoft', '2'); this.selectors = null; }
   async init() { this.selectors = selectorManager.getSelectors('microsoft-login'); }
-  async canHandle(page: any) { await this.init(); const url = page.url(); return url.includes('login.microsoftonline.com'); }
+  async canHandle(page: any) { 
+    await this.init(); 
+    const url = page.url(); 
+    // FIX: Match broader Microsoft auth domains — msftauth.net is used for
+    // redirects during conditional access, consent prompts, etc.
+    if (url.includes('login.microsoftonline.com') || url.includes('login.live.com') || url.includes('msftauth.net')) {
+      return true;
+    }
+    // FIX: Content-based detection — if the URL changed but we're still on a
+    // Microsoft auth page (e.g. after a redirect to an unexpected subdomain)
+    try {
+      const body = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+      if (body.includes('Microsoft') && (body.includes('Enter your email') || body.includes('password') || body.includes('Sign in'))) {
+        return true;
+      }
+    } catch {}
+    return false; 
+  }
 
   async authenticate(page: any, credentials: any) {
     await this.init();
