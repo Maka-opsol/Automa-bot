@@ -198,6 +198,27 @@ log(`Operational mode: ${memoryMode.getMode()} (thresholds: warn=${memoryMode.ge
 // Longevity subsystems
 startSubsystemGroup('longevity');
 
+// Screenshot external storage (before training, since training depends on it)
+try {
+  const ssStorage = require('./screenshot-storage');
+  const ssResult = ssStorage.init();
+  if (ssResult.enabled) {
+    log(`Screenshot storage: backend=${ssResult.backend}`, 'INFO', 'render-free-plan');
+  }
+} catch (e: any) {
+  log(`Screenshot storage init failed: ${e.message || e}`, 'WARN', 'render-free-plan');
+}
+
+// Pixel training system (learns from successful actions)
+try {
+  const pixelTraining = require('./pixel-training');
+  pixelTraining.init();
+  const status = pixelTraining.getStatus();
+  log(`Pixel training: initialized, ${status.cacheSize} samples in cache, ${status.dbRowCount} in DB`, 'INFO', 'render-free-plan');
+} catch (e: any) {
+  log(`Pixel training init failed: ${e.message || e}`, 'WARN', 'render-free-plan');
+}
+
 // Seed initial active model if needed
 const { getActiveModel, upsertModel } = require('./database');
 const active = getActiveModel.get();
@@ -327,6 +348,13 @@ async function gracefulShutdown(signal: string) {
   requestStop();
   // Flush persistent config to disk before dying
   try { require('./persistent-config').flush(); } catch { /* best-effort */ }
+  // Flush screenshot upload queue
+  try {
+    const ss = require('./screenshot-storage');
+    if (ss.flushQueue) await ss.flushQueue();
+  } catch { /* best-effort */ }
+  // Shutdown pixel training
+  try { require('./pixel-training').shutdown(); } catch { /* best-effort */ }
   try {
     const { gracefulShutdown: runHooks } = require('./cycle-shutdown');
     await runHooks(signal);
@@ -363,80 +391,95 @@ registerShutdownHook(async () => {
 // MEMORY MANAGEMENT — Mode-aware, dynamically tuned for 512 MB
 // ═══════════════════════════════════════════════════════════════════════
 // Thresholds come from memory-mode.ts based on current operational mode.
-// In full_power:  warn=350MB, restart=400MB, GC=90s, monitor=20s
-// In memory_protection: warn=250MB, restart=280MB, GC=60s, monitor=15s
+// In full_power:       warn=350MB, restart=400MB, GC=90s, monitor=20s
+// In memory_protection: warn=250MB, restart=280MB, GC=30s, monitor=10s
 // ═══════════════════════════════════════════════════════════════════════
 
 let _memoryWarningCount = 0;
 let _lastRss = 0;
 const persistConfigMod = require('./persistent-config');
+let _memoryMonitorInterval: ReturnType<typeof setInterval> | null = null;
 
 // ── Mode-aware memory monitoring ──
 // Uses thresholds from the active mode. Auto-downgrades to memory_protection
 // if heap exceeds the global danger zone (320MB) or RSS > 440MB.
-setInterval(() => {
-  if (isShuttingDown) return;
-  const mem = process.memoryUsage();
-  const used = mem.heapUsed / 1024 / 1024;
-  const rss = mem.rss / 1024 / 1024;
-  const thresholds = memoryMode.getThresholds();
+//
+// v3 FIX: Interval is now restartable. When memory-mode changes, the old
+// interval is cleared and a new one starts with the new monitor interval.
+// Previously the interval was set once with .unref() and never updated,
+// so in memory_protection mode (10s interval) it still polled at 20s.
+//
+// v3 FIX: On warning streak, calls memoryMode.shedMemory() for comprehensive
+// cleanup instead of just browser close + GC.
 
-  // Record memory reading for history-based detection
-  persistConfigMod.pushMemoryReading(Math.round(used * 10) / 10, Math.round(rss * 10) / 10);
-
-  // Auto-downgrade check (before applying mode-specific thresholds)
-  if (memoryMode.checkAutoDowngrade(used, rss)) {
-    // Mode switched — get fresh thresholds
-    _memoryWarningCount = 0;
-    _lastRss = rss;
-    return;
+function _startMemoryMonitor(): void {
+  if (_memoryMonitorInterval) {
+    clearInterval(_memoryMonitorInterval);
+    _memoryMonitorInterval = null;
   }
+  const intervalMs = memoryMode.getThresholds().monitorIntervalMs;
+  log(`Memory monitor starting (interval=${intervalMs}ms, mode=${memoryMode.getMode()})`, 'DEBUG', 'render-free-plan');
+  _memoryMonitorInterval = setInterval(() => {
+    if (isShuttingDown) return;
+    const mem = process.memoryUsage();
+    const used = mem.heapUsed / 1024 / 1024;
+    const rss = mem.rss / 1024 / 1024;
 
-  const activeRestart = thresholds.restartHeapMB;
-  const activeWarn = thresholds.warnHeapMB;
-  const activeRssHard = thresholds.rssHardLimitMB;
-  const activeStreak = thresholds.warningStreak;
+    // Record memory reading for history-based detection
+    persistConfigMod.pushMemoryReading(Math.round(used * 10) / 10, Math.round(rss * 10) / 10);
 
-  // Critical: immediate browser close + double GC
-  if (used > activeRestart || rss > activeRssHard) {
-    log(`Memory CRITICAL (${memoryMode.getMode()}): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — closing browser + double GC`, 'ERROR', 'render-free-plan');
-    try {
-      const browserMod = container.get('browser', { required: false });
-      if (browserMod?.browserManager?.pageInstance && !browserMod.browserManager.pageInstance.isClosed()) {
-        browserMod.browserManager.cleanup().catch(() => {});
-      }
-    } catch { /* best effort */ }
-    if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
-    setTimeout(() => { if (global.gc) try { global.gc(); } catch {} }, 5000).unref();
-    _memoryWarningCount = 0;
-    _lastRss = rss;
-  } else if (used > activeWarn) {
-    _memoryWarningCount++;
-    if (_memoryWarningCount >= activeStreak) {
-      log(`Memory warning persistent (${_memoryWarningCount}/${activeStreak}, mode=${memoryMode.getMode()}): heap=${used.toFixed(0)}MB — closing browser`, 'WARN', 'render-free-plan');
-      try {
-        const browserMod = container.get('browser', { required: false });
-        if (browserMod?.browserManager?.pageInstance && !browserMod.browserManager.pageInstance.isClosed()) {
-          browserMod.browserManager.cleanup().catch(() => {});
-        }
-      } catch { /* best effort */ }
-      if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
-      setTimeout(() => { if (global.gc) try { global.gc(); } catch {} }, 5000).unref();
+    // Auto-downgrade check (before applying mode-specific thresholds)
+    if (memoryMode.checkAutoDowngrade(used, rss)) {
+      // Mode switched to memory_protection — shedMemory was already called
+      // by _applyMode. Restart the monitor with the new (faster) interval.
       _memoryWarningCount = 0;
       _lastRss = rss;
-    } else {
-      const rssTrend = _lastRss > 0 ? (rss - _lastRss > 10 ? 'rising' : 'stable') : 'unknown';
-      log(
-        `Memory warning: heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB [${_memoryWarningCount}/${activeStreak}] mode=${memoryMode.getMode()} trend=${rssTrend}`,
-        'WARN',
-        'render-free-plan'
-      );
+      _startMemoryMonitor(); // Restart with new interval
+      return;
     }
-  } else {
-    _memoryWarningCount = 0;
+
+    // Get FRESH thresholds (mode may have changed)
+    const thresholds = memoryMode.getThresholds();
+    const activeRestart = thresholds.restartHeapMB;
+    const activeWarn = thresholds.warnHeapMB;
+    const activeRssHard = thresholds.rssHardLimitMB;
+    const activeStreak = thresholds.warningStreak;
+
+    // Critical: immediate comprehensive memory shed
+    if (used > activeRestart || rss > activeRssHard) {
+      log(`Memory CRITICAL (${memoryMode.getMode()}): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed`, 'ERROR', 'render-free-plan');
+      try { memoryMode.shedMemory('render-monitor-critical'); } catch { /* best effort */ }
+      if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
+      setTimeout(() => { if (global.gc) try { global.gc(); } catch {} }, 3000).unref();
+      _memoryWarningCount = 0;
+      _lastRss = rss;
+    } else if (used > activeWarn) {
+      _memoryWarningCount++;
+      if (_memoryWarningCount >= activeStreak) {
+        log(`Memory warning persistent (${_memoryWarningCount}/${activeStreak}, mode=${memoryMode.getMode()}): heap=${used.toFixed(0)}MB — memory shed`, 'WARN', 'render-free-plan');
+        // v3 FIX: Use shedMemory instead of manual browser close
+        try { memoryMode.shedMemory('render-monitor-warning'); } catch { /* best effort */ }
+        if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
+        _memoryWarningCount = 0;
+        _lastRss = rss;
+      } else {
+        const rssTrend = _lastRss > 0 ? (rss - _lastRss > 10 ? 'rising' : 'stable') : 'unknown';
+        log(
+          `Memory warning: heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB [${_memoryWarningCount}/${activeStreak}] mode=${memoryMode.getMode()} trend=${rssTrend}`,
+          'WARN',
+          'render-free-plan'
+        );
+      }
+    } else {
+      _memoryWarningCount = 0;
+    }
+    _lastRss = rss;
+  }, intervalMs);
+  if (_memoryMonitorInterval && typeof (_memoryMonitorInterval as any).unref === 'function') {
+    (_memoryMonitorInterval as any).unref();
   }
-  _lastRss = rss;
-}, memoryMode.getThresholds().monitorIntervalMs).unref();
+}
+_startMemoryMonitor();
 
 // ═══════════════════════════════════════════════════════════════════════
 // HTTP SERVER — Render requires listening on $PORT
@@ -601,6 +644,100 @@ a{color:#818cf8}a:hover{color:#a5b4fc}
     } catch (e: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message || 'Health check failed' }));
+    }
+    return;
+  }
+
+  // ── API: Pixel Training Status ──
+  if (pathname === '/api/training' && req.method === 'GET') {
+    try {
+      const pt = require('./pixel-training');
+      const ss = require('./screenshot-storage');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        training: pt.getStatus(),
+        storage: ss.getStatus(),
+      }));
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // ── API: Training Data (for export / continual improvement) ──
+  if (pathname === '/api/training/data' && req.method === 'GET') {
+    try {
+      const pt = require('./pixel-training');
+      const db = require('./database').db;
+      if (!db) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Database not available' }));
+        return;
+      }
+      const url = new URL(req.url || '/', `http://${req.headers.host}`);
+      const state = url.searchParams.get('state') || '';
+      const limit = Math.min(100, parseInt(url.searchParams.get('limit') || '50', 10));
+
+      let rows;
+      if (state) {
+        rows = db.prepare(
+          'SELECT sample_id, state, action_type, x_percent, y_percent, success_count, provider, page_url_hash, screenshot_key, created_at FROM pixel_training_data WHERE state = ? ORDER BY success_count DESC, created_at DESC LIMIT ?'
+        ).all(state, limit);
+      } else {
+        rows = db.prepare(
+          'SELECT sample_id, state, action_type, x_percent, y_percent, success_count, provider, page_url_hash, screenshot_key, created_at FROM pixel_training_data ORDER BY success_count DESC, created_at DESC LIMIT ?'
+        ).all(limit);
+      }
+
+      // Include external storage URLs for screenshot retrieval
+      const ss = require('./screenshot-storage');
+      const results = (rows as any[]).map((r: any) => ({
+        ...r,
+        screenshotUrl: r.screenshot_key ? ss.getPublicUrl(r.screenshot_key) : null,
+      }));
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        total: results.length,
+        stateFilter: state || 'all',
+        data: results,
+      }));
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // ── API: Upload screenshot manually (for training from external sources) ──
+  if (pathname === '/api/training/upload' && req.method === 'POST') {
+    try {
+      const ss = require('./screenshot-storage');
+      if (!ss.isEnabled()) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'External storage not configured' }));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: any) => chunks.push(chunk));
+      req.on('end', async () => {
+        const buf = Buffer.concat(chunks);
+        const result = await ss.uploadScreenshot(buf, 'manual', {
+          source: 'dashboard_upload',
+          format: 'png',
+          priority: 'high',
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: !!result,
+          key: result?.key || null,
+          url: result?.url || null,
+        }));
+      });
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
     }
     return;
   }
