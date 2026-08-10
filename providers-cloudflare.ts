@@ -1,6 +1,6 @@
 'use strict';
 
-// ─── Cloudflare Workers AI Provider (v2) ────────────────────────────────────
+// ─── Cloudflare Workers AI Provider (v3) ────────────────────────────────────
 //
 // Uses Cloudflare Workers AI API (/accounts/{id}/ai/run/{model}).
 // This is NOT an OpenAI-compatible API — it has its own URL structure
@@ -8,15 +8,15 @@
 //
 // Supports:
 //   - System messages (via `messages` array with `system` role)
+//   - Vision (multimodal): all models support image input
 //   - Model cascade (like Gemini): tries primary model, then fallbacks
 //   - Per-model cooldown tracking for 429 rate limits
 //
-// Current primary model: @cf/moonshotai/kimi-k2.7-code (strong reasoning)
-// Fallback chain: llama-4-scout → llama-3.3-70b → llama-3.1-8b
+// Current primary model: @cf/meta/llama-4-scout-17b-16e-instruct
+// Fallback chain: moondream3.1 → kimi-k2.6 → gemma-4-26b → kimi-k2.5 → llama-3.2-11b-vision
 //
-// NOTE: Images are still stripped. Cloudflare Workers AI doesn't reliably
-// support vision across all models. Vision analysis comes from the tribunal's
-// other vision-capable providers (Gemini, z.ai, OpenRouter).
+// Vision: All 6 models are vision-capable. Images are sent as multimodal
+// content parts in the user message (type: "image" + type: "text").
 //
 // P7: providerName passed to retryWithBackoff for health-aware retries.
 // P20: Structured error logging.
@@ -41,7 +41,7 @@ const _modelCooldowns: Record<string, { expiresAt: number; consecutive429s: numb
  */
 function _getModelChain(): string[] {
   const config = getProviderConfig('Cloudflare');
-  const primary = config?.model || '@cf/moonshotai/kimi-k2.7-code';
+  const primary = config?.model || '@cf/meta/llama-4-scout-17b-16e-instruct';
   const fallbacks = getFallbackModels('Cloudflare');
   // Deduplicate while preserving order
   const seen = new Set<string>();
@@ -110,7 +110,7 @@ function CloudflareProvider() {
       }
 
       try {
-        const result = await _callWithModel(accountId, apiKey, modelId, prompt, signal, options);
+        const result = await _callWithModel(accountId, apiKey, modelId, base64Image, prompt, signal, options);
         // Success — clear any 429 record for this model
         _clearModel429(modelId);
         return result;
@@ -134,7 +134,7 @@ function CloudflareProvider() {
               log(`Rolled back Cloudflare model config.`, 'INFO', 'cloudflare');
               const newConfig = getProviderConfig('Cloudflare');
               if (newConfig.model && newConfig.model !== modelId) {
-                const retryResult = await _callWithModel(accountId, apiKey, newConfig.model, prompt, signal, options);
+                const retryResult = await _callWithModel(accountId, apiKey, newConfig.model, base64Image, prompt, signal, options);
                 _clearModel429(newConfig.model);
                 return retryResult;
               }
@@ -156,11 +156,13 @@ function CloudflareProvider() {
 /**
  * Call a specific Cloudflare Workers AI model.
  * Uses the standard chat messages format with system + user roles.
+ * Supports vision: sends base64 image as multimodal content part when available.
  */
 async function _callWithModel(
   accountId: string,
   apiKey: string,
   modelId: string,
+  base64Image: any,
   prompt: any,
   signal: any,
   options: any = {}
@@ -168,20 +170,36 @@ async function _callWithModel(
   const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${modelId}`;
 
   // Build messages array with system prompt + user content
-  // Kimi and newer CF models support system role in messages
-  const messages: Array<{ role: string; content: string }> = [];
+  // All current CF models support system role in messages
+  const messages: Array<{ role: string; content: any }> = [];
 
-  // Add system message for action guidance (Kimi models support this)
+  // Add system message for action guidance
   messages.push({
     role: 'system',
     content: 'You are a helpful assistant that analyzes screenshots and returns JSON action objects. Always respond with valid JSON only.',
   });
 
-  // Add user message — prompt is always a string for Cloudflare
-  messages.push({
-    role: 'user',
-    content: typeof prompt === 'string' ? prompt : String(prompt),
-  });
+  // Build user message content — multimodal if image present, plain string otherwise
+  const promptText = typeof prompt === 'string' ? prompt : String(prompt);
+  if (base64Image && typeof base64Image === 'string' && base64Image.length > 0) {
+    // Cloudflare Workers AI multimodal format: array of content parts
+    // Image part uses base64 data URI
+    const imagePart = base64Image.startsWith('data:')
+      ? base64Image
+      : `data:image/png;base64,${base64Image}`;
+    messages.push({
+      role: 'user',
+      content: [
+        { type: 'image', image: imagePart },
+        { type: 'text', text: promptText },
+      ],
+    });
+  } else {
+    messages.push({
+      role: 'user',
+      content: promptText,
+    });
+  }
 
   const payload = {
     messages,
