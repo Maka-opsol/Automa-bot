@@ -10,7 +10,7 @@
 //   2. LLM path (only if fast = UNKNOWN): Ask vision model for type
 //
 // Also includes:
-//   - LaTeX-to-plain-text simplifier for Mathpix output
+//   - LaTeX-to-plain-text simplifier for Pix2Tex output
 //   - OCR quality heuristics (detect garbled text from vision models)
 //   - Model-type affinity tracking (which models are best at which types)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -328,7 +328,7 @@ function simplifyLatex(text: string): string {
 
 /**
  * Estimate OCR text quality. Returns 0-100 confidence score.
- * Low scores indicate garbled text that might benefit from Mathpix OCR.
+ * Low scores indicate garbled text that might benefit from Pix2Tex OCR.
  */
 function estimateOCRQuality(text: string): number {
   if (!text || text.trim().length === 0) return 0;
@@ -429,19 +429,19 @@ function classifyProblem(text: string): ClassificationResult {
 }
 
 /**
- * Check if OCR text should be sent to Mathpix for re-OCR.
+ * Check if OCR text should be sent to Pix2Tex for re-OCR.
  * Returns true when:
  *   - OCR quality is low (< 50)
  *   - Problem type is CALCULUS or PROOF (high notation density)
  *   - previousAttemptFailed is true (likely OCR error)
  */
-function shouldUseMathpix(text: string, problemType: ProblemType, previousAttemptFailed: boolean = false): boolean {
+function shouldUsePix2Tex(text: string, problemType: ProblemType, previousAttemptFailed: boolean = false): boolean {
   const ocrQuality = estimateOCRQuality(text);
 
-  // Low OCR quality — Mathpix might help
+  // Low OCR quality — Pix2Tex might help
   if (ocrQuality < 50) return true;
 
-  // High notation density types — Mathpix excels at these
+  // High notation density types — Pix2Tex excels at these
   if (problemType === 'CALCULUS' || problemType === 'PROOF') return true;
 
   // Previous attempt failed — OCR error might be the cause
@@ -524,7 +524,7 @@ module.exports = {
   // Core classification
   classifyProblem,
   classifyByRegex,
-  shouldUseMathpix,
+  shouldUsePix2Tex,
 
   // OCR quality
   estimateOCRQuality,
