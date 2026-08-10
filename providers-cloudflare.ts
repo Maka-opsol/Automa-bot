@@ -16,7 +16,7 @@
 // Fallback chain: moondream3.1 → kimi-k2.6 → gemma-4-26b → kimi-k2.5 → llama-3.2-11b-vision
 //
 // Vision: All 6 models are vision-capable. Images are sent as multimodal
-// content parts in the user message (type: "image" + type: "text").
+// content parts in the user message (type: "image_url" + type: "text").
 //
 // P7: providerName passed to retryWithBackoff for health-aware retries.
 // P20: Structured error logging.
@@ -183,14 +183,14 @@ async function _callWithModel(
   const promptText = typeof prompt === 'string' ? prompt : String(prompt);
   if (base64Image && typeof base64Image === 'string' && base64Image.length > 0) {
     // Cloudflare Workers AI multimodal format: array of content parts
-    // Image part uses base64 data URI
+    // Image part uses image_url type (NOT 'image' — that's not a valid CF type)
     const imagePart = base64Image.startsWith('data:')
       ? base64Image
       : `data:image/png;base64,${base64Image}`;
     messages.push({
       role: 'user',
       content: [
-        { type: 'image', image: imagePart },
+        { type: 'image_url', image_url: { url: imagePart } },
         { type: 'text', text: promptText },
       ],
     });
