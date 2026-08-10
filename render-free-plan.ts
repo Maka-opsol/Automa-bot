@@ -214,9 +214,9 @@ try {
 // Pixel training system (learns from successful actions)
 try {
   const pixelTraining = require('./pixel-training');
-  pixelTraining.init();
-  const status = pixelTraining.getStatus();
-  log(`Pixel training: initialized, ${status.cacheSize} samples in cache, ${status.dbRowCount} in DB`, 'INFO', 'render-free-plan');
+  // pixel-training uses lazy init via _ensureDb() — no .init() needed.
+  const status = pixelTraining.getStats();
+  log(`Pixel training: ready, ${status.cacheSize} samples in cache, ${status.totalRecords} in DB`, 'INFO', 'render-free-plan');
 } catch (e: any) {
   log(`Pixel training init failed: ${e.message || e}`, 'WARN', 'render-free-plan');
 }
