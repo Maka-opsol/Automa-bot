@@ -540,12 +540,13 @@ class SelfDeploy {
     try { getSendAlert()('UNRECOVERABLE: Codebase corruption cannot be fixed. Entering HIBERNATION.', 1); } catch (e: any) {}
     this._logEvent('full_recovery', 'UNRECOVERABLE - all methods failed');
 
-    // Enter HIBERNATION via degradation ladder
+    // Enter DORMANT (level 4) via degradation ladder
+    // FIX: setMode() does not exist — use setLevel(4, reason)
     try {
       const { degradationLadder } = require('./self-heal-degradation-ladder');
-      degradationLadder.setMode('HIBERNATION', 'UNRECOVERABLE codebase corruption', true);
+      degradationLadder.setLevel(4, 'UNRECOVERABLE codebase corruption');
     } catch (err: any) {
-      logError('Failed to enter HIBERNATION mode', err);
+      logError('Failed to enter DORMANT mode', err);
     }
 
     return { recovered: false, reason: 'unrecoverable', action: 'hibernation' };
