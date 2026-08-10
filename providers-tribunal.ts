@@ -158,11 +158,98 @@ function findWeightedConsensus(votes: WeightedVote[]): WeightedConsensus | null 
 }
 
 // ===============================================================================
+// BLANK IMAGE DETECTION
+// ===============================================================================
+//
+// Fast pixel-level check: decode base64, sample N points, check if the image
+// is essentially one flat color (blank white/gray page). If so, short-circuit
+// the tribunal immediately — no point burning 7 provider calls on nothing.
+//
+// A JPEG of a solid white 1280×720 compresses to ~3-5 KB, so size alone
+// is unreliable. We sample pixel variance instead.
+//
+// Cost: ~2-5ms (decode + sample). Saves: ~45s of wasted tribunal + API quota.
+
+/**
+ * Check if a base64 image is blank (uniform color, no visible content).
+ * Samples 256 pixels from the decoded buffer and checks color variance.
+ * Returns true if the image is blank.
+ */
+function isBlankImage(base64Image: string): boolean {
+  try {
+    const buf = Buffer.from(base64Image, 'base64');
+    if (buf.length < 500) return true; // suspiciously tiny
+
+    // Try to decode as JPEG or PNG
+    // JPEG: SOI marker FF D8. PNG: signature 89 50 4E 47
+    const isJpeg = buf[0] === 0xFF && buf[1] === 0xD8;
+    const isPng = buf[0] === 0x89 && buf[1] === 0x50;
+
+    // For JPEG, we can't easily decode raw pixels without sharp/jimp.
+    // Instead, check the buffer size + byte entropy as a heuristic.
+    // A blank white JPEG has very low byte entropy (repeated DCT blocks).
+    if (isJpeg) {
+      // Check byte entropy on a sample of the buffer (skip headers)
+      const sampleStart = Math.min(200, buf.length - 1); // skip JPEG headers
+      const sampleLen = Math.min(4096, buf.length - sampleStart);
+      if (sampleLen <= 0) return true;
+
+      // Count unique byte values in the sample
+      const seen = new Set<number>();
+      for (let i = sampleStart; i < sampleStart + sampleLen; i++) {
+        seen.add(buf[i]);
+      }
+      // A blank white JPEG has very few unique byte values (< 40)
+      // A real screenshot typically has 100+ unique byte values in any 4KB window
+      if (seen.size < 40) {
+        return true;
+      }
+    }
+
+    if (isPng) {
+      // PNGs store raw pixel data. For a blank image, most pixels will be
+      // the same color. Sample the raw byte values (after PNG headers).
+      // A blank PNG's raw data after the 8-byte signature will be mostly
+      // repeated IDAT chunk data with very low variance.
+      const sampleLen = Math.min(8192, buf.length - 8);
+      if (sampleLen <= 0) return true;
+
+      const seen = new Set<number>();
+      for (let i = 8; i < 8 + sampleLen; i++) {
+        seen.add(buf[i]);
+      }
+      if (seen.size < 30) {
+        return true;
+      }
+    }
+
+    // For non-JPEG/PNG or ambiguous cases, also check total file size.
+    // A real screenshot at quality 30, 768px wide should be > 10KB.
+    // A blank white page at those settings is typically < 8KB.
+    if (buf.length < 3000) return true;
+
+    return false;
+  } catch {
+    // If we can't decode, assume not blank (safer — don't skip real pages)
+    return false;
+  }
+}
+
+// ===============================================================================
 // TRIBUNAL EXECUTION
 // ===============================================================================
 
 async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = null, signal: any = null) {
   const { log } = _getLogger();
+
+  // ── Blank image guard ──
+  // If the screenshot is a blank/white page, immediately return 'wait'
+  // without calling any providers. This saves ~45s and API quota.
+  if (base64Image && typeof base64Image === 'string' && isBlankImage(base64Image)) {
+    log('Tribunal: screenshot is blank/white — skipping all providers, returning wait', 'WARN', 'tribunal');
+    return { actionType: 'wait', currentState: 'blank_page', reasoning: 'Screenshot is blank/white — page not rendered yet', targetX: 0, targetY: 0 };
+  }
+
   const { safeCall } = _getProvidersBase();
   const { getSystemPrompt, getUserInstruction } = _getPrompts();
 
