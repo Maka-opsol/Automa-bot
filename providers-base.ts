@@ -280,18 +280,19 @@ async function safeCall(
   const log = _getLog().log;
 
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
-  const controller = { aborted: false };
+  const abortController = new AbortController();
+  const { signal } = abortController;
 
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(() => {
-      controller.aborted = true;
+      abortController.abort();
       reject(new Error(`${label} timed out after ${timeoutMs}ms${url ? ` (${url})` : ''}`));
     }, timeoutMs);
   });
 
   try {
     const result = await Promise.race([
-      fn(controller),
+      fn(signal),
       timeoutPromise,
     ]);
     return result;
