@@ -11,19 +11,6 @@
 // circular dependency crash. Always use the CONFIG() accessor instead.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ═══════════════════════════════════════════════════════════════
-// FATAL FIX: Cache native Array.isArray at module load time.
-// Under memory pressure on Render, the global Array object can be
-// shadowed or corrupted (e.g. by polyfills, vm sandbox leaks, or
-// native module corruption). This causes every Array.isArray call
-// to crash with "TypeError: Array.isArray is not a function",
-// which then cascades through the error handler → safeLog → deepRedact
-// → another Array.isArray crash → _fatalException → process.exit.
-// By caching the native reference here, deepRedact survives even if
-// the global gets corrupted later.
-// ═══════════════════════════════════════════════════════════════
-const _isArray: (arg: any) => arg is any[] = Array.isArray;
-
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -147,8 +134,12 @@ function deepRedact(obj: any, depth = 0, maxDepth = 5) {
     'privatekey', 'private_key', 'credential', 'authorization'
   ]);
   if (typeof obj === 'string') return redactSensitive(obj);
-  // FIX: Use cached _isArray instead of Array.isArray to survive global corruption
-  if (_isArray(obj)) return obj.map(item => deepRedact(item, depth + 1, maxDepth));
+  // Defensive: use Object.prototype.toString when Array.isArray is corrupted
+  // (happens under memory pressure on Render when global Array is shadowed)
+  const isArray = typeof Array.isArray === 'function'
+    ? Array.isArray(obj)
+    : Object.prototype.toString.call(obj) === '[object Array]';
+  if (isArray) return obj.map(item => deepRedact(item, depth + 1, maxDepth));
   if (typeof obj === 'object') {
     const redacted = {};
     for (const [key, value] of Object.entries(obj)) {
@@ -175,8 +166,45 @@ function parseLogLevel(level: any) {
 // Start with stdout; _initLogStream() is called after config is fully loaded
 // (called from config.js or agent.js) to switch to file logging
 // If BetterStack Logtail is available, use multi-stream to ship logs to both file and BetterStack
+// FIX: Capture real Array at module load so pino internals can be
+// repaired when the global is corrupted under Render memory pressure.
+const _realArray = Array;
+
+// FIX: Dedup wrapper — prevents duplicate log lines when pino multistream
+// fans out to multiple destinations that both resolve to stdout.
+const _lastLogMsg = new Map<string, number>();
+const _DEDUP_WINDOW_MS = 500;
+function _dedupWrite(originalWrite: any) {
+  return function(chunk: string, enc: string, cb: Function) {
+    try {
+      const key = chunk.substring(0, 200);
+      const now = Date.now();
+      const last = _lastLogMsg.get(key);
+      if (last && now - last < _DEDUP_WINDOW_MS) {
+        if (typeof cb === 'function') cb();
+        return; // suppress duplicate
+      }
+      _lastLogMsg.set(key, now);
+      // Prune old entries periodically
+      if (_lastLogMsg.size > 50) {
+        for (const [k, t] of _lastLogMsg) { if (now - t > _DEDUP_WINDOW_MS) _lastLogMsg.delete(k); }
+      }
+    } catch { /* non-critical */ }
+    return originalWrite.call(this, chunk, enc, cb);
+  };
+}
+
 const streams = [logStream];
 if (logtailDestination) streams.push(logtailDestination);
+
+// Wrap each stream with dedup to prevent double-output
+const dedupStreams = streams.map((s: any) => {
+  if (s && typeof s.write === 'function' && s !== process.stdout) {
+    const origWrite = s.write.bind(s);
+    s.write = _dedupWrite(origWrite);
+  }
+  return s;
+});
 
 const logger = pino({
   level: parseLogLevel(process.env.LOG_LEVEL),
@@ -189,7 +217,7 @@ const logger = pino({
   serializers: { err: pino.stdSerializers.err, error: pino.stdSerializers.err },
   redact: { paths: ['req.headers.authorization', 'req.headers.cookie'], censor: '[REDACTED]' }
 }, logtailDestination
-  ? pino.multistream(streams)
+  ? pino.multistream(dedupStreams)
   : logStream
 );
 
@@ -218,6 +246,12 @@ function log(message: any, level = 'INFO', module = 'main') {
       safeMessage = `${message.message}\n${message.stack?.substring(0, 5000) || ''}`;
     } else {
       try { safeMessage = JSON.stringify(message)?.substring(0, 10000) || String(message); } catch { safeMessage = '[UNSTRINGIFIABLE_MESSAGE]'; }
+    }
+    // FIX: Repair corrupted global Array before pino touches it.
+    // Pino internally calls Array.isArray during serialization;
+    // under Render memory pressure this global can be corrupted.
+    if (typeof Array.isArray !== 'function') {
+      try { (globalThis as any).Array = _realArray; } catch { /* best effort */ }
     }
     let child = _childLoggerCache.get(safeModule);
     if (!child) { child = logger.child({ module: safeModule }); _childLoggerCache.set(safeModule, child); }
