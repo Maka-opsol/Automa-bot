@@ -216,35 +216,15 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
     return await tryLocalVLM(compressedBase64, prompt, validator, setCachedVisionResponse, base64Image);
   }
 
-  // FIX: Execute providers SEQUENTIALLY instead of in parallel.
-  // Parallel execution causes:
-  //   1. All 4 providers hitting the same rate limit simultaneously
-  //   2. Thundering-herd effect burning through API quotas
-  //   3. No backoff benefit since all requests fire at once
-  // Sequential with staggered timeout: try fastest first, if it fails,
-  // the next provider gets a fresh chance with the full timeout.
-  // The first success returns immediately (no need to wait for others).
-  const failedProviders: string[] = [];
-  for (const provider of orderedProviders) {
-    if (signal?.aborted) break;
-
-    // FIX: Skip providers in 429 cooldown
-    try {
-      const { getProviderCooldownRemainingMs } = require('./providers-base');
-      const cooldownMs = getProviderCooldownRemainingMs(provider.name);
-      if (cooldownMs > 0) {
-        log(`Vision: skipping ${provider.name} (${Math.round(cooldownMs / 1000)}s cooldown remaining)`, 'WARN', 'vision');
-        failedProviders.push(provider.name);
-        continue;
-      }
-    } catch {}
-
+  // Execute all providers in parallel
+  const promises = orderedProviders.map(async (provider: any) => {
+    if (signal?.aborted) throw new Error('Aborted');
     const start = Date.now();
     try {
       const raw = await safeCall(
         (sig: any) => provider.fn(compressedBase64, prompt, sig, { validate: false }),
         `Vision ${provider.name}`,
-        { timeoutMs, url: provider.name, maxRetries: 0, signal }  // FIX: no retries at vision level — let circuit breaker handle it
+        { timeoutMs, url: provider.name, maxRetries: 1, signal }
       );
       const latency = Date.now() - start;
 
@@ -257,8 +237,7 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
       } catch (e: any) {
         log(`Provider ${provider.name} returned invalid JSON: ${e.message}`, 'DEBUG', 'vision');
         recordProviderResult(provider.name, false, latency);
-        failedProviders.push(provider.name);
-        continue;
+        return null;
       }
 
       // Validate
@@ -268,30 +247,63 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
         catch (e: any) {
           log(`Provider ${provider.name} validation failed: ${e.message}`, 'DEBUG', 'vision');
           recordProviderResult(provider.name, false, latency);
-          failedProviders.push(provider.name);
-          continue;
+          return null;
         }
       }
 
       recordProviderResult(provider.name, true, latency);
-      if (failedProviders.length > 0) {
-        log(`Vision pipeline: ${failedProviders.length}/${orderedProviders.length} providers failed, using ${provider.name}`, 'INFO', 'vision');
-      }
-      const value = { result, provider: provider.name };
-      setCachedVisionResponse(prompt, base64Image, value);
-      return value;
+      return { result, provider: provider.name };
     } catch (err: any) {
       const latency = Date.now() - start;
+      // Only log at DEBUG - the safeCall already logged at WARN with structured details
       log(`Provider ${provider.name} vision failed: ${err.message || err}`, 'DEBUG', 'vision');
       recordProviderResult(provider.name, false, latency);
-      failedProviders.push(provider.name);
+      return null;
+    }
+  });
+
+  const results = await Promise.allSettled(promises);
+
+  // Return first successful result (providers are ordered by health + Groq priority)
+  const failedCount = results.filter(r => r.status === 'rejected' || r.value === null).length;
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value !== null) {
+      if (failedCount > 0) {
+        log(`Vision pipeline: ${failedCount}/${results.length} providers failed, using ${r.value.provider}`, 'INFO', 'vision');
+      }
+      setCachedVisionResponse(prompt, base64Image, r.value);
+      return r.value;
     }
   }
 
   // ─── All cloud providers failed → local VLM fallback ───
-  log(`All ${orderedProviders.length} cloud vision providers failed (${failedProviders.join(', ')}), attempting local VLM fallback`, 'WARN', 'vision');
+  log(`All ${results.length} cloud vision providers failed, attempting fallback chain`, 'WARN', 'vision');
+
+  // Fallback 1: Pix2Tex OCR (free, local math OCR via Python)
+  try {
+    log('Trying Pix2Tex OCR fallback for vision...', 'INFO', 'vision');
+    const pix2texService = require('./services-pix2tex');
+    if (pix2texService?.ocrMath) {
+      const ocrResult = await pix2texService.ocrMath(compressedBase64);
+      if (ocrResult && ocrResult.text && ocrResult.text.length > 5) {
+        log('Pix2Tex OCR fallback succeeded', 'INFO', 'vision');
+        const result = { result: { text: ocrResult.text, source: 'pix2tex-ocr-fallback' }, provider: 'pix2tex-ocr' };
+        setCachedVisionResponse(prompt, base64Image, result);
+        return result;
+      }
+    }
+  } catch (e: any) {
+    log(`Pix2Tex OCR fallback failed: ${e.message || e}`, 'DEBUG', 'vision');
+  }
+
+  // Fallback 2: Local VLM (disabled on Render free plan)
   log(`Local VLM is ${getCONFIG().ENABLE_LOCAL_VLM ? 'enabled' : 'DISABLED (Render free plan limitation)'}`, 'INFO', 'vision');
-  return await tryLocalVLM(compressedBase64, prompt, validator, setCachedVisionResponse, base64Image);
+  const localResult = await tryLocalVLM(compressedBase64, prompt, validator, setCachedVisionResponse, base64Image);
+  if (localResult) return localResult;
+
+  // Fallback 3: Return structured error action instead of null
+  log('All vision fallbacks exhausted — returning error-wait action', 'ERROR', 'vision');
+  return { result: { actionType: 'wait', currentState: 'error', reasoning: 'All vision providers and fallbacks failed', targetX: 0, targetY: 0 }, provider: 'fallback-error' };
 }
 
 module.exports = { runVisionPipeline, _injectDependencies };
