@@ -22,6 +22,11 @@
 
 const persistConfig = require('./persistent-config');
 
+// Calibration keys for DB-backed persistence (survives /tmp wipes via Turso)
+const CALIBRATION_KEY_MODE = 'memory_mode_current';
+const CALIBRATION_KEY_OOM_EXIT = 'oom_last_exit_ts';
+const OOM_RECOVERY_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+
 // ── Mode thresholds ──
 const MODE_THRESHOLDS = {
   full_power: {
@@ -107,8 +112,17 @@ function _applyMode(mode: 'full_power' | 'memory_protection', reason: string): v
     _log(`FULL POWER mode activated: ${reason}. Heavy modules will re-enable on restart. Thresholds: warn=${thresholds.warnHeapMB}MB restart=${thresholds.restartHeapMB}MB GC=${thresholds.gcIntervalMs / 1000}s`, 'INFO');
   }
 
-  // Persist mode
+  // Persist mode to /tmp (fast, same-instance)
   persistConfig.setMode(mode, reason, prev !== mode);
+
+  // Persist mode to calibration table (local SQLite — sync write).
+  // Periodic Turso sync will push this to cloud, surviving /tmp wipes on restart.
+  try {
+    const dbMod = require('./database');
+    if (dbMod?.db && dbMod.upsertCalibration) {
+      dbMod.upsertCalibration.run(CALIBRATION_KEY_MODE, JSON.stringify({ mode, reason, ts: Date.now() }), Date.now());
+    }
+  } catch { /* DB not ready yet — non-critical */ }
 
   // Notify callbacks
   if (prev !== mode) {
@@ -175,6 +189,75 @@ function _restartTimers(): void {
   // so it can pick it up.
 }
 
+/**
+ * Post-Turso-sync OOM check. Called after Turso pulls calibration data.
+ * On Render free plan, /tmp is wiped on restart so persistent-config is empty.
+ * But Turso restores calibration entries including OOM markers and mode state.
+ */
+function checkAfterTursoSync(selectCalibration: any, upsertCalibration: any): void {
+  if (!selectCalibration || !upsertCalibration) return;
+
+  try {
+    // Check 1: Was the mode persisted as memory_protection in the DB (via Turso)?
+    const modeRow = selectCalibration.get(CALIBRATION_KEY_MODE);
+    if (modeRow) {
+      try {
+        const parsed = JSON.parse(modeRow.value);
+        if (parsed.mode === 'memory_protection' && _currentMode !== 'memory_protection') {
+          _applyMode('memory_protection', `db_restored:${parsed.reason || 'unknown'}`);
+          _restartTimers();
+          _log('Restored MEMORY PROTECTION mode from database (Turso recovery)', 'WARN');
+          return;
+        }
+      } catch { /* parse error */ }
+    }
+
+    // Check 2: Was there a recent OOM exit recorded in the DB (via Turso)?
+    const oomRow = selectCalibration.get(CALIBRATION_KEY_OOM_EXIT);
+    if (oomRow) {
+      const oomTs = parseInt(oomRow.value, 10);
+      if (!isNaN(oomTs) && Date.now() - oomTs < OOM_RECOVERY_WINDOW_MS) {
+        if (_currentMode !== 'memory_protection') {
+          _applyMode('memory_protection', `db_oom_recovery:exit_${Math.round((Date.now() - oomTs) / 1000)}s_ago`);
+          _restartTimers();
+          _log(`Detected OOM exit ${Math.round((Date.now() - oomTs) / 1000)}s ago in database — switching to MEMORY PROTECTION`, 'WARN');
+        }
+        return;
+      }
+    }
+  } catch (e: any) {
+    _log(`Post-Turso OOM check failed: ${e.message}`, 'WARN');
+  }
+}
+
+/**
+ * Record an OOM exit event to the calibration table (called by heap guardian).
+ * Writes to local SQLite (sync). Also attempts direct Turso write.
+ */
+function recordOOMExit(heapMB: number, rssMB: number): void {
+  const now = Date.now();
+  const value = String(now);
+
+  // Write to local SQLite (sync — guaranteed before exit)
+  try {
+    const dbMod = require('./database');
+    if (dbMod?.db && dbMod.upsertCalibration) {
+      dbMod.upsertCalibration.run(CALIBRATION_KEY_OOM_EXIT, value, now);
+    }
+  } catch { /* DB not available */ }
+
+  // Fire-and-forget direct Turso write (survives even if periodic sync hasn't run)
+  try {
+    const turso = require('./database-turso');
+    if (turso?.tursoUpsertCalibration) {
+      turso.tursoUpsertCalibration(CALIBRATION_KEY_OOM_EXIT, value, now)
+        .catch(() => { /* best-effort */ });
+    }
+  } catch { /* turso module not available */ }
+
+  _log(`OOM exit recorded: heap=${heapMB.toFixed(0)}MB rss=${rssMB.toFixed(0)}MB`, 'WARN');
+}
+
 // ── Initialize: restore persisted mode + check for OOM history ──
 function init(): void {
   try {
@@ -212,6 +295,8 @@ module.exports = {
   isMemoryProtection,
   switchMode,
   checkAutoDowngrade,
+  checkAfterTursoSync,
+  recordOOMExit,
   onModeChange,
   HEAVY_SELF_HEAL_KEYS,
   HEAVY_RESILIENCE_KEYS,
