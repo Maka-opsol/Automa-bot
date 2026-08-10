@@ -87,6 +87,14 @@ let _stats = {
   totalFilesDeleted: 0,
 };
 
+// FIX: Stuck detection — prevents futile cleanup loops.
+// On Render, statfs may report high usage from read-only base files.
+// If we prune 3 times in a row and free 0 bytes each time, the usage
+// is from non-cleanable files. We stop retrying and log once.
+let _consecutiveZeroFreed = 0;
+const MAX_CONSECUTIVE_ZERO_FREED = 3;
+let _stuckWarningLogged = false;
+
 function getStats() {
   return {
     ..._stats,
@@ -108,39 +116,42 @@ function getStats() {
  * Get disk usage for /tmp using statfs (Node.js >= 18.15)
  * or df command as fallback.
  */
+/**
+ * Get disk usage for /tmp.
+ *
+ * FIX: Previously used fs.statfs('/tmp') which reports the ENTIRE mount point
+ * (root filesystem on Render). On Render free tier, the base app + node_modules
+ * consume ~83% of the disk and are read-only — no amount of /tmp cleanup can
+ * reduce the statfs usage. The guardian would see 83.7% and aggressively prune
+ * /tmp, freeing 0 bytes every cycle (futile loop).
+ *
+ * Now: measures ACTUAL /tmp content by walking the directory tree.
+ * statfs is kept only for freeBytes (to detect when the overall disk is truly
+ * full, which would make /tmp writes fail even if /tmp itself is small).
+ */
 function getDiskUsage(): DiskUsage {
+  // Measure actual /tmp usage by walking the directory
+  const tmpUsage = _estimateDiskUsage();
+
+  // Also get mount-level freeBytes from statfs (to detect overall disk pressure)
+  let mountFreeBytes = tmpUsage.freeBytes; // fallback to estimate
   try {
-    // Node.js 18.15+ has fs.statfs
     if (typeof fs.statfs === 'function') {
       const stats = fs.statfs(TMP_DIR);
-      const totalBytes = stats.bavail * stats.bsize;
-      const freeBytes = stats.bfree * stats.bsize;
-      const usedBytes = (stats.blocks - stats.bfree) * stats.bsize;
-      const usagePct = stats.blocks > 0 ? (stats.blocks - stats.bfree) / stats.blocks : 0;
-      return { totalBytes, usedBytes, freeBytes, usagePct };
+      mountFreeBytes = stats.bavail * stats.bsize;
     }
-  } catch { /* statfs not available, try fallback */ }
+  } catch { /* statfs not available */ }
 
-  // Fallback: try to read from /proc or use directory listing heuristic
-  try {
-    // On Linux, we can parse /proc/mounts or check df
-    const { execSync } = require('child_process');
-    const output = execSync(`df -B1 ${TMP_DIR} 2>/dev/null | tail -1`, {
-      encoding: 'utf8',
-      timeout: 5000,
-    });
-    const parts = output.trim().split(/\s+/);
-    if (parts.length >= 6) {
-      const totalBytes = parseInt(parts[1], 10);
-      const usedBytes = parseInt(parts[2], 10);
-      const freeBytes = parseInt(parts[3], 10);
-      const usagePct = totalBytes > 0 ? usedBytes / totalBytes : 0;
-      return { totalBytes, usedBytes, freeBytes, usagePct };
-    }
-  } catch { /* df not available */ }
+  // Use /tmp-only usagePct for pruning decisions, but cap freeBytes
+  // at the mount-level free (if mount is fuller than /tmp estimate)
+  const effectiveFreeBytes = Math.min(tmpUsage.freeBytes, mountFreeBytes);
 
-  // Last resort: estimate from directory listing
-  return _estimateDiskUsage();
+  return {
+    totalBytes: tmpUsage.totalBytes,
+    usedBytes: tmpUsage.usedBytes,
+    freeBytes: effectiveFreeBytes,
+    usagePct: tmpUsage.usagePct, // /tmp-only percentage (not whole disk)
+  };
 }
 
 /**
@@ -352,6 +363,33 @@ function prune(): PruneResult {
     _stats.totalFreedBytes += freedBytes;
     _stats.totalFilesDeleted += filesDeleted;
 
+    // FIX: Stuck detection — stop futile cleanup loops
+    if (freedBytes === 0 && level !== 'none') {
+      _consecutiveZeroFreed++;
+      if (_consecutiveZeroFreed >= MAX_CONSECUTIVE_ZERO_FREED && !_stuckWarningLogged) {
+        _stuckWarningLogged = true;
+        log(`/tmp guardian STUCK: ${_consecutiveZeroFreed} consecutive prunes freed 0 bytes. ` +
+          `Usage ${(before.usagePct * 100).toFixed(1)}% is from non-cleanable files ` +
+          `(likely read-only base app + node_modules on shared mount). ` +
+          `Suspending further prune attempts until usage changes.`, 'WARN', 'tmp-guardian');
+        // Log mount-level context for debugging
+        try {
+          if (typeof fs.statfs === 'function') {
+            const mountStats = fs.statfs(TMP_DIR);
+            const mountTotal = mountStats.blocks * mountStats.bsize;
+            const mountUsed = (mountStats.blocks - mountStats.bfree) * mountStats.bsize;
+            log(`/tmp guardian mount context: total=${(mountTotal / 1024 / 1024).toFixed(0)}MB ` +
+              `used=${(mountUsed / 1024 / 1024).toFixed(0)}MB ` +
+              `(${(mountUsed / mountTotal * 100).toFixed(1)}% of mount)`, 'WARN', 'tmp-guardian');
+          }
+        } catch { /* non-critical */ }
+      }
+    } else if (freedBytes > 0) {
+      // Reset stuck counter when we actually free something
+      _consecutiveZeroFreed = 0;
+      _stuckWarningLogged = false;
+    }
+
     _running = false;
     return result;
   } catch (e: any) {
@@ -440,6 +478,18 @@ function check() {
       log(`/tmp guardian: usage ${(usage.usagePct * 100).toFixed(1)}% (${_formatBytes(usage.usedBytes)} / ${_formatBytes(usage.totalBytes)})`, 'DEBUG', 'tmp-guardian');
     }
     return;
+  }
+
+  // FIX: Skip prune if stuck (non-cleanable files causing high usage)
+  if (_stuckWarningLogged) {
+    // Only re-check if usage changed significantly (±5%)
+    if (_lastPrune && Math.abs(usage.usagePct - _lastPrune.before.usagePct) < 0.05) {
+      return; // still stuck, skip
+    }
+    // Usage changed — reset stuck state and retry
+    _stuckWarningLogged = false;
+    _consecutiveZeroFreed = 0;
+    log(`/tmp guardian: usage changed to ${(usage.usagePct * 100).toFixed(1)}% — resuming pruning`, 'INFO', 'tmp-guardian');
   }
 
   // Prune
