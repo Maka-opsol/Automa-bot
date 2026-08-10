@@ -1,5 +1,6 @@
 'use strict';
 // Last modified: 2026-08-11 — Runtime /tmp overlay for self-heal on read-only filesystems
+// Last modified: 2026-08-11 — Added patch pruning (stale detection, cap, DB collapse)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Self-Heal /tmp Overlay
@@ -16,6 +17,13 @@
 //
 // Persistence: Patched file contents are stored in the patch_history DB table
 // (already exists). On boot, restoreOverlay() re-applies them from DB to /tmp.
+//
+// Pruning: Without pruning the bot would eventually die from fixing itself.
+//   - Stale detection: if the base file (git-deployed) now matches the overlay,
+//     the patch is redundant and gets removed.
+//   - Active cap: max MAX_ACTIVE_PATCHES overlay files; oldest evicted first.
+//   - DB collapse: only the latest 'applied' patch per file is kept; older
+//     attempts for the same file are marked 'superseded' and deleted sooner.
 //
 // Security: Only files matching ALLOWED_PREFIXES can be overlaid. The
 // interceptor validates paths stay within the overlay directory.
@@ -37,6 +45,12 @@ function getCONFIG(): Record<string, any> { return _deps.config || (() => { try 
 
 const OVERLAY_DIR = process.env.SELF_HEAL_OVERLAY_DIR || '/tmp/self-heal-overlay';
 
+// Pruning configuration
+const MAX_ACTIVE_PATCHES = 20;           // Max overlay files before eviction kicks in
+const STALE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // Check for stale patches every 6h
+const DB_APPLIED_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;  // 30 days for applied (base file likely redeployed by then)
+const DB_NON_APPLIED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days for rejected/rolled_back/superseded
+
 // Only these file prefixes can be healed (same as self-deploy's ALLOWED_PREFIXES)
 const ALLOWED_PREFIXES = [
   'selectors-', 'providers-detection-', 'providers-detection-',
@@ -53,6 +67,7 @@ const ALLOWED_PREFIXES = [
 
 let _interceptorInstalled = false;
 let _overlayFileCount = 0;
+let _pruneInterval: any = null;
 
 // ─── Core: Write a patched file to the overlay ────────────────────────────
 
@@ -455,16 +470,346 @@ function init(): void {
   if (installed) {
     // Restore previous patches from DB
     const { restored, skipped } = restoreOverlay();
+
+    // Prune stale/redundant patches immediately after restore
+    let pruneResult: any = null;
+    try {
+      pruneResult = pruneOverlayPatches();
+    } catch (err: any) {
+      logError('Post-restore pruning failed (non-fatal)', err);
+    }
+
     if (restored > 0) {
-      log(`Self-heal overlay initialized: ${restored} patches restored, interceptor active`, 'INFO', 'self-heal-overlay');
+      const pruneInfo = pruneResult
+        ? ` (${pruneResult.supersededByBase} superseded, ${pruneResult.evictedByCap} evicted by cap)`
+        : '';
+      log(`Self-heal overlay initialized: ${restored} patches restored${pruneInfo}, interceptor active`, 'INFO', 'self-heal-overlay');
     } else {
       log('Self-heal overlay initialized: interceptor active, no previous patches', 'INFO', 'self-heal-overlay');
     }
+
+    // Start periodic pruning
+    startPeriodicPruning();
   }
 }
 
 // Auto-init on first require (after DI injection at container startup)
 init();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Patch Pruning — prevents ironic death by accumulated Band-Aids
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Walk the overlay directory and return relative paths of all .ts/.js files.
+ */
+function listOverlayFiles(): string[] {
+  const results: string[] = [];
+  try {
+    if (!fs.existsSync(OVERLAY_DIR)) return results;
+    const walk = (dir: string): string[] => {
+      let files: string[] = [];
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          files = files.concat(walk(fullPath));
+        } else if (entry.name.endsWith('.ts') || entry.name.endsWith('.js')) {
+          files.push(path.relative(OVERLAY_DIR, fullPath));
+        }
+      }
+      return files;
+    };
+    return walk(OVERLAY_DIR);
+  } catch {
+    return results;
+  }
+}
+
+/**
+ * 1) Stale detection: Compare each overlay file against its read-only base.
+ *    If the base file now contains the same content (git deploy fixed it
+//    natively), the overlay patch is redundant and should be removed.
+//
+ *    Also checks a weaker condition: if the base file is NEWER than the
+ *    overlay's DB timestamp (meaning a fresh deploy happened), and the
+ *    base file is structurally valid, mark the patch for review.
+ */
+function reconcileOverlayWithBase(): { superseded: number; kept: number } {
+  let superseded = 0;
+  let kept = 0;
+  const db = getDb();
+  const overlayFiles = listOverlayFiles();
+
+  for (const file of overlayFiles) {
+    const overlayPath = path.resolve(OVERLAY_DIR, file);
+    const basePath = path.resolve(PROJECT_ROOT, file);
+
+    // If the base file doesn't exist at all, keep the overlay (it's still needed)
+    if (!fs.existsSync(basePath)) {
+      kept++;
+      continue;
+    }
+
+    try {
+      const overlayContent = fs.readFileSync(overlayPath, 'utf8');
+      const baseContent = fs.readFileSync(basePath, 'utf8');
+
+      // EXACT MATCH: base file now has the patch natively — superseded
+      if (overlayContent === baseContent) {
+        log(`Prune: ${file} is identical to base — superseded (git deploy fixed it)`, 'INFO', 'self-heal-overlay');
+        removeFromOverlay(file);
+        evictModule(file);
+
+        // Mark all applied patches for this file as 'superseded' in DB
+        if (db) {
+          try {
+            db.prepare(
+              "UPDATE patch_history SET status = 'superseded' WHERE file = ? AND status = 'applied'"
+            ).run(file);
+          } catch { /* non-critical */ }
+        }
+        superseded++;
+        continue;
+      }
+
+      // DIFF MATCH: check if the overlay is just the base + our recorded patch applied.
+      // If the base was updated and now already contains the key changes, the patch
+      // may be partially or fully redundant. For safety, we check a weaker signal:
+      // the base file's mtime (deploy time) vs. when we applied the patch.
+      if (db) {
+        try {
+          const latestPatch = db.prepare(
+            "SELECT id, timestamp FROM patch_history WHERE file = ? AND status = 'applied' ORDER BY timestamp DESC LIMIT 1"
+          ).get(file);
+
+          if (latestPatch) {
+            const baseStat = fs.statSync(basePath);
+            // If base file was modified AFTER our patch was applied (i.e., a new deploy),
+            // check if the key fixes from the overlay are present in the new base.
+            // We use a simple heuristic: if >80% of non-whitespace, non-comment lines
+            // from the overlay exist in the base, consider it superseded.
+            if (baseStat.mtimeMs > latestPatch.timestamp) {
+              const overlayLines = new Set(
+                overlayContent.split('\n')
+                  .map(l => l.trim())
+                  .filter(l => l.length > 10 && !l.startsWith('//') && !l.startsWith('/*') && !l.startsWith('*'))
+              );
+              const baseLines = new Set(
+                baseContent.split('\n')
+                  .map(l => l.trim())
+                  .filter(l => l.length > 10 && !l.startsWith('//') && !l.startsWith('/*') && !l.startsWith('*'))
+              );
+
+              if (overlayLines.size > 0) {
+                let matchCount = 0;
+                for (const line of overlayLines) {
+                  if (baseLines.has(line)) matchCount++;
+                }
+                const similarity = matchCount / overlayLines.size;
+
+                if (similarity >= 0.95) {
+                  log(`Prune: ${file} is ${Math.round(similarity * 100)}% similar to updated base — superseded`, 'INFO', 'self-heal-overlay');
+                  removeFromOverlay(file);
+                  evictModule(file);
+                  db.prepare(
+                    "UPDATE patch_history SET status = 'superseded' WHERE file = ? AND status = 'applied'"
+                  ).run(file);
+                  superseded++;
+                  continue;
+                } else if (similarity >= 0.80) {
+                  log(`Prune: ${file} is ${Math.round(similarity * 100)}% similar to updated base — keeping but flagging`, 'WARN', 'self-heal-overlay');
+                }
+              }
+            }
+          }
+        } catch { /* non-critical: stale check is best-effort */ }
+      }
+
+      kept++;
+    } catch {
+      kept++; // If we can't read/compare, keep the overlay
+    }
+  }
+
+  return { superseded, kept };
+}
+
+/**
+ * 2) Active patch cap: if more than MAX_ACTIVE_PATCHES files are in the
+ *    overlay, evict the oldest ones first (by DB timestamp).
+ */
+function enforceOverlayCap(): { evicted: number; remaining: number } {
+  const db = getDb();
+  const overlayFiles = listOverlayFiles();
+
+  if (overlayFiles.length <= MAX_ACTIVE_PATCHES) {
+    return { evicted: 0, remaining: overlayFiles.length };
+  }
+
+  const toEvict = overlayFiles.length - MAX_ACTIVE_PATCHES;
+  let evicted = 0;
+
+  // Sort by patch timestamp (oldest first) — need DB for this
+  if (db) {
+    try {
+      const fileTimestamps: Map<string, number> = new Map();
+      for (const file of overlayFiles) {
+        const row = db.prepare(
+          "SELECT MAX(timestamp) as latest_ts FROM patch_history WHERE file = ? AND status = 'applied'"
+        ).get(file);
+        fileTimestamps.set(file, row?.latest_ts || 0);
+      }
+
+      // Sort oldest first
+      const sorted = overlayFiles.sort((a, b) =>
+        (fileTimestamps.get(a) || 0) - (fileTimestamps.get(b) || 0)
+      );
+
+      // Evict the oldest `toEvict` files
+      for (let i = 0; i < toEvict && i < sorted.length; i++) {
+        const file = sorted[i];
+        log(`Prune: evicting ${file} from overlay (cap: ${MAX_ACTIVE_PATCHES}, oldest patch)`, 'WARN', 'self-heal-overlay');
+        removeFromOverlay(file);
+        evictModule(file);
+
+        // Mark as 'superseded' rather than delete — preserves history but
+        // prevents re-restoring on next boot
+        db.prepare(
+          "UPDATE patch_history SET status = 'superseded' WHERE file = ? AND status = 'applied'"
+        ).run(file);
+        evicted++;
+      }
+    } catch (err: any) {
+      logError('Prune: overlay cap enforcement failed', err);
+    }
+  }
+
+  return { evicted, remaining: listOverlayFiles().length };
+}
+
+/**
+ * 3) DB collapse: for each file that has multiple 'applied' patches in
+ *    patch_history, keep only the latest one and mark all older ones as
+ *    'superseded'. Also clean up non-applied patches by shorter retention.
+ *    This prevents the DB from bloating with redundant full-text patch copies.
+ */
+function collapseRedundantPatchHistory(): { superseded: number; deleted: number } {
+  let superseded = 0;
+  let deleted = 0;
+  const db = getDb();
+  if (!db) return { superseded: 0, deleted: 0 };
+
+  try {
+    // Step 1: For each file, find all 'applied' patches and keep only the latest
+    const appliedPerFile = db.prepare(
+      "SELECT file, COUNT(*) as cnt, MAX(timestamp) as latest_ts FROM patch_history WHERE status = 'applied' GROUP BY file HAVING cnt > 1"
+    ).all();
+
+    for (const row of appliedPerFile) {
+      // Mark all but the latest as 'superseded'
+      const result = db.prepare(
+        "UPDATE patch_history SET status = 'superseded' WHERE file = ? AND status = 'applied' AND timestamp < ?"
+      ).run(row.file, row.latest_ts);
+      superseded += result.changes;
+    }
+
+    // Step 2: Delete old non-applied patches (rejected, rolled_back, superseded)
+    // using shorter retention than the janitor's blanket 365-day policy
+    const nonAppliedCutoff = Date.now() - DB_NON_APPLIED_RETENTION_MS;
+    const delResult = db.prepare(
+      "DELETE FROM patch_history WHERE status IN ('rejected', 'rolled_back', 'superseded') AND timestamp < ?"
+    ).run(nonAppliedCutoff);
+    deleted += delResult.changes;
+
+    // Step 3: Also clean up orphaned patch_embeddings that reference
+    // deleted patch_history rows or non-applied statuses
+    try {
+      db.prepare(
+        `DELETE FROM patch_embeddings WHERE status IN ('rejected', 'rolled_back', 'superseded') AND timestamp < ?`
+      ).run(nonAppliedCutoff);
+    } catch { /* patch_embeddings may not exist yet */ }
+
+    // Step 4: Cap total applied patches — if somehow we still have too many
+    // unique-file applied patches beyond a hard limit, age out the oldest
+    const appliedCutoff = Date.now() - DB_APPLIED_RETENTION_MS;
+    const oldApplied = db.prepare(
+      "DELETE FROM patch_history WHERE status = 'applied' AND timestamp < ?"
+    ).run(appliedCutoff);
+    deleted += oldApplied.changes;
+
+    if (superseded > 0 || deleted > 0) {
+      log(`Prune: DB collapse — ${superseded} superseded, ${deleted} deleted`, 'INFO', 'self-heal-overlay');
+    }
+  } catch (err: any) {
+    logError('Prune: DB collapse failed', err);
+  }
+
+  return { superseded, deleted };
+}
+
+/**
+ * Master pruning function. Runs all three pruning strategies in sequence.
+ * Called on boot after restoreOverlay() and periodically.
+ *
+ * Returns a summary of all pruning actions.
+ */
+function pruneOverlayPatches(): {
+  supersededByBase: number;
+  keptByBase: number;
+  evictedByCap: number;
+  remainingOverlay: number;
+  dbSuperseded: number;
+  dbDeleted: number;
+} {
+  const reconcileResult = reconcileOverlayWithBase();
+  const capResult = enforceOverlayCap();
+  const dbResult = collapseRedundantPatchHistory();
+
+  // Update overlay file count after all pruning
+  _overlayFileCount = listOverlayFiles().length;
+
+  return {
+    supersededByBase: reconcileResult.superseded,
+    keptByBase: reconcileResult.kept,
+    evictedByCap: capResult.evicted,
+    remainingOverlay: capResult.remaining,
+    dbSuperseded: dbResult.superseded,
+    dbDeleted: dbResult.deleted,
+  };
+}
+
+/**
+ * Start periodic pruning alongside the DB janitor.
+ */
+function startPeriodicPruning(): void {
+  if (_pruneInterval) return;
+
+  _pruneInterval = setInterval(() => {
+    try {
+      const result = pruneOverlayPatches();
+      const totalAction = result.supersededByBase + result.evictedByCap + result.dbDeleted;
+      if (totalAction > 0) {
+        log(`Periodic prune: ${result.supersededByBase} superseded, ${result.evictedByCap} evicted, ${result.dbDeleted} DB-deleted (${result.remainingOverlay} overlay files remain)`, 'INFO', 'self-heal-overlay');
+      }
+    } catch (err: any) {
+      logError('Periodic pruning failed', err);
+    }
+  }, STALE_CHECK_INTERVAL_MS);
+
+  if (_pruneInterval.unref) _pruneInterval.unref();
+  log(`Periodic overlay pruning started (interval: ${STALE_CHECK_INTERVAL_MS / 3600000}h)`, 'INFO', 'self-heal-overlay');
+}
+
+/**
+ * Stop periodic pruning.
+ */
+function stopPeriodicPruning(): void {
+  if (_pruneInterval) {
+    clearInterval(_pruneInterval);
+    _pruneInterval = null;
+  }
+}
 
 module.exports = {
   // Core API
@@ -482,6 +827,14 @@ module.exports = {
   // Persistence
   restoreOverlay,
 
+  // Pruning
+  pruneOverlayPatches,
+  reconcileOverlayWithBase,
+  enforceOverlayCap,
+  collapseRedundantPatchHistory,
+  startPeriodicPruning,
+  stopPeriodicPruning,
+
   // Status
   getStatus,
   isFileAllowed,
@@ -495,4 +848,5 @@ module.exports = {
   // Constants
   OVERLAY_DIR,
   ALLOWED_PREFIXES,
+  MAX_ACTIVE_PATCHES,
 };
