@@ -1175,6 +1175,10 @@ function createContainer(): DIContainerType {
     ['pixel-calibration', 'pixelCalibration', ['config', 'logger', 'database']],
     // R4c: Blind pixel exploration (discovers clickable regions in unknown UIs)
     ['pixel-explorer', 'pixelExplorer', ['config', 'logger', 'database']],
+    // R4d: Cloudinary screenshot storage (offloads screenshots to avoid OOM)
+    ['screenshot-storage', 'screenshotStorage', ['config', 'logger']],
+    // R4e: Pixel self-training (learns from successful AI actions)
+    ['pixel-training', 'pixelTraining', ['config', 'logger', 'database']],
     // R5: Disk wipe protection
     ['survival-ephemeral-shield', 'survivalEphemeralShield', ['config', 'logger', 'database'], ['statePersist']],
     // R6: External liveness beacon
