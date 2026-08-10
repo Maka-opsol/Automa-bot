@@ -1,4 +1,4 @@
-/ Resilience R6: External Liveness Beacon — mathu-bot-resilience-worklog.md
+// Resilience R6: External Liveness Beacon — mathu-bot-resilience-worklog.md
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════
