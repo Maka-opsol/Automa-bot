@@ -16,7 +16,7 @@ const { PROJECT_ROOT } = require('./project-root');
 const CONFIG = require('./get-config');
 
 const DOM_TRUNCATE_BYTES = 500 * 1024; // 500KB
-const TOMBSTONE_FILE = path.join(PROJECT_ROOT, '.tombstone.json');
+const TOMBSTONE_FILE = path.join(process.env.TMPDIR || '/tmp', 'mathu-data', '.tombstone.json');
 const DEFAULT_MAX_FULL_ENTRIES = CONFIG.BLACKBOX_FULL_MAX_ENTRIES || 20;
 
 class BlackboxReplay {
@@ -381,6 +381,11 @@ class BlackboxReplay {
         lastCheckpoint: crashInfo.lastCheckpoint || Date.now(),
       };
 
+      // Ensure directory exists (writable location on Render)
+      const dir = path.dirname(TOMBSTONE_FILE);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
       fs.writeFileSync(TOMBSTONE_FILE, JSON.stringify(tombstone, null, 2), 'utf8');
 // @ts-expect-error
       logAudit('tombstone_written', `error=${tombstone.error}, state=${tombstone.lastState}`);
