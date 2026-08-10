@@ -144,7 +144,17 @@ failsafeCoordinator.registerHealthCheck('database', async () => {
 
 failsafeCoordinator.registerHealthCheck('filesystem', async () => {
   const fs = require('fs');
-  fs.accessSync(CONFIG.LOG_DIR, fs.constants.W_OK);
+  // FIX: Ensure LOG_DIR exists before checking. On fresh starts the logger's
+  // _initLogStream() may not have run yet, so the directory won't exist.
+  // Previously this threw ENOENT and the health check reported critical.
+  const logDir = CONFIG.LOG_DIR;
+  if (logDir) {
+    try { fs.accessSync(logDir, fs.constants.W_OK); }
+    catch {
+      try { fs.mkdirSync(logDir, { recursive: true, mode: 0o750 }); }
+      catch { throw new Error(`LOG_DIR '${logDir}' does not exist and cannot be created`); }
+    }
+  }
   fs.accessSync(require('path').dirname(CONFIG.DB_PATH), fs.constants.W_OK);
   return { writable: true };
 }, 60000);
