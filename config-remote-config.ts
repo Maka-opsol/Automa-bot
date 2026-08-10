@@ -30,14 +30,18 @@ async function loadRemoteConfig() {
     }
   } catch {}
   try {
-    const config = await fetchJSON(REMOTE_CONFIG_URL, {}, 15000);
+    // Reduced from 15s to 5s — at startup, 15s blocks the entire boot sequence
+    // and triggers the config-reconciler's "Timed out waiting for remote config"
+    // message. If the remote config server can't respond in 5s, it won't in 15s either.
+    const config = await fetchJSON(REMOTE_CONFIG_URL, {}, 5000);
     if (!isValidRemoteConfig(config)) { log('Invalid remote config structure', 'WARN', 'remote-config'); return null; }
     fs.writeFileSync(REMOTE_CONFIG_CACHE, JSON.stringify(config, null, 2));
     remoteConfig = config;
-    log('✅ Loaded remote configuration', 'INFO', 'remote-config');
+    log('Loaded remote configuration', 'INFO', 'remote-config');
     return config;
   } catch (err: any) {
-    logError('Failed to load remote config', err);
+    // Tag with module name so it doesn't appear as unattributed output
+    logError('Failed to load remote config, using local/cached fallback', err, { module: 'remote-config' });
     try { if (fs.existsSync(REMOTE_CONFIG_CACHE)) { const cached = JSON.parse(fs.readFileSync(REMOTE_CONFIG_CACHE, 'utf8')); if (typeof isValidRemoteConfig === 'function' && !isValidRemoteConfig(cached)) { log('Stale remote config cache failed validation, discarding', 'WARN', 'remote-config'); return null; } return cached; } } catch {}
     return null;
   }
