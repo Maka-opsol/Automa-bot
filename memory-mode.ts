@@ -61,6 +61,13 @@ const MODE_THRESHOLDS = {
 const AUTO_DOWNGRADE_HEAP_MB = 320;
 const AUTO_DOWNGRADE_RSS_MB = 440;
 
+// FIX: Auto-promote back to full_power when memory is stable for 3 consecutive checks
+const AUTO_PROMOTE_STABLE_CHECKS = 3; // must be below threshold this many times
+const AUTO_PROMOTE_HEAP_MB = 250; // must be well below downgrade trigger
+const AUTO_PROMOTE_CHECK_INTERVAL_MS = 60 * 1000; // check every 60s
+let _promoteCheckCount = 0;
+let _promoteCheckTimer: ReturnType<typeof setInterval> | null = null;
+
 // Modules to disable in memory_protection mode
 const HEAVY_SELF_HEAL_KEYS = [
   'BLACKBOX_FULL_ENABLED', 'ENABLE_EXPLORATION_PASS', 'ENABLE_ADAPTIVE_PERFORMANCE',
@@ -304,6 +311,34 @@ function checkAutoDowngrade(heapMB: number, rssMB: number): boolean {
   return shouldDowngrade;
 }
 
+/**
+ * FIX: Check if memory is stable enough to auto-promote back to full_power.
+ * Requires heap < 250MB for 3 consecutive checks (60s apart = 3 minutes stable).
+ * This prevents permanent hobbling during unattended 90-day runs.
+ */
+function _checkAutoPromote(): void {
+  if (_currentMode !== 'memory_protection') return;
+
+  const heapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+
+  if (heapMB < AUTO_PROMOTE_HEAP_MB) {
+    _promoteCheckCount++;
+    if (_promoteCheckCount >= AUTO_PROMOTE_STABLE_CHECKS) {
+      _log(`Auto-promoting to FULL POWER: heap stable at ${heapMB.toFixed(0)}MB for ${AUTO_PROMOTE_STABLE_CHECKS} checks`);
+      _applyMode('full_power', `auto_promote:heap_stable_${heapMB.toFixed(0)}MB`);
+      _promoteCheckCount = 0;
+    } else {
+      _log(`Auto-promote check ${_promoteCheckCount}/${AUTO_PROMOTE_STABLE_CHECKS}: heap=${heapMB.toFixed(0)}MB`, 'DEBUG');
+    }
+  } else {
+    // Reset counter if memory spikes
+    if (_promoteCheckCount > 0) {
+      _log(`Auto-promote counter reset: heap spiked to ${heapMB.toFixed(0)}MB`, 'DEBUG');
+    }
+    _promoteCheckCount = 0;
+  }
+}
+
 // ── Register mode change callback ──
 function onModeChange(cb: (mode: string, reason: string) => void): void {
   _modeChangeCallbacks.push(cb);
@@ -313,6 +348,7 @@ function onModeChange(cb: (mode: string, reason: string) => void): void {
 function _restartTimers(): void {
   if (_gcTimer) { clearInterval(_gcTimer); _gcTimer = null; }
   if (_monitorTimer) { clearInterval(_monitorTimer); _monitorTimer = null; }
+  if (_promoteCheckTimer) { clearInterval(_promoteCheckTimer); _promoteCheckTimer = null; }
 
   const thresholds = MODE_THRESHOLDS[_currentMode];
 
@@ -323,6 +359,18 @@ function _restartTimers(): void {
     }
   }, thresholds.gcIntervalMs);
   if (_gcTimer && typeof (_gcTimer as any).unref === 'function') (_gcTimer as any).unref();
+
+  // FIX: Start auto-promote check timer when in memory_protection
+  if (_currentMode === 'memory_protection') {
+    _promoteCheckCount = 0;
+    _promoteCheckTimer = setInterval(() => {
+      if (_isShuttingDown) return;
+      _checkAutoPromote();
+    }, AUTO_PROMOTE_CHECK_INTERVAL_MS);
+    if (_promoteCheckTimer && typeof (_promoteCheckTimer as any).unref === 'function') {
+      (_promoteCheckTimer as any).unref();
+    }
+  }
 }
 
 /**
@@ -431,6 +479,7 @@ function shutdown(): void {
   _isShuttingDown = true;
   if (_gcTimer) { clearInterval(_gcTimer); _gcTimer = null; }
   if (_monitorTimer) { clearInterval(_monitorTimer); _monitorTimer = null; }
+  if (_promoteCheckTimer) { clearInterval(_promoteCheckTimer); _promoteCheckTimer = null; }
 }
 
 module.exports = {
