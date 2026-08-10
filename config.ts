@@ -578,6 +578,17 @@ const env = envalid.cleanEnv(process.env, {
   // Critical patch consensus safety timeouts
   CRITICAL_CONSENSUS_COOLING_OFF_MS: num({ default: 5 * 60 * 1000 }),
   CRITICAL_CONSENSUS_VERIFY_WINDOW_MS: num({ default: 10 * 60 * 1000 }),
+  // Cloudinary screenshot storage
+  CLOUDINARY_CLOUD_NAME: str({ default: 'xlhumi67' }),
+  CLOUDINARY_API_KEY: str({ default: '' }),
+  CLOUDINARY_API_SECRET: str({ default: '' }),
+  CLOUDINARY_FOLDER: str({ default: 'mathu-bot/screenshots' }),
+  SCREENSHOT_STORAGE_ENABLED: bool({ default: true }),
+  // Pixel self-training
+  PIXEL_TRAINING_ENABLED: bool({ default: true }),
+  PIXEL_TRAINING_MAX_CACHE: num({ default: 200 }),
+  PIXEL_TRAINING_SIMILARITY_THRESHOLD: num({ default: 0.3 }),
+  PIXEL_TRAINING_MAX_RESULTS: num({ default: 5 }),
 }, { strict: false, reporter: (errors: any) => { if (Object.keys(errors).length > 0) { console.warn('Environment validation warnings:', Object.values(errors as any)); } } });
 
 // ─── CONFIG object ───────────────────────────────────────────────────────────
@@ -822,6 +833,17 @@ const _configStore: Record<string, any> = {
   SELF_DEPLOY_ENABLED: env.SELF_DEPLOY_ENABLED,
   CRITICAL_CONSENSUS_COOLING_OFF_MS: env.CRITICAL_CONSENSUS_COOLING_OFF_MS,
   CRITICAL_CONSENSUS_VERIFY_WINDOW_MS: env.CRITICAL_CONSENSUS_VERIFY_WINDOW_MS,
+  // Cloudinary screenshot storage
+  CLOUDINARY_CLOUD_NAME: env.CLOUDINARY_CLOUD_NAME || 'xlhumi67',
+  CLOUDINARY_API_KEY: env.CLOUDINARY_API_KEY || '',
+  CLOUDINARY_API_SECRET: env.CLOUDINARY_API_SECRET || '',
+  CLOUDINARY_FOLDER: env.CLOUDINARY_FOLDER || 'mathu-bot/screenshots',
+  SCREENSHOT_STORAGE_ENABLED: env.SCREENSHOT_STORAGE_ENABLED,
+  // Pixel self-training
+  PIXEL_TRAINING_ENABLED: env.PIXEL_TRAINING_ENABLED,
+  PIXEL_TRAINING_MAX_CACHE: env.PIXEL_TRAINING_MAX_CACHE,
+  PIXEL_TRAINING_SIMILARITY_THRESHOLD: env.PIXEL_TRAINING_SIMILARITY_THRESHOLD,
+  PIXEL_TRAINING_MAX_RESULTS: env.PIXEL_TRAINING_MAX_RESULTS,
 };
 
 // ─── Config validation ──────────────────────────────────────────────────────
