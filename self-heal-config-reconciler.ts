@@ -1,11 +1,12 @@
 'use strict';
 // self-heal-config-reconciler.ts — Reconciles local config with remote overrides.
-// P15 fixes:
+// Fixes applied:
 //   1. reconcileAll() is now async — awaits remote config readiness before reconciling
 //   2. start() eliminated duplicate timer — subsystem-runner owns the scheduling
-//   3. DB inserts batched in a transaction (Render free plan I/O efficiency)
+//   3. DB inserts batched using db.transaction() (better-sqlite3 API, not raw SQL)
 //   4. _categorizeKey() tightened: MAX_ prefix only for known numeric patterns
 //   5. _getLocalConfigValues() uses config snapshot (avoids Proxy overhead)
+//   6. _waitForRemoteConfig() reduced from 10s to 5s poll timeout
 
 let _deps: Record<string, any> = {};
 
@@ -127,9 +128,8 @@ class ConfigReconciler {
 
   /**
    * Wait for remote config to be loaded before reconciling.
-   * P15 fix: Without this, reconcileAll() ran against an empty remote config
+   * Without this, reconcileAll() ran against an empty remote config
    * at startup, making the entire reconciler useless.
-   * On Render free plan, remote config fetch may take a few seconds.
    */
   async _waitForRemoteConfig(): Promise<void> {
     // CONFIG.waitForRemoteConfig() returns a Promise that resolves when
@@ -143,8 +143,9 @@ class ConfigReconciler {
       }
     }
     // Also give config-remote-config module a chance to populate
-    // (it may have been loaded but not yet awaited by the reconciler's caller)
-    const MAX_WAIT_MS = 10000;
+    // Reduced from 10s to 5s — the fetch itself is now 5s max, so
+    // waiting 10s on top is redundant.
+    const MAX_WAIT_MS = 5000;
     const POLL_INTERVAL = 500;
     const start = Date.now();
     while (Date.now() - start < MAX_WAIT_MS) {
@@ -167,17 +168,14 @@ class ConfigReconciler {
 
   /**
    * Detect drift between local config, env vars, and remote config.
-   * P15 fix: Now async — awaits remote config readiness.
    * @returns {Promise<object>} { contradictions: Array<{key, localValue, remoteValue, category}> }
    */
   async detectDrift(): Promise<{ contradictions: any[]; timestamp: number }> { 
     const contradictions = [];
 
     try {
-      // P15: Ensure remote config is loaded before detecting drift
       const localConfig = this._getLocalConfigValues();
 
-      // Load remote config overrides
       let remoteOverrides: Record<string, any> = {};
       try {
         const { getRemoteOverrides } = require('./config-remote-config');
@@ -186,13 +184,11 @@ class ConfigReconciler {
         log('Remote config not available for drift detection', 'DEBUG', 'config-reconciler');
       }
 
-      // Compare each remote override against local
       for (const [key, remoteValue] of Object.entries(remoteOverrides)) {
 // @ts-expect-error
         const localValue = localConfig[key];
-        if (localValue === undefined) continue; // Remote-only key, no conflict
+        if (localValue === undefined) continue;
 
-        // Normalize for comparison
         const normalizedLocal = this._normalizeValue(localValue);
         const normalizedRemote = this._normalizeValue(remoteValue);
 
@@ -222,14 +218,6 @@ class ConfigReconciler {
 
   /**
    * Reconcile a single key with proper precedence rules.
-   *
-   * Precedence:
-   * 1. Security-critical: never override from remote
-   * 2. Numeric max limits: pick the more conservative (lower)
-   * 3. Numeric min thresholds: pick the more conservative (higher)
-   * 4. Boolean feature flags: prefer local
-   * 5. Timing/delay: pick higher (more conservative/stable)
-   * 6. Default: prefer local
    */
   reconcileKey(key: string, localValue: any, remoteValue: any): { resolved: any; resolution: string; reason: string } { 
     const category = this._categorizeKey(key);
@@ -326,17 +314,11 @@ class ConfigReconciler {
   /**
    * Run full reconciliation: detect drift and reconcile all contradictions.
    * Applies resolved values to CONFIG in memory.
-   * Does NOT persist to env vars (that would be circular).
    *
-   * P15 fix: Now async — awaits remote config before reconciling.
-   * P15 fix: DB inserts batched in a transaction (Render free plan I/O).
-   *
-   * @returns {Promise<object>} { reconciliations: Array, appliedCount: number }
+   * FIX: Uses db.transaction() (better-sqlite3 API) instead of raw
+   * `db.exec('BEGIN TRANSACTION')` which fails with better-sqlite3.
    */
   async reconcileAll(): Promise<{ timestamp: number; reconciliations: any[]; appliedCount: number }> { 
-    // P15: Wait for remote config to be available before reconciling.
-    // Without this, the first reconcileAll() call at startup (from subsystem-runner
-    // with immediate: true) would always see empty remote overrides.
     await this._waitForRemoteConfig();
 
     const drift = await this.detectDrift();
@@ -349,24 +331,24 @@ class ConfigReconciler {
         try { db.exec(ENSURE_TABLE_SQL); } catch (e: any) { /* table may already exist */ }
       }
 
-      // P15: Batch DB inserts in a transaction (Render free plan — limited I/O)
-      let insertStmt: any = null;
-      let inTransaction = false;
-      if (db) {
-        try {
-          db.exec('BEGIN TRANSACTION');
-          inTransaction = true;
-          insertStmt = db.prepare(`
-            INSERT INTO config_reconciliation (reconciled_at, key, local_value, remote_value, resolved_value, resolution, reason)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
-          `);
-        } catch (e: any) {
-          // Transaction not supported — fall back to individual inserts
-          log('DB transaction not available, using individual inserts', 'DEBUG', 'config-reconciler');
-        }
-      }
+      // Use better-sqlite3's db.transaction() API instead of raw BEGIN/COMMIT.
+      // Raw `db.exec('BEGIN TRANSACTION')` fails in better-sqlite3 because it
+      // manages transactions internally via its C binding.
+      const insertReconciliation = db
+        ? db.transaction((recons: any[]) => {
+            const stmt = db.prepare(`
+              INSERT INTO config_reconciliation (reconciled_at, key, local_value, remote_value, resolved_value, resolution, reason)
+              VALUES(?, ?, ?, ?, ?, ?, ?)
+            `);
+            for (const r of recons) {
+              stmt.run(r.reconciled_at, r.key, r.local_value, r.remote_value, r.resolved_value, r.resolution, r.reason);
+            }
+          })
+        : null;
 
       try {
+        const dbEntries: any[] = [];
+
         for (const contradiction of drift.contradictions) {
           const result = this.reconcileKey(
             contradiction.key,
@@ -380,24 +362,18 @@ class ConfigReconciler {
             ...result,
           });
 
-          // Log to database (batched in transaction)
-          if (insertStmt) {
-            try {
-              insertStmt.run(
-                Date.now(),
-                contradiction.key,
-                JSON.stringify(contradiction.localValue),
-                JSON.stringify(contradiction.remoteValue),
-                JSON.stringify(result.resolved),
-                result.resolution,
-                result.reason
-              );
-            } catch (dbErr: any) {
-              logError('Failed to log config reconciliation entry', dbErr);
-            }
-          }
+          // Collect for DB insert
+          dbEntries.push({
+            reconciled_at: Date.now(),
+            key: contradiction.key,
+            local_value: JSON.stringify(contradiction.localValue),
+            remote_value: JSON.stringify(contradiction.remoteValue),
+            resolved_value: JSON.stringify(result.resolved),
+            resolution: result.resolution,
+            reason: result.reason,
+          });
 
-          // Apply resolved value to CONFIG in memory via updateConfig (validates + audits)
+          // Apply resolved value to CONFIG in memory via updateConfig
           if (result.resolution === 'conservative' || result.resolution === 'remote') {
             try {
               const parsed = this._parseToType(result.resolved, contradiction.localValue);
@@ -411,16 +387,17 @@ class ConfigReconciler {
             log(`Kept local value for ${contradiction.key}: ${result.reason}`, 'DEBUG', 'config-reconciler');
           }
         }
-      } finally {
-        // Commit or rollback the transaction
-        if (inTransaction && db) {
+
+        // Batch-insert all entries in a single transaction
+        if (insertReconciliation && dbEntries.length > 0) {
           try {
-            db.exec('COMMIT');
-          } catch (e: any) {
-            try { db.exec('ROLLBACK'); } catch (e2: any) { /* ignore */ }
-            logError('Failed to commit reconciliation transaction', e);
+            insertReconciliation(dbEntries);
+          } catch (dbErr: any) {
+            logError('Failed to log config reconciliation entries', dbErr);
           }
         }
+      } catch (err: any) {
+        logError('Config reconciliation iteration failed', err);
       }
 
       if (appliedCount > 0) {
@@ -442,36 +419,27 @@ class ConfigReconciler {
 
   /**
    * Categorize a config key for reconciliation rules.
-   * P15 fix: Tightened MAX_ prefix matching — now requires the key to be in
-   * MAX_LIMIT_KEYS set OR match _MAX_ pattern (not just any key starting with MAX_).
-   * This prevents mis-categorizing string keys like MAX_RETRY_MESSAGE.
    */
   _categorizeKey(key: string): string { 
     const upperKey = key.toUpperCase();
 
-    // Check security-critical (exact match or contains pattern)
     for (const secKey of SECURITY_CRITICAL_KEYS) {
       if (upperKey === secKey || upperKey.endsWith('_' + secKey) || upperKey.startsWith(secKey + '_')) {
         return 'security';
       }
     }
-    // Broader security check: key matches common secret patterns
     if (/^(.*_)?(API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)(_.*)?$/.test(upperKey)) {
       return 'security';
     }
 
-    // Check max limits — P15: require set membership OR _MAX_ infix (not just prefix)
-    // Old code: `upperKey.startsWith('MAX_')` matched ANY MAX_ key including string templates
     if (MAX_LIMIT_KEYS.has(upperKey) || /_MAX_/.test(upperKey)) {
       return 'max_limit';
     }
 
-    // Check min thresholds
     if (MIN_THRESHOLD_KEYS.has(upperKey) || (upperKey.includes('MIN_') && !upperKey.includes('MINUTE'))) {
       return 'min_threshold';
     }
 
-    // Check feature flags
     if (FEATURE_FLAG_KEYS.has(upperKey)) {
       return 'feature_flag';
     }
@@ -479,7 +447,6 @@ class ConfigReconciler {
       return 'feature_flag';
     }
 
-    // Check timing/delay
     if (TIMING_KEYS.has(upperKey)) {
       return 'timing';
     }
@@ -492,20 +459,16 @@ class ConfigReconciler {
 
   /**
    * Get the current local config values for comparison.
-   * P15: Uses CONFIG.getConfigSnapshot() when available (avoids Proxy iteration
-   * overhead on Render free plan). Falls back to Object.entries(CONFIG).
    */
   _getLocalConfigValues(): Record<string, any> { 
     const values: Record<string, any> = {};
     try {
-      // P15: Prefer snapshot — it's a plain object copy, no Proxy overhead
       const source: Record<string, any> = typeof CONFIG.getConfigSnapshot === 'function'
         ? CONFIG.getConfigSnapshot()
         : CONFIG;
 
       for (const [key, value] of Object.entries(source)) {
         if (typeof value === 'function') continue;
-        // Skip non-plain objects (Maps, Sets, etc.) — arrays are fine
         if (typeof value === 'object' && value !== null && !(value instanceof Array)) {
           if (value.constructor && value.constructor !== Object) continue;
         }
@@ -517,9 +480,6 @@ class ConfigReconciler {
     return values;
   }
 
-  /**
-   * Normalize a value for comparison (stringify).
-   */
   _normalizeValue(value: any): string { 
     if (value === null || value === undefined) return '';
     if (typeof value === 'boolean') return value ? 'true' : 'false';
@@ -528,9 +488,6 @@ class ConfigReconciler {
     return String(value).trim().toLowerCase();
   }
 
-  /**
-   * Parse a resolved value back to the type matching the reference.
-   */
   _parseToType(resolved: any, reference: any): any { 
     if (reference === undefined || reference === null) return resolved;
     if (typeof reference === 'number') return parseFloat(resolved);
@@ -541,27 +498,14 @@ class ConfigReconciler {
     return resolved;
   }
 
-  /**
-   * Get the last reconciliation result.
-   */
   getLastReconciliation(): any { 
     return this._lastReconciliation;
   }
 
   /**
    * Start periodic config reconciliation.
-   * P15 fix: Eliminated duplicate scheduling. The subsystem-runner already
-   * calls reconcileAll() immediately and manages its own interval via start().
-   * This method now ONLY sets up the periodic interval — no initial timer.
-   * The initial reconciliation is handled by the subsystem-runner's immediate: true flag.
-   *
-   * On Render free plan, we use a longer default interval (8 hours instead of 6)
-   * to reduce CPU/memory pressure from periodic reconciliation.
-   *
-   * @param {number} intervalMs - Check interval (default 8 hours on free plan)
    */
   start(intervalMs?: number): void { 
-    // P15: Detect Render free plan — use longer interval to conserve resources
     const isFreePlan = !process.env.RENDER_SERVICE_TYPE || process.env.RENDER_SERVICE_TYPE === 'free';
     const defaultInterval = isFreePlan ? 8 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000;
     const interval = intervalMs || defaultInterval;
@@ -574,23 +518,15 @@ class ConfigReconciler {
     this._started = true;
     log(`Config reconciler started (interval: ${Math.round(interval / 60000)}min, freePlan: ${isFreePlan})`, 'INFO', 'config-reconciler');
 
-    // P15: Removed the 2-minute initial timer — the subsystem-runner already calls
-    // reconcileAll() immediately with `immediate: true`. Having both caused
-    // double reconciliation and the timer was redundant.
-
     this._intervalId = setInterval(() => {
       this.reconcileAll().catch((err: any) => {
         logError('Periodic config reconciliation failed', err);
       });
     }, interval);
 
-    // Don't prevent process exit on Render free plan
     if (this._intervalId.unref) this._intervalId.unref();
   }
 
-  /**
-   * Stop the periodic scheduler.
-   */
   stop(): void { 
     if (this._intervalId) {
       clearInterval(this._intervalId);
