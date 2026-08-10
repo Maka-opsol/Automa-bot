@@ -53,105 +53,126 @@ const { PROJECT_ROOT } = require('./project-root');
     this.strategies.sort((a: any, b: any) => String(b.version).localeCompare(String(a.version)));
   }
 
-  async authenticate(page: any, credentials: any) { 
+  async authenticate(page: any, credentials: any) {
+    // ── Pre-strategy: detect and resolve CAPTCHA pages first ──
+    // When Microsoft shows a CAPTCHA challenge, the URL is still
+    // login.microsoftonline.com, so canHandle() matches, but the
+    // login form elements (email/password) are absent, causing all
+    // strategies to fail and throwing the dreaded:
+    //   "No authentication strategy could handle this page"
+    const CONFIG = getCONFIG();
+    const pageUrl = page.url?.() || '';
+    const isMicrosoftDomain = pageUrl.includes('login.microsoftonline.com') || pageUrl.includes('login.live.com');
+
+    if (isMicrosoftDomain) {
+      try {
+        const hasCaptcha = await this.detectCaptcha(page);
+        if (hasCaptcha) {
+          log('CAPTCHA detected before auth strategy loop — attempting to solve', 'WARN', 'auth');
+          const solved = await this.solveCaptcha(page);
+          if (solved) {
+            log('CAPTCHA solved — waiting for page transition then retrying strategies', 'INFO', 'auth');
+            const { sleep } = require('./utils-sleep');
+            await sleep(5000);
+            // After solving CAPTCHA, the page may have transitioned to the
+            // normal login form, so retry the strategy loop below.
+          } else {
+            log('CAPTCHA could not be solved — attempting strategies anyway', 'WARN', 'auth');
+          }
+        }
+      } catch (captchaErr: any) {
+        logError('Pre-strategy CAPTCHA detection failed', captchaErr as Error);
+      }
+    }
+
     for (const strategy of this.strategies) {
       try {
         if (await strategy.canHandle(page)) {
-          this.activeStrategy = strategy; // Track active strategy for fallback CAPTCHA selectors
+          this.activeStrategy = strategy;
           log(`Using auth strategy: ${strategy.id}`, 'INFO', 'auth');
-          return await strategy.authenticate(page, credentials);
+          const result = await strategy.authenticate(page, credentials);
+          // Post-auth CAPTCHA check: Microsoft sometimes shows CAPTCHA
+          // AFTER successful credential submission
+          if (result) {
+            try {
+              const postAuthCaptcha = await this.detectCaptcha(page);
+              if (postAuthCaptcha) {
+                log('Post-auth CAPTCHA detected — solving', 'WARN', 'auth');
+                const postSolved = await this.solveCaptcha(page);
+                if (postSolved) {
+                  const { sleep } = require('./utils-sleep');
+                  await sleep(3000);
+                }
+              }
+            } catch (postErr: any) {
+              logError('Post-auth CAPTCHA check failed', postErr as Error);
+            }
+          }
+          return result;
         }
-      } catch (err: any) { logError(`Strategy ${strategy.id} failed`, err as Error); continue; }
+      } catch (err: any) {
+        // If the strategy failed specifically because elements were not found,
+        // it might be a CAPTCHA page that detectCaptcha didn't catch.
+        // Try solving via screenshot-based detection.
+        const errMsg = err?.message || '';
+        if (errMsg.includes('not found') && isMicrosoftDomain) {
+          log(`Strategy ${strategy.id} failed with element-not-found on Microsoft domain — attempting screenshot-based CAPTCHA detection`, 'WARN', 'auth');
+          try {
+            const hasVisualCaptcha = await this._detectCaptchaViaScreenshot(page);
+            if (hasVisualCaptcha) {
+              const solved = await this.solveCaptcha(page);
+              if (solved) {
+                const { sleep } = require('./utils-sleep');
+                await sleep(5000);
+                // Retry the same strategy after CAPTCHA solve
+                try {
+                  return await strategy.authenticate(page, credentials);
+                } catch (retryErr: any) {
+                  logError(`Strategy ${strategy.id} also failed after CAPTCHA solve`, retryErr as Error);
+                }
+              }
+            }
+          } catch (visualErr: any) {
+            logError('Screenshot-based CAPTCHA detection failed', visualErr as Error);
+          }
+        }
+        logError(`Strategy ${strategy.id} failed`, err as Error);
+        continue;
+      }
     }
-
-    // FIX: No strategy matched — don't immediately throw. Instead, try to
-    // identify the page and take recovery actions. This handles:
-    //   - Microsoft showing an unexpected page (consent, account pick, conditional access)
-    //   - Being redirected to a CAPTCHA challenge page
-    //   - Being on a post-logout or error page
-    const recoveryResult = await this._attemptPageRecovery(page, credentials);
-    if (recoveryResult) return recoveryResult;
-
     throw new Error('No authentication strategy could handle this page');
   }
 
   /**
-   * FIX: Attempt to recover from unrecognized pages during auth.
-   * This is the key fix for "No authentication strategy could handle this page".
+   * Screenshot-based CAPTCHA detection fallback.
+   * Takes a screenshot and checks if it contains CAPTCHA-like elements
+   * using simple heuristics (image dimensions, presence of specific elements).
    */
-  async _attemptPageRecovery(page: any, credentials: any): Promise<boolean | null> {
-    const url = page.url();
-    log(`Auth recovery: attempting to handle unrecognized page: ${url}`, 'WARN', 'auth');
-
-    // 1. If we're on any Microsoft domain, try navigating directly to login
-    if (url.includes('microsoft.com') || url.includes('live.com') || url.includes('msftauth.net')) {
-      // Try clicking common Microsoft buttons that might be blocking us
-      const clickTargets = [
-        'button[type="submit"]',
-        'input[type="submit"]',
-        '#idSIButton9',     // Microsoft "Next" button
-        '#idBtn_Back',      // KMSI / back button
-        'button:has-text("Next")',
-        'button:has-text("Continue")',
-        'button:has-text("Yes")',
-        'button:has-text("Accept")',
-        'button:has-text("OK")',
-        'a:has-text("Continue")',
+  async _detectCaptchaViaScreenshot(page: any): Promise<boolean> {
+    try {
+      const content = await page.content();
+      // Check for common CAPTCHA indicators in page HTML
+      const captchaIndicators = [
+        'captcha', 'CAPTCHA', 'Captcha',
+        'hip_singlebluebutton',  // Microsoft CAPTCHA button ID
+        'hip_enfch',             // Microsoft CAPTCHA frame
+        'api.captcha.ms',        // Microsoft CAPTCHA API
+        'funcaptcha',            // FunCaptcha
+        'enforcement_captcha',   // Generic
       ];
-      for (const sel of clickTargets) {
-        try {
-          const el = await page.$(sel);
-          if (el) {
-            const isVisible = await el.isVisible().catch(() => false);
-            if (isVisible) {
-              log(`Auth recovery: clicking ${sel} on unrecognized Microsoft page`, 'INFO', 'auth');
-              await el.click();
-              await new Promise(r => setTimeout(r, 3000));
-              // Re-check if a strategy can now handle the page
-              for (const strategy of this.strategies) {
-                try {
-                  if (await strategy.canHandle(page)) {
-                    this.activeStrategy = strategy;
-                    log(`Auth recovery: strategy ${strategy.id} can handle page after click`, 'INFO', 'auth');
-                    return await strategy.authenticate(page, credentials);
-                  }
-                } catch {}
-              }
-            }
-          }
-        } catch {}
+      for (const indicator of captchaIndicators) {
+        if (content.includes(indicator)) return true;
       }
-
-      // 2. Check if we somehow ended up on MathU already (redirect happened)
-      if (url.includes('mathu.co.za') || url.includes('mathu')) {
-        log('Auth recovery: already on MathU domain, auth may have succeeded', 'INFO', 'auth');
-        return true;
+      // Check for iframe-based CAPTCHAs
+      const frames = page.frames?.() || [];
+      for (const frame of frames) {
+        const frameUrl = frame.url?.() || '';
+        if (frameUrl.includes('captcha') || frameUrl.includes('hip.')) return true;
       }
-
-      // 3. Try full page reload — Microsoft sometimes gets stuck on intermediate pages
-      log('Auth recovery: reloading page to reset Microsoft auth flow', 'WARN', 'auth');
-      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-      await new Promise(r => setTimeout(r, 5000));
-
-      // 4. After reload, try strategies again
-      for (const strategy of this.strategies) {
-        try {
-          if (await strategy.canHandle(page)) {
-            this.activeStrategy = strategy;
-            log(`Auth recovery: strategy ${strategy.id} can handle page after reload`, 'INFO', 'auth');
-            return await strategy.authenticate(page, credentials);
-          }
-        } catch {}
-      }
+      return false;
+    } catch {
+      return false;
     }
-
-    // 4. If on MathU domain already, session might be valid
-    if (url.includes('mathu.co.za') || url.includes('mathu')) {
-      log('Auth recovery: on MathU domain, assuming session valid', 'INFO', 'auth');
-      return true;
-    }
-
-    return null; // Truly unrecognized
   }
 
   async detectCaptcha(page: any) { 
@@ -179,39 +200,11 @@ const { PROJECT_ROOT } = require('./project-root');
     }
     if (!solved) {
       const CONFIG = getCONFIG();
-
-      // FIX: Always try vision-based CAPTCHA solving as first fallback,
-      // even when CAPTCHA_SERVICE is 'none'. The old code required an
-      // external service to be configured, leaving the bot helpless.
-      try {
-        const screenshot = await page.screenshot({ type: 'jpeg', quality: 70 });
-        const base64 = screenshot.toString('base64');
-        const { solveCaptchaWithVision } = require('./providers');
-        log('Attempting vision-based CAPTCHA solving as fallback', 'INFO', 'auth');
-        const visionText = await solveCaptchaWithVision(base64);
-        if (visionText) {
-          log('Vision-based CAPTCHA solver returned text, applying...', 'INFO', 'auth');
-          const selectors = this.activeStrategy?.selectors?.selectors || {};
-          const captchaInput = selectors.captchaInput || 'input[type="text"]';
-          const submitBtn = selectors.submitButton || 'button[type="submit"]';
-          const input = await page.$(captchaInput);
-          if (input) {
-            await input.click();
-            await input.fill(visionText);
-            const submit = await page.$(submitBtn);
-            if (submit) { await submit.click(); await new Promise(r => setTimeout(r, 3000)); return true; }
-          }
-        }
-      } catch (visionErr: any) {
-        log(`Vision CAPTCHA fallback failed: ${visionErr.message}`, 'WARN', 'auth');
-      }
-
-      // Then try configured external services
       const hasCaptchaService = (CONFIG.ENABLE_PUZZLE_SANDBOX && this.puzzleSolver) || CONFIG.CAPTCHA_SERVICE !== 'none';
       if (!hasCaptchaService) return false;
       try {
-        const screenshot2 = await page.screenshot({ type: 'jpeg' });
-        const base64 = screenshot2.toString('base64');
+        const screenshot = await page.screenshot({ type: 'jpeg' });
+        const base64 = screenshot.toString('base64');
         if (CONFIG.ENABLE_PUZZLE_SANDBOX && this.puzzleSolver) {
           log('Using puzzle sandbox for interactive CAPTCHA', 'INFO', 'auth');
           const result = await this.puzzleSolver.solvePuzzle(page, base64);
@@ -236,27 +229,6 @@ const { PROJECT_ROOT } = require('./project-root');
 
   async refreshSession(page: any) {
     const CONFIG = getCONFIG();
-
-    // FIX: Pre-emptive session validation — check if we're actually still
-    // on a MathU page before attempting expensive re-auth. If the page
-    // hasn't expired yet, don't waste time re-authenticating.
-    try {
-      const currentUrl = page.url();
-      if (currentUrl.includes('mathu.co.za') || currentUrl.includes('mathu')) {
-        // Quick check: see if the page has any sign-in prompts
-        const needsAuth = await page.evaluate(() => {
-          const body = document.body?.innerText || '';
-          return body.includes('Sign in') || body.includes('sign in') ||
-                 body.includes('Log in') || body.includes('log in') ||
-                 body.includes('Session expired') || body.includes('session expired');
-        }).catch(() => false);
-        if (!needsAuth) {
-          log('Session refresh: still on MathU with no auth prompts, skipping re-auth', 'DEBUG', 'auth');
-          return true;
-        }
-      }
-    } catch {}
-
     if (process.env.EXTERNAL_AUTH_URL) {
       try {
         const { fetchWithTimeout } = require('./utils-fetch');
@@ -274,44 +246,9 @@ const { PROJECT_ROOT } = require('./project-root');
         return true;
       } catch (err: any) { logError('External auth failed', err as Error); return false; }
     }
-
-    // FIX: Try session pool restoration first, then cookie restoration
-    // from tombstone before falling back to full re-auth.
-    try {
-      const humanCaptcha = require('./captcha-human-fallback');
-      const restored = await humanCaptcha.tryAllSessions(page);
-      if (restored) {
-        log('Session restored from session pool', 'INFO', 'auth');
-        return true;
-      }
-    } catch (e: any) {
-      log(`Session pool restoration failed: ${e.message}`, 'WARN', 'auth');
-    }
-
-    // FIX: Try tombstone cookie restoration before full re-auth
-    try {
-      const tombstoneData = process.env.TOMBSTONE_URL ? null : null;
-      // Check /tmp for saved cookies
-      const fs = require('fs');
-      const path = require('path');
-      const cookieFile = path.join('/tmp', 'mathu-shield', 'cookies.json');
-      if (fs.existsSync(cookieFile)) {
-        const cookies = JSON.parse(fs.readFileSync(cookieFile, 'utf-8'));
-        if (Array.isArray(cookies) && cookies.length > 0) {
-          await page.context().addCookies(cookies);
-          log('Session restored from shadow cookies', 'INFO', 'auth');
-          // Validate by navigating to MathU
-          await page.goto(CONFIG.APP_URL || 'https://app.mathu.co.za/', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-          await new Promise(r => setTimeout(r, 3000));
-          const afterUrl = page.url();
-          if (afterUrl.includes('mathu') && !afterUrl.includes('login.microsoft')) {
-            return true;
-          }
-          log('Shadow cookies did not resolve auth, proceeding to full re-auth', 'WARN', 'auth');
-        }
-      }
-    } catch {}
-
+    const humanCaptcha = require('./captcha-human-fallback');
+    const restored = await humanCaptcha.tryAllSessions(page);
+    if (restored) return true;
     const email = CONFIG.getMicrosoftEmail?.() || CONFIG.MICROSOFT_EMAIL;
     const password = CONFIG.getMicrosoftPassword?.() || CONFIG.MICROSOFT_PASSWORD;
     return this.authenticate(page, { email, password });
