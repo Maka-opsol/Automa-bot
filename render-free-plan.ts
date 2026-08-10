@@ -308,6 +308,10 @@ log(
 
 let isShuttingDown = false;
 const originalExit = process.exit.bind(process);
+// Expose original exit so heap guardian can bypass the interceptor for OOM exits.
+// Without this, the heap guardian's process.exit(1) is intercepted, the process
+// keeps running at critical memory, and Render SIGKILLs it (losing all state).
+(process as any)._originalExit = originalExit;
 (process as any).exit = (code?: number) => {
   if (isShuttingDown) { originalExit(code || 0); return; }
   log(`process.exit(${code}) intercepted — attempting recovery instead of dying`, 'WARN', 'render-free-plan');
@@ -722,7 +726,19 @@ container.get('remoteConfig', { required: false })?.loadRemoteConfig?.().catch((
 // Turso cloud sync (graceful no-op if not configured)
 try {
   const tursoSync = require('./database-turso');
-  tursoSync.startTursoSync().catch((err: any) => {
+  tursoSync.startTursoSync().then(() => {
+    // After Turso pulls calibration data, check for OOM history.
+    // On Render free plan, /tmp is wiped on restart so persistent-config is empty,
+    // but Turso restores calibration entries including OOM markers and mode state.
+    try {
+      memoryMode.checkAfterTursoSync(selectCalibration, upsertCalibration);
+      if (memoryMode.isMemoryProtection()) {
+        log(`Post-Turso OOM check: switched to ${memoryMode.getMode()} mode`, 'WARN', 'render-free-plan');
+      }
+    } catch (e: any) {
+      log(`Post-Turso OOM check failed: ${e.message}`, 'WARN', 'render-free-plan');
+    }
+  }).catch((err: any) => {
     log(`Turso sync failed to start: ${err.message}`, 'WARN', 'render-free-plan');
   });
 } catch { /* module not found — skip */ }
