@@ -16,12 +16,15 @@
 //
 // P7: providerName passed to retryWithBackoff for health-aware retries.
 //
-// MODEL ROTATION (v2):
+// MODEL ROTATION (v3):
 //   When a model hits 429 (RESOURCE_EXHAUSTED), the provider automatically
-//   tries the next model in the fallback chain. This uses all available
-//   Google free-tier models for maximum throughput:
-//     gemini-2.5-flash → gemini-3-flash → gemini-3.5-flash → gemini-3.6-flash
-//     → gemini-2.5-flash-lite → gemini-3.1-flash-lite → gemini-3.5-flash-lite
+//   tries the next model in the fallback chain. Uses all available
+//   Google free-tier TEXT-OUT models for maximum throughput:
+//     gemini-2.5-flash → gemini-2.5-flash-lite → gemini-2.5-pro
+//     → gemini-3-flash → gemini-3.1-pro → gemini-3.1-flash-lite
+//     → gemini-2.0-flash → gemini-1.5-flash
+//   NOTE: Image generation (Nano Banana) and TTS models are excluded —
+//   they produce non-text output incompatible with the action pipeline.
 //   Each model has its own RPM limit, so cycling through them effectively
 //   multiplies the available rate limit.
 //   A per-model cooldown tracker prevents retrying a rate-limited model
