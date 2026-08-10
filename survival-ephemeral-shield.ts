@@ -65,13 +65,13 @@ function logError(msg: string, err: Error) {
 // ─── Constants ───
 const DEFAULT_SYNC_INTERVAL_MS = 30 * 1000;      // 30 seconds
 const DEFAULT_MANIFEST_CHECK_MS = 10 * 1000;     // 10 seconds
-const DEFAULT_DISK_CHECK_INTERVAL_MS = 60 * 1000; // 60 seconds
-const DISK_SPACE_CRITICAL_PERCENT = 90;           // Trigger cleanup above this
-const DISK_SPACE_LOW_PERCENT = 75;                // Log warning + aggressive cleanup above this
-const DISK_SPACE_HIGH_PERCENT = 85;               // Delete everything possible above this
-const MAX_LOG_FILES = 5;                          // Keep only N most recent log files
-const MAX_LOG_AGE_MS = 2 * 60 * 60 * 1000;       // 2 hours
-const MAX_SCREENSHOT_AGE_MS = 30 * 60 * 1000;     // 30 minutes
+const DEFAULT_DISK_CHECK_INTERVAL_MS = 30 * 1000; // FIX: 30s (was 60s) — check more often on constrained disks
+const DISK_SPACE_CRITICAL_PERCENT = 85;           // FIX: 85% (was 90%) — trigger emergency cleanup sooner
+const DISK_SPACE_LOW_PERCENT = 60;                // FIX: 60% (was 75%) — start preemptive cleanup much earlier
+const DISK_SPACE_HIGH_PERCENT = 75;               // FIX: 75% (was 85%) — aggressive cleanup threshold lowered
+const MAX_LOG_FILES = 3;                          // FIX: 3 (was 5) — keep fewer logs on constrained disks
+const MAX_LOG_AGE_MS = 30 * 60 * 1000;           // FIX: 30min (was 2h) — age out logs faster
+const MAX_SCREENSHOT_AGE_MS = 10 * 60 * 1000;    // FIX: 10min (was 30min) — age out screenshots faster
 const SHADOW_DIR = '/tmp/mathu-shield';           // Shadow copies directory
 const MANIFEST_FILE = '/tmp/mathu-shield/manifest.json';
 const SHIELD_VERSION = 1;
@@ -941,12 +941,37 @@ function checkDiskSpace(): void {
     log(`Disk usage HIGH: ${_diskUsagePercent.toFixed(1)}% — aggressive cleanup (deleting ALL deletable files)`, 'WARN');
     const nukeResult = _nukeAllDeletable();
     log(`Aggressive cleanup freed ${(nukeResult.freedBytes / 1024).toFixed(0)} KB (${nukeResult.filesDeleted} files)`, 'WARN');
+    // FIX: Also do standard cleanup after nuke for thoroughness
+    const stdResult = cleanupNonCriticalFiles();
+    if (stdResult.filesDeleted > 0) {
+      log(`Post-nuke standard cleanup freed ${(stdResult.freedBytes / 1024).toFixed(0)} KB`, 'INFO');
+    }
   } else if (_diskUsagePercent > DISK_SPACE_LOW_PERCENT) {
     log(`Disk usage elevated: ${_diskUsagePercent.toFixed(1)}% — preemptive cleanup`, 'WARN');
     const result = cleanupNonCriticalFiles();
     if (result.filesDeleted > 0) {
       log(`Preemptive cleanup freed ${(result.freedBytes / 1024).toFixed(0)} KB (${result.filesDeleted} files)`, 'INFO');
     }
+    // FIX: Also trim Turso WAL/SHM files if DB is nearby — these can be 50MB+
+    try {
+      const fs = getFs();
+      const pathMod = getPath();
+      const paths = getCriticalPaths();
+      for (const ext of ['-wal', '-shm']) {
+        const walPath = paths.dbPath + ext;
+        try {
+          if (fs.existsSync(walPath)) {
+            const stat = fs.statSync(walPath);
+            if (stat.size > 5 * 1024 * 1024) { // >5MB WAL is bloated
+              // SQLite WAL auto-checkpoint happens on read, but we can hint it
+              // by deleting WAL/SHM (safe: SQLite recreates them)
+              log(`Trimming large ${ext} file: ${(stat.size / 1024 / 1024).toFixed(1)}MB`, 'INFO');
+              fs.unlinkSync(walPath);
+            }
+          }
+        } catch {}
+      }
+    } catch {}
   }
 }
 
