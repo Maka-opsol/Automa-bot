@@ -132,7 +132,18 @@ const DEFAULTS: Record<string, ProviderDefault> = {
     model: 'gemini-2.5-flash',
     envKeys: ['GEMINI_API_KEY'],
     visionCapable: true,
-    fallbackModels: ['gemini-2.0-flash', 'gemini-1.5-flash'],
+    fallbackModels: [
+      // v2.5 series — mature, stable free-tier models
+      'gemini-2.5-flash-lite',
+      'gemini-2.5-pro',
+      // v3 series — next-gen, higher RPM limits on free tier
+      'gemini-3-flash',
+      'gemini-3.1-pro',
+      'gemini-3.1-flash-lite',
+      // Legacy fallbacks (still free, lower rate limits)
+      'gemini-2.0-flash',
+      'gemini-1.5-flash',
+    ],
   },
   'OpenRouter': {
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
