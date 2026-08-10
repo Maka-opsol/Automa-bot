@@ -88,10 +88,42 @@ let cycleFailCounts: Record<string, number> = {};
 let dynamicProviders: Array<{ name: string; fn: any }> = [];
 
 // ===============================================================================
-// RETIRED PROVIDERS (permanent until restart or manual intervention)
+// RETIRED PROVIDERS (persisted to DB, survives restarts via Turso)
 // ===============================================================================
 
 const retiredProviders = new Map<string, { reason: string; retiredAt: number }>();
+
+/**
+ * Load retired providers from the calibration table (DB/Turso).
+ * Called on startup so dead providers aren't retried after Render restarts.
+ * Keys are stored as 'retired_<ProviderName>' in the calibration table.
+ */
+function _loadRetiredProvidersFromDb(): void {
+  try {
+    const db = _deps.database;
+    if (!db?.selectCalibration) return;
+    const rows = db.selectCalibration.all();
+    let loaded = 0;
+    for (const row of rows) {
+      if (typeof row.key === 'string' && row.key.startsWith('retired_')) {
+        try {
+          const parsed = JSON.parse(row.value);
+          if (parsed.reason && parsed.retiredAt) {
+            const providerName = row.key.substring('retired_'.length);
+            retiredProviders.set(providerName, { reason: parsed.reason, retiredAt: parsed.retiredAt });
+            loaded++;
+          }
+        } catch {}
+      }
+    }
+    if (loaded > 0) {
+      getLog()(`Loaded ${loaded} retired providers from DB: ${[...retiredProviders.keys()].join(', ')}`, 'WARN', 'registry');
+    }
+  } catch {}
+}
+
+// Load retired providers immediately on module require
+_loadRetiredProvidersFromDb();
 
 // ===============================================================================
 // GEMINI 429 ESCALATING COOLDOWN (P10)
@@ -273,14 +305,23 @@ function isProviderBlacklisted(name: string): boolean {
 
 function retireProvider(name: string, reason: string) { 
   const log = getLog();
-  retiredProviders.set(name, { reason, retiredAt: Date.now() });
+  const retiredAt = Date.now();
+  retiredProviders.set(name, { reason, retiredAt });
   log(`Provider ${name} retired: ${reason}`, 'WARN', 'registry');
+  // Persist to local DB (sync) — survives via Turso sync
   try {
     const db = _deps.database;
     if (db?.upsertCalibration) {
-      db.upsertCalibration.run(`retired_${name}`, JSON.stringify({ reason, retiredAt: Date.now() }), Date.now());
+      db.upsertCalibration.run(`retired_${name}`, JSON.stringify({ reason, retiredAt }), retiredAt);
     }
   } catch (e: any) {}
+  // Also push to Turso immediately (don't wait for 30s sync cycle)
+  try {
+    const turso = require('./database-turso');
+    if (turso?.isAvailable?.()) {
+      turso.tursoUpsertCalibration(`retired_${name}`, JSON.stringify({ reason, retiredAt }), retiredAt).catch(() => {});
+    }
+  } catch {}}
 
   // P8: Attempt auto-replacement
   try {
