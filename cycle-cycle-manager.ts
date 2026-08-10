@@ -453,6 +453,19 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
       const base64 = screenshot.toString('base64');
       // Feed screenshot to dashboard cache (non-blocking)
+
+      // ─── Cloudinary: upload cycle screenshot (fire-and-forget) ───
+      try {
+        const screenshotStorage = require('./screenshot-storage');
+        if (screenshotStorage?.isEnabled?.() && screenshotStorage?.uploadScreenshot) {
+          screenshotStorage.uploadScreenshot(screenshot, 'cycle', {
+            state: currentState || 'unknown',
+            cycle: String(getStats().cycleCount || 0),
+          }).catch(() => {});
+        }
+      } catch (uploadErr: any) {
+        log(`Screenshot Cloudinary upload failed (non-critical): ${uploadErr.message || uploadErr}`, 'DEBUG', 'cycle');
+      }
       try {
         const setShot = (globalThis as any).__setLatestScreenshot;
         if (setShot) {
@@ -962,6 +975,31 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         }
       }
 
+      // ─── Pixel Training: Record successful action for self-training ───
+      // After EVERY successful click (from any source — AI, pixel-fallback,
+      // pixel-explorer, action cache), record the (screenshot, action, result)
+      // triple so pixel-fallback can learn from it.
+      if (actionSuccess && action.actionType === 'click' && (action.targetX > 0 || action.targetY > 0)) {
+        try {
+          const pixelTraining = require('./pixel-training');
+          if (pixelTraining && pixelTraining.recordSuccess) {
+            // Reuse the PNG from calibration if available, otherwise training will capture its own
+            const trainingPng = (typeof pngShot !== 'undefined' && pngShot && pngShot.length > 100) ? pngShot : undefined;
+            pixelTraining.recordSuccess({
+              page,
+              action,
+              screenshotBuf: trainingPng,
+              pageFingerprint: typeof screenshotHash === 'string' ? screenshotHash : '',
+              viewportWidth: 1280,
+              viewportHeight: 720,
+              latencyMs: Date.now() - startTime,
+            }).catch(() => {});
+          }
+        } catch (trainErr: any) {
+          log(`Pixel training recording failed: ${trainErr.message || trainErr}`, 'DEBUG', 'cycle');
+        }
+      }
+
       // ─── Pixel Explorer Outcome Observation ───
       // If this was a pixel-explorer action, observe the outcome to learn from it.
       if (actionSuccess && action._pixelExplorer && action._explorationMapKey) {
@@ -1338,6 +1376,18 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     }
     log(`Cycle complete: ${questionsCompleted} questions processed`, 'INFO', 'cycle');
     consecutiveFailures = 0;
+
+    // ─── Training maintenance: prune old data every 50 cycles ───
+    const _cycleNum = getStats().cycleCount || 0;
+    if (_cycleNum % 50 === 0) {
+      try {
+        const pixelTraining = require('./pixel-training');
+        if (pixelTraining?.getStatus?.()?.dbRowCount > 200) {
+          // pruneOldData not in existing API — rely on MAX_SAMPLES_PER_STATE in recordSuccess
+          log(`Training data: ${pixelTraining.getStatus().dbRowCount} entries in DB`, 'DEBUG', 'cycle');
+        }
+      } catch {}
+    }
   } catch (err: any) {
     const errorType = classifyProviderError?.(err);
     const isRetryable = errorType?.retryable ?? false;
