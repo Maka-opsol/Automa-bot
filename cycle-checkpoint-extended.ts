@@ -1,4 +1,4 @@
-'use strict';
+use strict';
 
 let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
@@ -12,7 +12,7 @@ const MAX_CHECKPOINT_SIZE_BYTES = 100 * 1024; // 100KB
 const CHECKPOINT_MAX_AGE_MS = 2 * 60 * 60 * 1000; // 2 hours for resume
 const CHECKPOINT_STALE_MS = 24 * 60 * 60 * 1000; // 24 hours = stale
 
-function _getTombstoneFile() { return (getCONFIG().CHECKPOINT_FILE || './checkpoint.json') + '.tombstone.json'; }
+function _getTombstoneFile() { return '/tmp/mathu-data/checkpoint.tombstone.json'; }
 
 /**
  * Extended checkpoint system for restart amnesia prevention.
