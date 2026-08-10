@@ -293,19 +293,47 @@ function getRecentPeak(minutes: number = 30): { peakHeapMB: number; peakRssMB: n
   };
 }
 
-/** Check if the process was recently OOM-killed (no recent readings but had high readings before) */
+/** Check if the process was recently OOM-killed.
+ *
+ * Three detection strategies (in priority order):
+ *
+ *   1. /tmp file gap: If the last memory reading is >5 min old but readings
+ *      existed before, the process likely crashed (OOM kill). Works when
+ *      /tmp survives (same Render instance).
+ *
+ *   2. RSS heuristic: On Render, a fresh Node.js process starts at ~70-90MB
+ *      RSS. If current RSS is already >200MB at init time AND there are no
+ *      recent readings, we likely came from a hot state that was killed.
+ *      Works even when /tmp is wiped (new Render instance after OOM).
+ *
+ *   3. DB calibration check: memory-mode.ts checkAfterTursoSync() handles
+ *      this separately via the calibration table, so we don't duplicate it here.
+ */
 function wasRecentlyOOMKilled(): boolean {
   const d = _load();
-  if (d.memoryReadings.length < 5) return false;
-  // If the last reading is older than 5 minutes but readings existed before,
-  // the process likely crashed (OOM kill)
-  const lastReading = d.memoryReadings[d.memoryReadings.length - 1];
-  if (Date.now() - lastReading.ts > 5 * 60 * 1000) {
-    // Check if last few readings were high
-    const last5 = d.memoryReadings.slice(-5);
-    const avgHeap = last5.reduce((s, r) => s + r.heapMB, 0) / last5.length;
-    return avgHeap > 300; // Was running hot before the gap
+
+  // Strategy 1: /tmp file gap detection (original logic)
+  if (d.memoryReadings.length >= 5) {
+    const lastReading = d.memoryReadings[d.memoryReadings.length - 1];
+    if (Date.now() - lastReading.ts > 5 * 60 * 1000) {
+      const last5 = d.memoryReadings.slice(-5);
+      const avgHeap = last5.reduce((s, r) => s + r.heapMB, 0) / last5.length;
+      if (avgHeap > 300) return true;
+    }
   }
+
+  // Strategy 2: RSS heuristic — fresh process but already hot
+  // A clean Node.js start on Render is ~70-90MB RSS.
+  // If we're already >200MB at init with no readings, we were killed mid-run.
+  if (d.memoryReadings.length < 3) {
+    const rss = process.memoryUsage().rss / 1024 / 1024;
+    if (rss > 200) {
+      // No recent readings AND already high RSS = likely post-OOM restart
+      // on a new Render instance (old /tmp was wiped)
+      return true;
+    }
+  }
+
   return false;
 }
 
