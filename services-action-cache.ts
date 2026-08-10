@@ -237,6 +237,8 @@ function lookup(contextSignature: string): {
                 tursoRow.success_count || 1, tursoRow.failure_count || 0,
                 tursoRow.hit_count || 0, Date.now(), tursoRow.last_used
               );
+              // Mark table dirty so periodic Turso sync picks up the population
+              try { require('./database-turso').markTableDirty('action_cache'); } catch {}
               log(`Action cache: populated local from Turso for sig=${contextSignature.substring(0, 8)}`, 'DEBUG', 'action-cache');
             }
           } catch {}
@@ -286,6 +288,7 @@ function save(
           ORDER BY last_used ASC LIMIT ?
         )`
       ).run(toEvict);
+      try { require('./database-turso').markTableDirty('action_cache'); } catch {}
     }
 
     const now = Date.now();
@@ -320,6 +323,9 @@ function save(
       now,
       now
     );
+
+    // Mark table dirty so periodic Turso sync picks up the new/updated entry
+    try { require('./database-turso').markTableDirty('action_cache'); } catch {}
 
     // Async: write to Turso via unifiedDb (fire-and-forget)
     const udb = _getUnifiedDb();
@@ -402,6 +408,7 @@ function _markEvicted(contextSignature: string): void {
     const dbMod = _getDb();
     if (!dbMod) return;
     dbMod.prepare(`UPDATE action_cache SET evicted = 1 WHERE context_sig = ?`).run(contextSignature);
+    try { require('./database-turso').markTableDirty('action_cache'); } catch {}
   } catch { /* non-critical */ }
 }
 
@@ -429,6 +436,7 @@ async function runMaintenanceAsync(): Promise<void> {
     if (result.changes > 0) {
       log(`Action cache maintenance: evicted ${result.changes} expired local entries`, 'INFO', 'action-cache');
       updateStats('evictions');
+      try { require('./database-turso').markTableDirty('action_cache'); } catch {}
     }
 
     dbMod.prepare(
@@ -472,6 +480,7 @@ function runMaintenance(): void {
     if (result.changes > 0) {
       _getLog()(`Action cache maintenance: evicted ${result.changes} expired entries`, 'INFO', 'action-cache');
       updateStats('evictions');
+      try { require('./database-turso').markTableDirty('action_cache'); } catch {}
     }
 
     dbMod.prepare(
@@ -543,6 +552,7 @@ async function clearAsync(): Promise<void> {
     const dbMod = _getDb();
     if (dbMod) {
       dbMod.prepare(`DELETE FROM action_cache`).run();
+      try { require('./database-turso').markTableDirty('action_cache'); } catch {}
     }
   } catch {}
 
@@ -566,6 +576,7 @@ function clear(): void {
     const dbMod = _getDb();
     if (dbMod) {
       dbMod.prepare(`DELETE FROM action_cache`).run();
+      try { require('./database-turso').markTableDirty('action_cache'); } catch {}
     }
   } catch {}
 
