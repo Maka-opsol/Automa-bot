@@ -174,17 +174,24 @@ async function backupCode() {
   return backupPath;
 }
 
-function restoreFromBackup(backupPath: any) { 
+function restoreFromBackup(backupPath: any, overlay?: any) { 
   const backupScope = getBACKUP_SCOPE();
+  const isOverlay = !!overlay;
   for (const file of backupScope) {
     const src = path.join(backupPath, file);
-    const dest = path.join(SOURCE_DIR, file);
     if (fs.existsSync(src)) {
-      const destDir = path.dirname(dest);
-      if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
       try {
         const content = fs.readFileSync(src, 'utf8');
-        atomicReplaceFile(dest, content);
+        if (isOverlay) {
+          // Restore = remove from overlay (falls back to read-only original)
+          overlay.removeFromOverlay(file);
+          overlay.evictModule(file);
+        } else {
+          const dest = path.join(SOURCE_DIR, file);
+          const destDir = path.dirname(dest);
+          if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+          atomicReplaceFile(dest, content);
+        }
       } catch (err: any) {
         logError(`Atomic rollback failed for ${file}`, err);
         // Continue restoring other files — partial rollback is better than none
@@ -213,24 +220,36 @@ function copyToStaging() {
   return stagingSource;
 }
 
-function promoteStaging() { 
+function promoteStaging(overlay?: any) {
   const stagingSource = path.join(getSTAGING_DIR(), 'source');
   const promotedFiles = [];
   const failedFiles = [];
+  const isOverlay = !!overlay;
 
   const backupScope = getBACKUP_SCOPE();
   for (const file of backupScope) {
     const src = path.join(stagingSource, file);
-    const dest = path.join(SOURCE_DIR, file);
     if (fs.existsSync(src)) {
-      const destDir = path.dirname(dest);
-      if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
       try {
         const content = fs.readFileSync(src, 'utf8');
-        atomicReplaceFile(dest, content);
-        promotedFiles.push(file);
+        if (isOverlay) {
+          // On read-only FS: write to /tmp overlay instead of SOURCE_DIR
+          const ok = overlay.writeToOverlay(file, content);
+          if (ok) {
+            promotedFiles.push(file);
+          } else {
+            failedFiles.push(file);
+          }
+        } else {
+          // Normal writable FS: atomic replace in place
+          const dest = path.join(SOURCE_DIR, file);
+          const destDir = path.dirname(dest);
+          if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+          atomicReplaceFile(dest, content);
+          promotedFiles.push(file);
+        }
       } catch (err: any) {
-        logError(`Atomic promotion failed for ${file}`, err);
+        logError(`Promotion failed for ${file}`, err);
         failedFiles.push(file);
       }
     }
@@ -241,13 +260,19 @@ function promoteStaging() {
     return false;
   }
 
-  log(`Staging promoted to production (${promotedFiles.length} files, all atomic)`, 'INFO', 'self-heal');
+  // Evict overlaid modules from require.cache so they reload on next require
+  if (isOverlay) {
+    const evicted = overlay.evictAllOverlaidModules();
+    log(`Staging promoted to /tmp overlay (${promotedFiles.length} files, ${evicted} modules evicted from cache)`, 'INFO', 'self-heal');
+  } else {
+    log(`Staging promoted to production (${promotedFiles.length} files, all atomic)`, 'INFO', 'self-heal');
+  }
   return true;
 }
 
-function rollbackAndAlert(backupPath: any, patchId: any) { 
+function rollbackAndAlert(backupPath: any, patchId: any, overlay?: any) { 
   log('Rolling back to backup...', 'WARN', 'self-heal');
-  restoreFromBackup(backupPath);
+  restoreFromBackup(backupPath, overlay);
   logAudit('Rollback completed from ' + backupPath, 'self-heal');
   try { ((_deps.alerting?.sendAlert) || (() => {}))('Self-heal failed. Rolled back.'); } catch (e: any) { /* non-critical */ }
   // Record rollback in patch memory so the system learns from it
@@ -265,40 +290,39 @@ function rollbackAndAlert(backupPath: any, patchId: any) {
  * Verify promoted files are readable and have valid structure.
  * Catches corruption from mid-crash scenarios.
  */
-function verifyPromotedFiles(fixes: any) {
+function verifyPromotedFiles(fixes: any, overlay?: any) {
   const targetFiles = fixes.map((f: any) => f.file);
   let allValid = true;
 
   for (const file of targetFiles) {
-    const filePath = path.join(SOURCE_DIR, file);
-    if (!fs.existsSync(filePath)) {
-      log(`Post-promotion verification FAILED: ${file} does not exist after promotion`, 'ERROR', 'self-heal');
-      allValid = false;
-      continue;
-    }
-
-    try {
-      const content = fs.readFileSync(filePath, 'utf8');
-      // Check file is not empty or whitespace-only
-      if (content.trim().length === 0) {
-        log(`Post-promotion verification FAILED: ${file} is empty`, 'ERROR', 'self-heal');
+    // When using overlay, verify from the overlay path
+    let content: string | null = null;
+    if (overlay) {
+      content = overlay.readFromOverlay(file);
+    } else {
+      const filePath = path.join(SOURCE_DIR, file);
+      if (!fs.existsSync(filePath)) {
+        log(`Post-promotion verification FAILED: ${file} does not exist after promotion`, 'ERROR', 'self-heal');
         allValid = false;
         continue;
       }
-      // Check file has reasonable minimum length (at least 50 chars for any valid source file)
-      if (content.length < 50) {
-        log(`Post-promotion verification WARNING: ${file} is suspiciously short (${content.length} chars)`, 'WARN', 'self-heal');
-      }
-      // Verify the file starts with 'use strict' or a valid module pattern
-      const trimmedStart = content.trimStart().substring(0, 20);
-      const validStarts = ["'use strict'", '"use strict"', "'use strict';", '"use strict";', 'import ', 'export ', '//', '/*', '/**'];
-      const hasValidStart = validStarts.some(s => trimmedStart.startsWith(s));
-      if (!hasValidStart) {
-        log(`Post-promotion verification WARNING: ${file} does not start with a recognized pattern (starts with: "${trimmedStart.substring(0, 30)}")`, 'WARN', 'self-heal');
-      }
-    } catch (err: any) {
-      log(`Post-promotion verification FAILED: ${file} read error: ${err.message}`, 'ERROR', 'self-heal');
+      content = fs.readFileSync(filePath, 'utf8');
+    }
+
+    if (!content || content.trim().length === 0) {
+      log(`Post-promotion verification FAILED: ${file} is empty`, 'ERROR', 'self-heal');
       allValid = false;
+      continue;
+    }
+    if (content.length < 50) {
+      log(`Post-promotion verification WARNING: ${file} is suspiciously short (${content.length} chars)`, 'WARN', 'self-heal');
+    }
+    // Verify the file starts with 'use strict' or a valid module pattern
+    const trimmedStart = content.trimStart().substring(0, 20);
+    const validStarts = ["'use strict'", '"use strict"', "'use strict';", '"use strict";', 'import ', 'export ', '//', '/*', '/**'];
+    const hasValidStart = validStarts.some(s => trimmedStart.startsWith(s));
+    if (!hasValidStart) {
+      log(`Post-promotion verification WARNING: ${file} does not start with a recognized pattern (starts with: "${trimmedStart.substring(0, 30)}")`, 'WARN', 'self-heal');
     }
   }
 
@@ -533,14 +557,26 @@ let _healInProgress = false;
 
 async function performSelfHeal() {
   if (_healInProgress) { log('Self-heal already in progress, skipping', 'DEBUG', 'self-heal'); return false; }
-  // v6-fix: On Render/ephemeral disks, source files are read-only (deployed from git).
-  // Self-heal writes to source files will fail with EACCES/EROFS. Detect early
-  // and skip rather than crashing through 200 lines of investigation/audit/staging.
+  // v8-fix: On Render/ephemeral disks, source files are read-only (deployed from git).
+  // Use the /tmp overlay system: patches are written to /tmp/self-heal-overlay/,
+  // and a require() interceptor makes Node load them instead of the read-only
+  // originals. The overlay is repopulated from patch_history DB on each boot.
   const isReadOnlyFs = !!(process.env.RENDER || process.env.RENDER_SERVICE_ID);
+  let overlay: any = null;
   if (isReadOnlyFs) {
-    log('Self-heal skipped: read-only filesystem detected (Render). File modifications require a git push.', 'WARN', 'self-heal');
-    try { getInsertSelfHealEvent()?.(Date.now(), 'core', 'skipped', 'Read-only filesystem', null, 0, 0, 0, null, null, 'readonly_fs'); } catch {}
-    return false;
+    try {
+      overlay = require('./self-heal-tmp-overlay');
+      if (!overlay.installInterceptor() && !overlay.getStatus().interceptorInstalled) {
+        log('Self-heal: overlay interceptor not available, skipping', 'WARN', 'self-heal');
+        try { getInsertSelfHealEvent()?.(Date.now(), 'core', 'skipped', 'Overlay interceptor unavailable', null, 0, 0, 0, null, null, 'no_overlay'); } catch {}
+        return false;
+      }
+      log('Self-heal: using /tmp overlay for patches (read-only FS)', 'INFO', 'self-heal');
+    } catch (overlayErr: any) {
+      log(`Self-heal: overlay module failed to load: ${overlayErr.message}`, 'WARN', 'self-heal');
+      try { getInsertSelfHealEvent()?.(Date.now(), 'core', 'skipped', 'Overlay module load failed', null, 0, 0, 0, null, null, 'overlay_load_error'); } catch {}
+      return false;
+    }
   }
   _healInProgress = true;
   try {
@@ -656,7 +692,7 @@ async function performSelfHeal() {
     const applyOk = applyFixesToStaging(safeFixes, stagingSource);
     if (!applyOk) {
       log('Apply to staging failed, rolling back', 'WARN', 'self-heal');
-      rollbackAndAlert(backupPath, safeFixes[0]?.id);
+      rollbackAndAlert(backupPath, safeFixes[0]?.id, overlay);
       continue;
     }
 
@@ -670,7 +706,7 @@ async function performSelfHeal() {
         Date.now(), 'core', 'failed', 'Pre-promotion validation failed',
         null, safeFixes.length, safeFixes.length, 0, null, null, 'validation'
       );
-      rollbackAndAlert(backupPath, safeFixes[0]?.id);
+      rollbackAndAlert(backupPath, safeFixes[0]?.id, overlay);
       continue;
     }
 
@@ -718,22 +754,22 @@ async function performSelfHeal() {
     }
 
     if (promotedDirectly) {
-      const promotedOk = promoteStaging();
+      const promotedOk = promoteStaging(overlay);
       if (!promotedOk) {
         log('Promotion failed (atomic write errors), rolling back', 'ERROR', 'self-heal');
-        rollbackAndAlert(backupPath, safeFixes[0]?.id);
+        rollbackAndAlert(backupPath, safeFixes[0]?.id, overlay);
         continue;
       }
 
       // Post-promotion verification: check files are valid after atomic write
-      const verified = verifyPromotedFiles(safeFixes);
+      const verified = verifyPromotedFiles(safeFixes, overlay);
       if (!verified) {
         log('Post-promotion verification failed, rolling back to backup', 'ERROR', 'self-heal');
         getInsertSelfHealEvent().run(
           Date.now(), 'core', 'failed', 'Post-promotion verification failed',
           null, safeFixes.length, safeFixes.length, 0, null, null, 'post-promotion-verification'
         );
-        rollbackAndAlert(backupPath, safeFixes[0]?.id);
+        rollbackAndAlert(backupPath, safeFixes[0]?.id, overlay);
         if (getCONFIG().ALERT_ON_ERROR) {
           try { ((_deps.alerting?.sendAlert) || (() => {}))('Self-heal post-promotion verification failed. Rolled back.'); } catch (e: any) { /* non-critical */ }
         }
@@ -782,7 +818,7 @@ async function performSelfHeal() {
   if (!healed) {
     log('Self-heal failed after max attempts.', 'ERROR', 'self-heal');
     _lastFailureTime = Date.now();
-    rollbackAndAlert(backupPath, safeFixes[0]?.id);
+    rollbackAndAlert(backupPath, safeFixes[0]?.id, overlay);
     try { ((_deps.alerting?.sendAlert) || (() => {}))('Self-heal failed after all attempts. Rolled back.'); } catch (e: any) { /* non-critical */ }
     return false;
   } else {
