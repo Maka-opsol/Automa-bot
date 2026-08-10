@@ -3783,6 +3783,39 @@ async function _generatePixelFallbackActionInner(
     // ── Generate candidate action ──
     const action = await _generatePixelAction(page, url, rgba, width, height);
 
+    // ── Training fallback: query historical data if pixel analysis found nothing ──
+    if (!action) {
+      try {
+        const pixelTraining = require('./pixel-training');
+        if (pixelTraining?.queryMatches) {
+          const matches = pixelTraining.queryMatches({
+            pngBuffer: Buffer.from(rgba.buffer, rgba.byteOffset, rgba.byteLength),
+            state: currentState || 'unknown',
+            viewportWidth: width,
+            viewportHeight: height,
+          });
+          if (matches && matches.length > 0) {
+            const best = matches[0];
+            const trainedAction = {
+              actionType: 'click',
+              targetX: best.targetX,
+              targetY: best.targetY,
+              currentState: currentState || best.state || 'unknown',
+              reasoning: `Pixel training fallback: reusing action from ${best.provider} (similarity=${best.similarity.toFixed(3)}, used=${best.successCount}x)`,
+              _trainingSource: 'pixel-training',
+            };
+            log(`Training fallback activated: ${best.provider} action at (${best.targetX},${best.targetY}) similarity=${best.similarity.toFixed(3)}`, 'INFO', 'pixel-fallback');
+            _recordAction(trainedAction, fingerprint);
+            pixelTraining.recordUsage?.(best.sampleId);
+            _memory.consecutiveFailures = 0;
+            return trainedAction;
+          }
+        }
+      } catch (trainErr: any) {
+        log(`Training query failed (non-critical): ${trainErr.message || trainErr}`, 'DEBUG', 'pixel-fallback');
+      }
+    }
+
     // ── State-awareness filter ──
     if (action && currentState) {
       if (!_isActionStateCompatible(action, currentState)) {
