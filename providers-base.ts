@@ -388,15 +388,35 @@ function getProviderConfig(providerName: string): Record<string, any> {
 
 // ─── classifyError ───────────────────────────────────────────────────────
 
+// ─── Per-provider 429 cooldown tracker ───
+// FIX: Stop hammering providers that are already rate-limited.
+// When a provider hits 429, we record the cooldown end time and refuse
+// to retry until the cooldown expires. This prevents the retry storm
+// seen in logs where Gemini/OpenRouter/z.ai all burn through retries
+// simultaneously while already rate-limited.
+const _providerCooldowns = new Map<string, number>(); // provider -> cooldownEndMs
+
+function setProviderCooldown(providerName: string, cooldownMs: number): void {
+  _providerCooldowns.set(providerName, Date.now() + cooldownMs);
+}
+
+function getProviderCooldownRemainingMs(providerName: string): number {
+  const end = _providerCooldowns.get(providerName);
+  if (!end) return 0;
+  const remaining = end - Date.now();
+  if (remaining <= 0) { _providerCooldowns.delete(providerName); return 0; }
+  return remaining;
+}
+
 function classifyError(err: any): { category: string; retryable: boolean; retryAfterMs: number } {
   const msg = err?.message || err?.toString?.() || '';
   const status = err?.status || err?.statusCode || 0;
 
   // Rate limited
   if (status === 429 || msg.includes('rate_limit') || msg.includes('rate limit') || msg.includes('rate_limited')) {
-    // Extract retry-after from message or default to 60s
+    // Extract retry-after from message or default to 120s (was 60s — too aggressive)
     const match = msg.match(/retry after (\d+)ms/);
-    const retryAfterMs = match ? parseInt(match[1], 10) : 60000;
+    const retryAfterMs = match ? parseInt(match[1], 10) : 120000;
     return { category: 'rate_limited', retryable: true, retryAfterMs };
   }
 
@@ -430,6 +450,11 @@ function classifyError(err: any): { category: string; retryable: boolean; retryA
  * Retry a function with exponential backoff.
  * Respects circuit breaker via providerName.
  */
+/**
+ * Retry a function with exponential backoff + jitter.
+ * FIX: Added per-provider 429 cooldown awareness and jitter to prevent
+ * thundering-herd effect where all providers retry simultaneously.
+ */
 async function retryWithBackoff(
   fn: () => Promise<any>,
   options: {
@@ -441,6 +466,19 @@ async function retryWithBackoff(
   const { maxRetries = 3, baseDelayMs = 1000, providerName } = options;
   const log = _getLog().log;
 
+  // FIX: Check if provider is already in cooldown from a previous 429
+  if (providerName) {
+    const cooldownRemaining = getProviderCooldownRemainingMs(providerName);
+    if (cooldownRemaining > 0) {
+      log(
+        `Provider ${providerName} in 429 cooldown (${Math.round(cooldownRemaining / 1000)}s remaining) — skipping retries`,
+        'WARN',
+        'base'
+      );
+      throw new Error(`PROVIDER_COOLDOWN: ${providerName} rate-limited, retry after ${Math.round(cooldownRemaining / 1000)}s`);
+    }
+  }
+
   let lastError: any = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -448,6 +486,12 @@ async function retryWithBackoff(
     } catch (err: any) {
       lastError = err;
       const classified = classifyError(err);
+
+      // FIX: On 429, register provider-level cooldown so future calls
+      // (even from different code paths) won't hammer the same provider
+      if (classified.category === 'rate_limited' && providerName) {
+        setProviderCooldown(providerName, classified.retryAfterMs);
+      }
 
       if (!classified.retryable || attempt >= maxRetries) {
         log(
@@ -458,9 +502,12 @@ async function retryWithBackoff(
         throw err;
       }
 
-      const delay = Math.min(classified.retryAfterMs || baseDelayMs * Math.pow(2, attempt), 60000);
+      // FIX: Add jitter (±25%) to prevent synchronized retry storms
+      const baseDelay = classified.retryAfterMs || baseDelayMs * Math.pow(2, attempt);
+      const jitter = baseDelay * 0.25 * (Math.random() * 2 - 1);
+      const delay = Math.min(Math.round(baseDelay + jitter), 120000); // cap at 2min
       log(
-        `Retry ${attempt + 1}/${maxRetries} for ${providerName || 'unknown'} after ${delay}ms: ${classified.category}: retry after ${Math.min(delay, 60000)}ms`,
+        `Retry ${attempt + 1}/${maxRetries} for ${providerName || 'unknown'} after ${delay}ms: ${classified.category}`,
         'WARN',
         'base'
       );
@@ -581,12 +628,13 @@ module.exports = {
   classifyError,
   safeCall,
   coalescer,
-  // FIX: These were imported by providers but never exported,
-  // causing "X is not a function" crashes for 6/7 tribunal providers.
   callChatCompletionWithRollback,
   fetchWithTimeout,
   sanitizeErrorText,
   getFallbackModels,
   _getOrLimiter,
   _injectDependencies,
+  // FIX: Export cooldown functions so providers can check before calling
+  setProviderCooldown,
+  getProviderCooldownRemainingMs,
 };
