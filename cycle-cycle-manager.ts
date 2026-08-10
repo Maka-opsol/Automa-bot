@@ -67,8 +67,8 @@ let _healthWatchdog: any = null;
 function _getHealthWatchdog() { if (!_healthWatchdog) { try { _healthWatchdog = require('./longevity-self-ping'); } catch { _healthWatchdog = null; } } return _healthWatchdog; }
 let _problemClassifier: any = null;
 function _getProblemClassifier() { if (!_problemClassifier) { try { _problemClassifier = require('./math-problem-classifier'); } catch { _problemClassifier = null; } } return _problemClassifier; }
-let _mathpix: any = null;
-function _getMathpix() { if (!_mathpix) { try { _mathpix = require('./services-mathpix'); } catch { _mathpix = null; } } return _mathpix; }
+let _pix2tex: any = null;
+function _getPix2tex() { if (!_pix2tex) { try { _pix2tex = require('./services-pix2tex'); } catch { _pix2tex = null; } } return _pix2tex; }
 let _degradationLadder: any = null;
 function _getDegradationLadder() { if (!_degradationLadder) { try { _degradationLadder = require('./self-heal-degradation-ladder'); } catch { _degradationLadder = null; } } return _degradationLadder; }
 let _actionCache: any = null;
@@ -748,7 +748,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
       // ─── Problem Classification Pipeline (Response 4) ───
       // Classify the math problem type from available text, and optionally
-      // re-OCR with Mathpix if the vision model's text quality is poor.
+      // re-OCR with Pix2Tex if the vision model's text quality is poor.
       // This runs before math verification to provide better context.
       const classifier = _getProblemClassifier();
       if (classifier && action && (action.currentState === 'question' || action.actionType === 'keypad_input' || action.value)) {
@@ -770,17 +770,17 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           if (ocrText) {
             const classification = classifier.classifyProblem(ocrText);
 
-            // Check if Mathpix should re-OCR this image
-            const mathpix = _getMathpix();
-            if (mathpix && mathpix.ENABLED && classifier.shouldUseMathpix(ocrText, classification.type, false)) {
-              const mathpixResult = await mathpix.ocrMath(base64);
-              if (mathpixResult.text && mathpixResult.text.length > 10) {
-                log(`Mathpix re-OCR: ${mathpixResult.text.length} chars (conf=${mathpixResult.confidence}%)`, 'INFO', 'cycle');
-                // Use Mathpix text for re-classification
-                const reclassified = classifier.classifyProblem(mathpixResult.text);
+            // Check if Pix2Tex should re-OCR this image
+            const pix2tex = _getPix2tex();
+            if (pix2tex && classifier.shouldUsePix2Tex(ocrText, classification.type, false)) {
+              const p2tResult = await pix2tex.ocrMath(base64);
+              if (p2tResult.text && p2tResult.text.length > 10) {
+                log(`Pix2Tex re-OCR: ${p2tResult.text.length} chars (conf=${p2tResult.confidence}%)`, 'INFO', 'cycle');
+                // Use Pix2Tex text for re-classification
+                const reclassified = classifier.classifyProblem(p2tResult.text);
                 // Attach to action for downstream consumers
-                action._mathpixText = mathpixResult.text;
-                action._mathpixLatex = mathpixResult.latex;
+                action._pix2texText = p2tResult.text;
+                action._pix2texLatex = p2tResult.latex;
                 action._problemType = reclassified.type;
                 action._problemConfidence = reclassified.confidence;
                 action._ocrQuality = reclassified.ocrQuality;
@@ -790,7 +790,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 classifier.recordModelTypeAffinity(reclassified.type, providerName, true); // optimistic, updated later on failure
               }
             } else {
-              // No Mathpix needed — use regex classification
+              // No Pix2Tex re-OCR needed — use regex classification
               action._problemType = classification.type;
               action._problemConfidence = classification.confidence;
               action._ocrQuality = classification.ocrQuality;
