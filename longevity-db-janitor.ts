@@ -12,7 +12,12 @@ const RETENTION_DAYS = {
   progress_log: 90,       // Progress logs - keep 3 months
   semantics_snapshots: 7,  // Semantics snapshots - keep 1 week
   flutter_semantics_cache: 3, // Flutter semantics cache - keep 3 days
-  patch_history: 365,     // Patch history - keep 1 year
+  // patch_history: NOT cleaned by blanket time-based cleanup anymore.
+  // The overlay module's collapseRedundantPatchHistory() handles it with
+  // status-aware retention: 30d for 'applied', 7d for rejected/rolled_back/superseded.
+  // Keeping it here with a conservative 365d as a safety net for any rows
+  // that slip through, but the overlay module should handle 99% of cleanup.
+  patch_history: 365,     // Safety net only — overlay module does the real pruning
   gitops_rollback_chain: 90, // GitOps rollback - keep 3 months
   performance_profile: 30, // Performance profiles - keep 1 month
   exploration_maps: 14,   // Exploration maps - keep 2 weeks
@@ -110,13 +115,69 @@ function vacuumIfNeeded() {
   }
 }
 
+/**
+ * Smart cleanup for patch_history — status-aware retention.
+ * Runs alongside the blanket cleanup but with much shorter windows
+ * for non-applied patches. The overlay module's collapseRedundantPatchHistory()
+ * is the primary pruner; this is a complementary safety net.
+ */
+function cleanupPatchHistorySmart() {
+  try {
+    const db = getDb();
+    if (!db) return 0;
+    let total = 0;
+
+    // 1) Delete old rejected/rolled_back/superseded patches (7 days)
+    const nonAppliedCutoff = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    const r1 = db.prepare(
+      "DELETE FROM patch_history WHERE status IN ('rejected', 'rolled_back', 'superseded') AND timestamp < ?"
+    ).run(nonAppliedCutoff);
+    total += r1.changes;
+
+    // 2) Delete old applied patches (30 days) — if the overlay module didn't
+    //    already handle it, this catches stragglers. Any patch older than 30 days
+    //    that's still 'applied' either got superseded by a git deploy or is
+    //    stale. The overlay module's reconcileOverlayWithBase() handles the
+    //    graceful detection; this is the hard deadline.
+    const appliedCutoff = Date.now() - (30 * 24 * 60 * 60 * 1000);
+    const r2 = db.prepare(
+      "DELETE FROM patch_history WHERE status = 'applied' AND timestamp < ?"
+    ).run(appliedCutoff);
+    total += r2.changes;
+
+    // 3) Collapse redundant: for files with multiple 'applied' patches,
+    //    keep only the latest (same as overlay module, but as safety net)
+    const duplicates = db.prepare(
+      "SELECT file, COUNT(*) as cnt, MAX(timestamp) as latest_ts FROM patch_history WHERE status = 'applied' GROUP BY file HAVING cnt > 1"
+    ).all();
+    for (const row of duplicates) {
+      const r3 = db.prepare(
+        "UPDATE patch_history SET status = 'superseded' WHERE file = ? AND status = 'applied' AND timestamp < ?"
+      ).run(row.file, row.latest_ts);
+      total += r3.changes;
+    }
+
+    if (total > 0) {
+      log(`Janitor: smart patch_history cleanup — ${total} rows pruned (status-aware)`, 'INFO', 'db-janitor');
+    }
+    return total;
+  } catch (err: any) {
+    return 0;
+  }
+}
+
 function runJanitor() { 
   log('Running database janitor...', 'DEBUG', 'db-janitor');
   let totalDeleted = 0;
 
   for (const [table, days] of Object.entries(RETENTION_DAYS)) {
+    // Skip patch_history for blanket cleanup — handled by smart cleanup below
+    if (table === 'patch_history') continue;
     totalDeleted += cleanupTable(table, days);
   }
+
+  // Smart patch_history cleanup (status-aware, much more aggressive than 365d)
+  totalDeleted += cleanupPatchHistorySmart();
 
   cleanupProviderQuotas();
 
