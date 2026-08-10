@@ -44,6 +44,18 @@ const SYNC_INTERVAL_MS_DEFAULT = 30000; // 30s — push local → Turso
 const WRITE_RETRY_DELAY_MS = 1000;
 const WRITE_RETRY_COUNT = 1;
 
+// ─── Dirty table tracking ────────────────────────────────────────────────
+// Instead of pushing ALL rows every 30s, only push tables that have been
+// modified locally since the last successful push.
+const SYNCED_TABLES = ['calibration', 'completed_modules', 'last_state', 'banned_actions', 'provider_registry', 'model_registry', 'action_cache'] as const;
+type SyncedTable = typeof SYNCED_TABLES[number];
+const _dirtyTables = new Set<SyncedTable>();
+
+/** Mark a table as dirty (call from local write functions). */
+function markTableDirty(table: SyncedTable): void {
+  _dirtyTables.add(table);
+}
+
 let _deps: Record<string, any> = {};
 
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
@@ -608,90 +620,102 @@ async function syncToTurso(): Promise<{ synced: number; errors: number }> {
   const client = _getClient();
   if (!client) return { synced: 0, errors: 0 };
 
+  // Skip push if no tables are dirty (nothing changed locally)
+  if (_dirtyTables.size === 0) {
+    return { synced: 0, errors: 0 };
+  }
+
   let synced = 0;
   let errors = 0;
+  const tablesToSync = Array.from(_dirtyTables);
 
   try {
     const db = require('./database');
 
-    // Sync calibration (includes solution cache entries — critical!)
-    try {
-      const rows = db.db?.prepare('SELECT * FROM calibration')?.all() || [];
-      for (const row of rows) {
-        const ok = await _exec(
-          'INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (?, ?, ?)',
-          [row.key, row.value, row.updated_at]
-        );
-        if (ok) synced++; else errors++;
-      }
-    } catch (e: any) { errors++; }
+    if (tablesToSync.includes('calibration')) {
+      try {
+        const rows = db.db?.prepare('SELECT * FROM calibration')?.all() || [];
+        for (const row of rows) {
+          const ok = await _exec(
+            'INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (?, ?, ?)',
+            [row.key, row.value, row.updated_at]
+          );
+          if (ok) synced++; else errors++;
+        }
+      } catch (e: any) { errors++; }
+    }
 
-    // Sync completed_modules
-    try {
-      const modules = db.db?.prepare('SELECT * FROM completed_modules')?.all() || [];
-      for (const row of modules) {
-        const ok = await _exec(
-          'INSERT OR REPLACE INTO completed_modules (name, completed_at, attempts, completion_time_ms, last_attempt) VALUES (?, ?, ?, ?, ?)',
-          [row.name, row.completed_at, row.attempts, row.completion_time_ms, row.last_attempt]
-        );
-        if (ok) synced++; else errors++;
-      }
-    } catch (e: any) { errors++; }
+    if (tablesToSync.includes('completed_modules')) {
+      try {
+        const modules = db.db?.prepare('SELECT * FROM completed_modules')?.all() || [];
+        for (const row of modules) {
+          const ok = await _exec(
+            'INSERT OR REPLACE INTO completed_modules (name, completed_at, attempts, completion_time_ms, last_attempt) VALUES (?, ?, ?, ?, ?)',
+            [row.name, row.completed_at, row.attempts, row.completion_time_ms, row.last_attempt]
+          );
+          if (ok) synced++; else errors++;
+        }
+      } catch (e: any) { errors++; }
+    }
 
-    // Sync last_state
-    try {
-      const lastState = db.db?.prepare('SELECT * FROM last_state ORDER BY timestamp DESC LIMIT 1')?.get();
-      if (lastState) {
-        const ok = await _exec(
-          'INSERT OR REPLACE INTO last_state (url, state, timestamp) VALUES (?, ?, ?)',
-          [lastState.url, lastState.state, lastState.timestamp]
-        );
-        if (ok) synced++; else errors++;
-      }
-    } catch (e: any) { errors++; }
+    if (tablesToSync.includes('last_state')) {
+      try {
+        const lastState = db.db?.prepare('SELECT * FROM last_state ORDER BY timestamp DESC LIMIT 1')?.get();
+        if (lastState) {
+          const ok = await _exec(
+            'INSERT OR REPLACE INTO last_state (url, state, timestamp) VALUES (?, ?, ?)',
+            [lastState.url, lastState.state, lastState.timestamp]
+          );
+          if (ok) synced++; else errors++;
+        }
+      } catch (e: any) { errors++; }
+    }
 
-    // Sync banned_actions
-    try {
-      const banned = db.db?.prepare('SELECT * FROM banned_actions')?.all() || [];
-      for (const row of banned) {
-        const ok = await _exec(
-          'INSERT OR REPLACE INTO banned_actions (action_type, banned_by, banned_at, reason) VALUES (?, ?, ?, ?)',
-          [row.action_type, row.banned_by, row.banned_at, row.reason]
-        );
-        if (ok) synced++; else errors++;
-      }
-    } catch (e: any) { errors++; }
+    if (tablesToSync.includes('banned_actions')) {
+      try {
+        const banned = db.db?.prepare('SELECT * FROM banned_actions')?.all() || [];
+        for (const row of banned) {
+          const ok = await _exec(
+            'INSERT OR REPLACE INTO banned_actions (action_type, banned_by, banned_at, reason) VALUES (?, ?, ?, ?)',
+            [row.action_type, row.banned_by, row.banned_at, row.reason]
+          );
+          if (ok) synced++; else errors++;
+        }
+      } catch (e: any) { errors++; }
+    }
 
-    // Sync provider_registry
-    try {
-      const providers = db.db?.prepare('SELECT * FROM provider_registry')?.all() || [];
-      for (const row of providers) {
-        const ok = await _exec(
-          'INSERT OR REPLACE INTO provider_registry (provider_name, endpoint, model, last_verified, history, success_count, failure_count, total_latency, last_check) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [row.provider_name, row.endpoint, row.model, row.last_verified, row.history, row.success_count, row.failure_count, row.total_latency, row.last_check]
-        );
-        if (ok) synced++; else errors++;
-      }
-    } catch (e: any) { errors++; }
+    if (tablesToSync.includes('provider_registry')) {
+      try {
+        const providers = db.db?.prepare('SELECT * FROM provider_registry')?.all() || [];
+        for (const row of providers) {
+          const ok = await _exec(
+            'INSERT OR REPLACE INTO provider_registry (provider_name, endpoint, model, last_verified, history, success_count, failure_count, total_latency, last_check) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [row.provider_name, row.endpoint, row.model, row.last_verified, row.history, row.success_count, row.failure_count, row.total_latency, row.last_check]
+          );
+          if (ok) synced++; else errors++;
+        }
+      } catch (e: any) { errors++; }
+    }
 
-    // Sync model_registry
-    try {
-      const models = db.db?.prepare('SELECT * FROM model_registry')?.all() || [];
-      for (const row of models) {
-        const ok = await _exec(
-          'INSERT OR REPLACE INTO model_registry (provider, model_id, is_free, is_working, role, last_tested_at, last_success_at, failure_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-          [row.provider, row.model_id, row.is_free, row.is_working, row.role, row.last_tested_at, row.last_success_at, row.failure_count]
-        );
-        if (ok) synced++; else errors++;
-      }
-    } catch (e: any) { errors++; }
+    if (tablesToSync.includes('model_registry')) {
+      try {
+        const models = db.db?.prepare('SELECT * FROM model_registry')?.all() || [];
+        for (const row of models) {
+          const ok = await _exec(
+            'INSERT OR REPLACE INTO model_registry (provider, model_id, is_free, is_working, role, last_tested_at, last_success_at, failure_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            [row.provider, row.model_id, row.is_free, row.is_working, row.role, row.last_tested_at, row.last_success_at, row.failure_count]
+          );
+          if (ok) synced++; else errors++;
+        }
+      } catch (e: any) { errors++; }
+    }
 
-    // Sync action_cache (R6: critical — avoids redundant AI calls)
-    try {
-      const actions = db.db?.prepare('SELECT * FROM action_cache WHERE evicted = 0')?.all() || [];
-      for (const row of actions) {
-        const ok = await _exec(
-          `INSERT INTO action_cache (context_sig, action_type, target_x, target_y, value,
+    if (tablesToSync.includes('action_cache')) {
+      try {
+        const actions = db.db?.prepare('SELECT * FROM action_cache WHERE evicted = 0')?.all() || [];
+        for (const row of actions) {
+          const ok = await _exec(
+            `INSERT INTO action_cache (context_sig, action_type, target_x, target_y, value,
             keypad_sequence, current_state, reasoning, success_count, failure_count,
             hit_count, created_at, last_used, evicted)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -700,20 +724,25 @@ async function syncToTurso(): Promise<{ synced: number; errors: number }> {
              target_x = excluded.target_x,
              target_y = excluded.target_y,
              hit_count = MAX(action_cache.hit_count, excluded.hit_count)`,
-          [row.context_sig, row.action_type, row.target_x, row.target_y, row.value,
-           row.keypad_sequence, row.current_state, row.reasoning, row.success_count,
-           row.failure_count, row.hit_count, row.created_at, row.last_used, row.evicted]
-        );
-        if (ok) synced++; else errors++;
-      }
-    } catch (e: any) { errors++; }
+            [row.context_sig, row.action_type, row.target_x, row.target_y, row.value,
+             row.keypad_sequence, row.current_state, row.reasoning, row.success_count,
+             row.failure_count, row.hit_count, row.created_at, row.last_used, row.evicted]
+          );
+          if (ok) synced++; else errors++;
+        }
+      } catch (e: any) { errors++; }
+    }
 
     _lastSyncTime = Date.now();
     if (synced > 0 || errors > 0) {
-      _getLog()(`Pushed ${synced} rows to Turso (${errors} errors)`);
+      _getLog()(`Pushed ${synced} rows to Turso from ${tablesToSync.length} dirty table(s): [${tablesToSync.join(', ')}] (${errors} errors)`);
     }
 
-    if (errors === 0) _consecutiveErrors = 0;
+    // Clear dirty flags on successful push
+    if (errors === 0) {
+      _dirtyTables.clear();
+      _consecutiveErrors = 0;
+    }
   } catch (err: any) {
     _getLog()(`Sync error: ${err.message}`, 'ERROR');
     errors++;
@@ -753,6 +782,12 @@ async function startTursoSync(): Promise<void> {
   const pullResult = await pullFromTurso();
   if (pullResult.pulled > 0) {
     _getLog()(`Cold start recovery: ${pullResult.pulled} rows restored from Turso`, 'INFO');
+  }
+
+  // After pull, mark all tables as dirty for the initial push
+  // (local may have data that Turso doesn't, or pull may have modified local)
+  for (const table of SYNCED_TABLES) {
+    _dirtyTables.add(table);
   }
 
   // Start periodic push sync (local → Turso)
@@ -808,6 +843,7 @@ module.exports = {
   // Sync
   syncToTurso,
   pullFromTurso,
+  markTableDirty,
 
   // Direct reads (Turso-first)
   tursoGetCalibration,
