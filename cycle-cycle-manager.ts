@@ -272,8 +272,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             const h = await page.evaluate(() => Math.max(
               document.body?.scrollHeight || 0,
               document.body?.offsetHeight || 0,
-              document.documentElement?.scrollHeight || 0,
-              document.documentElement?.clientHeight || 0
+              document.documentElement?.scrollHeight || 0
+              // NOTE: do NOT include clientHeight — it returns viewport height
+              // (always ~768px), not content height. On a blank page, content
+              // scrollHeight/offsetHeight are 0 but clientHeight is nonzero,
+              // which would falsely declare the page as "has content".
             ));
             if (h > 0) {
               log(`Fresh start: page height=${h}px after ${(w + 1) * 2}s — proceeding`, 'INFO', 'cycle');
@@ -383,8 +386,9 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             return Math.max(
               document.body?.scrollHeight || 0,
               document.body?.offsetHeight || 0,
-              document.documentElement?.scrollHeight || 0,
-              document.documentElement?.clientHeight || 0
+              document.documentElement?.scrollHeight || 0
+              // NOTE: do NOT include clientHeight — it returns viewport height,
+              // not content height. See fresh-start check above for details.
             );
           });
           isBlank = pageHeight === 0;
@@ -403,8 +407,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 return Math.max(
                   document.body?.scrollHeight || 0,
                   document.body?.offsetHeight || 0,
-                  document.documentElement?.scrollHeight || 0,
-                  document.documentElement?.clientHeight || 0
+                  document.documentElement?.scrollHeight || 0
                 );
               });
               if (h > 0) {
