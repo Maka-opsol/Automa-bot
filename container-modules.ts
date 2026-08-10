@@ -305,10 +305,10 @@ function createContainer(): DIContainerType {
     tags: ['services'],
   });
 
-  // Response 4: Mathpix OCR client (no DI deps needed — uses lazy requires)
-  c.register('mathpix', {
+  // Pix2Tex OCR client — free, local math OCR via Python
+  c.register('pix2tex', {
     factory: (deps: any) => {
-      const mod = require('./services-mathpix');
+      const mod = require('./services-pix2tex');
       mod._injectDependencies(deps);
       return mod;
     },
@@ -556,7 +556,7 @@ function createContainer(): DIContainerType {
            'canary', 'regressionBank', 'rewardTracker', 'healerCircuitBreaker',
            'browser', 'auth', 'alerting'],
     // P13: sandboxExecutor and selfHealAuditor are lazy-required internally
-    optionalDeps: ['sandboxExecutor', 'selfHealAuditor'],
+    optionalDeps: ['sandboxExecutor', 'selfHealAuditor', 'selfHealOverlay'],
     critical: false,
     tags: ['self-heal'],
   });
@@ -573,6 +573,19 @@ function createContainer(): DIContainerType {
     },
     deps: ['config', 'logger', 'database'],
     optionalDeps: ['sandboxExecutor'],
+    critical: false,
+    tags: ['self-heal'],
+  });
+
+  // Self-heal /tmp overlay — enables self-heal on Render (read-only FS)
+  // Must be registered BEFORE selfHeal so the interceptor is installed early
+  c.register('selfHealOverlay', {
+    factory: (deps: any) => {
+      const mod = require('./self-heal-tmp-overlay');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
     critical: false,
     tags: ['self-heal'],
   });
