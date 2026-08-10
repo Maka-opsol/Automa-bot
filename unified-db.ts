@@ -156,6 +156,8 @@ async function deleteCalibration(key: string): Promise<boolean> {
   try {
     const db = _getLocalDb();
     db?.db?.prepare('DELETE FROM calibration WHERE key = ?')?.run(key);
+    // Mark table dirty so periodic Turso sync picks up the deletion
+    try { require('./database-turso').markTableDirty('calibration'); } catch {}
   } catch {}
 
   const turso = _getTurso();
@@ -440,6 +442,8 @@ async function saveActionCache(data: {
         data.contextSig, data.actionType, data.targetX, data.targetY, data.value,
         keypadJson, data.currentState, data.reasoning, now, now
       );
+      // Mark table dirty so periodic Turso sync picks up the change
+      try { require('./database-turso').markTableDirty('action_cache'); } catch {}
     }
   } catch {}
 
@@ -483,6 +487,8 @@ async function recordActionCacheFailure(contextSig: string): Promise<boolean> {
         if (newFailCount >= 3) {
           db.db.prepare('UPDATE action_cache SET evicted = 1 WHERE context_sig = ?').run(contextSig);
         }
+        // Mark table dirty so periodic Turso sync picks up the change
+        try { require('./database-turso').markTableDirty('action_cache'); } catch {}
       }
     }
   } catch {}
@@ -503,6 +509,8 @@ async function evictActionCache(contextSig: string): Promise<boolean> {
   try {
     const db = _getLocalDb();
     db?.db?.prepare('UPDATE action_cache SET evicted = 1 WHERE context_sig = ?')?.run(contextSig);
+    // Mark table dirty so periodic Turso sync picks up the eviction
+    try { require('./database-turso').markTableDirty('action_cache'); } catch {}
   } catch {}
 
   const turso = _getTurso();
@@ -547,6 +555,10 @@ async function runActionCacheMaintenance(ttlMs: number, maxEntries: number): Pro
           SELECT context_sig FROM action_cache WHERE evicted = 1 ORDER BY last_used DESC LIMIT 50
         )`
       ).run();
+      // Mark table dirty if anything changed
+      if (evicted > 0) {
+        try { require('./database-turso').markTableDirty('action_cache'); } catch {}
+      }
     }
   } catch {}
 
@@ -608,6 +620,8 @@ async function clearActionCache(): Promise<void> {
   try {
     const db = _getLocalDb();
     db?.db?.prepare('DELETE FROM action_cache')?.run();
+    // Mark table dirty so periodic Turso sync picks up the clear
+    try { require('./database-turso').markTableDirty('action_cache'); } catch {}
   } catch {}
 
   const turso = _getTurso();
