@@ -155,6 +155,13 @@ class FlutterStabilityWaiter {
     // Network: must be idle
     const netOk = curr.networkIdle;
 
+    // ── Anti-blank guard ──
+    // If ALL content signals are zero, the page hasn't rendered yet.
+    // Do NOT declare stability — keep polling until something appears.
+    // This prevents declaring a blank white Flutter canvas as "stable".
+    const allZero = curr.semanticsCount === 0 && curr.domCount === 0 && curr.bodyHeight === 0;
+    if (allZero) return false;
+
     // Require at least 2 of {semanticsOk, domOk, layoutOk} plus network idle
     const structuralSignals = [semanticsOk, domOk, layoutOk].filter(Boolean).length;
     return structuralSignals >= 2 && netOk;
