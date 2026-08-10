@@ -7,11 +7,15 @@ function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function getCONFIG(): any { return _deps.config || {}; }
 function log(msg: string, level?: string, mod?: string) { _deps.logger?.log?.(msg, level, mod) ?? console.log(msg); }
 function logError(msg: string, err: Error, ctx?: any) { _deps.logger?.logError?.(msg, err, ctx) ?? console.error(msg, err); }
-function safeLog(obj: any, level?: string, mod?: string) { _deps.logger?.safeLog?.(obj, level, mod) ?? console.log(JSON.stringify(obj)); }
 
 const { retryWithBackoff } = require('./providers-base');
 
 let authAttempts = 0;
+
+// FIX: Track consecutive captcha failures across cycles to detect
+// captcha feedback loops that burn Render hours for nothing.
+let _consecutiveCaptchaFailures = 0;
+const MAX_CONSECUTIVE_CAPTCHA_FAILURES = 3;
 
 /**
  * Default SPA domains for MathU. On these domains the URL never changes
@@ -32,8 +36,8 @@ function _getSpaDomains(): string[] {
 function _isSpaDomain(url: string): boolean {
   try {
     const domains = _getSpaDomains();
-    const origin = new URL(url).origin;               // e.g. https://app.mathu.co.za
-    const hostname = new URL(url).hostname;             // e.g. app.mathu.co.za
+    const origin = new URL(url).origin;
+    const hostname = new URL(url).hostname;
     return domains.some(d => origin.includes(d) || hostname === d || hostname.endsWith('.' + d));
   } catch { return false; }
 }
@@ -58,22 +62,17 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
 
   // Positive signal: on MathU SPA domain
   if (!_isSpaDomain(url)) {
-    // Not on a MathU SPA domain at all — could be an error page or redirect
     log(`SPA check: URL ${url} is not a recognized SPA domain`, 'DEBUG', 'auth-guard');
     return false;
   }
 
   // Content-based validation: look for MathU app elements in the page
   try {
-    // Strategy 1: Check for sidebar nav or main app shell
     const hasAppShell = await page.evaluate(() => {
       const body = document.body?.innerText || '';
-      // MathU dashboard shows "Assignments" and "Courses" in sidebar
       const hasAssignments = body.includes('Assignments') || body.includes('assignments');
       const hasCourses = body.includes('Courses') || body.includes('courses');
-      // Crawford branding often visible in the app
       const hasCrawford = body.includes('Crawford') || body.includes('crawford');
-      // Any of these indicate we're inside the MathU app shell
       return hasAssignments || hasCourses || hasCrawford;
     }).catch(() => false);
 
@@ -82,15 +81,12 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
       return true;
     }
 
-    // Strategy 2: Check for Flutter web canvas (MathU is Flutter-based)
     const hasFlutterCanvas = await page.evaluate(() => {
-      // Flutter Web renders in a <flt-glass-pane> or canvases with specific classes
       const canvases = document.querySelectorAll('canvas');
       for (const c of canvases) {
         const cls = (c.className || '').toString();
         if (cls.includes('flt') || cls.includes('flutter')) return true;
       }
-      // Also check for the glass-pane element
       const glassPane = document.querySelector('flt-glass-pane');
       if (glassPane) return true;
       return false;
@@ -101,7 +97,6 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
       return true;
     }
 
-    // Strategy 3: Check for auth-related content (sign-in prompts, error pages)
     const hasSignInPrompt = await page.evaluate(() => {
       const body = document.body?.innerText || '';
       return body.includes('Sign in') || body.includes('sign in') ||
@@ -114,17 +109,15 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
       return false;
     }
 
-    // Fallback: on SPA domain with no contradictory signals — assume valid
-    // This prevents false re-auth triggers when the page is still loading
     log('SPA check: No contradictory signals on SPA domain — assuming valid', 'DEBUG', 'auth-guard');
     return true;
   } catch (err: any) {
     log(`SPA check: evaluate failed (${err.message}) — assuming valid`, 'WARN', 'auth-guard');
-    return true; // Fail-open: don't re-auth on evaluation errors
+    return true;
   }
 }
 
-async function ensureAuthenticated(page: any) { 
+async function ensureAuthenticated(page: any) {
   const CONFIG = getCONFIG();
   const auth = _deps.auth || {};
   const browser = _deps.browser || {};
@@ -137,34 +130,52 @@ async function ensureAuthenticated(page: any) {
       authAttempts = 0;
       return page;
     }
-    // If invalid, fall through to re-auth below
-    log('🔐 SPA session invalid, re-authenticating...', 'WARN', 'auth-guard');
+    log('SPA session invalid, re-authenticating...', 'WARN', 'auth-guard');
   } else {
-    // Non-SPA path: use original URL-based check (for non-SPA deployments)
     if (url.includes('/assignments')) { authAttempts = 0; return page; }
   }
 
-  // ── Re-authentication flow (triggers for both SPA and non-SPA) ──
+  // ── Re-authentication flow ──
   if (url.includes('login.microsoftonline.com') || url.includes(CONFIG.APP_URL) || _isSpaDomain(url)) {
-    log('🔐 Session expired, re-authenticating...', 'WARN', 'auth-guard');
+    log('Session expired, re-authenticating...', 'WARN', 'auth-guard');
     authAttempts++;
-    if (authAttempts > CONFIG.MAX_AUTH_ATTEMPTS) { if (CONFIG.ALERT_ON_AUTH_FAILURE) try { (_deps.alerting?.sendAlert || (() => {}))('Max authentication attempts exceeded'); } catch (alertErr: any) { log('Failed to send auth failure alert', 'ERROR', 'auth-guard'); } throw new Error('Max authentication attempts exceeded'); }
+    if (authAttempts > CONFIG.MAX_AUTH_ATTEMPTS) {
+      try { (_deps.alerting?.sendAlert || (() => {}))('Max authentication attempts exceeded'); } catch (alertErr: any) { log('Failed to send auth failure alert', 'ERROR', 'auth-guard'); }
+      throw new Error('Max authentication attempts exceeded');
+    }
     const refreshed = await auth.refreshSession?.(page);
     if (refreshed) { authAttempts = 0; return page; }
     await browser.closeBrowser?.();
     const newPage = await retryWithBackoff(browser.launchBrowser, { maxRetries: 2 });
-    await auth.authenticate?.(newPage);
-    authAttempts = 0;
-    return newPage;
+    try {
+      await auth.authenticate?.(newPage);
+      authAttempts = 0;
+      return newPage;
+    } catch (authErr: any) {
+      // FIX: Distinguish MFA_REQUIRED from other auth failures.
+      // MFA is permanent — no point retrying, escalate immediately.
+      const errMsg = authErr?.message || '';
+      if (errMsg.includes('MFA_REQUIRED')) {
+        log('MFA required — alerting and entering long sleep to avoid hour burn', 'ERROR', 'auth-guard');
+        try { (_deps.alerting?.sendAlert || (() => {}))('MFA required — human intervention needed. Bot entering DORMANT.', 1); } catch {}
+        // Trigger degradation to DORMANT to stop burning hours
+        try {
+          const { degradationLadder } = require('./self-heal-degradation-ladder');
+          degradationLadder.setLevel(4, 'MFA_REQUIRED — cannot authenticate without human intervention');
+        } catch {}
+        throw new Error('MFA_REQUIRED: Cannot proceed without human MFA intervention');
+      }
+      throw authErr;
+    }
   }
   return page;
 }
 
-async function handleCaptcha(page: any) { 
+async function handleCaptcha(page: any) {
   const CONFIG = getCONFIG();
   const auth = _deps.auth || {};
   if (await auth.detectCaptcha?.(page)) {
-    log('🧩 CAPTCHA detected.', 'WARN', 'auth-guard');
+    log('CAPTCHA detected.', 'WARN', 'auth-guard');
     let solved = false;
     let attempts = 0;
     while (!solved && attempts < CONFIG.CAPTCHA_MAX_ATTEMPTS) {
@@ -177,17 +188,61 @@ async function handleCaptcha(page: any) {
       }
     }
     if (!solved) {
-      log('❌ Failed to solve CAPTCHA after max attempts. Waiting and retrying later.', 'ERROR', 'auth-guard');
-      if (CONFIG.ALERT_ON_ERROR) try { (_deps.alerting?.sendAlert || (() => {}))('CAPTCHA solving failed after max attempts'); } catch (e: any) {}
-      const baseDelay = 60000;
-      for (let i = 0; i < 5; i++) {
-        const delay = Math.min(baseDelay * Math.pow(2, i), 1800000);
-        await new Promise(r => setTimeout(r, delay));
-        if (await auth.solveCaptcha?.(page)) { solved = true; break; }
+      // FIX: Original code entered a 44-minute backoff loop that burned Render hours.
+      // New behavior: track consecutive failures across cycles. If we've failed
+      // N times in a row, enter DORMANT for a long sleep instead of burning hours.
+      _consecutiveCaptchaFailures++;
+      log(`CAPTCHA failed after ${attempts} attempts (consecutive failures: ${_consecutiveCaptchaFailures})`, 'ERROR', 'auth-guard');
+
+      if (_consecutiveCaptchaFailures >= MAX_CONSECUTIVE_CAPTCHA_FAILURES) {
+        log(`CAPTCHA feedback loop detected (${_consecutiveCaptchaFailures} consecutive). Entering DORMANT to stop burning Render hours.`, 'ERROR', 'auth-guard');
+        try { (_deps.alerting?.sendAlert || (() => {}))(`CAPTCHA loop: ${_consecutiveCaptchaFailures} consecutive failures. Bot entering DORMANT for 2 hours.`, 1); } catch {}
+
+        // Enter DORMANT to stop burning hours
+        try {
+          const { degradationLadder } = require('./self-heal-degradation-ladder');
+          degradationLadder.setLevel(4, `CAPTCHA_LOOP: ${_consecutiveCaptchaFailures} consecutive captcha failures`);
+        } catch {}
+
+        // Sleep for 2 hours instead of a 44-minute retry loop.
+        // This preserves ~1.9 of the 2 hours that would have been wasted.
+        log('Sleeping for 2 hours to conserve Render hours...', 'WARN', 'auth-guard');
+        await sleep(2 * 60 * 60 * 1000);
+        throw new Error('CAPTCHA_LOOP: Sleeping after repeated captcha failures');
       }
-      if (!solved) throw new Error('CAPTCHA could not be solved after multiple backoff attempts');
+
+      // First/second consecutive failure: short backoff (max 5 minutes total, not 44 minutes)
+      const shortDelay = Math.min(60000 * _consecutiveCaptchaFailures, 300000); // 1-5 minutes
+      log(`CAPTCHA backoff: ${Math.round(shortDelay / 1000)}s (failure ${_consecutiveCaptchaFailures}/${MAX_CONSECUTIVE_CAPTCHA_FAILURES})`, 'WARN', 'auth-guard');
+      await new Promise(r => setTimeout(r, shortDelay));
+      if (await auth.solveCaptcha?.(page)) {
+        _consecutiveCaptchaFailures = 0;
+        return;
+      }
+      throw new Error('CAPTCHA could not be solved after retries');
     }
+
+    // Reset counter on success
+    _consecutiveCaptchaFailures = 0;
   }
 }
 
-module.exports = { ensureAuthenticated, handleCaptcha, _injectDependencies };
+/**
+ * Reset the consecutive captcha failure counter.
+ * Called when a cycle completes successfully (captcha was either not needed or solved).
+ */
+function resetCaptchaFailureCount(): void {
+  if (_consecutiveCaptchaFailures > 0) {
+    log(`Reset captcha failure counter (was ${_consecutiveCaptchaFailures})`, 'DEBUG', 'auth-guard');
+  }
+  _consecutiveCaptchaFailures = 0;
+}
+
+/**
+ * Get the current consecutive captcha failure count (for diagnostics).
+ */
+function getCaptchaFailureCount(): number {
+  return _consecutiveCaptchaFailures;
+}
+
+module.exports = { ensureAuthenticated, handleCaptcha, resetCaptchaFailureCount, getCaptchaFailureCount, _injectDependencies };
