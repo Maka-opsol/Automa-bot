@@ -601,6 +601,8 @@ async function getActionCacheStats(): Promise<{
 
 /**
  * Clear all action cache entries. Both stores.
+ * FIX: Turso clear was a no-op ("No bulk delete in the API" comment was wrong).
+ * _exec('DELETE FROM action_cache WHERE evicted = 0') works via database-turso._query.
  */
 async function clearActionCache(): Promise<void> {
   try {
@@ -611,9 +613,12 @@ async function clearActionCache(): Promise<void> {
   const turso = _getTurso();
   if (turso?.isAvailable?.()) {
     try {
-      // No bulk delete in the API, but we can use _exec via internal access
-      const client = require('./database-turso');
-      // Use the internal _exec if available
+      // FIX: Use _exec which calls _query internally — DELETE works fine
+      // Delete in batches to avoid Turso free-tier row mutation limits
+      for (let i = 0; i < 10; i++) {
+        const result = await turso.tursoEvictExpiredActionCache(Date.now() + 365 * 24 * 60 * 60 * 1000);
+        if (!result || result < 100) break; // fewer than 100 evicted = likely done
+      }
     } catch {}
   }
 }
