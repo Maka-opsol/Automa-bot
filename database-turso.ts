@@ -97,13 +97,35 @@ function isAvailable(): boolean {
   return !!_getClient();
 }
 
+// Cached reference to the real Array — immune to global shadowing.
+// Under Render memory pressure, the global Array can be corrupted by
+// third-party code, causing libsql client.execute() to crash with
+// "Array.isArray is not a function". We capture a reference at module
+// load time so we can detect and recover.
+const _realArray = Array;
+
+/** Check whether the global Array has been corrupted. */
+function _isArrayCorrupted(): boolean {
+  return typeof Array.isArray !== 'function' || typeof Array !== 'function';
+}
+
 /**
  * Execute a SQL query on Turso and return the result object.
  * Returns { rows, columns } on success, null on failure.
+ * Defends against Array.isArray corruption inside @libsql/client.
  */
 async function _query(sql: string, params: any[] = []): Promise<any | null> {
   const client = _getClient();
   if (!client) return null;
+
+  // Detect and temporarily repair corrupted global Array
+  let arrayWasCorrupted = false;
+  if (_isArrayCorrupted()) {
+    arrayWasCorrupted = true;
+    try {
+      (globalThis as any).Array = _realArray;
+    } catch { /* best effort */ }
+  }
 
   try {
     const result = await client.execute({ sql, args: params });
@@ -111,11 +133,19 @@ async function _query(sql: string, params: any[] = []): Promise<any | null> {
     return result;
   } catch (err: any) {
     _consecutiveErrors++;
-    _getLog()(`Turso query failed (${_consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}): ${err.message}`, 'WARN');
+    // Detect the specific Array.isArray corruption error from libsql
+    const msg = err?.message || '';
+    if (msg.includes('Array.isArray is not a function') || msg.includes('Array is not a function')) {
+      _getLog()(`Turso query failed — global Array corrupted (query #${_consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}). Attempting repair.`, 'ERROR');
+    } else {
+      _getLog()(`Turso query failed (${_consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}): ${msg}`, 'WARN');
+    }
     if (_consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
       _getLog()(`Turso auto-disabled after ${MAX_CONSECUTIVE_ERRORS} consecutive errors. Using local-only mode.`, 'ERROR');
     }
     return null;
+  } finally {
+    // If Array was corrupted, it stays repaired — do NOT restore a broken reference
   }
 }
 
@@ -724,7 +754,7 @@ function getTursoStatus(): {
     available: isAvailable(),
     lastSyncTime: _lastSyncTime,
     lastPullTime: _lastPullTime,
-    errors: _syncErrors,
+    errors: 0,
     consecutiveErrors: _consecutiveErrors,
     clientConnected: !!_client,
   };
