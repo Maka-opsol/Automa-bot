@@ -26,7 +26,7 @@
 
 interface KeyEntry {
   envVar: string;
-  envVar2?: string;        // Some services need 2 keys (e.g., MATHPIX_APP_KEY)
+  envVar2?: string;        // Some services need 2 keys (e.g., API_SECRET)
   service: string;
   id: string;              // Lowercase, no spaces (for DB keys)
   validate: () => Promise<{ valid: boolean; error?: string }>;
@@ -182,20 +182,10 @@ const KEY_REGISTRY: KeyEntry[] = [
       }
     },
   },
-  {
-    envVar: 'MATHPIX_APP_ID',
-    envVar2: 'MATHPIX_APP_KEY',
-    service: 'Mathpix',
-    id: 'mathpix',
-    validate: async () => {
-      const appId = process.env.MATHPIX_APP_ID;
-      const appKey = process.env.MATHPIX_APP_KEY;
-      if (!appId || !appKey) return { valid: false, error: 'no key' };
-      // Mathpix has no lightweight test endpoint — just check key format
-      if (appId.length < 10 || appKey.length < 10) return { valid: false, error: 'key too short' };
-      return { valid: true };
-    },
-  },
+  // Pix2Tex is a local Python tool — no API keys needed.
+  // Removed Mathpix entry (replaced by free Pix2Tex OCR).
+  // If p2t CLI is missing, the vault won't flag it as a key issue;
+  // the contextual alert system handles availability monitoring.
   {
     envVar: 'NTFY_TOPIC',
     service: 'NTFY',
