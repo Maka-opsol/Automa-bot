@@ -321,7 +321,7 @@ function retireProvider(name: string, reason: string) {
     if (turso?.isAvailable?.()) {
       turso.tursoUpsertCalibration(`retired_${name}`, JSON.stringify({ reason, retiredAt }), retiredAt).catch(() => {});
     }
-  } catch {}}
+  } catch {}
 
   // P8: Attempt auto-replacement
   try {
