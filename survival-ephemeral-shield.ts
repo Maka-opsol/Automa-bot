@@ -90,6 +90,14 @@ let _diskUsagePercent = 0;
 let _cleanupCount = 0;
 let _started = false;
 
+// ─── Disk cleanup backoff state ───
+// When disk is persistently high but cleanup frees 0 bytes, we back off
+// logging to avoid spamming WARN every 30s with no actionable result.
+let _consecutiveZeroFreed = 0;
+const MAX_CONSECUTIVE_ZERO_FREED = 3; // After this many, suppress WARN logs
+let _diskCleanupSuppressedUntil = 0; // Timestamp until which to suppress WARN
+const DISK_CLEANUP_SUPPRESS_MS = 5 * 60 * 1000; // Suppress for 5 minutes after repeated 0-freed
+
 // ─── Helpers ───
 
 /**
@@ -461,7 +469,9 @@ function detectWipe(): { wipeDetected: boolean; missingFiles: string[]; reason: 
   }
 
   if (missingFiles.length > 0) {
-    log(`Non-critical files missing: ${missingFiles.join(', ')}`, 'INFO');
+    // Downgrade to DEBUG — missing non-critical dirs (e.g. logDir) is normal on
+    // fresh deploys and not actionable. Was INFO which polluted logs every 10s.
+    log(`Non-critical files missing: ${missingFiles.join(', ')}`, 'DEBUG');
   }
 
   return { wipeDetected: false, missingFiles: [], reason: 'ok' };
@@ -927,7 +937,12 @@ function checkDiskSpace(): void {
     return;
   }
 
+  const now = Date.now();
+  const isSuppressed = now < _diskCleanupSuppressedUntil;
+
   if (_diskUsagePercent > DISK_SPACE_CRITICAL_PERCENT) {
+    // CRITICAL — always log, never suppress
+    _consecutiveZeroFreed = 0; // Reset backoff on CRITICAL
     log(`Disk usage CRITICAL: ${_diskUsagePercent.toFixed(1)}% — triggering emergency cleanup`, 'ERROR');
     const result = cleanupNonCriticalFiles();
     const nukeResult = _nukeAllDeletable();
@@ -942,15 +957,38 @@ function checkDiskSpace(): void {
       }
     } catch { /* non-critical */ }
   } else if (_diskUsagePercent > DISK_SPACE_HIGH_PERCENT) {
-    log(`Disk usage HIGH: ${_diskUsagePercent.toFixed(1)}% — aggressive cleanup (deleting ALL deletable files)`, 'WARN');
     const nukeResult = _nukeAllDeletable();
-    log(`Aggressive cleanup freed ${(nukeResult.freedBytes / 1024).toFixed(0)} KB (${nukeResult.filesDeleted} files)`, 'WARN');
-    // FIX: Also do standard cleanup after nuke for thoroughness
+    const totalFreed = nukeResult.freedBytes;
+
+    if (totalFreed === 0) {
+      _consecutiveZeroFreed++;
+      if (_consecutiveZeroFreed >= MAX_CONSECUTIVE_ZERO_FREED) {
+        // Activate suppression — nothing more we can do
+        if (!isSuppressed) {
+          log(`Disk usage HIGH: ${_diskUsagePercent.toFixed(1)}% — cleanup freed 0 KB for ${_consecutiveZeroFreed} consecutive checks. Suppressing further warnings for ${DISK_CLEANUP_SUPPRESS_MS / 1000}s.`, 'WARN');
+          _diskCleanupSuppressedUntil = now + DISK_CLEANUP_SUPPRESS_MS;
+        }
+      } else {
+        // Still logging at WARN while we have hope
+        log(`Disk usage HIGH: ${_diskUsagePercent.toFixed(1)}% — aggressive cleanup (deleting ALL deletable files)`, 'WARN');
+        log(`Aggressive cleanup freed 0 KB (${nukeResult.filesDeleted} files)`, 'WARN');
+      }
+    } else {
+      // Freed something — reset backoff counter
+      _consecutiveZeroFreed = 0;
+      _diskCleanupSuppressedUntil = 0;
+      log(`Disk usage HIGH: ${_diskUsagePercent.toFixed(1)}% — aggressive cleanup (deleting ALL deletable files)`, 'WARN');
+      log(`Aggressive cleanup freed ${(totalFreed / 1024).toFixed(0)} KB (${nukeResult.filesDeleted} files)`, 'WARN');
+    }
+    // Also do standard cleanup after nuke for thoroughness
     const stdResult = cleanupNonCriticalFiles();
     if (stdResult.filesDeleted > 0) {
       log(`Post-nuke standard cleanup freed ${(stdResult.freedBytes / 1024).toFixed(0)} KB`, 'INFO');
     }
   } else if (_diskUsagePercent > DISK_SPACE_LOW_PERCENT) {
+    // LOW — reset backoff since we're below HIGH threshold now
+    _consecutiveZeroFreed = 0;
+    _diskCleanupSuppressedUntil = 0;
     log(`Disk usage elevated: ${_diskUsagePercent.toFixed(1)}% — preemptive cleanup`, 'WARN');
     const result = cleanupNonCriticalFiles();
     if (result.filesDeleted > 0) {
