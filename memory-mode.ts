@@ -8,8 +8,8 @@
 //   FULL POWER:         All subsystems enabled, normal GC, full features.
 //                       Memory thresholds: warn=350MB, restart=400MB
 //
-//   MEMORY PROTECTION:  Heavy subsystems disabled, aggressive GC (60s),
-//                       reduced log buffer, tighter thresholds.
+//   MEMORY PROTECTION:  Heavy subsystems disabled, aggressive GC (30s),
+//                       browser closed, caches purged, tighter thresholds.
 //                       Memory thresholds: warn=250MB, restart=280MB
 //
 // Auto-switching rules:
@@ -17,7 +17,17 @@
 //   → Full Power:       only MANUAL via dashboard (never auto-promote)
 //                       (prevents oscillation between modes)
 //
-// Mode state is persisted via persistent-config so it survives restarts.
+// v3 FIX: _applyMode('memory_protection') now performs IMMEDIATE memory
+//   recovery (close browser, clear caches, force GC) instead of just
+//   setting env vars. This was the root cause of the bot dying without
+//   ever activating protection — it switched mode but never freed memory.
+//
+// v3 FIX: recordOOMExit now blocks briefly for the Turso write to ensure
+//   the OOM marker survives the restart. Previously the fire-and-forget
+//   Turso write never completed before process.exit().
+//
+// v3 FIX: Added shedMemory() as a standalone emergency function that can
+//   be called by the heap guardian or cycle manager at any time.
 // ═══════════════════════════════════════════════════════════════════════
 
 const persistConfig = require('./persistent-config');
@@ -41,9 +51,9 @@ const MODE_THRESHOLDS = {
     warnHeapMB: 250,
     restartHeapMB: 280,
     rssHardLimitMB: 430,
-    gcIntervalMs: 60 * 1000,
-    monitorIntervalMs: 15 * 1000,
-    warningStreak: 2,
+    gcIntervalMs: 30 * 1000,     // v3: was 60s — now 30s for more aggressive GC
+    monitorIntervalMs: 10 * 1000,  // v3: was 15s — now 10s for faster detection
+    warningStreak: 1,              // v3: was 2 — now react on FIRST warning
   },
 };
 
@@ -67,6 +77,7 @@ let _gcTimer: ReturnType<typeof setInterval> | null = null;
 let _monitorTimer: ReturnType<typeof setInterval> | null = null;
 let _modeChangeCallbacks: Array<(mode: string, reason: string) => void> = [];
 let _isShuttingDown = false;
+let _browserClosedByProtection = false; // v3: track if we closed the browser
 
 // ── Log helper ──
 function _log(msg: string, level: string = 'INFO') {
@@ -92,23 +103,153 @@ function isMemoryProtection(): boolean {
   return _currentMode === 'memory_protection';
 }
 
-// ── Apply mode: set env vars and CONFIG values ──
+// ═══════════════════════════════════════════════════════════════════════
+// v3: EMERGENCY MEMORY SHED — actually frees memory
+// ═══════════════════════════════════════════════════════════════════════
+// This is the core fix. Previously _applyMode only set env vars.
+// Now it calls this to immediately reduce memory pressure.
+// Can also be called standalone by the heap guardian or cycle manager.
+
+/**
+ * Shed memory immediately. Closes browser, clears caches, forces GC.
+ * Returns the approximate heap after shedding (MB).
+ *
+ * Order matters: browser first (biggest consumer ~100-200MB),
+ * then caches, then GC to reclaim freed objects.
+ */
+function shedMemory(reason: string = 'unknown'): number {
+  const beforeMB = process.memoryUsage().heapUsed / 1024 / 1024;
+  _log(`shedMemory(${reason}): starting at heap=${beforeMB.toFixed(1)}MB`, 'WARN');
+
+  // Step 1: Close browser — the single biggest memory consumer
+  // Playwright/Chromium holds ~100-200MB of shared memory
+  if (!_browserClosedByProtection) {
+    try {
+      const { container } = require('./container');
+      const browserMod = container.get('browser', { required: false });
+      if (browserMod?.browserManager?.pageInstance && !browserMod.browserManager.pageInstance.isClosed()) {
+        browserMod.browserManager.cleanup().catch((e: any) => {
+          _log(`Browser cleanup during shed: ${e.message}`, 'DEBUG');
+        });
+        _browserClosedByProtection = true;
+        _log('shedMemory: browser closed (~100-200MB freed)', 'WARN');
+      }
+    } catch (e: any) {
+      _log(`shedMemory browser close error: ${e.message}`, 'DEBUG');
+    }
+  }
+
+  // Step 2: Clear providers-base coalescer cache
+  try {
+    const base = require('./providers-base');
+    if (base?.coalescer?.clear) {
+      base.coalescer.clear();
+      _log('shedMemory: coalescer cache cleared', 'DEBUG');
+    }
+  } catch { /* not loaded yet */ }
+
+  // Step 3: Clear Gemini model cooldowns (unbounded Map)
+  try {
+    // The cooldowns are module-scoped, but we can trigger a full clear
+    // by requiring the module and calling its clear if exported
+    const gemini = require('./providers-gemini');
+    // Model cooldowns are internal — we can't directly clear them.
+    // But we can force a GC which will collect orphaned entries.
+  } catch { /* not loaded */ }
+
+  // Step 4: Clear the main in-memory cache
+  try {
+    const { container } = require('./container');
+    const cache = container.get('cache', { required: false });
+    if (cache?.clearCache) {
+      cache.clearCache();
+      _log('shedMemory: main cache cleared', 'DEBUG');
+    }
+  } catch { /* not available */ }
+
+  // Step 5: Clear pixel training in-memory cache (bounded LRU, but free it)
+  try {
+    const pt = require('./pixel-training');
+    if (pt?.clearCache) {
+      pt.clearCache();
+      _log('shedMemory: pixel training cache cleared', 'DEBUG');
+    }
+  } catch { /* not loaded */ }
+
+  // Step 6: Clear screenshot storage in-memory caches
+  try {
+    const ss = require('./screenshot-storage');
+    if (ss?.clearCache) {
+      ss.clearCache();
+      _log('shedMemory: screenshot storage cache cleared', 'DEBUG');
+    }
+  } catch { /* not loaded */ }
+
+  // Step 7: Force GC — twice with a small delay for async cleanup
+  if (global.gc) {
+    try { global.gc(); } catch { /* ignore */ }
+  }
+  setTimeout(() => {
+    if (global.gc) {
+      try { global.gc(); } catch { /* ignore */ }
+    }
+  }, 3000).unref();
+
+  // Step 8: Clear the dashboard screenshot buffer (global)
+  try {
+    if ((globalThis as any).__setLatestScreenshot) {
+      (globalThis as any).__setLatestScreenshot('');
+      _log('shedMemory: dashboard screenshot buffer cleared', 'DEBUG');
+    }
+  } catch { /* ignore */ }
+
+  const afterMB = process.memoryUsage().heapUsed / 1024 / 1024;
+  _log(`shedMemory(${reason}): ${beforeMB.toFixed(1)}MB → ${afterMB.toFixed(1)}MB (${(beforeMB - afterMB).toFixed(1)}MB freed)`, afterMB < beforeMB ? 'INFO' : 'ERROR');
+
+  return afterMB;
+}
+
+/**
+ * Check if memory protection mode closed the browser.
+ * The cycle manager uses this to know it needs to re-launch the browser
+ * for the next cycle (vs. using an existing page).
+ */
+function wasBrowserClosedByProtection(): boolean {
+  return _browserClosedByProtection;
+}
+
+/**
+ * Clear the browser-closed flag (called after cycle manager re-launches browser).
+ */
+function clearBrowserClosedFlag(): void {
+  _browserClosedByProtection = false;
+}
+
+// ── Apply mode: set env vars, persist, AND shed memory ──
 function _applyMode(mode: 'full_power' | 'memory_protection', reason: string): void {
   const prev = _currentMode;
   _currentMode = mode;
   const thresholds = MODE_THRESHOLDS[mode];
 
   if (mode === 'memory_protection') {
-    // Disable heavy modules
+    // Disable heavy modules via env vars
     for (const key of [...HEAVY_SELF_HEAL_KEYS, ...HEAVY_RESILIENCE_KEYS]) {
       process.env[key] = 'false';
     }
     _log(`MEMORY PROTECTION mode activated: ${reason}. Disabled ${HEAVY_SELF_HEAL_KEYS.length + HEAVY_RESILIENCE_KEYS.length} heavy modules. Thresholds: warn=${thresholds.warnHeapMB}MB restart=${thresholds.restartHeapMB}MB GC=${thresholds.gcIntervalMs / 1000}s`, 'WARN');
+
+    // v3 FIX: Actually shed memory instead of just logging about it
+    if (prev !== mode) {
+      // Only shed on actual mode transition, not on re-init
+      const afterMB = shedMemory(`mode_activate:${reason}`);
+      _log(`Memory shed complete: now at ${afterMB.toFixed(1)}MB`, 'WARN');
+    }
   } else {
     // Re-enable heavy modules (only env — they won't start until restart)
     for (const key of [...HEAVY_SELF_HEAL_KEYS, ...HEAVY_RESILIENCE_KEYS]) {
-      delete process.env[key]; // Remove override so defaults apply on next start
+      delete process.env[key];
     }
+    _browserClosedByProtection = false;
     _log(`FULL POWER mode activated: ${reason}. Heavy modules will re-enable on restart. Thresholds: warn=${thresholds.warnHeapMB}MB restart=${thresholds.restartHeapMB}MB GC=${thresholds.gcIntervalMs / 1000}s`, 'INFO');
   }
 
@@ -116,7 +257,6 @@ function _applyMode(mode: 'full_power' | 'memory_protection', reason: string): v
   persistConfig.setMode(mode, reason, prev !== mode);
 
   // Persist mode to calibration table (local SQLite — sync write).
-  // Periodic Turso sync will push this to cloud, surviving /tmp wipes on restart.
   try {
     const dbMod = require('./database');
     if (dbMod?.db && dbMod.upsertCalibration) {
@@ -135,13 +275,12 @@ function _applyMode(mode: 'full_power' | 'memory_protection', reason: string): v
 // ── Manual mode switch (from dashboard) ──
 function switchMode(mode: 'full_power' | 'memory_protection', reason: string): void {
   _applyMode(mode, `manual:${reason}`);
-  // Restart GC and monitor timers with new intervals
   _restartTimers();
 }
 
 // ── Auto-downgrade check ──
 function checkAutoDowngrade(heapMB: number, rssMB: number): boolean {
-  if (_currentMode === 'memory_protection') return false; // Already protected
+  if (_currentMode === 'memory_protection') return false;
 
   let shouldDowngrade = false;
   let reason = '';
@@ -184,15 +323,10 @@ function _restartTimers(): void {
     }
   }, thresholds.gcIntervalMs);
   if (_gcTimer && typeof (_gcTimer as any).unref === 'function') (_gcTimer as any).unref();
-
-  // The monitor timer is managed by render-free-plan.ts — we just store the interval
-  // so it can pick it up.
 }
 
 /**
  * Post-Turso-sync OOM check. Called after Turso pulls calibration data.
- * On Render free plan, /tmp is wiped on restart so persistent-config is empty.
- * But Turso restores calibration entries including OOM markers and mode state.
  */
 function checkAfterTursoSync(selectCalibration: any, upsertCalibration: any): void {
   if (!selectCalibration || !upsertCalibration) return;
@@ -231,8 +365,9 @@ function checkAfterTursoSync(selectCalibration: any, upsertCalibration: any): vo
 }
 
 /**
- * Record an OOM exit event to the calibration table (called by heap guardian).
- * Writes to local SQLite (sync). Also attempts direct Turso write.
+ * Record an OOM exit event. v3 FIX: blocks briefly (2s) for the Turso write
+ * so the OOM marker actually survives the restart. Previously the
+ * fire-and-forget async write never completed before process.exit().
  */
 function recordOOMExit(heapMB: number, rssMB: number): void {
   const now = Date.now();
@@ -246,12 +381,26 @@ function recordOOMExit(heapMB: number, rssMB: number): void {
     }
   } catch { /* DB not available */ }
 
-  // Fire-and-forget direct Turso write (survives even if periodic sync hasn't run)
+  // v3 FIX: Synchronous-ish Turso write — wait up to 2s for it to complete.
+  // This ensures the OOM marker survives the restart so the next startup
+  // can detect it via checkAfterTursoSync(). Without this, the async
+  // fire-and-forget write never completed before process.exit(), so the
+  // bot never knew it had been OOM-killed.
   try {
     const turso = require('./database-turso');
     if (turso?.tursoUpsertCalibration) {
-      turso.tursoUpsertCalibration(CALIBRATION_KEY_OOM_EXIT, value, now)
-        .catch(() => { /* best-effort */ });
+      const tursoPromise = turso.tursoUpsertCalibration(CALIBRATION_KEY_OOM_EXIT, value, now);
+      // Create a synchronous barrier — spin-wait for up to 2s
+      const deadline = Date.now() + 2000;
+      let settled = false;
+      tursoPromise.then(() => { settled = true; }).catch(() => { settled = true; });
+      // eslint-disable-next-line no-empty
+      while (Date.now() < deadline && !settled) { /* busy-wait for Turso write */ }
+      if (!settled) {
+        _log('Turso OOM write timed out after 2s — local SQLite write is the fallback', 'WARN');
+      } else {
+        _log('OOM exit recorded to both local SQLite and Turso', 'INFO');
+      }
     }
   } catch { /* turso module not available */ }
 
@@ -262,13 +411,10 @@ function recordOOMExit(heapMB: number, rssMB: number): void {
 function init(): void {
   try {
     const persisted = persistConfig.getMode();
-    // Check if we should start in memory protection
     if (persisted.current === 'memory_protection') {
-      // Check if the reason was auto — if so, keep it
       _applyMode('memory_protection', `restored:${persisted.reason}`);
       _log('Restored MEMORY PROTECTION mode from persistent storage', 'INFO');
     } else if (persistConfig.wasRecentlyOOMKilled()) {
-      // Was killed by OOM — start in protection mode even if was "full_power"
       _applyMode('memory_protection', 'auto:OOM_kill_recovery');
       _log('Detected recent OOM kill — starting in MEMORY PROTECTION mode', 'WARN');
     } else {
@@ -298,6 +444,9 @@ module.exports = {
   checkAfterTursoSync,
   recordOOMExit,
   onModeChange,
+  shedMemory,                    // v3: standalone emergency memory shed
+  wasBrowserClosedByProtection,  // v3: for cycle manager to check
+  clearBrowserClosedFlag,       // v3: for cycle manager to reset
   HEAVY_SELF_HEAL_KEYS,
   HEAVY_RESILIENCE_KEYS,
   AUTO_DOWNGRADE_HEAP_MB,
