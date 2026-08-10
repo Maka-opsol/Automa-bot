@@ -53,6 +53,10 @@ const PROTECTED_PATTERNS = [
   'checkpoint.json',
   'last-state.json',
   'state.json',
+  'manifest.json',
+  'manifest.json.tmp',
+  'tombstone_latest.json.gz',
+  '.tombstone.json',
 ];
 
 // ─── State ──────────────────────────────────────────────────────────────────
@@ -207,6 +211,9 @@ function _isProtected(filePath: string): boolean {
   if (basename.endsWith('.db') || basename.endsWith('.db-wal') || basename.endsWith('.db-shm')) return true;
   // Lock files
   if (basename.endsWith('.lock')) return true;
+  // Protected directories (shield manifests, data backups)
+  const parts = filePath.replace(/\\/g, '/').split('/');
+  if (parts.includes('mathu-shield') || parts.includes('mathu-data')) return true;
   return false;
 }
 
