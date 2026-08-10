@@ -6,6 +6,14 @@ if (IS_HF_SPACE) { console.log('━━━ Running on Hugging Face Spaces — all
 
 // ─── Error handler MUST load first — registers uncaughtException / unhandledRejection ───
 require('./error-handler');
+
+// ─── Instance lock — prevent dual instances (duplicated logs, double API calls) ───
+const { acquireLock } = require('./instance-lock');
+if (!acquireLock()) {
+  console.error('━━━ EXITING: Another MathU-bot instance is already running ━━━');
+  process.exit(1);
+}
+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
