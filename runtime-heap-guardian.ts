@@ -177,6 +177,17 @@ function checkMemory(): boolean {
 
     if (_hardTriggerCount >= MAX_HARD_TRIGGERS) {
       log(`Hard threshold hit ${MAX_HARD_TRIGGERS} times. Permanent shutdown.`, 'FATAL');
+      // v4: Run full preservation before exiting (tombstone, checkpoint, Turso sync, caches)
+      try {
+        const guardian = require('./survival-restart-guardian');
+        if (guardian?.preserveBeforeExit) {
+          guardian.preserveBeforeExit('OOM_HARD_THRESHOLD_3x').finally(() => {
+            const origExit = (process as any)._originalExit || process.exit.bind(process);
+            origExit(137);
+          });
+          return true; // Don't fall through to recovery
+        }
+      } catch { /* guardian not available */ }
       const origExit = (process as any)._originalExit || process.exit.bind(process);
       origExit(137);
     }
@@ -186,6 +197,17 @@ function checkMemory(): boolean {
     const afterRecoveryMB = getHeapUsedMB();
     if (afterRecoveryMB >= hardThreshold) {
       log(`Memory still critical after recovery: ${afterRecoveryMB.toFixed(1)}MB. Exiting for Render restart.`, 'FATAL');
+      // v4: Use restart guardian's comprehensive preservation (includes tombstone + more)
+      try {
+        const guardian = require('./survival-restart-guardian');
+        if (guardian?.preserveBeforeExit) {
+          guardian.preserveBeforeExit('OOM_RECOVERY_FAILED').finally(() => {
+            const origExit = (process as any)._originalExit || process.exit.bind(process);
+            origExit(1);
+          });
+          return true;
+        }
+      } catch { /* guardian not available, fall through to original logic */ }
       pushTombstoneBeforeDeath().finally(() => {
         const origExit = (process as any)._originalExit || process.exit.bind(process);
         origExit(1);
