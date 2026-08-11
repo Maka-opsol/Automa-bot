@@ -247,12 +247,7 @@ const logger = pino({
     level: (label: any) => ({ level: label.toUpperCase() }),
     bindings: (bindings: any) => bindings ? { pid: bindings.pid, host: bindings.hostname?.substring(0, 50) || 'unknown' } : {}
   },
-  timestamp: () => {
-  // SAST = UTC+2 — shift the time and use +02:00 offset instead of Z
-  const d = new Date(Date.now() + 2 * 3600000);
-  const iso = d.toISOString();
-  return `,"timestamp":"${iso.replace('Z', '+02:00')}"`;
-},
+  timestamp: () => `,"timestamp":"${new Date().toISOString()}"`,
   base: undefined,
   serializers: { err: pino.stdSerializers.err, error: pino.stdSerializers.err },
   redact: { paths: ['req.headers.authorization', 'req.headers.cookie'], censor: '[REDACTED]' }
@@ -290,7 +285,9 @@ function log(message: any, level = 'INFO', module = 'main') {
     // FIX: Repair corrupted global Array before pino touches it.
     // Pino internally calls Array.isArray during serialization;
     // under Render memory pressure this global can be corrupted.
-    if (typeof Array.isArray !== 'function') {
+    // Check ALL critical static methods — corruption may strip individual
+    // methods (e.g. Array.from) while leaving Array.isArray intact.
+    if (typeof Array.isArray !== 'function' || typeof Array.from !== 'function' || typeof Array.of !== 'function') {
       try { (globalThis as any).Array = _realArray; } catch { /* best effort */ }
     }
     let child = _childLoggerCache.get(safeModule);
