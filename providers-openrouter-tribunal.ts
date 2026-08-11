@@ -107,7 +107,7 @@ function OpenRouterTribunalProvider() {
             endpoint, apiKey, m, base64Image, prompt, 'OpenRouter',
             { signal }
           ),
-          { providerName: 'OpenRouter', maxRetries: 2, baseDelay: 1000 }
+          { providerName: 'OpenRouter', maxRetries: 2, baseDelay: 1000, signal }
         );
 
         if (options.validate === false) return rawContent;
