@@ -40,13 +40,6 @@ let _consecutiveErrors = 0;
 const MAX_CONSECUTIVE_ERRORS = 5; // Auto-disable after 5 consecutive failures
 const SYNC_INTERVAL_MS_DEFAULT = 30000; // 30s — push local → Turso
 
-// Dirty flag: set to true when local DB writes occur, cleared after push.
-// database.ts calls markDirty() via _wrapForTursoSync after each write.
-let _dirty = false;
-
-/** Mark local data as dirty — Turso needs to re-push on next sync cycle. */
-function markDirty(): void { _dirty = true; }
-
 // FIX: Retry transient write failures (1 retry with 1s backoff)
 const WRITE_RETRY_DELAY_MS = 1000;
 const WRITE_RETRY_COUNT = 1;
@@ -115,9 +108,15 @@ function isAvailable(): boolean {
 // load time so we can detect and recover.
 const _realArray = Array;
 
-/** Check whether the global Array has been corrupted. */
+/** Check whether the global Array has been corrupted.
+ *  Checks all critical static methods — corruption may strip individual
+ *  methods (e.g. Array.from) while leaving Array.isArray intact.
+ */
 function _isArrayCorrupted(): boolean {
-  return typeof Array.isArray !== 'function' || typeof Array !== 'function';
+  return typeof Array !== 'function'
+    || typeof Array.isArray !== 'function'
+    || typeof Array.from !== 'function'
+    || typeof Array.of !== 'function';
 }
 
 /**
@@ -146,7 +145,7 @@ async function _query(sql: string, params: any[] = []): Promise<any | null> {
     _consecutiveErrors++;
     // Detect the specific Array.isArray corruption error from libsql
     const msg = err?.message || '';
-    if (msg.includes('Array.isArray is not a function') || msg.includes('Array is not a function')) {
+    if (msg.includes('Array.isArray is not a function') || msg.includes('Array is not a function') || msg.includes('Array.from is not a function')) {
       _getLog()(`Turso query failed — global Array corrupted (query #${_consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}). Attempting repair.`, 'ERROR');
     } else {
       _getLog()(`Turso query failed (${_consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}): ${msg}`, 'WARN');
@@ -615,9 +614,6 @@ async function syncToTurso(): Promise<{ synced: number; errors: number }> {
   const client = _getClient();
   if (!client) return { synced: 0, errors: 0 };
 
-  // Skip push if nothing changed locally since last sync.
-  if (!_dirty) return { synced: 0, errors: 0 };
-
   let synced = 0;
   let errors = 0;
 
@@ -723,10 +719,7 @@ async function syncToTurso(): Promise<{ synced: number; errors: number }> {
       _getLog()(`Pushed ${synced} rows to Turso (${errors} errors)`);
     }
 
-    if (errors === 0) {
-      _consecutiveErrors = 0;
-      _dirty = false; // Clear dirty flag after successful push
-    }
+    if (errors === 0) _consecutiveErrors = 0;
   } catch (err: any) {
     _getLog()(`Sync error: ${err.message}`, 'ERROR');
     errors++;
@@ -777,9 +770,6 @@ async function startTursoSync(): Promise<void> {
 
   // Initial push (local may have data that Turso doesn't)
   await syncToTurso();
-
-  // Mark dirty after cold start pull so initial sync pushes pull data back
-  _dirty = true;
 
   _getLog()(`Turso PRIMARY sync started (push interval: ${syncIntervalMs / 1000}s)`);
 }
@@ -851,7 +841,4 @@ module.exports = {
   tursoActionCacheCapacityEvict,
   tursoDeleteCalibration,
   tursoBulkUpsertCalibration,
-
-  // Dirty flag (called by database.ts _wrapForTursoSync)
-  markDirty,
 };
