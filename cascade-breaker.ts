@@ -247,7 +247,7 @@ function _triggerCascade(failedModules: Set<string>): void {
 
   log(
     `[CASCADE] ⚠ CASCADE EVENT DETECTED: ${failedModules.size} modules failed within ${_getWindowMs() / 1000}s: ` +
-    Array.from(failedModules).join(', '),
+    [...failedModules].join(', '),
     'ERROR'
   );
 
@@ -303,7 +303,7 @@ function _triggerCascade(failedModules: Set<string>): void {
   const cascadeEvent: CascadeEvent = {
     timestamp: Date.now(),
     failureCount: recentFailures.length,
-    modules: Array.from(failedModules),
+    modules: [...failedModules],
     failures: recentFailures,
     recoveryActions,
   };
@@ -319,7 +319,7 @@ function _triggerCascade(failedModules: Set<string>): void {
     if (alerting?.sendAlert) {
       alerting.sendAlert(
         `Cascade Event: ${failedModules.size} Modules Failed`,
-        `Modules: ${Array.from(failedModules).join(', ')}\n` +
+        `Modules: ${[...failedModules].join(', ')}\n` +
         `Recovery actions:\n${recoveryActions.join('\n')}`
       );
     }
@@ -330,7 +330,7 @@ function _triggerCascade(failedModules: Set<string>): void {
     const db = (_deps as any).database;
     if (db?.upsertCalibration) {
       db.upsertCalibration('cascade_total', String(_totalCascadesTriggered));
-      db.upsertCalibration('cascade_last_modules', Array.from(failedModules).join(','));
+      db.upsertCalibration('cascade_last_modules', [...failedModules].join(','));
       db.upsertCalibration('cascade_last_time', String(Date.now()));
     }
   } catch { /* non-critical */ }
@@ -355,7 +355,7 @@ function isCascadeActive(): boolean {
  */
 function getFailedModules(): string[] {
   _pruneWindow();
-  return Array.from(_getUniqueModulesInWindow());
+  return [..._getUniqueModulesInWindow()];
 }
 
 /**
