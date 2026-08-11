@@ -48,6 +48,72 @@ const RECENT_ERROR_WINDOW_MS = 15 * 60 * 1000; // 15-minute window
 const RECENT_ERROR_MAX = 20;
 let explorationFailures = 0;
 
+/* ── OR Budget Park ──────────────────────────────────────────────────────────
+ * When OpenRouter's daily limit is exhausted and no other providers exist,
+ * the bot "parks" — skips screenshots and tribunal, just sleeps until
+ * midnight UTC. The screen stays untouched, so it resumes on the same
+ * question. Zero memory waste during the park.
+ */
+let _orParked = false;
+let _orParkedDate = '';   // YYYY-MM-DD UTC of the day we parked
+const OR_PARK_CHECK_INTERVAL_MS = 60000; // Check for midnight every 60s
+
+/**
+ * Check if OpenRouter budget is exhausted AND no other providers available.
+ * If so, enter park mode (returns true). If midnight has rolled over,
+ * unparks and returns false.
+ */
+async function _checkOrPark(log: any): Promise<boolean> {
+  // Already parked — check if midnight rolled over
+  if (_orParked) {
+    const todayUTC = new Date().toISOString().slice(0, 10);
+    if (todayUTC !== _orParkedDate) {
+      _orParked = false;
+      _orParkedDate = '';
+      log('OR park: midnight rollover detected, resuming normal operation', 'INFO', 'cycle');
+      return false;
+    }
+    // Still parked — caller should sleep and continue
+    return true;
+  }
+
+  // Not parked — check if we SHOULD park
+  try {
+    const orLimiter = require('./openrouter-rate-limiter');
+    const budgetPct = orLimiter.getBudgetPct?.();
+    if (budgetPct === undefined || budgetPct > 0) return false; // Budget available
+
+    // Budget is 0 — check if other providers exist
+    const registry = require('./providers-registry');
+    const providers = await registry.getAvailableProviders?.();
+    const hasOthers = Array.isArray(providers) && providers.some((p: any) => p.name !== 'OpenRouter');
+    if (hasOthers) {
+      log('OR budget exhausted but other providers available — not parking', 'INFO', 'cycle');
+      return false;
+    }
+
+    // No other providers — enter park
+    _orParked = true;
+    _orParkedDate = new Date().toISOString().slice(0, 10);
+
+    const now = new Date();
+    const tomorrow = new Date(now);
+    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+    tomorrow.setUTCHours(0, 0, 0, 0);
+    const msUntilMidnight = tomorrow.getTime() - now.getTime();
+    const parkMinutes = Math.min(Math.round(msUntilMidnight / 60000), 30);
+
+    log('OR daily limit exhausted, no other providers. Parking ~' + parkMinutes + 'min until midnight UTC. Screen untouched.', 'WARN', 'cycle');
+    try {
+      const sendAlert = require('./alerting').sendAlert;
+      sendAlert?.('OR budget parked: sleeping until midnight UTC, no other providers');
+    } catch { /* non-critical */ }
+    return true;
+  } catch {
+    return false; // Can't determine state — don't park
+  }
+}
+
 // v4: Error codes that are ALWAYS transient — self-heal cannot fix these.
 // If ALL recent errors fall in this set, do NOT activate self-heal.
 const TRANSIENT_ERROR_CODES = new Set([
@@ -430,6 +496,16 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
     while (questionsCompleted < CONFIG.MAX_QUESTIONS && !stopRequested) {
       try { fs.writeFileSync(CONFIG.HEARTBEAT_FILE, String(Date.now())); } catch (_e: any) { /* best-effort heartbeat write */ }
+
+      // ── OR Budget Park: skip everything when OR is exhausted ──
+      // When parked, we skip screenshots, tribunal, and all actions.
+      // The screen stays exactly as-is (same question). We just sleep
+      // until midnight UTC when the budget resets.
+      if (await _checkOrPark(log)) {
+        await new Promise(r => setTimeout(r, OR_PARK_CHECK_INTERVAL_MS));
+        continue;
+      }
+
       // Resilience: heap guardian check (supplements built-in checkMemoryAndRecover)
       runtimeHeapGuardian?.checkMemory?.();
       if (checkMemoryAndRecover(CONFIG, log, clearCache)) {
@@ -702,6 +778,15 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           try {
             action = await safeCall((_sig: any) => determineNextAction(base64, page.url(), explorationMode ? explorationMap : null), 'Tribunal', { timeoutMs: CONFIG.TRIBUNAL_TIMEOUT_MS, url: 'tribunal' });
           } catch (err: any) {
+            const errMsg = err?.message || String(err);
+            // Fast-path: if OR daily limit just got exhausted, enter park immediately
+            // instead of burning memory on fallback chains that will also fail
+            if (errMsg.includes('OPENROUTER_DAILY_LIMIT') || errMsg.includes('free-models-per-day')) {
+              if (await _checkOrPark(log)) {
+                await new Promise(r => setTimeout(r, OR_PARK_CHECK_INTERVAL_MS));
+                continue;
+              }
+            }
             logError('Tribunal failed, using fallback', err);
             action = await getFallbackAction(page, currentState || undefined);
           }
