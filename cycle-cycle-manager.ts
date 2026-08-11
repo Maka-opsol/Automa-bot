@@ -615,16 +615,16 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
 
       const beforeUrl = page.url();
-      let screenshot = await page.screenshot({ type: 'jpeg', quality: 30 });
+      let screenshot = await page.screenshot({ type: 'jpeg', quality: 20 });
 
       // ── Screenshot validity check ──
-      // A valid screenshot of a rendered page should be >5KB even at quality:30.
+      // A valid screenshot of a rendered page should be >3KB even at quality:20.
       // If it's tiny, the page is likely blank (white rectangle).
-      if (screenshot.length < 5000) {
+      if (screenshot.length < 3000) {
         log(`Screenshot suspiciously small (${screenshot.length} bytes) — page may be blank. Waiting 3s and retaking...`, 'WARN', 'cycle');
         await new Promise(r => setTimeout(r, 3000));
         try {
-          const retryShot = await page.screenshot({ type: 'jpeg', quality: 30 });
+          const retryShot = await page.screenshot({ type: 'jpeg', quality: 20 });
           if (retryShot.length > screenshot.length) {
             log(`Retry screenshot is ${retryShot.length} bytes (was ${screenshot.length}) — using retry`, 'INFO', 'cycle');
             screenshot = retryShot;
@@ -878,7 +878,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         }
       } catch { /* non-critical */ }
 
-      // UI drift detection
+      // UI drift detection (uses base64 — must run before we null it)
       if (uiDrift) {
         const uiDrifted = await uiDrift.detectDrift(action.currentState, base64);
         if (uiDrifted) {
@@ -1359,6 +1359,12 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // Stagnation recovery & module tracking
       if (recoverIfStuck) await recoverIfStuck(page, screenshot, action);
       if (trackModuleProgress) await trackModuleProgress(page, base64);
+      // ── Memory: release screenshot + base64 after ALL consumers ──
+      // This is the last place either is used in the loop iteration.
+      // Nulling frees ~20-60KB (base64) + ~15-25KB (raw Buffer) immediately.
+      screenshot = null as any;
+      base64 = null as any;
+      _actionCacheSig = null;
       // Resilience: semantic progress detection
       if (progressSemanticDetector) {
         try {
