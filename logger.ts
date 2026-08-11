@@ -247,7 +247,12 @@ const logger = pino({
     level: (label: any) => ({ level: label.toUpperCase() }),
     bindings: (bindings: any) => bindings ? { pid: bindings.pid, host: bindings.hostname?.substring(0, 50) || 'unknown' } : {}
   },
-  timestamp: () => `,"timestamp":"${new Date().toISOString()}"`,
+  timestamp: () => {
+  // SAST = UTC+2 — shift the time and use +02:00 offset instead of Z
+  const d = new Date(Date.now() + 2 * 3600000);
+  const iso = d.toISOString();
+  return `,"timestamp":"${iso.replace('Z', '+02:00')}"`;
+},
   base: undefined,
   serializers: { err: pino.stdSerializers.err, error: pino.stdSerializers.err },
   redact: { paths: ['req.headers.authorization', 'req.headers.cookie'], censor: '[REDACTED]' }
