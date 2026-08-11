@@ -80,6 +80,10 @@ function _scheduleWrite(): void {
     _dirty = false;
     try {
       fs.writeFileSync(PERSIST_PATH, JSON.stringify(_data, null, 2), 'utf8');
+      // Defense-in-depth: once we've successfully written the persist file,
+      // mark it as loaded so wasRecentlyOOMKilled() Strategy 3 (missing file)
+      // won't trigger on future calls within this same process lifetime.
+      _persistFileLoaded = true;
     } catch (writeErr: any) {
       console.error(`[persistent-config] Write failed: ${writeErr.message}`);
     }
@@ -100,6 +104,7 @@ function flush(): void {
   _dirty = false;
   try {
     fs.writeFileSync(PERSIST_PATH, JSON.stringify(_data, null, 2), 'utf8');
+    _persistFileLoaded = true;
   } catch {
     // best-effort
   }
