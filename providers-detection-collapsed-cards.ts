@@ -9,7 +9,7 @@ const { runVisionPipeline } = require('./providers-vision-pipeline');
 const { log } = require('./logger');
 
 // BUG FIX (Response 19): Timeout for vision pipeline
-const VISION_TIMEOUT_MS = 10000;
+const VISION_TIMEOUT_MS = 120000;
 
 // BUG FIX (Response 19): Maximum number of collapsed cards to return
 const MAX_COLLAPSED_CARDS = 10;
