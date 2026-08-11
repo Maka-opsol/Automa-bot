@@ -44,6 +44,7 @@ interface PersistData {
 let _data: PersistData | null = null;
 let _writeTimer: ReturnType<typeof setTimeout> | null = null;
 let _dirty = false;
+let _persistFileLoaded = false; // Track whether we loaded from disk (vs fresh create)
 
 function _load(): PersistData {
   if (_data) return _data;
@@ -52,6 +53,7 @@ function _load(): PersistData {
     const parsed = JSON.parse(raw);
     if (parsed && parsed.version === VERSION) {
       _data = parsed;
+      _persistFileLoaded = true; // Successfully loaded from disk
       return _data;
     }
   } catch {
@@ -295,7 +297,7 @@ function getRecentPeak(minutes: number = 30): { peakHeapMB: number; peakRssMB: n
 
 /** Check if the process was recently OOM-killed.
  *
- * Three detection strategies (in priority order):
+ * Four detection strategies (in priority order):
  *
  *   1. /tmp file gap: If the last memory reading is >5 min old but readings
  *      existed before, the process likely crashed (OOM kill). Works when
@@ -306,8 +308,16 @@ function getRecentPeak(minutes: number = 30): { peakHeapMB: number; peakRssMB: n
  *      recent readings, we likely came from a hot state that was killed.
  *      Works even when /tmp is wiped (new Render instance after OOM).
  *
- *   3. DB calibration check: memory-mode.ts checkAfterTursoSync() handles
- *      this separately via the calibration table, so we don't duplicate it here.
+ *   3. Missing persist file: If /tmp/mathu-persist.json does NOT exist on
+ *      disk, the previous instance was killed externally (SIGKILL/OOM)
+ *      without writing its state, and /tmp was wiped by Render. This is the
+ *      most reliable signal for Render OOM kills. The cost is a false
+ *      positive on first-ever deploys (starts in memory_protection for 3 min
+ *      until auto-promote), which is acceptable.
+ *
+ *   4. DB calibration check: memory-mode.ts checkAfterTursoSync() handles
+ *      this separately via the calibration table (OOM markers, heartbeat),
+ *      so we don't duplicate it here.
  */
 function wasRecentlyOOMKilled(): boolean {
   const d = _load();
@@ -332,6 +342,17 @@ function wasRecentlyOOMKilled(): boolean {
       // on a new Render instance (old /tmp was wiped)
       return true;
     }
+  }
+
+  // Strategy 3: Missing persist file = external kill (SIGKILL/OOM)
+  // On Render free tier, /tmp is wiped on new instance creation.
+  // A clean shutdown (SIGTERM) always writes the persist file before exit.
+  // If the file doesn't exist, the previous instance was killed without
+   // cleanup — almost always OOM on Render.
+  // False positive on first-ever deploy: starts in memory_protection,
+  // auto-promotes to full_power after 3 min stable memory. Acceptable.
+  if (!_persistFileLoaded) {
+    return true;
   }
 
   return false;
