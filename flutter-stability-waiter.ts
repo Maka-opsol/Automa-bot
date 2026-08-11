@@ -138,8 +138,9 @@ class FlutterStabilityWaiter {
    * Compare two snapshots. A page is considered stable if:
    *   - Semantics count is unchanged (or both 0 — non-Flutter page)
    *   - DOM count is unchanged
-   *   - Body height is unchanged (±2px for sub-pixel rounding)
-   *   - Network is idle
+   *   - Body height is unchanged (±5px for sub-pixel rounding on Render free tier)
+   *   - Network idle is a soft bonus signal (not a hard gate — Flutter keep-alives
+   *     prevent true network idle, so we require 3 of 4 signals to agree)
    */
   private _isStable(prev: StabilitySnapshot, curr: StabilitySnapshot): boolean {
     // Semantics: stable if unchanged, or both zero (non-Flutter fallback)
@@ -149,10 +150,13 @@ class FlutterStabilityWaiter {
     // DOM: stable if count unchanged
     const domOk = prev.domCount === curr.domCount;
 
-    // Layout: stable if body height within 2px (sub-pixel rounding on Render)
-    const layoutOk = Math.abs(prev.bodyHeight - curr.bodyHeight) <= 2;
+    // Layout: stable if body height within 5px (sub-pixel rounding on Render free tier)
+    const layoutOk = Math.abs(prev.bodyHeight - curr.bodyHeight) <= 5;
 
-    // Network: must be idle
+    // Network: treated as a soft bonus signal, not a hard gate.
+    // Flutter web apps maintain long-polling/keep-alive connections that
+    // prevent networkIdle from ever being true, which would block stability
+    // declaration indefinitely.
     const netOk = curr.networkIdle;
 
     // ── Anti-blank guard ──
@@ -162,9 +166,12 @@ class FlutterStabilityWaiter {
     const allZero = curr.semanticsCount === 0 && curr.domCount === 0 && curr.bodyHeight === 0;
     if (allZero) return false;
 
-    // Require at least 2 of {semanticsOk, domOk, layoutOk} plus network idle
-    const structuralSignals = [semanticsOk, domOk, layoutOk].filter(Boolean).length;
-    return structuralSignals >= 2 && netOk;
+    // Require 3 of 4 signals (semantics, DOM, layout, network) to agree.
+    // This makes network a soft gate — stability can be declared even if
+    // background polling keeps networkIdle=false, as long as 3 structural
+    // signals are stable.
+    const allSignals = [semanticsOk, domOk, layoutOk, netOk].filter(Boolean).length;
+    return allSignals >= 3;
   }
 
   /**
