@@ -714,7 +714,7 @@ export function getHealthSnapshot(name: string): HealthSnapshot {
  * Get all provider names that have health data.
  */
 export function getTrackedProviders(): string[] {
-  return Array.from(healthInstances.keys());
+  return [...healthInstances.keys()];
 }
 
 /**
