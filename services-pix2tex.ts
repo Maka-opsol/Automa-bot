@@ -42,6 +42,7 @@ const ENABLE_LOCAL_VLM_FALLBACK = process.env.ENABLE_LOCAL_VLM !== 'false'; // d
 
 let _p2tAvailable: boolean | null = null; // null = not yet checked
 let _p2tPath: string | null = null;
+let _checkPromise: Promise<boolean> | null = null; // Guard against concurrent availability checks
 let _callCount = 0;
 let _failCount = 0;
 
@@ -49,11 +50,13 @@ let _failCount = 0;
 
 /**
  * Check if p2t CLI is available. Cached after first check.
+ * Uses a promise guard to prevent concurrent spawn storms.
  */
 async function checkAvailability(): Promise<boolean> {
   if (_p2tAvailable !== null) return _p2tAvailable;
+  if (_checkPromise) return _checkPromise;
 
-  return new Promise((resolve) => {
+  _checkPromise = new Promise<boolean>((resolve) => {
     const p2t = spawn('p2t', ['--help'], { timeout: 10000 });
     let stderr = '';
     p2t.stderr.on('data', (data: Buffer) => { stderr += data.toString(); });
@@ -74,6 +77,7 @@ async function checkAvailability(): Promise<boolean> {
       resolve(false);
     });
   });
+  return _checkPromise;
 }
 
 /**
