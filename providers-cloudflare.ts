@@ -143,6 +143,12 @@ function CloudflareProvider() {
             log(`Cloudflare rollback failed: ${rollbackErr.message || rollbackErr}`, 'WARN', 'cloudflare');
           }
         }
+        // Model returned non-JSON / unparseable response — try next model in chain
+        const parseErr = err?.message || '';
+        if (parseErr.includes('No action returned') || parseErr.includes('missing actionType') || parseErr.includes('no JSON object found')) {
+          log(`Cloudflare model ${modelId} returned invalid/unparseable response, trying next fallback`, 'WARN', 'cloudflare');
+          continue;
+        }
         // Non-recoverable error — don't try other models for auth/config errors
         throw err;
       }
