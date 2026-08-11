@@ -16,7 +16,7 @@ const { log, logError } = require('./logger');
 const MAX_COORDS = 20;
 
 // BUG FIX (Response 19): Timeout for vision pipeline call.
-const SOLVE_TIMEOUT_MS = 20000;
+const SOLVE_TIMEOUT_MS = 120000;
 
 const CAPTCHA_SOLVE_PROMPT = `
 You are a CAPTCHA image solver. You are given a screenshot of a reCAPTCHA image grid.
