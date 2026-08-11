@@ -1547,10 +1547,10 @@ async function enableSelfHeal() {
   toast('Enabling self-heal (all layers)...', 'info');
   const r = await api('/api/self-heal/enable', { method: 'POST' });
   if (r?.success) {
-    toast(`Self-heal enabled: \${r.totalReEnabled} sub-modules restored\${r.modeSwitched ? ', switched to full_power' : ''}`, 'success');
+    toast(\`Self-heal enabled: \${r.totalReEnabled} sub-modules restored\${r.modeSwitched ? ', switched to full_power' : ''}\`, 'success');
     refreshAll();
   } else {
-    toast(`Failed: \${r?.error || 'unknown'}`, 'error');
+    toast(\`Failed: \${r?.error || 'unknown'}\`, 'error');
   }
 }
 async function gc() {
