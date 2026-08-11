@@ -825,6 +825,58 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
+  // ── Self-heal enable-all (overrides memory_protection disables) ──
+  if (pathname === '/api/self-heal/enable' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        const CONFIG = require('./get-config');
+        const { updateConfig } = require('./get-config');
+        const memoryMode = require('./memory-mode');
+        const results: Record<string, any> = {};
+
+        // 1. Master switch
+        updateConfig('SELF_HEAL_ENABLED', true);
+        results.SELF_HEAL_ENABLED = true;
+
+        // 2. Re-enable all heavy self-heal sub-modules that memory_protection disabled
+        const { HEAVY_SELF_HEAL_KEYS, HEAVY_RESILIENCE_KEYS } = memoryMode;
+        const reEnabledKeys: string[] = [];
+        for (const key of [...HEAVY_SELF_HEAL_KEYS, ...HEAVY_RESILIENCE_KEYS]) {
+          if (process.env[key] === 'false') {
+            delete process.env[key];
+            reEnabledKeys.push(key);
+          }
+        }
+        results.reEnabledEnvVars = reEnabledKeys;
+
+        // 3. Reset the meta-self-test internal flag
+        try {
+          const { healerSelfTest } = require('./self-heal-meta-self-test');
+          if (healerSelfTest?.enableSelfHeal) {
+            healerSelfTest.enableSelfHeal();
+            results.metaSelfTestEnabled = true;
+          }
+        } catch (e: any) {
+          results.metaSelfTestEnabled = false;
+          results.metaSelfTestError = e.message;
+        }
+
+        // 4. If currently in memory_protection, promote to full_power
+        if (memoryMode.isMemoryProtection()) {
+          memoryMode.switchMode('full_power', 'manual:self_heal_enable');
+          results.modeSwitched = true;
+        } else {
+          results.modeSwitched = false;
+        }
+
+        results.totalReEnabled = reEnabledKeys.length;
+        log(`Self-heal fully enabled: master=true, env vars cleared=${reEnabledKeys.length}, mode=${memoryMode.getMode()}`, 'INFO', 'dashboard');
+        jsonRes(res, { success: true, ...results });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
   // ── Self-heal trigger ──
   if (pathname === '/api/self-heal/trigger' && req.method === 'POST') {
     authWrap(() => {
@@ -1304,6 +1356,7 @@ function getDashboardHTML(): string {
         <button class="btn danger" onclick="emergencyStop()">Emergency Stop</button>
         <button class="btn success" onclick="resumeDaemon()">Resume Daemon</button>
         <button class="btn primary" onclick="triggerSelfHeal()">Self-Heal</button>
+        <button class="btn primary" onclick="enableSelfHeal()" title="Re-enables SELF_HEAL_ENABLED + all sub-modules + switches to full_power">Enable Self-Heal</button>
       </div>
       <div class="btn-group">
         <button class="btn" onclick="gc()">Force GC</button>
@@ -1489,6 +1542,16 @@ async function triggerSelfHeal() {
   toast('Self-heal triggered...', 'info');
   const r = await api('/api/self-heal/trigger', { method: 'POST' });
   toast(r?.success ? 'Self-heal complete' : 'Self-heal failed', r?.success ? 'success' : 'error');
+}
+async function enableSelfHeal() {
+  toast('Enabling self-heal (all layers)...', 'info');
+  const r = await api('/api/self-heal/enable', { method: 'POST' });
+  if (r?.success) {
+    toast(`Self-heal enabled: ${r.totalReEnabled} sub-modules restored${r.modeSwitched ? ', switched to full_power' : ''}`, 'success');
+    refreshAll();
+  } else {
+    toast(`Failed: ${r?.error || 'unknown'}`, 'error');
+  }
 }
 async function gc() {
   const r = await api('/api/command', { method: 'POST', body: JSON.stringify({ action: 'gc' }) });
