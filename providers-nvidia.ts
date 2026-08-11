@@ -30,7 +30,7 @@ function NvidiaProvider() {
         config.endpoint, apiKey, config.model, base64Image, prompt, 'NVIDIA',
         { signal }
       ),
-      { providerName: 'NVIDIA' }
+      { providerName: 'NVIDIA', signal }
     );
 
     if (options.validate === false) return rawContent;
