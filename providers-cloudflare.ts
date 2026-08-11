@@ -120,6 +120,12 @@ function CloudflareProvider() {
           // Continue to next model in chain
           continue;
         }
+        // Empty response — this model returned nothing useful, try next model
+        // instead of retrying the same one (which would just waste time)
+        if (err.message && err.message.includes('CLOUDFLARE_EMPTY_RESPONSE')) {
+          log(`Cloudflare model ${modelId} returned empty response, trying next fallback`, 'WARN', 'cloudflare');
+          continue;
+        }
         // Non-429 error (401/403/404/500) — attempt rollback before giving up
         if (err.message && (
           err.message.includes('HTTP_ERROR_404') ||
@@ -258,7 +264,7 @@ async function _callWithModel(
     return responseText;
   };
 
-  const rawContent = await retryWithBackoff(makeRequest, { providerName: 'Cloudflare' });
+  const rawContent = await retryWithBackoff(makeRequest, { providerName: 'Cloudflare', signal });
   if (options.validate === false) return rawContent;
   return validateActionResponse(extractJSON(rawContent, 'Cloudflare'), 'Cloudflare');
 }
