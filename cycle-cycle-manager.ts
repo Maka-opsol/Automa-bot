@@ -37,7 +37,112 @@ let selfHealRunning = false;
 let _networkSetup = false;
 let explorationMode = false;
 let explorationMap: any = null;
+
+// v4: Track recent error codes to distinguish structural vs transient failures.
+// Self-heal should ONLY fire when the bot is structurally broken, not when
+// it's hitting transient provider issues. A rotating buffer of recent error
+// codes lets us assess: are we seeing the SAME transient error repeatedly
+// (don't self-heal) or DIFFERENT structural errors (do self-heal)?
+const _recentErrorCodes: Array<{ code: string; ts: number }> = [];
+const RECENT_ERROR_WINDOW_MS = 15 * 60 * 1000; // 15-minute window
+const RECENT_ERROR_MAX = 20;
 let explorationFailures = 0;
+
+// v4: Error codes that are ALWAYS transient — self-heal cannot fix these.
+// If ALL recent errors fall in this set, do NOT activate self-heal.
+const TRANSIENT_ERROR_CODES = new Set([
+  'E_NETWORK_TIMEOUT', 'E_RATE_LIMITED', 'E_PROVIDER_TEMPORARY',
+  'E_BROWSER_DISCONNECTED', 'E_CAPTCHA_ENCOUNTERED',
+  'E_CONNECTION_FAILED', // ECONNREFUSED/ENOTFOUND
+]);
+
+/**
+ * Record an error code in the rotating buffer. Called after every cycle error.
+ */
+function _recordErrorForDesperation(code: string) {
+  const now = Date.now();
+  _recentErrorCodes.push({ code, ts: now });
+  // Trim old entries
+  while (_recentErrorCodes.length > 0 && now - _recentErrorCodes[0].ts > RECENT_ERROR_WINDOW_MS) {
+    _recentErrorCodes.shift();
+  }
+  // Cap size
+  while (_recentErrorCodes.length > RECENT_ERROR_MAX) {
+    _recentErrorCodes.shift();
+  }
+}
+
+/**
+ * v4: Assess whether the bot is DESPERATELY in need of self-heal.
+ *
+ * Returns true ONLY when:
+ *   1. The error is classified as healable (selector drift, UI change, etc.)
+ *      AND consecutive failures >= threshold, OR
+ *   2. There are 3+ DIFFERENT non-transient error codes in the recent window
+ *      (suggests cascading structural failure, not a single transient issue), OR
+ *   3. The survival-restart-guardian has emergency mode active (OOM loop).
+ *
+ * Returns false when:
+ *   - All recent errors are transient (rate limits, timeouts, captchas)
+ *   - Same transient error repeating (provider outage, not code breakage)
+ *   - Fewer than threshold consecutive failures
+ *   - A self-heal session is already active
+ */
+function _isDesperatelyBroken(CONFIG: any): boolean {
+  // Must have enough consecutive failures
+  if (consecutiveFailures < CONFIG.SELF_HEAL_FAILURE_THRESHOLD) return false;
+
+  // Check if survival guardian has detected an OOM loop
+  try {
+    const guardian = require('./survival-restart-guardian');
+    if (guardian.isEmergencyMode?.()) return true;
+  } catch {}
+
+  // If we have very few recent errors recorded, fall back to count-only check
+  // (first few cycles — not enough data for pattern analysis)
+  if (_recentErrorCodes.length < 3) {
+    // With no error classification data, require higher threshold
+    return consecutiveFailures >= Math.max(CONFIG.SELF_HEAL_FAILURE_THRESHOLD, 10);
+  }
+
+  // Count distinct error codes and separate transient vs non-transient
+  const transientCount = _recentErrorCodes.filter(e => TRANSIENT_ERROR_CODES.has(e.code)).length;
+  const nonTransientCodes = new Set(
+    _recentErrorCodes.filter(e => !TRANSIENT_ERROR_CODES.has(e.code)).map(e => e.code)
+  );
+  const healableCodes = new Set(
+    _recentErrorCodes.filter(e => {
+      // Healable codes from errors.ts
+      const h = ['E_SELECTOR_DRIFT', 'E_UI_CHANGED', 'E_PROVIDER_PERMANENT', 'E_STATE_DEADLOCK', 'E_PATCH_FAILED'];
+      return h.includes(e.code);
+    }).map(e => e.code)
+  );
+
+  // Case 1: Explicitly healable errors with enough consecutive failures
+  if (healableCodes.size > 0 && consecutiveFailures >= CONFIG.SELF_HEAL_FAILURE_THRESHOLD) {
+    return true;
+  }
+
+  // Case 2: ALL errors are transient — NOT desperate, just unlucky
+  if (transientCount === _recentErrorCodes.length) {
+    // Same transient error repeating? Definitely not structural.
+    if (nonTransientCodes.size === 0) return false;
+  }
+
+  // Case 3: 3+ DIFFERENT non-transient error codes = cascading structural failure
+  if (nonTransientCodes.size >= 3) {
+    return true;
+  }
+
+  // Case 4: Mix of transient and non-transient, but non-transient are diverse
+  // (2+ different non-transient codes) AND failures are very high
+  if (nonTransientCodes.size >= 2 && consecutiveFailures >= CONFIG.SELF_HEAL_FAILURE_THRESHOLD * 2) {
+    return true;
+  }
+
+  // Default: not desperate enough
+  return false;
+}
 
 function requestStop() {  stopRequested = true; }
 
@@ -1392,13 +1497,16 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     const errorType = classifyProviderError?.(err);
     const isRetryable = errorType?.retryable ?? false;
     const isHealable = errorType?.healable ?? false;
-    logError(`Cycle error (${typeof errorType === 'string' ? errorType : errorType?.code || 'unknown'})`, err);
+    const errorCode = errorType?.code || 'E_UNKNOWN';
+    logError(`Cycle error (${errorCode})`, err);
     // Resilience: report failure to cascade breaker
     cascadeBreaker?.recordFailure?.('cycleManager', err);
     // Resilience: report failure to module quarantine
     runtimeModuleQuarantine?.recordFailure?.('cycleManager', err);
     updateStats({ errors: (getStats().errors || 0) + 1 });
     consecutiveFailures++;
+    // v4: Record error code for desperation analysis
+    _recordErrorForDesperation(errorCode);
     if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Cycle error: ${err instanceof Error ? err.message : String(err)}`); } catch (e: any) {}
 
     // Error routing based on type
@@ -1410,15 +1518,18 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     } else if (isErrorFatal) {
       log('Fatal error -- restarting cycle', 'ERROR', 'cycle');
     } else {
-      // Healable or unknown — try self-heal
-      if (CONFIG.SELF_HEAL_ENABLED && consecutiveFailures >= CONFIG.SELF_HEAL_FAILURE_THRESHOLD && !selfHealRunning && performSelfHeal) {
-        log(`${consecutiveFailures} consecutive failures. Attempting self-heal...`, 'WARN', 'cycle');
+      // v4: Only attempt self-heal when the bot is DESPERATELY broken.
+      // See _isDesperatelyBroken() for the full criteria.
+      if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning && performSelfHeal && _isDesperatelyBroken(CONFIG)) {
+        log(`${consecutiveFailures} consecutive failures (DESPERATE: error pattern analysis passed). Attempting self-heal...`, 'WARN', 'cycle');
         selfHealRunning = true;
         performSelfHeal().then((healed: any) => { 
           selfHealRunning = false;
           if (healed) { log('Self-heal successful. Resetting failure count.', 'INFO', 'cycle'); consecutiveFailures = 0; }
           else { log('Self-heal failed. Alerting and stopping.', 'ERROR', 'cycle'); if (CONFIG.ALERT_ON_ERROR) try { sendAlert('Self-heal failed after multiple attempts. Stopping.'); } catch (e: any) {} stopRequested = true; }
         }).catch((e: any) => { selfHealRunning = false; logError('Self-heal threw error', e); });
+      } else if (CONFIG.SELF_HEAL_ENABLED && consecutiveFailures >= CONFIG.SELF_HEAL_FAILURE_THRESHOLD) {
+        log(`${consecutiveFailures} consecutive failures but NOT desperate (transient/error pattern). Skipping self-heal. Will keep retrying.`, 'DEBUG', 'cycle');
       }
       if (consecutiveFailures % 5 === 0) {
         try { const pd = _getProviderDiscovery(); if (pd?.refreshAllProviderModels) pd.refreshAllProviderModels().catch((e: any) => logError('Model refresh failed', e)); } catch (e: any) { /* non-critical */ }
