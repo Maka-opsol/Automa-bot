@@ -102,8 +102,8 @@ function startSelfHealV2Subsystems(
   const flagMap: Record<string, SelfHealFlagConfig> = {
     predictiveHeal: { flag: 'PREDICTIVE_HEAL_ENABLED', arg: 60000 },
     structuralDrift: { flag: null, method: 'startBaselineCollection', arg: 3600000, accessor: 'structuralDriftFingerprinter' },
-    providerPrediction: { flag: null, arg: 300000 },
-    memoryPrediction: { flag: null, arg: 900000 },
+    providerPrediction: { flag: 'PROVIDER_PREDICTION_ENABLED', arg: 300000 },
+    memoryPrediction: { flag: 'SELF_HEAL_MEMORY_PREDICTION_ENABLED', arg: 900000 },
     dbHealer: { flag: 'DB_HEALER_ENABLED', arg: 6 * 60 * 60 * 1000 },
     // v5-fix H2: Added accessor 'authHealer' — the method lives on the
     // exported `authHealer` singleton instance, not at module top level.
