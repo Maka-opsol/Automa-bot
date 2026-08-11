@@ -52,6 +52,11 @@ let _lastRuntimeSample = 0;
 let _interval: ReturnType<typeof setInterval> | null = null;
 let _isRunning = false;
 
+// Suppress repeated identical health-level logs (same score + same check points)
+let _lastHealthLogKey = '';
+const _HEALTH_LOG_SUPPRESS_MS = 300000; // 5 minutes
+let _lastHealthLogTime = 0;
+
 let _healthState: HealthState = {
   score: 12,
   level: 'healthy',
@@ -419,7 +424,14 @@ async function runHealthCheck(): Promise<HealthState> {
   if (level === 'healthy') {
     if (Math.random() < 0.1) log(`Health: ${score}/12 [${Object.entries(checks).map(([k, v]) => `${k}=${v.points}`).join(', ')}] budget=${Math.round(getBudgetPct())}%, remaining=${getRemainingHours().toFixed(1)}h`, 'DEBUG');
   } else {
-    log(`Health ${level.toUpperCase()}: ${score}/12 [${Object.entries(checks).map(([k, v]) => `${k}=${v.points}`).join(', ')}]`, level === 'fatal' ? 'ERROR' : 'WARN');
+    // Suppress repeated identical degraded/critical/fatal logs (same score + check points)
+    const detailKey = `${level}:${score}:${Object.entries(checks).map(([k, v]) => v.points).join(',')}`;
+    const now = Date.now();
+    if (detailKey !== _lastHealthLogKey || (now - _lastHealthLogTime) > _HEALTH_LOG_SUPPRESS_MS) {
+      _lastHealthLogKey = detailKey;
+      _lastHealthLogTime = now;
+      log(`Health ${level.toUpperCase()}: ${score}/12 [${Object.entries(checks).map(([k, v]) => `${k}=${v.points}`).join(', ')}]`, level === 'fatal' ? 'ERROR' : 'WARN');
+    }
   }
 
   if (level !== prevLevel) {
