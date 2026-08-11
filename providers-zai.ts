@@ -27,7 +27,7 @@ function ZAIProvider() {
         config.endpoint, apiKey, config.model, base64Image, prompt, 'z.ai',
         { signal }
       ),
-      { providerName: 'z.ai' }
+      { providerName: 'z.ai', signal }
     );
 
     if (options.validate === false) return rawContent;
