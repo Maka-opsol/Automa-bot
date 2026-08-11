@@ -21,7 +21,7 @@ function _getCONFIG(): any {
 }
 
 // BUG FIX (Response 19): Timeout for vision pipeline
-const VISION_TIMEOUT_MS = 10000;
+const VISION_TIMEOUT_MS = 120000;
 
 // BUG FIX (Response 19): Timeout for OCR fallback
 const OCR_TIMEOUT_MS = 15000;
