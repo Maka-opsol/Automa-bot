@@ -35,7 +35,9 @@ const persistConfig = require('./persistent-config');
 // Calibration keys for DB-backed persistence (survives /tmp wipes via Turso)
 const CALIBRATION_KEY_MODE = 'memory_mode_current';
 const CALIBRATION_KEY_OOM_EXIT = 'oom_last_exit_ts';
+const CALIBRATION_KEY_MEMORY_HEARTBEAT = 'last_memory_heartbeat';
 const OOM_RECOVERY_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const HEARTBEAT_RECOVERY_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
 
 // ── Mode thresholds ──
 const MODE_THRESHOLDS = {
@@ -407,6 +409,28 @@ function checkAfterTursoSync(selectCalibration: any, upsertCalibration: any): vo
         return;
       }
     }
+
+    // Check 3: Was the last memory heartbeat showing high memory?
+    // The memory monitor writes a heartbeat every ~5 min to calibration DB.
+    // If the previous instance was running hot (>300MB heap) and died recently
+    // (heartbeat <15 min old), it was likely OOM-killed before recordOOMExit ran.
+    try {
+      const heartbeatRow = selectCalibration.get(CALIBRATION_KEY_MEMORY_HEARTBEAT);
+      if (heartbeatRow) {
+        const hb = JSON.parse(heartbeatRow.value);
+        if (hb && typeof hb.heapMB === 'number' && typeof hb.ts === 'number') {
+          const ageSeconds = Math.round((Date.now() - hb.ts) / 1000);
+          if (hb.heapMB > 300 && ageSeconds < HEARTBEAT_RECOVERY_WINDOW_MS / 1000) {
+            if (_currentMode !== 'memory_protection') {
+              _applyMode('memory_protection', `db_heartbeat:heap_${hb.heapMB.toFixed(0)}MB_${ageSeconds}s_ago`);
+              _restartTimers();
+              _log(`Detected high memory heartbeat (${hb.heapMB.toFixed(0)}MB heap, ${ageSeconds}s ago) — switching to MEMORY PROTECTION`, 'WARN');
+            }
+            return;
+          }
+        }
+      }
+    } catch { /* parse error — skip */ }
   } catch (e: any) {
     _log(`Post-Turso OOM check failed: ${e.message}`, 'WARN');
   }
