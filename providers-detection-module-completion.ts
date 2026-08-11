@@ -1,52 +1,53 @@
 'use strict';
 
 // ═════════════════════════════════════════════════════════════
-// Module Completion Detection — Checks if a module card's
-// progress bar is 100% complete via vision AI.
+// Collapsed Cards Detection — Finds collapsed module card headers
+// that need to be expanded on the MathU assignments page.
 // ═════════════════════════════════════════════════════════════
 
 const { runVisionPipeline } = require('./providers-vision-pipeline');
 const { log } = require('./logger');
 
 // BUG FIX (Response 19): Timeout for vision pipeline
-const VISION_TIMEOUT_MS = 10000;
+const VISION_TIMEOUT_MS = 120000;
 
-const MODULE_COMPLETION_PROMPT = `You are given a screenshot of a module card from an educational platform. The module card has a horizontal progress bar. Look carefully at the progress bar. If it is completely filled with yellow or blue colour and extends all the way to the right edge, then the module is 100% completed. Also look for "100%" text, "Completed", "Done", or a checkmark. Return ONLY a JSON object: {"completed": true/false, "reason": "brief reason"}`;
+// BUG FIX (Response 19): Maximum number of collapsed cards to return
+const MAX_COLLAPSED_CARDS = 10;
+
+const COLLAPSED_CARDS_PROMPT = `You are given a screenshot of the MathU assignments page. The page contains module cards. Some cards are collapsed and have a down-arrow or chevron icon on the right side. Return a JSON array of objects with "x" and "y" coordinates as percentages of viewport (0-1) for the collapsed card headers. If none, return an empty array. Example: [{"x": 0.1, "y": 0.2}, {"x": 0.3, "y": 0.4}]`;
 
 /**
- * Check if a module is 100% complete via vision analysis.
+ * Find coordinates of collapsed card headers.
  *
- * @param base64Image - Base64-encoded screenshot of the module card
+ * @param base64Image - Base64-encoded screenshot
  * @param signal - Optional AbortSignal
- * @returns true if complete, false if not, or null on failure
+ * @returns Array of {x, y} coordinates, or empty array on failure
  */
-async function checkModuleCompletionViaVision(base64Image: any, signal: any) {
+async function findCollapsedCardsCoordinates(base64Image: any, signal: any) {
   if (!base64Image) {
-    log('checkModuleCompletionViaVision: missing image', 'WARN', 'detection-completion');
-    return null;
+    log('findCollapsedCardsCoordinates: missing image', 'WARN', 'detection-collapsed');
+    return [];
   }
 
   try {
-    const res = await runVisionPipeline(base64Image, MODULE_COMPLETION_PROMPT, {
+    const res = await runVisionPipeline(base64Image, COLLAPSED_CARDS_PROMPT, {
       validator: (parsed: any) => {
-        // BUG FIX (Response 19): Strict validation
-        if (!parsed || typeof parsed !== 'object') {
-          throw new Error('Response is not an object');
-        }
-        if (typeof parsed.completed !== 'boolean') {
-          throw new Error('Missing boolean "completed" property');
-        }
-        return parsed.completed;
+        if (!Array.isArray(parsed)) throw new Error('Not an array');
+        // BUG FIX (Response 19): Validate each coordinate and cap count
+        const valid = parsed
+          .filter((c: any) => typeof c?.x === 'number' && typeof c?.y === 'number')
+          .filter((c: any) => c.x >= 0 && c.x <= 1 && c.y >= 0 && c.y <= 1)
+          .slice(0, MAX_COLLAPSED_CARDS);
+        return valid;
       },
       timeoutMs: VISION_TIMEOUT_MS,
       signal,
     });
-    return res ? res.result : null;
+    return res ? res.result : [];
   } catch (e: any) {
-    log(`Module completion detection failed: ${e.message}`, 'WARN', 'detection-completion');
-    return null;
+    log(`Collapsed cards detection failed: ${e.message}`, 'WARN', 'detection-collapsed');
+    return [];
   }
 }
 
-module.exports = { checkModuleCompletionViaVision };
-
+module.exports = { findCollapsedCardsCoordinates };
