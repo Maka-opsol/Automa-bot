@@ -194,6 +194,29 @@ memoryMode.init();
 log(`Operational mode: ${memoryMode.getMode()} (thresholds: warn=${memoryMode.getThresholds().warnHeapMB}MB, restart=${memoryMode.getThresholds().restartHeapMB}MB)`, 'INFO', 'render-free-plan');
 
 // ═══════════════════════════════════════════════════════════════════════
+// RESTART GUARDIAN — DB-backed crash loop detection
+// ═══════════════════════════════════════════════════════════════════════
+// Must init AFTER memory-mode (so it can switch modes) but BEFORE
+// subsystems start (so emergency mode can disable heavy modules).
+// Uses DB (via Turso) for restart counting — survives /tmp/ wipes.
+const restartGuardian = require('./survival-restart-guardian');
+const guardianResult = restartGuardian.init({
+  logger: container.get('logger', { required: false }),
+  database: container.get('database', { required: false }),
+  browser: container.get('browser', { required: false }),
+  cache: container.get('cache', { required: false }),
+});
+if (guardianResult.wasUnexpected) {
+  log(`Restart guardian: unexpected restart detected (${guardianResult.recentRestartCount} recent)`, 'WARN', 'render-free-plan');
+}
+if (guardianResult.emergencyMode) {
+  log(`Restart guardian: EMERGENCY MODE active — all preservation methods engaged`, 'ERROR', 'render-free-plan');
+}
+if (memoryMode.isMemoryProtection()) {
+  log(`Operational mode after restart guardian: ${memoryMode.getMode()}`, 'WARN', 'render-free-plan');
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // SUBSYSTEMS: Start ALL of them (respecting mode-specific env vars above)
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -214,9 +237,9 @@ try {
 // Pixel training system (learns from successful actions)
 try {
   const pixelTraining = require('./pixel-training');
-  // pixel-training uses lazy init via _ensureDb() — no .init() needed.
-  const status = pixelTraining.getStats();
-  log(`Pixel training: ready, ${status.cacheSize} samples in cache, ${status.totalRecords} in DB`, 'INFO', 'render-free-plan');
+  pixelTraining.init();
+  const status = pixelTraining.getStatus();
+  log(`Pixel training: initialized, ${status.cacheSize} samples in cache, ${status.dbRowCount} in DB`, 'INFO', 'render-free-plan');
 } catch (e: any) {
   log(`Pixel training init failed: ${e.message || e}`, 'WARN', 'render-free-plan');
 }
@@ -348,6 +371,8 @@ async function gracefulShutdown(signal: string) {
   isShuttingDown = true;
   log(`Received ${signal} — shutting down gracefully...`, 'INFO', 'render-free-plan');
   requestStop();
+  // v4: Write clean shutdown marker so restart guardian knows this was intentional
+  try { restartGuardian.writeCleanShutdownMarker(); } catch { /* best-effort */ }
   // Flush persistent config to disk before dying
   try { require('./persistent-config').flush(); } catch { /* best-effort */ }
   // Flush screenshot upload queue
@@ -357,6 +382,8 @@ async function gracefulShutdown(signal: string) {
   } catch { /* best-effort */ }
   // Shutdown pixel training
   try { require('./pixel-training').shutdown(); } catch { /* best-effort */ }
+  // v4: Stop restart guardian monitoring
+  try { restartGuardian.stop(); } catch { /* best-effort */ }
   try {
     const { gracefulShutdown: runHooks } = require('./cycle-shutdown');
     await runHooks(signal);
@@ -429,6 +456,18 @@ function _startMemoryMonitor(): void {
 
     // Record memory reading for history-based detection
     persistConfigMod.pushMemoryReading(Math.round(used * 10) / 10, Math.round(rss * 10) / 10);
+
+    // v4: Periodic memory heartbeat to calibration DB (survives SIGKILL via Turso)
+    // Written every ~5 minutes. On next startup, checkAfterTursoSync() reads this
+    // to detect if the previous instance was running hot before being killed.
+    const now = Date.now();
+    if (Math.floor(now / 300000) !== Math.floor((now - intervalMs) / 300000)) {
+      const heartbeat = JSON.stringify({ heapMB: Math.round(used), rssMB: Math.round(rss), ts: now });
+      try {
+        const { upsertCalibration: upsertCal } = require('./database');
+        if (upsertCal) upsertCal.run('last_memory_heartbeat', heartbeat, now);
+      } catch { /* DB not ready — non-critical */ }
+    }
 
     // Auto-downgrade check (before applying mode-specific thresholds)
     if (memoryMode.checkAutoDowngrade(used, rss)) {
