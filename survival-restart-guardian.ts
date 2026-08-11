@@ -8,28 +8,32 @@
 // This module activates ALL available memory preservation methods
 // simultaneously when multiple unexpected restarts are detected.
 //
-// Trigger: 3+ restarts within 30 minutes without a clean shutdown marker.
+// Trigger: 2+ restarts within 30 minutes without a clean shutdown marker.
+// (Lowered from 3 because /tmp/ wipes make every OOM look like the first.)
+//
+// v4 REWRITE: DB-backed restart counting
+//   Previous version stored all state in /tmp/ files which are wiped
+//   on Render OOM restart, making restart counting impossible.
+//   Now uses the calibration DB (synced via Turso) as the primary
+//   restart counter, with /tmp/ as a secondary fast-read cache.
+//
+// v4: Also switches to memory_protection mode on OOM loop detection,
+//   closes the browser, and forces aggressive Turso sync.
 //
 // When activated, this module:
-//   1. Forces a tombstone snapshot to ALL remote targets (TOMBSTONE_URL,
-//      Discord webhook) AND local file
-//   2. Writes a comprehensive checkpoint to /tmp (survives cold starts)
-//   3. Dumps in-memory state to a JSON file in /tmp
-//   4. Closes the browser immediately (largest memory consumer)
-//   5. Forces global GC
-//   6. Reduces operational mode to minimal (skip non-essential modules)
-//   7. Persists the Turso push interval to be more aggressive
-//   8. Writes a "last resort" state file that survives SIGKILL
+//   1. Switches to memory_protection mode (disables heavy modules)
+//   2. Forces a tombstone snapshot to ALL remote targets
+//   3. Writes a comprehensive checkpoint
+//   4. Dumps in-memory state to a compressed file
+//   5. Closes the browser immediately (largest memory consumer)
+//   6. Forces global GC
+//   7. Forces Turso sync (push local DB to cloud)
+//   8. Clears all caches
 //
-// Files created:
-//   /tmp/mathu-restart-guardian-state.json — restart tracking
-//   /tmp/mathu-last-resort-state.json.gz — compressed full state dump
-//   /tmp/mathu-restart-count.json — simple counter for fast reads
-//
-// Integration:
-//   - Called from render-cold-start.ts on startup
-//   - Called from runtime-heap-guardian.ts before OOM exit
-//   - Called from container-subsystem-runner.ts during init
+// Integration points:
+//   - render-free-plan.ts: init() at startup, clean shutdown marker on exit
+//   - runtime-heap-guardian.ts: preserveBeforeExit() before OOM exits
+//   - container-subsystem-runner.ts: _injectDependencies() during init
 // ═══════════════════════════════════════════════════════════════════════════
 
 const fs = require('fs');
@@ -43,41 +47,45 @@ function _injectDependencies(deps: Record<string, any>) {
   _deps = deps;
 }
 
-function log(msg: string, level: string = 'INFO', mod: string = 'restart-guardian') {
+function _log(msg: string, level: string = 'INFO') {
   try {
     const logger = (_deps as any).logger;
-    if (logger?.log) { logger.log(msg, level, mod); return; }
+    if (logger?.log) { logger.log(msg, level, 'restart-guardian'); return; }
   } catch { /* fall through */ }
-  console.log(`[${level}] [${mod}] ${msg}`);
+  console.log(`[${level}] [restart-guardian] ${msg}`);
 }
 
-function logError(msg: string, err: Error) {
+function _logError(msg: string, err: Error) {
   try {
     const logger = (_deps as any).logger;
     if (logger?.logError) { logger.logError(msg, err); return; }
   } catch { /* fall through */ }
-  console.error(`[ERROR] [${mod}] ${msg}`, err);
+  console.error(`[ERROR] [restart-guardian] ${msg}`, err);
 }
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
-const RESTART_COUNT_FILE = path.join(os.tmpdir(), 'mathu-restart-count.json');
 const STATE_FILE = path.join(os.tmpdir(), 'mathu-restart-guardian-state.json');
 const LAST_RESORT_FILE = path.join(os.tmpdir(), 'mathu-last-resort-state.json.gz');
+const CLEAN_SHUTDOWN_MARKER = path.join(os.tmpdir(), 'mathu-clean-shutdown.json');
 
-// 3 restarts within 30 minutes = OOM loop detected
-const RESTART_THRESHOLD = 3;
+// v4: Lowered from 3 to 2 because /tmp/ wipes on Render OOM make every
+// crash look like the first one. With DB backing, we can trust the count.
+const RESTART_THRESHOLD = 2;
 const RESTART_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
+
+// DB calibration key for restart history (survives /tmp/ wipes via Turso)
+const DB_KEY_RESTART_HISTORY = 'restart_guardian_history';
 
 // ─── State ──────────────────────────────────────────────────────────────────
 
 interface RestartRecord {
   timestamp: number;
   pid: number;
-  wasClean: boolean;    // true if process wrote a shutdown marker
-   heapUsedMB: number;    // last known heap before death
-   uptimeMs: number;      // how long the process was running
-   triggerReason?: string; // 'OOM_HARD', 'memory_threshold', 'SIGKILL', etc.
+  wasClean: boolean;
+  heapUsedMB: number;
+  uptimeMs: number;
+  triggerReason?: string;
 }
 
 interface GuardianState {
@@ -97,65 +105,114 @@ let _state: GuardianState = {
 let _stateLoaded = false;
 let _monitoringInterval: ReturnType<typeof setInterval> | null = null;
 
+// ─── DB-backed Restart History ─────────────────────────────────────────────
+
+/**
+ * Load restart history from the calibration DB (primary source).
+ * This survives /tmp/ wipes because Turso syncs the calibration table.
+ */
+function _loadRestartHistoryFromDB(): RestartRecord[] {
+  try {
+    const dbMod = require('./database');
+    const selectCalibration = dbMod?.selectCalibration || dbMod?.db?.prepare?.('SELECT value FROM calibration WHERE key = ?')?.get;
+    
+    // Try the prepared statement approach first (unified-db pattern)
+    if (dbMod?.selectCalibration) {
+      const row = dbMod.selectCalibration.get(DB_KEY_RESTART_HISTORY);
+      if (row?.value) {
+        const parsed = JSON.parse(row.value);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    }
+    
+    // Fallback: direct db.prepare
+    if (dbMod?.db?.prepare) {
+      const row = dbMod.db.prepare('SELECT value FROM calibration WHERE key = ?').get(DB_KEY_RESTART_HISTORY);
+      if (row?.value) {
+        const parsed = JSON.parse(row.value);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    }
+  } catch { /* DB not ready or corrupt */ }
+  return [];
+}
+
+/**
+ * Save restart history to the calibration DB (sync write, guaranteed).
+ */
+function _saveRestartHistoryToDB(): void {
+  try {
+    const dbMod = require('./database');
+    const value = JSON.stringify(_state.restarts.slice(-20)); // Keep last 20
+    const now = Date.now();
+
+    if (dbMod?.upsertCalibration) {
+      dbMod.upsertCalibration.run(DB_KEY_RESTART_HISTORY, value, now);
+    } else if (dbMod?.db?.prepare) {
+      dbMod.db.prepare(
+        'INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (?, ?, ?)'
+      ).run(DB_KEY_RESTART_HISTORY, value, now);
+    }
+  } catch { /* DB not available — non-critical, /tmp/ file is the fallback */ }
+}
+
 // ─── State Persistence ──────────────────────────────────────────────────────
 
-/** Load state from /tmp file (survives cold starts). */
+/** Load state from DB (primary) + /tmp file (secondary). */
 function _loadState(): GuardianState {
+  if (_stateLoaded) return _state;
+
+  // Primary: load from DB (survives /tmp/ wipes via Turso)
+  const dbRestarts = _loadRestartHistoryFromDB();
+  if (dbRestarts.length > 0) {
+    _state.restarts = dbRestarts;
+    _log(`Loaded ${dbRestarts.length} restart records from DB`);
+  }
+
+  // Secondary: load emergency mode state from /tmp (same-instance only)
   try {
     if (fs.existsSync(STATE_FILE)) {
       const data = fs.readFileSync(STATE_FILE, 'utf8');
       const parsed = JSON.parse(data);
-      if (parsed && Array.isArray(parsed.restarts)) {
-        _state = parsed;
-        _stateLoaded = true;
-        return _state;
-      }
-    }
-  } catch { /* corrupt or missing — start fresh */ }
-
-  // Also try the simple count file for backward compat
-  try {
-    if (fs.existsSync(RESTART_COUNT_FILE)) {
-      const countData = JSON.parse(fs.readFileSync(RESTART_COUNT_FILE, 'utf8'));
-      if (countData && typeof countData.count === 'number') {
-        for (let i = 0; i < countData.count; i++) {
-          _state.restarts.push({
-            timestamp: Date.now() - (countData.count - i) * 60000,
-            pid: 0,
-            wasClean: false,
-            heapUsedMB: 0,
-            uptimeMs: 0,
-          });
+      if (parsed) {
+        // Merge: DB has authoritative restart history, /tmp has emergency state
+        if (parsed.emergencyModeActive) {
+          _state.emergencyModeActive = true;
+          _state.emergencyActivatedAt = parsed.emergencyActivatedAt;
+          _state.totalEmergencyActivations = parsed.totalEmergencyActivations || 0;
+        }
+        // If DB had no records but /tmp file does (shouldn't happen, but safety)
+        if (_state.restarts.length === 0 && Array.isArray(parsed.restarts)) {
+          _state.restarts = parsed.restarts;
         }
       }
     }
-  } catch { /* ignore */ }
+  } catch { /* corrupt or missing — DB data is sufficient */ }
 
   _stateLoaded = true;
   return _state;
 }
 
-/** Save state to /tmp file. */
+/** Save state to both DB and /tmp file. */
 function _saveState(): void {
-  try {
-    // Keep only last 20 restart records to prevent unbounded growth
-    if (_state.restarts.length > 20) {
-      _state.restarts = _state.restarts.slice(-20);
-    }
-    fs.writeFileSync(STATE_FILE, JSON.stringify(_state, null, 2), 'utf8');
-  } catch (e: any) {
-    logError('Failed to save restart guardian state', e);
+  // Keep only last 20 restart records
+  if (_state.restarts.length > 20) {
+    _state.restarts = _state.restarts.slice(-20);
   }
+
+  // Save to DB (primary — survives /tmp/ wipes)
+  _saveRestartHistoryToDB();
+
+  // Save to /tmp (secondary — fast reads, emergency mode state)
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(_state, null, 2), 'utf8');
+  } catch { /* best-effort */ }
 }
 
 // ─── Restart Tracking ──────────────────────────────────────────────────────
 
 /**
  * Record a restart. Called at startup to track patterns.
- * @param wasClean - true if the previous process wrote a shutdown marker
- * @param heapUsedMB - last known heap usage before death (from tombstone)
- * @param uptimeMs - how long the previous process was running
- * @param triggerReason - what caused the restart (if known)
  */
 function recordRestart(wasClean: boolean = false, heapUsedMB: number = 0, uptimeMs: number = 0, triggerReason?: string): void {
   if (!_stateLoaded) _loadState();
@@ -174,17 +231,17 @@ function recordRestart(wasClean: boolean = false, heapUsedMB: number = 0, uptime
 
   // Clean shutdowns don't count toward the OOM threshold
   if (wasClean) {
-    log(`Clean shutdown recorded (uptime: ${Math.round(uptimeMs / 1000)}s). Not counting toward restart threshold.`, 'INFO');
+    _log(`Clean shutdown recorded (uptime: ${Math.round(uptimeMs / 1000)}s). Not counting toward restart threshold.`);
     return;
   }
 
   // Check if we've exceeded the restart threshold
   const unexpectedRestarts = _getRecentUnexpectedRestarts();
   if (unexpectedRestarts.length >= RESTART_THRESHOLD) {
-    log(`⚠️ OOM LOOP DETECTED: ${unexpectedRestarts.length} unexpected restarts within ${Math.round(RESTART_WINDOW_MS / 60000)}min. Activating ALL memory preservation methods.`, 'ERROR');
+    _log(`OOM LOOP DETECTED: ${unexpectedRestarts.length} unexpected restarts within ${Math.round(RESTART_WINDOW_MS / 60000)}min. Activating emergency mode + memory protection.`, 'ERROR');
     _activateEmergencyMode(unexpectedRestarts);
-  } else if (unexpectedRestarts.length >= 2) {
-    log(`Warning: ${unexpectedRestarts.length} unexpected restarts within ${Math.round(RESTART_WINDOW_MS / 60000)}min. Approaching threshold (${RESTART_THRESHOLD}).`, 'WARN');
+  } else if (unexpectedRestarts.length >= 1) {
+    _log(`Warning: ${unexpectedRestarts.length} unexpected restart(s) within ${Math.round(RESTART_WINDOW_MS / 60000)}min. Approaching threshold (${RESTART_THRESHOLD}).`, 'WARN');
   }
 }
 
@@ -203,7 +260,7 @@ function _getRecentUnexpectedRestarts(): RestartRecord[] {
  */
 function _activateEmergencyMode(recentRestarts: RestartRecord[]): void {
   if (_state.emergencyModeActive) {
-    log('Emergency mode already active — skipping re-activation', 'WARN');
+    _log('Emergency mode already active — skipping re-activation', 'WARN');
     return;
   }
 
@@ -212,10 +269,16 @@ function _activateEmergencyMode(recentRestarts: RestartRecord[]): void {
   _state.totalEmergencyActivations++;
   _saveState();
 
+  // ──── Method 0: Switch to memory_protection mode ────
+  // This is the MOST IMPORTANT change. Previously the guardian
+  // did preservation but never told memory-mode to switch,
+  // so the bot kept OOMing even after detecting the loop.
+  _switchToMemoryProtection('oom_loop_detected');
+
   // ──── Method 1: Force tombstone to ALL targets ────
   _pushEmergencyTombstone('OOM_LOOP');
 
-  // ──── Method 2: Write comprehensive checkpoint to /tmp ────
+  // ──── Method 2: Write comprehensive checkpoint ────
   _writeEmergencyCheckpoint();
 
   // ──── Method 3: Dump full in-memory state to compressed file ────
@@ -233,10 +296,32 @@ function _activateEmergencyMode(recentRestarts: RestartRecord[]): void {
   // ──── Method 7: Clear all caches ────
   _clearAllCaches();
 
-  // ──── Method 8: Write shutdown marker for next startup ────
-  _writeCleanShutdownMarker();
+  _log(`Emergency mode activated: memory_protection + ${7} preservation methods executed`, 'WARN');
+}
 
-  log(`Emergency mode activated: all ${8} memory preservation methods executed`, 'WARN');
+/**
+ * Switch to memory_protection mode via memory-mode module.
+ * This disables heavy subsystems and tightens memory thresholds.
+ */
+function _switchToMemoryProtection(reason: string): void {
+  try {
+    const memoryMode = require('./memory-mode');
+    if (memoryMode.getMode() !== 'memory_protection') {
+      memoryMode.switchMode('memory_protection', reason);
+      _log(`Switched to MEMORY PROTECTION mode: ${reason}`, 'WARN');
+    }
+  } catch (e: any) {
+    _log(`Failed to switch to memory_protection: ${e.message}`, 'ERROR');
+    // Fallback: set env vars directly
+    const HEAVY_KEYS = [
+      'BLACKBOX_FULL_ENABLED', 'ENABLE_EXPLORATION_PASS', 'ENABLE_ADAPTIVE_PERFORMANCE',
+      'PROMPT_EVOLUTION_ENABLED', 'REGRESSION_BANK_ENABLED', 'PATCH_MEMORY_ENABLED',
+      'HEAL_REWARD_TRACKER_ENABLED', 'SELF_HEAL_TIMELINE_ENABLED', 'EXTENDED_CHECKPOINT_ENABLED',
+      'CANARY_ROLLOUT_ENABLED', 'DIFF_MINIMIZER_ENABLED', 'ENABLE_BLACKBOX',
+      'POLICY_ACTION_VALIDATOR_ENABLED',
+    ];
+    for (const key of HEAVY_KEYS) process.env[key] = 'false';
+  }
 }
 
 // ─── Individual Preservation Methods ──────────────────────────────────────
@@ -246,21 +331,19 @@ async function _pushEmergencyTombstone(reason: string): Promise<void> {
   try {
     const tombstone = (_deps as any).survivalTombstone;
     if (tombstone?.pushTombstone) {
-      // Skip rate limiting for emergency pushes
       const result = await tombstone.pushTombstone(reason);
-      log(`Emergency tombstone pushed: ${result ? 'success' : 'all targets failed'}`, result ? 'INFO' : 'ERROR');
+      _log(`Emergency tombstone pushed: ${result ? 'success' : 'all targets failed'}`, result ? 'INFO' : 'ERROR');
     } else {
-      // Try lazy loading
       try {
         const mod = require('./survival-tombstone');
         if (mod?.pushTombstone) {
           await mod.pushTombstone(reason);
-          log('Emergency tombstone pushed (lazy-loaded)', 'INFO');
+          _log('Emergency tombstone pushed (lazy-loaded)', 'INFO');
         }
       } catch { /* tombstone module not available */ }
     }
   } catch (e: any) {
-    logError('Emergency tombstone push failed', e);
+    _logError('Emergency tombstone push failed', e);
   }
 }
 
@@ -269,7 +352,6 @@ function _writeEmergencyCheckpoint(): void {
   try {
     const statePersist = (_deps as any).statePersist || require('./state-persist');
     if (statePersist?.saveCheckpoint) {
-      // Gather current state from all available sources
       const checkpointData: Record<string, any> = {
         emergencyMode: true,
         emergencyActivatedAt: _state.emergencyActivatedAt,
@@ -277,7 +359,6 @@ function _writeEmergencyCheckpoint(): void {
         savedAt: Date.now(),
       };
 
-      // Add cycle state if available
       try {
         const existingCheckpoint = statePersist.loadCheckpoint?.();
         if (existingCheckpoint) {
@@ -290,7 +371,6 @@ function _writeEmergencyCheckpoint(): void {
         }
       } catch {}
 
-      // Add DB state
       try {
         const db = (_deps as any).database;
         if (db?.database) {
@@ -306,14 +386,14 @@ function _writeEmergencyCheckpoint(): void {
       } catch {}
 
       statePersist.saveCheckpoint(checkpointData);
-      log('Emergency checkpoint written', 'INFO');
+      _log('Emergency checkpoint written', 'INFO');
     }
   } catch (e: any) {
-    logError('Emergency checkpoint failed', e);
+    _logError('Emergency checkpoint failed', e);
   }
 }
 
-/** Method 3: Dump full state to compressed file (survives SIGKILL). */
+/** Method 3: Dump full state to compressed file. */
 function _writeLastResortStateDump(): void {
   try {
     const dump: Record<string, any> = {
@@ -326,14 +406,11 @@ function _writeLastResortStateDump(): void {
       emergencyMode: true,
     };
 
-    // Serialize state from all known sources
-    // Source A: checkpoint
     try {
       const sp = (_deps as any).statePersist || require('./state-persist');
       if (sp?.loadCheckpoint) dump.checkpoint = sp.loadCheckpoint();
     } catch {}
 
-    // Source B: DB tables (critical ones)
     try {
       const db = (_deps as any).database;
       if (db?.database) {
@@ -345,28 +422,22 @@ function _writeLastResortStateDump(): void {
       }
     } catch {}
 
-    // Source C: provider health scores
     try {
       const health = require('./providers-health');
-      if (health?.getAllHealthSnapshots) {
-        dump.providerHealth = health.getAllHealthSnapshots();
-      }
+      if (health?.getAllHealthSnapshots) dump.providerHealth = health.getAllHealthSnapshots();
     } catch {}
 
-    // Source D: tombstone data (if available)
     try {
       const tombstone = (_deps as any).survivalTombstone || require('./survival-tombstone');
-      if (tombstone?.buildSnapshot) {
-        dump.tombstoneSnapshot = tombstone.buildSnapshot('EMERGENCY_DUMP');
-      }
+      if (tombstone?.buildSnapshot) dump.tombstoneSnapshot = tombstone.buildSnapshot('EMERGENCY_DUMP');
     } catch {}
 
     const json = JSON.stringify(dump);
     const compressed = zlib.gzipSync(Buffer.from(json, 'utf-8'), { level: 9 });
     fs.writeFileSync(LAST_RESORT_FILE, compressed);
-    log(`Last-resort state dump written (${compressed.length} bytes compressed, ${json.length} bytes uncompressed)`, 'INFO');
+    _log(`Last-resort state dump written (${compressed.length} bytes compressed, ${json.length} bytes uncompressed)`, 'INFO');
   } catch (e: any) {
-    logError('Last-resort state dump failed', e);
+    _logError('Last-resort state dump failed', e);
   }
 }
 
@@ -376,7 +447,7 @@ function _closeBrowserForMemory(): void {
     const browser = (_deps as any).browser;
     if (browser?.closeBrowser) {
       browser.closeBrowser().catch(() => {});
-      log('Browser closed for emergency memory preservation', 'WARN');
+      _log('Browser closed for emergency memory preservation', 'WARN');
     }
   } catch {}
 }
@@ -386,7 +457,7 @@ function _forceGC(): void {
   try {
     if (global.gc) {
       global.gc();
-      log('Forced GC executed', 'DEBUG');
+      _log('Forced GC executed', 'DEBUG');
     }
   } catch {}
 }
@@ -397,9 +468,9 @@ function _forceTursoSync(): void {
     const turso = (_deps as any).databaseTurso || require('./database-turso');
     if (turso?.forceSync) {
       turso.forceSync().then(() => {
-        log('Emergency Turso sync completed', 'INFO');
+        _log('Emergency Turso sync completed', 'INFO');
       }).catch((e: any) => {
-        logError('Emergency Turso sync failed', e);
+        _logError('Emergency Turso sync failed', e);
       });
     }
   } catch {}
@@ -407,59 +478,32 @@ function _forceTursoSync(): void {
 
 /** Method 7: Clear all caches. */
 function _clearAllCaches(): void {
-  // Clear provider-base coalescer cache
   try {
     const base = require('./providers-base');
     if (base?.coalescer?.clear) base.coalescer.clear();
   } catch {}
-
-  // Clear app cache
   try {
     const cache = (_deps as any).cache;
     if (cache?.clearCache) cache.clearCache();
   } catch {}
-
-  // Clear child logger cache
-  try {
-    const loggerMod = require('./logger');
-    // No clear method, but we can note it
-  } catch {}
-
-  log('All caches cleared', 'DEBUG');
-}
-
-/** Method 8: Write a clean shutdown marker for the next startup. */
-function _writeCleanShutdownMarker(): void {
-  try {
-    const markerFile = path.join(os.tmpdir(), 'mathu-clean-shutdown.json');
-    fs.writeFileSync(markerFile, JSON.stringify({
-      timestamp: Date.now(),
-      pid: process.pid,
-      reason: 'emergency_mode_prepared',
-    }));
-    log('Clean shutdown marker written', 'DEBUG');
-  } catch (e: any) {
-    logError('Failed to write clean shutdown marker', e);
-  }
+  _log('All caches cleared', 'DEBUG');
 }
 
 // ─── Pre-Exit Preservation ──────────────────────────────────────────────────
 
 /**
  * Called by runtime-heap-guardian.ts BEFORE process.exit() on OOM.
- * Activates ALL preservation methods to maximize state survival.
+ * Records the restart, activates emergency preservation, and pushes state to Turso.
  */
 async function preserveBeforeExit(triggerReason: string = 'OOM'): Promise<void> {
-  log(`Pre-exit preservation triggered: ${triggerReason}`, 'ERROR');
+  _log(`Pre-exit preservation triggered: ${triggerReason}`, 'ERROR');
 
-  // Record this as a non-clean restart for next startup
+  // Record this as a non-clean restart for next startup (writes to DB + /tmp)
   const mem = process.memoryUsage();
   recordRestart(false, Math.round(mem.heapUsed / 1024 / 1024), process.uptime() * 1000, triggerReason);
 
-  // Execute ALL preservation methods in parallel where possible
+  // Execute ALL preservation methods
   const tasks: Promise<void>[] = [];
-
-  // Tombstone (can be async)
   tasks.push(_pushEmergencyTombstone(triggerReason).catch(() => {}));
 
   // Synchronous methods
@@ -470,53 +514,81 @@ async function preserveBeforeExit(triggerReason: string = 'OOM'): Promise<void> 
   _forceTursoSync();
   _clearAllCaches();
 
-  // Wait for async tasks
-  await Promise.allSettled(tasks);
+  // Wait for async tasks (with timeout)
+  await Promise.race([
+    Promise.allSettled(tasks),
+    new Promise<void>(resolve => setTimeout(resolve, 5000)),
+  ]);
 
-  log('Pre-exit preservation complete', 'INFO');
+  _log('Pre-exit preservation complete', 'INFO');
 }
 
-// ─── Startup Check ──────────────────────────────────────────────────────────
+// ─── Clean Shutdown Marker ──────────────────────────────────────────────────
+
+/**
+ * Write a clean shutdown marker to /tmp. Called on graceful shutdown (SIGTERM).
+ * The next startup reads this to distinguish clean vs OOM kills.
+ * Note: This only works for same-instance restarts (SIGTERM spin-down).
+ * For OOM kills (SIGKILL), the DB-backed restart history is used instead.
+ */
+function writeCleanShutdownMarker(): void {
+  try {
+    fs.writeFileSync(CLEAN_SHUTDOWN_MARKER, JSON.stringify({
+      timestamp: Date.now(),
+      pid: process.pid,
+      reason: 'graceful_shutdown',
+    }));
+  } catch { /* best-effort */ }
+}
 
 /**
  * Check at startup if the previous exit was clean.
  * Returns true if the restart was unexpected (no clean shutdown marker).
  */
 function wasUnexpectedRestart(): boolean {
-  const markerFile = path.join(os.tmpdir(), 'mathu-clean-shutdown.json');
-  const markerExists = fs.existsSync(markerFile);
+  const markerExists = fs.existsSync(CLEAN_SHUTDOWN_MARKER);
 
-  // Remove the marker (one-time use)
   if (markerExists) {
-    try { fs.unlinkSync(markerFile); } catch {}
-    return false; // Clean shutdown detected
+    try { fs.unlinkSync(CLEAN_SHUTDOWN_MARKER); } catch {}
+    return false;
   }
 
-  return true; // No marker = unexpected restart
+  return true;
 }
 
+// ─── Startup Init ───────────────────────────────────────────────────────────
+
 /**
- * Initialize the restart guardian. Called once at startup.
- * Checks restart history and activates emergency mode if needed.
+ * Initialize the restart guardian. Called once at startup from render-free-plan.ts.
+ * Checks restart history (from DB + /tmp) and activates emergency mode if needed.
+ *
+ * @param deps - Optional dependencies (logger, database, browser, cache, etc.)
+ * @returns {{ wasUnexpected, emergencyMode, recentRestartCount }}
  */
-function init(): { wasUnexpected: boolean; emergencyMode: boolean; recentRestartCount: number } {
+function init(deps?: Record<string, any>): { wasUnexpected: boolean; emergencyMode: boolean; recentRestartCount: number } {
+  if (deps) _injectDependencies(deps);
+
   _loadState();
 
   const wasUnexpected = wasUnexpectedRestart();
   const mem = process.memoryUsage();
-  const recentRestarts = _getRecentUnexpectedRestarts();
 
   if (wasUnexpected) {
-    recordRestart(false, Math.round(mem.heapUsed / 1024 / 1024), 0);
+    recordRestart(false, Math.round(mem.heapUsed / 1024 / 1024), 0, 'unexpected_restart');
   } else {
-    recordRestart(true, Math.round(mem.heapUsed / 1024 / 1024), process.uptime() * 1000);
+    recordRestart(true, Math.round(mem.heapUsed / 1024 / 1024), process.uptime() * 1000, 'clean_shutdown');
   }
 
   // Re-check after recording
   const updatedRestarts = _getRecentUnexpectedRestarts();
   if (updatedRestarts.length >= RESTART_THRESHOLD) {
-    log(`Startup: ${updatedRestarts.length} unexpected restarts detected — emergency mode activating`, 'ERROR');
+    _log(`Startup: ${updatedRestarts.length} unexpected restarts in DB — emergency mode activating`, 'ERROR');
     _activateEmergencyMode(updatedRestarts);
+  } else if (updatedRestarts.length >= 1) {
+    _log(`Startup: ${updatedRestarts.length} unexpected restart(s) in DB — memory_protection as precaution`, 'WARN');
+    // Even 1 unexpected restart is suspicious on Render — switch to memory_protection
+    // to prevent a second OOM while we wait for the threshold.
+    _switchToMemoryProtection(`precautionary:${updatedRestarts.length}_unexpected_restart(s)`);
   }
 
   // Try to restore from last-resort dump if emergency mode is active
@@ -540,7 +612,7 @@ function init(): { wasUnexpected: boolean; emergencyMode: boolean; recentRestart
 function _attemptRestoreFromDump(): void {
   try {
     if (!fs.existsSync(LAST_RESORT_FILE)) {
-      log('No last-resort dump found for restoration', 'DEBUG');
+      _log('No last-resort dump found for restoration', 'DEBUG');
       return;
     }
 
@@ -548,61 +620,54 @@ function _attemptRestoreFromDump(): void {
     const json = zlib.gunzipSync(compressed).toString('utf-8');
     const dump = JSON.parse(json);
 
-    log(`Found last-resort dump (${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB heap, from ${new Date(dump.timestamp).toISOString()})`, 'INFO');
+    _log(`Found last-resort dump (from ${new Date(dump.timestamp).toISOString()})`, 'INFO');
 
-    // Restore checkpoint
     if (dump.checkpoint) {
       try {
         const sp = (_deps as any).statePersist || require('./state-persist');
         if (sp?.saveCheckpoint) {
           sp.saveCheckpoint(dump.checkpoint);
-          log('Restored checkpoint from last-resort dump', 'WARN');
+          _log('Restored checkpoint from last-resort dump', 'WARN');
         }
       } catch {}
     }
 
-    // Restore DB data
     try {
       const tombstone = (_deps as any).survivalTombstone || require('./survival-tombstone');
       if (tombstone?.restoreDbFromSnapshot) {
         tombstone.restoreDbFromSnapshot(dump);
-        log('Restored DB from last-resort dump', 'WARN');
+        _log('Restored DB from last-resort dump', 'WARN');
       }
     } catch {}
   } catch (e: any) {
-    logError('Failed to restore from last-resort dump', e);
+    _logError('Failed to restore from last-resort dump', e);
   }
 }
 
 /**
- * Start periodic monitoring for memory + state preservation.
+ * Start periodic monitoring.
  */
 function _startMonitoring(): void {
   if (_monitoringInterval) return;
 
   _monitoringInterval = setInterval(() => {
     try {
-      // If emergency mode is active, write periodic state dumps
       if (_state.emergencyModeActive) {
         _writeEmergencyCheckpoint();
-      }
 
-      // Check if we should deactivate emergency mode
-      // (if no unexpected restarts in the last window)
-      if (_state.emergencyModeActive) {
-        const recent = _getRecentUnexpectedRestarts();
         // Deactivate after 1 hour without further crashes
+        const recent = _getRecentUnexpectedRestarts();
         const timeSinceActivation = Date.now() - (_state.emergencyActivatedAt || 0);
         if (timeSinceActivation > 60 * 60 * 1000 && recent.length < RESTART_THRESHOLD) {
           _state.emergencyModeActive = false;
           _saveState();
-          log('Emergency mode deactivated — stable for 1 hour', 'INFO');
+          _log('Emergency mode deactivated — stable for 1 hour', 'INFO');
         }
       }
     } catch (e: any) {
-      logError('Monitor tick failed', e);
+      _logError('Monitor tick failed', e);
     }
-  }, 30000); // Check every 30 seconds
+  }, 30000);
 
   if (_monitoringInterval?.unref) _monitoringInterval.unref();
 }
@@ -617,7 +682,7 @@ function stop(): void {
 
 // ─── Status / Query ──────────────────────────────────────────────────────────
 
-/** Get diagnostic info about the restart guardian state. */
+/** Get diagnostic info. */
 function getStatus(): Record<string, any> {
   const recent = _getRecentUnexpectedRestarts();
   return {
@@ -631,6 +696,7 @@ function getStatus(): Record<string, any> {
     lastResortDumpSize: fs.existsSync(LAST_RESORT_FILE) ? fs.statSync(LAST_RESORT_FILE).size : 0,
     monitoringActive: _monitoringInterval !== null,
     totalRestartsRecorded: _state.restarts.length,
+    dbBacked: true,
     recentRestartDetails: recent.slice(-5).map(r => ({
       time: new Date(r.timestamp).toISOString(),
       heapMB: r.heapUsedMB,
@@ -644,13 +710,13 @@ function isEmergencyMode(): boolean {
   return _state.emergencyModeActive;
 }
 
-/** Manually clear the restart history (for testing / after fix deployment). */
+/** Manually clear the restart history. */
 function clearRestartHistory(): void {
   _state.restarts = [];
   _state.emergencyModeActive = false;
   _state.emergencyActivatedAt = null;
   _saveState();
-  log('Restart history cleared', 'INFO');
+  _log('Restart history cleared', 'INFO');
 }
 
 module.exports = {
@@ -661,6 +727,7 @@ module.exports = {
   // Recording
   recordRestart,
   wasUnexpectedRestart,
+  writeCleanShutdownMarker,
 
   // Emergency
   preserveBeforeExit,
