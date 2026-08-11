@@ -1,22 +1,18 @@
 'use strict';
-// Last modified: 2026-08-08 — OpenRouter rate limiter integration, graceful sleep
+// Last modified: 2026-08-12 — openrouter/free-first strategy with fallback fatigue
 
 // ─── OpenRouter Tribunal Provider ───────────────────────────────────────────
 //
-// Uses OpenRouter's API to access multiple free vision models.
-// This is the most flexible provider — it can route to any OpenRouter model.
+// Strategy: openrouter/free is king. It auto-routes to whatever free model
+// is healthy on OpenRouter. We give it the most chances and only fall back
+// to specific models as a distant last resort.
 //
-// Key behaviors:
-//   - Uses callChatCompletionWithRollback (not bare callChatCompletion)
-//     for protocol chameleon 422 recovery and config rollback support
-//   - Falls back through a chain of known free vision models
-//   - Model-level vision capability check via providers-serializers
-//     (e.g., llama-4-scout is text-only and will be skipped for vision tasks)
-//   - P7: providerName passed to retryWithBackoff for health-aware retries
-//   - P19: Fallback chain includes multiple free vision models for resilience
-//   - Rate limiter: delegates to openrouter-rate-limiter.ts for budget tracking
-//   - Graceful sleep: when budget exhausted AND no other providers, sleeps
-//     until midnight UTC (the "OpenRouter is the only provider" scenario)
+// Why? On 512MB Render, cycling through 6 specific models burns memory.
+// openrouter/free will work *eventually* — and time is the one thing we have.
+//
+// Phase 1: openrouter/free with generous retries (4 attempts)
+// Phase 2: Specific fallback models (only if not fatigued)
+// Phase 3: Last-gasp openrouter/free
 
 const { extractJSON, validateActionResponse, callChatCompletionWithRollback, retryWithBackoff, _getOrLimiter } = require('./providers-base');
 const { providerSupportsVision } = require('./providers-serializers');
@@ -29,13 +25,51 @@ function _getLogger() { if (!_logger) _logger = require('./logger'); return _log
 let _registry: any = null;
 function _getRegistry() { if (!_registry) _registry = require('./providers-registry'); return _registry; }
 
+/* ── Fallback fatigue ───────────────────────────────────────────────────
+ * When specific fallback models keep failing, we stop bothering with them
+ * entirely. openrouter/free auto-routes anyway — no point naming specific
+ * models if they all die. Fatigue resets on any success or after 10 min.
+ */
+let _fallbackFatigueCount = 0;
+let _fallbackFatigueResetTimer: any = null;
+const FALLBACK_FATIGUE_THRESHOLD = 3;         // 3 specific-model failures → skip them
+const FALLBACK_FATIGUE_RESET_MS = 10 * 60 * 1000;
+
+/* ── openrouter/free retry config ───────────────────────────────────────────
+ * openrouter/free gets way more chances than any specific model.
+ * It auto-routes to whatever's healthy — it'll work eventually.
+ */
+const OR_FREE_RETRIES = 3;                    // retries (4 total attempts: 1 + 3)
+const OR_FREE_BASE_DELAY = 2000;              // 2s → 4s → 8s backoff
+
+/** Record a specific-model failure. Returns true when fatigue threshold is hit. */
+function _recordFallbackFailure(): boolean {
+  _fallbackFatigueCount++;
+  // Reset the cooldown timer on each new failure
+  if (_fallbackFatigueResetTimer) clearTimeout(_fallbackFatigueResetTimer);
+  _fallbackFatigueResetTimer = setTimeout(() => {
+    _fallbackFatigueCount = 0;
+    _fallbackFatigueResetTimer = null;
+  }, FALLBACK_FATIGUE_RESET_MS);
+  return _fallbackFatigueCount >= FALLBACK_FATIGUE_THRESHOLD;
+}
+
+/** Reset fatigue on any success. */
+function _resetFallbackFatigue(): void {
+  _fallbackFatigueCount = 0;
+  if (_fallbackFatigueResetTimer) {
+    clearTimeout(_fallbackFatigueResetTimer);
+    _fallbackFatigueResetTimer = null;
+  }
+}
+
+function _isFallbackFatigued(): boolean {
+  return _fallbackFatigueCount >= FALLBACK_FATIGUE_THRESHOLD;
+}
+
 /**
  * Known free vision models on OpenRouter, ordered by quality.
- * Text-only models are filtered out at runtime via providerSupportsVision().
- *
- * Models marked with (V) are confirmed vision-capable.
- * Models marked with (T) are text-only — included as last-resort fallbacks
- * when no image is present, or when vision providers all fail.
+ * (V) = vision-capable. Text-only models filtered at runtime.
  */
 const VISION_FALLBACK_MODELS = [
   'google/gemma-4-31b-it:free',           // (V) Best free vision model on OpenRouter
@@ -65,78 +99,135 @@ function OpenRouterTribunalProvider() {
   const primaryModel = process.env.OPENROUTER_TRIBUNAL_MODEL || 'openrouter/free';
   const endpoint = 'https://openrouter.ai/api/v1/chat/completions';
 
+  /**
+   * Try a single model with retries. Returns parsed result on success.
+   */
+  const _tryModel = async (model: string): Promise<any> => {
+    const rawContent = await retryWithBackoff(
+      () => callChatCompletionWithRollback(
+        endpoint, apiKey, model, base64Image, prompt, 'OpenRouter',
+        { signal }
+      ),
+      { providerName: 'OpenRouter', maxRetries: OR_FREE_RETRIES, baseDelay: OR_FREE_BASE_DELAY, signal }
+    );
+    if (options.validate === false) return rawContent;
+    return validateActionResponse(extractJSON(rawContent, 'OpenRouter'), 'OpenRouter');
+  };
+
   return async (base64Image: any, prompt: any, signal: any, options: any = {}) => {
     const log = _getLogger().log;
     const hasImage = !!base64Image;
+    const isFatigued = _isFallbackFatigued();
 
-    // Build fallback chain based on whether we have an image
-    // If image present: try vision models first, then text fallbacks
-    // If no image: try primary model, then text fallbacks
-    const candidates = [primaryModel];
-    const fallbackPool = hasImage
-      ? [...VISION_FALLBACK_MODELS, ...TEXT_FALLBACK_MODELS]
-      : [...TEXT_FALLBACK_MODELS];
-
-    // Deduplicate (primary model might be in the fallback pool)
-    const seen = new Set<string>();
-    for (const m of candidates) {
-      if (!seen.has(m)) seen.add(m);
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 1: openrouter/free — always first, always the most chances
+    // It auto-routes to whatever free model is healthy. Gamble, but cheap.
+    // ══════════════════════════════════════════════════════════════════════════
+    if (isFatigued) {
+      log('OpenRouter: fatigued (' + _fallbackFatigueCount + ' failures), openrouter/free only', 'WARN', 'openrouter');
     }
-    for (const m of fallbackPool) {
-      if (!seen.has(m)) seen.add(m);
-    }
-    const models = Array.from(seen);
 
-    let lastErr: any = null;
-    for (const m of models) {
-      // P1: Skip text-only models when we have an image
-      // (the serializer would strip the image, resulting in a blind analysis)
-      if (hasImage && !providerSupportsVision('OpenRouter', m)) {
-        log(`OpenRouter: skipping text-only model ${m} for vision request`, 'DEBUG', 'openrouter');
-        continue;
+    try {
+      const result = await _tryModel('openrouter/free');
+      _resetFallbackFatigue();
+      return result;
+    } catch (phase1Err: any) {
+      // openrouter/free didn't work this time — that's fine, it'll work eventually
+      const p1Msg = phase1Err?.message || String(phase1Err);
+
+      // Permanent errors (auth) — no point trying anything else
+      if (p1Msg.includes('HTTP_ERROR_401') || p1Msg.includes('HTTP_ERROR_403')) {
+        throw phase1Err;
       }
 
+      log('OpenRouter: openrouter/free failed (' + p1Msg.slice(0, 80) + '), trying specific fallbacks', 'WARN', 'openrouter');
+
+      // ══════════════════════════════════════════════════════════════════════
+      // PHASE 2: Specific fallback models (only if NOT fatigued)
+      // If specific models have been failing, don't waste memory on them.
+      // ══════════════════════════════════════════════════════════════════════
+      if (!isFatigued) {
+        const fallbackPool = hasImage
+          ? [...VISION_FALLBACK_MODELS, ...TEXT_FALLBACK_MODELS]
+          : [...TEXT_FALLBACK_MODELS];
+
+        // Deduplicate against openrouter/free (already tried)
+        const seen = new Set<string>(['openrouter/free']);
+        const models = fallbackPool.filter((m: string) => {
+          if (seen.has(m)) return false;
+          seen.add(m);
+          return true;
+        });
+
+        for (const m of models) {
+          // Skip text-only for vision requests
+          if (hasImage && !providerSupportsVision('OpenRouter', m)) {
+            continue;
+          }
+
+          try {
+            const result = await retryWithBackoff(
+              () => callChatCompletionWithRollback(
+                endpoint, apiKey, m, base64Image, prompt, 'OpenRouter',
+                { signal }
+              ),
+              { providerName: 'OpenRouter', maxRetries: 1, baseDelay: 1000, signal }
+            );
+            // Specific model worked — but openrouter/free is still king
+            _resetFallbackFatigue();
+            if (options.validate === false) return result;
+            return validateActionResponse(extractJSON(result, 'OpenRouter'), 'OpenRouter');
+          } catch (err: any) {
+            const errMsg = err?.message || String(err);
+
+            // Permanent = stop entirely
+            if (errMsg.includes('HTTP_ERROR_400') || errMsg.includes('HTTP_ERROR_401') || errMsg.includes('HTTP_ERROR_403')) {
+              throw err;
+            }
+
+            // Track fatigue — if specific models keep dying, stop bothering
+            if (_recordFallbackFailure()) {
+              log('OpenRouter: fallback fatigue hit (' + _fallbackFatigueCount + '), skipping rest', 'WARN', 'openrouter');
+              break;
+            }
+
+            if (errMsg.includes('HTTP_ERROR_404') || errMsg.includes('does not exist')) {
+              log('OpenRouter: model ' + m + ' gone, next', 'WARN', 'openrouter');
+              continue;
+            }
+            if (errMsg.includes('HTTP_ERROR_429') || errMsg.includes('HTTP_ERROR_5') || errMsg.includes('timeout') || errMsg.includes('ECONNREFUSED')) {
+              log('OpenRouter: model ' + m + ' transient error, next', 'WARN', 'openrouter');
+              continue;
+            }
+            if (errMsg.includes('No action returned') || errMsg.includes('missing actionType') || errMsg.includes('no JSON object found')) {
+              log('OpenRouter: model ' + m + ' bad response, next', 'WARN', 'openrouter');
+              continue;
+            }
+            throw err;
+          }
+        }
+      }
+
+      // ══════════════════════════════════════════════════════════════════════
+      // PHASE 3: Last-gasp openrouter/free
+      // Everything else failed. One more shot at the auto-router.
+      // ══════════════════════════════════════════════════════════════════════
+      log('OpenRouter: all fallbacks failed, one last openrouter/free attempt', 'WARN', 'openrouter');
       try {
-        // Use callChatCompletionWithRollback for:
-        //   - Protocol chameleon 422 recovery
-        //   - Config rollback on 404/401
-        // P7: providerName for health-aware retries
-        const rawContent = await retryWithBackoff(
+        const result = await retryWithBackoff(
           () => callChatCompletionWithRollback(
-            endpoint, apiKey, m, base64Image, prompt, 'OpenRouter',
+            endpoint, apiKey, 'openrouter/free', base64Image, prompt, 'OpenRouter',
             { signal }
           ),
-          { providerName: 'OpenRouter', maxRetries: 2, baseDelay: 1000, signal }
+          { providerName: 'OpenRouter', maxRetries: 1, baseDelay: 3000, signal }
         );
-
-        if (options.validate === false) return rawContent;
-        return validateActionResponse(extractJSON(rawContent, 'OpenRouter'), 'OpenRouter');
-      } catch (err: any) {
-        lastErr = err;
-        const errMsg = err?.message || String(err);
-
-        // On 404 or model-not-found, try next model in chain
-        // On other errors, also try next (the fallback chain IS the retry strategy)
-        if (errMsg.includes('HTTP_ERROR_404') || errMsg.includes('does not exist')) {
-          log(`OpenRouter: model ${m} not found, trying next fallback`, 'WARN', 'openrouter');
-          continue;
-        }
-        // For transient errors (429, 5xx), try next model rather than failing immediately
-        if (errMsg.includes('HTTP_ERROR_429') || errMsg.includes('HTTP_ERROR_5') || errMsg.includes('timeout') || errMsg.includes('ECONNREFUSED')) {
-          log(`OpenRouter: model ${m} transient error, trying next fallback`, 'WARN', 'openrouter');
-          continue;
-        }
-        // Model returned non-JSON / unparseable response — try next model in chain
-        if (errMsg.includes('No action returned') || errMsg.includes('missing actionType') || errMsg.includes('no JSON object found')) {
-          log(`OpenRouter: model ${m} returned invalid/unparseable response, trying next fallback`, 'WARN', 'openrouter');
-          continue;
-        }
-        // Permanent errors (400, 401, 403) — no point trying other models with same key
-        throw err;
+        _resetFallbackFatigue();
+        if (options.validate === false) return result;
+        return validateActionResponse(extractJSON(result, 'OpenRouter'), 'OpenRouter');
+      } catch (finalErr: any) {
+        throw finalErr;
       }
     }
-
-    throw lastErr || new Error('OpenRouter: all models exhausted');
   };
 }
 
@@ -186,4 +277,4 @@ async function waitForOpenRouterBudget(): Promise<void> {
   });
 }
 
-module.exports = { OpenRouterTribunalProvider, waitForOpenRouterBudget };
+module.exports = { OpenRouterTribunalProvider, waitForOpenRouterBudget, _fallbackFatigueCount: () => _fallbackFatigueCount };
