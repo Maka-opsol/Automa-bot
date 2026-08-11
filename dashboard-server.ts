@@ -861,12 +861,23 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           results.metaSelfTestError = e.message;
         }
 
-        // 4. If currently in memory_protection, promote to full_power
+        // 4. If currently in memory_protection, start a self-heal session
+        //    instead of blindly switching to full_power. This gives the bot
+        //    full power under a 30-minute timeout with DB-backed progress.
         if (memoryMode.isMemoryProtection()) {
-          memoryMode.switchMode('full_power', 'manual:self_heal_enable');
-          results.modeSwitched = true;
+          if (memoryMode.beginSelfHealSession) {
+            memoryMode.beginSelfHealSession('manual_dashboard_enable');
+            results.modeSwitched = true;
+            results.sessionBased = true;
+          } else {
+            // Fallback for older memory-mode versions
+            memoryMode.switchMode('full_power', 'manual:self_heal_enable');
+            results.modeSwitched = true;
+            results.sessionBased = false;
+          }
         } else {
           results.modeSwitched = false;
+          results.sessionBased = false;
         }
 
         results.totalReEnabled = reEnabledKeys.length;
@@ -887,6 +898,51 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
         }).catch((err: any) => {
           jsonRes(res, { error: err.message }, 500);
         });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── Self-heal session status ──
+  if (pathname === '/api/self-heal/session' && req.method === 'GET') {
+    authWrap(() => {
+      try {
+        const memoryMode = require('./memory-mode');
+        const sessionActive = memoryMode.isSelfHealSessionActive?.() ?? false;
+        const currentMode = memoryMode.getMode();
+        const thresholds = memoryMode.getThresholds();
+        let sessionDetails: any = null;
+        try {
+          const dbMod = require('./database');
+          if (dbMod?.selectCalibration) {
+            const row = dbMod.selectCalibration.get('self_heal_session');
+            if (row) sessionDetails = JSON.parse(row.value);
+          }
+        } catch {}
+        jsonRes(res, {
+          sessionActive,
+          currentMode,
+          warnHeapMB: thresholds.warnHeapMB,
+          restartHeapMB: thresholds.restartHeapMB,
+          sessionDetails,
+          sessionTimeoutMin: Math.round((memoryMode.SELF_HEAL_SESSION_TIMEOUT_MS || 1800000) / 60000),
+        });
+      } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
+    });
+    return true;
+  }
+
+  // ── Self-heal session abort (manual) ──
+  if (pathname === '/api/self-heal/session/abort' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        const memoryMode = require('./memory-mode');
+        if (memoryMode.isSelfHealSessionActive?.()) {
+          memoryMode.abortSelfHealSession('manual_dashboard_abort');
+          jsonRes(res, { success: true, message: 'Session aborted, returned to MEMORY PROTECTION' });
+        } else {
+          jsonRes(res, { success: false, message: 'No active session' });
+        }
       } catch (e: any) { jsonRes(res, { error: e.message }, 500); }
     });
     return true;
@@ -1547,7 +1603,7 @@ async function enableSelfHeal() {
   toast('Enabling self-heal (all layers)...', 'info');
   const r = await api('/api/self-heal/enable', { method: 'POST' });
   if (r?.success) {
-    toast(\`Self-heal enabled: \${r.totalReEnabled} sub-modules restored\${r.modeSwitched ? ', switched to full_power' : ''}\`, 'success');
+    toast(\`Self-heal enabled: \${r.totalReEnabled} sub-modules restored\${r.modeSwitched ? (r.sessionBased ? ', self-heal session active (30min timeout)' : ', switched to full_power') : ''}\`, 'success');
     refreshAll();
   } else {
     toast(\`Failed: \${r?.error || 'unknown'}\`, 'error');
