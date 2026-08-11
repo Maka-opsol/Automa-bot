@@ -127,6 +127,11 @@ function OpenRouterTribunalProvider() {
           log(`OpenRouter: model ${m} transient error, trying next fallback`, 'WARN', 'openrouter');
           continue;
         }
+        // Model returned non-JSON / unparseable response — try next model in chain
+        if (errMsg.includes('No action returned') || errMsg.includes('missing actionType') || errMsg.includes('no JSON object found')) {
+          log(`OpenRouter: model ${m} returned invalid/unparseable response, trying next fallback`, 'WARN', 'openrouter');
+          continue;
+        }
         // Permanent errors (400, 401, 403) — no point trying other models with same key
         throw err;
       }
