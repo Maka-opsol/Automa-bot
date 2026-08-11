@@ -9,7 +9,7 @@ const { runVisionPipeline } = require('./providers-vision-pipeline');
 const { log } = require('./logger');
 
 // BUG FIX (Response 19): Timeout for vision pipeline
-const VISION_TIMEOUT_MS = 10000;
+const VISION_TIMEOUT_MS = 120000;
 
 const SIGNIN_BUTTON_PROMPT = `You are given a screenshot of the MathU landing page. The page contains a button labeled "Sign in with Microsoft". Find the center coordinates of that button as percentages of the viewport width/height. Return ONLY a JSON object with "x" and "y" properties (values between 0 and 1). Example: {"x": 0.5, "y": 0.4} Do NOT include any extra text.`;
 
