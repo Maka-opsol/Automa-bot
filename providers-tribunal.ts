@@ -271,7 +271,7 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
 
   // --- Consult all providers in parallel ---
   // FIX: Add overall timeout so slow providers don't block the tribunal forever.
-  const TRIBUNAL_TIMEOUT_MS = 45000; // 45s total (3 providers × 15s max each)
+  const TRIBUNAL_TIMEOUT_MS = 120000; // 120s total — don't cut off slow free-tier providers
   const tribunalController = new AbortController();
   const tribunalTimeout = setTimeout(() => tribunalController.abort(), TRIBUNAL_TIMEOUT_MS);
   if (signal) {
