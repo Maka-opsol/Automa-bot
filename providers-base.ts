@@ -559,14 +559,23 @@ async function safeCall(
     }, timeoutMs);
   });
 
+  // Start fn(signal) so we can attach a catch handler if timeout wins the race.
+  // Without this, when the timeout fires first, fn()'s promise keeps running
+  // in the background — if it later rejects (e.g. Array.from corruption),
+  // that rejection is unhandled and crashes the process.
+  const fnPromise = fn(signal);
+
   try {
     const result = await Promise.race([
-      fn(signal),
+      fnPromise,
       timeoutPromise,
     ]);
     return result;
   } catch (err: any) {
     log(`${label} failed: ${err.message || err}`, 'WARN', 'base');
+    // If we timed out, fnPromise is still in flight. Attach a silent catch
+    // to prevent UNHANDLED_REJECTION if it later rejects.
+    fnPromise.catch(() => {});
     throw err;
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
@@ -645,4 +654,4 @@ module.exports = {
   // FIX: Export cooldown functions so providers can check before calling
   setProviderCooldown,
   getProviderCooldownRemainingMs,
-}
+};
