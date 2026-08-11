@@ -99,25 +99,26 @@ function OpenRouterTribunalProvider() {
   const primaryModel = process.env.OPENROUTER_TRIBUNAL_MODEL || 'openrouter/free';
   const endpoint = 'https://openrouter.ai/api/v1/chat/completions';
 
-  /**
-   * Try a single model with retries. Returns parsed result on success.
-   */
-  const _tryModel = async (model: string): Promise<any> => {
-    const rawContent = await retryWithBackoff(
-      () => callChatCompletionWithRollback(
-        endpoint, apiKey, model, base64Image, prompt, 'OpenRouter',
-        { signal }
-      ),
-      { providerName: 'OpenRouter', maxRetries: OR_FREE_RETRIES, baseDelay: OR_FREE_BASE_DELAY, signal }
-    );
-    if (options.validate === false) return rawContent;
-    return validateActionResponse(extractJSON(rawContent, 'OpenRouter'), 'OpenRouter');
-  };
-
   return async (base64Image: any, prompt: any, signal: any, options: any = {}) => {
     const log = _getLogger().log;
     const hasImage = !!base64Image;
     const isFatigued = _isFallbackFatigued();
+
+    /**
+     * Try a single model with retries. Must live here to capture
+     * signal/base64Image/prompt/options from the closure.
+     */
+    const _tryModel = async (model: string, retries = OR_FREE_RETRIES, baseDelay = OR_FREE_BASE_DELAY): Promise<any> => {
+      const rawContent = await retryWithBackoff(
+        () => callChatCompletionWithRollback(
+          endpoint, apiKey, model, base64Image, prompt, 'OpenRouter',
+          { signal }
+        ),
+        { providerName: 'OpenRouter', maxRetries: retries, baseDelay, signal }
+      );
+      if (options.validate === false) return rawContent;
+      return validateActionResponse(extractJSON(rawContent, 'OpenRouter'), 'OpenRouter');
+    };
 
     // ══════════════════════════════════════════════════════════════════════════
     // PHASE 1: openrouter/free — always first, always the most chances
@@ -213,20 +214,9 @@ function OpenRouterTribunalProvider() {
       // Everything else failed. One more shot at the auto-router.
       // ══════════════════════════════════════════════════════════════════════
       log('OpenRouter: all fallbacks failed, one last openrouter/free attempt', 'WARN', 'openrouter');
-      try {
-        const result = await retryWithBackoff(
-          () => callChatCompletionWithRollback(
-            endpoint, apiKey, 'openrouter/free', base64Image, prompt, 'OpenRouter',
-            { signal }
-          ),
-          { providerName: 'OpenRouter', maxRetries: 1, baseDelay: 3000, signal }
-        );
-        _resetFallbackFatigue();
-        if (options.validate === false) return result;
-        return validateActionResponse(extractJSON(result, 'OpenRouter'), 'OpenRouter');
-      } catch (finalErr: any) {
-        throw finalErr;
-      }
+      const result = await _tryModel('openrouter/free', 1, 3000);
+      _resetFallbackFatigue();
+      return result;
     }
   };
 }
