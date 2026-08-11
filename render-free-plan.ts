@@ -80,6 +80,13 @@ if (!process.env.SELF_HEAL_STAGING_DIR) process.env.SELF_HEAL_STAGING_DIR = path
 if (!process.env.SELF_HEAL_OVERLAY_DIR) process.env.SELF_HEAL_OVERLAY_DIR = path.join(DATA_DIR, 'self-heal-overlay');
 if (!process.env.REGRESSION_BANK_DIR)   process.env.REGRESSION_BANK_DIR   = path.join(DATA_DIR, 'mathu-regression');
 
+// Display — smaller viewport on Render free tier saves ~40-60% on screenshot size
+// (800x600 vs 1280x800 = 480K pixels vs 1024K pixels).
+// JPEG quality 30 at 800x600 ≈ 15-25KB per screenshot vs 30-60KB at 1280x800.
+// The AI providers can still read math at this resolution.
+if (!process.env.DISPLAY_WIDTH)  process.env.DISPLAY_WIDTH  = '800';
+if (!process.env.DISPLAY_HEIGHT) process.env.DISPLAY_HEIGHT = '600';
+
 // Memory — only set MAX_MEMORY_MB if not already set.
 // Render free plan = 512 MB total. Aggressive threshold to prevent OOM kills.
 if (!process.env.MAX_MEMORY_MB) process.env.MAX_MEMORY_MB = '400';
