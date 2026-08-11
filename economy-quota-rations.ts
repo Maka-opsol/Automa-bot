@@ -315,7 +315,7 @@ function getProviderUsage(providerName: string): {
  * Check if economy mode should be activated/deactivated.
  */
 function _checkEconomyMode(): void {
-  const providers = Array.from(_usage.values());
+  const providers = [..._usage.values()];
   if (providers.length === 0) return;
 
   const throttledCount = providers.filter(p => p.throttled).length;
