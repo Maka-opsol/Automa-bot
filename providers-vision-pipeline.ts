@@ -110,7 +110,7 @@ async function tryLocalVLM(
   return null;
 }
 
-async function runVisionPipeline(base64Image: string, prompt: string, { validator = null, timeoutMs = 15000, signal }: any = {}) {
+async function runVisionPipeline(base64Image: string, prompt: string, { validator = null, timeoutMs = 120000, signal }: any = {}) {
   const CONFIG = getCONFIG();
   const log = getLog();
   const logError = getLogError();
