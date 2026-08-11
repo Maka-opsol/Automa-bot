@@ -14,8 +14,9 @@
 //
 // Auto-switching rules:
 //   → Memory Protection: when heap > 320MB or RSS > 440MB or wasRecentlyOOMKilled()
-//   → Full Power:       only MANUAL via dashboard (never auto-promote)
-//                       (prevents oscillation between modes)
+//   → Full Power:       ONLY after a verified self-heal fix is promoted
+//                       (via promoteAfterSelfHealFix). NEVER auto-promotes.
+//                       Manual dashboard switch is still available for testing.
 //
 // v3 FIX: _applyMode('memory_protection') now performs IMMEDIATE memory
 //   recovery (close browser, clear caches, force GC) instead of just
@@ -63,12 +64,24 @@ const MODE_THRESHOLDS = {
 const AUTO_DOWNGRADE_HEAP_MB = 320;
 const AUTO_DOWNGRADE_RSS_MB = 440;
 
-// FIX: Auto-promote back to full_power when memory is stable for 3 consecutive checks
-const AUTO_PROMOTE_STABLE_CHECKS = 3; // must be below threshold this many times
-const AUTO_PROMOTE_HEAP_MB = 250; // must be well below downgrade trigger
-const AUTO_PROMOTE_CHECK_INTERVAL_MS = 60 * 1000; // check every 60s
-let _promoteCheckCount = 0;
-let _promoteCheckTimer: ReturnType<typeof setInterval> | null = null;
+// v4: Auto-promote REMOVED. Full power is only granted after a verified
+// self-heal fix is promoted. This prevents the bot from eagerly switching
+// to full power and OOMing again. See promoteAfterSelfHealFix().
+//
+// Self-heal session lifecycle (DB-backed, survives restarts):
+//   beginSelfHealSession()  — temporarily grant full power for healing
+//   appendSelfHealProgress() — save incremental work to DB
+//   promoteAfterSelfHealFix() — called after verified fix is promoted
+//   finalizeSelfHealSession() — delete patch drafts, return to MEM PROTECTION
+//   abortSelfHealSession()  — cleanup on failure, return to MEM PROTECTION
+//
+// The calibration keys used:
+//   'self_heal_session'     — active session state (in_progress/done/aborted)
+//   'self_heal_granted_ts'  — when full power was granted for this session
+const CALIBRATION_KEY_SELF_HEAL_SESSION = 'self_heal_session';
+const CALIBRATION_KEY_SELF_HEAL_GRANTED_TS = 'self_heal_granted_ts';
+const SELF_HEAL_SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 min max per session
+let _selfHealSessionTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Modules to disable in memory_protection mode
 const HEAVY_SELF_HEAL_KEYS = [
@@ -87,6 +100,7 @@ let _monitorTimer: ReturnType<typeof setInterval> | null = null;
 let _modeChangeCallbacks: Array<(mode: string, reason: string) => void> = [];
 let _isShuttingDown = false;
 let _browserClosedByProtection = false; // v3: track if we closed the browser
+let _selfHealSessionActive = false; // v4: track if a self-heal session owns full power
 
 // ── Log helper ──
 function _log(msg: string, level: string = 'INFO') {
@@ -303,8 +317,7 @@ function checkAutoDowngrade(heapMB: number, rssMB: number): boolean {
   }
   // NOTE: wasRecentlyOOMKilled() is NOT checked here. It is a startup-time
   // heuristic (file-gap, RSS, missing-persist-file) that only makes sense at
-  // boot. It is already called in init(). Calling it on every monitor tick
-  // caused an oscillation loop: auto-promote → immediate downgrade → repeat.
+  // boot. It is already called in init().
   // Mid-run OOM detection is handled by checkAfterTursoSync() via the DB.
 
   if (shouldDowngrade) {
@@ -315,32 +328,256 @@ function checkAutoDowngrade(heapMB: number, rssMB: number): boolean {
   return shouldDowngrade;
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// v4: Self-Heal Session Lifecycle — DB-backed, survives restarts
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Philosophy: The bot should NOT freely roam in FULL POWER mode.
+// Full power is a scarce, dangerous resource on 512MB Render free tier.
+// It is ONLY granted when self-heal desperately needs it to concoct
+// a fix. Every action during that window is saved to the database so
+// progress survives OOM kills. After a verified fix is promoted, the
+// bot deletes old patch drafts and returns to MEMORY PROTECTION.
+//
+// If a self-heal session is active when the bot OOMs, the next
+// startup detects it via the DB and can resume or abort.
+
 /**
- * FIX: Check if memory is stable enough to auto-promote back to full_power.
- * Requires heap < 250MB for 3 consecutive checks (60s apart = 3 minutes stable).
- * This prevents permanent hobbling during unattended 90-day runs.
+ * Check if there's an active self-heal session in the DB.
+ * Called at init() to detect sessions that survived a restart.
  */
-function _checkAutoPromote(): void {
-  if (_currentMode !== 'memory_protection') return;
+function _checkForActiveSelfHealSession(): void {
+  try {
+    const dbMod = require('./database');
+    if (!dbMod?.db?.prepare || !dbMod?.selectCalibration) return;
 
-  const heapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+    const row = dbMod.selectCalibration.get(CALIBRATION_KEY_SELF_HEAL_SESSION);
+    if (!row) return;
 
-  if (heapMB < AUTO_PROMOTE_HEAP_MB) {
-    _promoteCheckCount++;
-    if (_promoteCheckCount >= AUTO_PROMOTE_STABLE_CHECKS) {
-      _log(`Auto-promoting to FULL POWER: heap stable at ${heapMB.toFixed(0)}MB for ${AUTO_PROMOTE_STABLE_CHECKS} checks`);
-      _applyMode('full_power', `auto_promote:heap_stable_${heapMB.toFixed(0)}MB`);
-      _promoteCheckCount = 0;
-    } else {
-      _log(`Auto-promote check ${_promoteCheckCount}/${AUTO_PROMOTE_STABLE_CHECKS}: heap=${heapMB.toFixed(0)}MB`, 'DEBUG');
+    let session: any;
+    try { session = JSON.parse(row.value); } catch { return; }
+
+    if (session.status !== 'in_progress') return;
+
+    const grantedTs = parseInt(session.grantedTs || '0', 10);
+    const elapsed = Date.now() - grantedTs;
+
+    if (elapsed > SELF_HEAL_SESSION_TIMEOUT_MS) {
+      // Session expired — abort it, stay in memory_protection
+      _log(`Self-heal session expired (${Math.round(elapsed / 60000)}min > ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min timeout). Aborting.`, 'WARN');
+      _writeSelfHealSessionToDB({ status: 'aborted', reason: 'session_timeout', abortedAt: Date.now() });
+      return;
     }
-  } else {
-    // Reset counter if memory spikes
-    if (_promoteCheckCount > 0) {
-      _log(`Auto-promote counter reset: heap spiked to ${heapMB.toFixed(0)}MB`, 'DEBUG');
-    }
-    _promoteCheckCount = 0;
+
+    // Session still valid — grant full power again to continue healing
+    _log(`Resuming self-heal session (elapsed: ${Math.round(elapsed / 60000)}min, timeout: ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min). Granting FULL POWER.`, 'WARN');
+    _selfHealSessionActive = true;
+    _applyMode('full_power', `self_heal_resume:elapsed_${Math.round(elapsed / 60000)}min`);
+    _startSelfHealSessionTimeout(SELF_HEAL_SESSION_TIMEOUT_MS - elapsed);
+  } catch (e: any) {
+    _log(`Self-heal session restore check failed: ${e.message}`, 'DEBUG');
   }
+}
+
+/**
+ * Write self-heal session state to the calibration DB.
+ */
+function _writeSelfHealSessionToDB(state: Record<string, any>): void {
+  try {
+    const dbMod = require('./database');
+    if (dbMod?.db && dbMod.upsertCalibration) {
+      dbMod.upsertCalibration.run(
+        CALIBRATION_KEY_SELF_HEAL_SESSION,
+        JSON.stringify({ ...state, updatedTs: Date.now() }),
+        Date.now()
+      );
+    }
+  } catch { /* non-critical — session is best-effort */ }
+}
+
+/**
+ * Start the session timeout. If the session isn't finalized/aborted
+ * before this fires, we abort automatically to prevent permanent full power.
+ */
+function _startSelfHealSessionTimeout(remainingMs: number): void {
+  if (_selfHealSessionTimer) { clearTimeout(_selfHealSessionTimer); _selfHealSessionTimer = null; }
+  _selfHealSessionTimer = setTimeout(() => {
+    _log('Self-heal session timed out — forcing abort and return to MEMORY PROTECTION', 'ERROR');
+    abortSelfHealSession('session_timeout');
+  }, remainingMs);
+  // Do NOT .unref() — we want this to fire even if the event loop is idle
+}
+
+/**
+ * Begin a self-heal session. Grants FULL POWER temporarily.
+ * This is the ONLY way to get full power automatically.
+ *
+ * The bot should call this ONLY when self-heal is desperately needed
+ * and memory_protection is blocking the heavy modules required to fix
+ * the problem. The caller must save all progress to the database after
+ * each step so it survives OOM kills.
+ *
+ * Returns true if the session was started, false if one is already active
+ * or the bot isn't in memory_protection mode.
+ */
+function beginSelfHealSession(reason: string): boolean {
+  if (_selfHealSessionActive) {
+    _log(`Self-heal session already active — ignoring beginSelfHealSession('${reason}')`, 'WARN');
+    return false;
+  }
+  if (_currentMode !== 'memory_protection') {
+    _log(`Not in memory_protection mode (current: ${_currentMode}) — self-heal session not needed`, 'DEBUG');
+    return false;
+  }
+
+  _selfHealSessionActive = true;
+  const grantedTs = Date.now();
+
+  // Persist session to DB (survives restarts)
+  _writeSelfHealSessionToDB({
+    status: 'in_progress',
+    reason,
+    grantedTs,
+  });
+
+  // Also write the granted timestamp as a separate key for fast lookups
+  try {
+    const dbMod = require('./database');
+    if (dbMod?.db && dbMod.upsertCalibration) {
+      dbMod.upsertCalibration.run(CALIBRATION_KEY_SELF_HEAL_GRANTED_TS, String(grantedTs), grantedTs);
+    }
+  } catch { /* non-critical */ }
+
+  // Switch to full power
+  _applyMode('full_power', `self_heal_begin:${reason}`);
+  _log(`SELF-HEAL SESSION STARTED: ${reason}. Full power granted for up to ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min. SAVE ALL PROGRESS TO DB.`, 'WARN');
+
+  // Start timeout
+  _startSelfHealSessionTimeout(SELF_HEAL_SESSION_TIMEOUT_MS);
+
+  return true;
+}
+
+/**
+ * Append progress data for the current self-heal session.
+ * Saved to DB so it survives OOM kills. Call this after every
+ * meaningful step (investigation, patch generated, patch validated, etc.)
+ */
+function appendSelfHealProgress(step: string, data: Record<string, any>): void {
+  if (!_selfHealSessionActive) return;
+
+  try {
+    const dbMod = require('./database');
+    if (!dbMod?.db?.prepare) return;
+
+    const progressKey = `self_heal_progress_${step}`;
+    dbMod.upsertCalibration?.run(
+      progressKey,
+      JSON.stringify({ step, ...data, ts: Date.now() }),
+      Date.now()
+    );
+  } catch { /* non-critical */ }
+
+  _log(`Self-heal progress saved: ${step}`, 'DEBUG');
+}
+
+/**
+ * Called after a verified self-heal fix has been successfully promoted.
+ * This is the ONLY path that keeps full power active — but only briefly,
+ * until finalizeSelfHealSession() cleans up and returns to memory_protection.
+ *
+ * The reason this exists: after a successful heal, the bot may need to
+ * run a few more cycles in full power to verify the fix works in production.
+ * But it MUST call finalizeSelfHealSession() when done.
+ */
+function promoteAfterSelfHealFix(filesFixed: string[]): void {
+  if (!_selfHealSessionActive) {
+    _log('promoteAfterSelfHealFix called but no active session — ignoring', 'WARN');
+    return;
+  }
+
+  _writeSelfHealSessionToDB({
+    status: 'fix_promoted',
+    filesFixed,
+    promotedAt: Date.now(),
+  });
+
+  _log(`Self-heal fix PROMOTED for: ${filesFixed.join(', ')}. Call finalizeSelfHealSession() when verification is complete to return to MEMORY PROTECTION.`, 'INFO');
+}
+
+/**
+ * Finalize the self-heal session: delete patch drafts, return to MEMORY PROTECTION.
+ * This MUST be called after promoteAfterSelfHealFix() once the fix is verified.
+ */
+function finalizeSelfHealSession(): void {
+  if (!_selfHealSessionActive) return;
+
+  // Clear the session timeout
+  if (_selfHealSessionTimer) { clearTimeout(_selfHealSessionTimer); _selfHealSessionTimer = null; }
+
+  _selfHealSessionActive = false;
+
+  // Mark session as done in DB
+  _writeSelfHealSessionToDB({
+    status: 'done',
+    finalizedAt: Date.now(),
+  });
+
+  // Delete progress keys (cleanup old drafts)
+  try {
+    const dbMod = require('./database');
+    if (dbMod?.db?.prepare) {
+      const rows = dbMod.db.prepare("SELECT key FROM calibration WHERE key LIKE 'self_heal_progress_%'").all();
+      const deleteStmt = dbMod.db.prepare('DELETE FROM calibration WHERE key = ?');
+      for (const row of rows) {
+        deleteStmt.run(row.key);
+      }
+      _log(`Cleaned up ${rows.length} self-heal progress keys`, 'DEBUG');
+    }
+  } catch { /* non-critical */ }
+
+  // Return to memory protection
+  if (_currentMode !== 'memory_protection') {
+    _applyMode('memory_protection', 'self_heal_finalize:fix_verified');
+    _restartTimers();
+  }
+
+  _log('Self-heal session FINALIZED. Returning to MEMORY PROTECTION. Patch drafts deleted.', 'INFO');
+}
+
+/**
+ * Abort the self-heal session (e.g., on failure, timeout, or OOM).
+ * Returns to MEMORY PROTECTION immediately.
+ */
+function abortSelfHealSession(reason: string): void {
+  if (!_selfHealSessionActive) return;
+
+  // Clear the session timeout
+  if (_selfHealSessionTimer) { clearTimeout(_selfHealSessionTimer); _selfHealSessionTimer = null; }
+
+  _selfHealSessionActive = false;
+
+  // Mark session as aborted in DB
+  _writeSelfHealSessionToDB({
+    status: 'aborted',
+    reason,
+    abortedAt: Date.now(),
+  });
+
+  // Return to memory protection immediately
+  if (_currentMode !== 'memory_protection') {
+    _applyMode('memory_protection', `self_heal_abort:${reason}`);
+    _restartTimers();
+  }
+
+  _log(`Self-heal session ABORTED: ${reason}. Returned to MEMORY PROTECTION.`, 'WARN');
+}
+
+/**
+ * Check if a self-heal session is currently active.
+ */
+function isSelfHealSessionActive(): boolean {
+  return _selfHealSessionActive;
 }
 
 // ── Register mode change callback ──
@@ -352,7 +589,7 @@ function onModeChange(cb: (mode: string, reason: string) => void): void {
 function _restartTimers(): void {
   if (_gcTimer) { clearInterval(_gcTimer); _gcTimer = null; }
   if (_monitorTimer) { clearInterval(_monitorTimer); _monitorTimer = null; }
-  if (_promoteCheckTimer) { clearInterval(_promoteCheckTimer); _promoteCheckTimer = null; }
+  if (_selfHealSessionTimer) { clearTimeout(_selfHealSessionTimer); _selfHealSessionTimer = null; }
 
   const thresholds = MODE_THRESHOLDS[_currentMode];
 
@@ -364,15 +601,12 @@ function _restartTimers(): void {
   }, thresholds.gcIntervalMs);
   if (_gcTimer && typeof (_gcTimer as any).unref === 'function') (_gcTimer as any).unref();
 
-  // FIX: Start auto-promote check timer when in memory_protection
-  if (_currentMode === 'memory_protection') {
-    _promoteCheckCount = 0;
-    _promoteCheckTimer = setInterval(() => {
-      if (_isShuttingDown) return;
-      _checkAutoPromote();
-    }, AUTO_PROMOTE_CHECK_INTERVAL_MS);
-    if (_promoteCheckTimer && typeof (_promoteCheckTimer as any).unref === 'function') {
-      (_promoteCheckTimer as any).unref();
+  // v4: No auto-promote timer. Full power is only granted via self-heal session.
+  // If a self-heal session is active, ensure its timeout is running.
+  if (_selfHealSessionActive && _currentMode === 'full_power') {
+    // Timer should already be running, but ensure it
+    if (!_selfHealSessionTimer) {
+      _startSelfHealSessionTimeout(SELF_HEAL_SESSION_TIMEOUT_MS);
     }
   }
 }
@@ -492,11 +726,19 @@ function init(): void {
       _applyMode('memory_protection', 'auto:OOM_kill_recovery');
       _log('Detected recent OOM kill — starting in MEMORY PROTECTION mode', 'WARN');
     } else {
-      _applyMode('full_power', 'initial');
+      // v4: Default to memory_protection. Full power requires self-heal session
+      // or manual dashboard switch. This is the safe default on 512MB.
+      _applyMode('memory_protection', 'init_default_safe');
+      _log('Starting in MEMORY PROTECTION mode (safe default). Full power requires self-heal session or manual switch.', 'INFO');
     }
   } catch (e: any) {
-    _applyMode('full_power', 'init_fallback');
+    _applyMode('memory_protection', 'init_fallback');
+    _log('Init fallback — MEMORY PROTECTION mode', 'WARN');
   }
+
+  // v4: Check for an active self-heal session from a previous instance.
+  // If found and not expired, resume full power to continue healing.
+  _checkForActiveSelfHealSession();
 
   _restartTimers();
 }
@@ -505,7 +747,17 @@ function shutdown(): void {
   _isShuttingDown = true;
   if (_gcTimer) { clearInterval(_gcTimer); _gcTimer = null; }
   if (_monitorTimer) { clearInterval(_monitorTimer); _monitorTimer = null; }
-  if (_promoteCheckTimer) { clearInterval(_promoteCheckTimer); _promoteCheckTimer = null; }
+  if (_selfHealSessionTimer) { clearTimeout(_selfHealSessionTimer); _selfHealSessionTimer = null; }
+
+  // On graceful shutdown, abort any active self-heal session
+  if (_selfHealSessionActive) {
+    _writeSelfHealSessionToDB({
+      status: 'aborted',
+      reason: 'graceful_shutdown',
+      abortedAt: Date.now(),
+    });
+    _selfHealSessionActive = false;
+  }
 }
 
 module.exports = {
@@ -522,8 +774,17 @@ module.exports = {
   shedMemory,                    // v3: standalone emergency memory shed
   wasBrowserClosedByProtection,  // v3: for cycle manager to check
   clearBrowserClosedFlag,       // v3: for cycle manager to reset
+  // v4: Self-heal session lifecycle
+  beginSelfHealSession,
+  appendSelfHealProgress,
+  promoteAfterSelfHealFix,
+  finalizeSelfHealSession,
+  abortSelfHealSession,
+  isSelfHealSessionActive,
+  // Constants
   HEAVY_SELF_HEAL_KEYS,
   HEAVY_RESILIENCE_KEYS,
   AUTO_DOWNGRADE_HEAP_MB,
   AUTO_DOWNGRADE_RSS_MB,
+  SELF_HEAL_SESSION_TIMEOUT_MS,
 };
