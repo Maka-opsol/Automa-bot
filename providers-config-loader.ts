@@ -99,8 +99,6 @@ const DEFAULTS: Record<string, ProviderDefault> = {
     envKeys: ['CF_API_KEY', 'CF_ACCOUNT_ID'],
     visionCapable: true,
     fallbackModels: [
-      '@cf/moondream/moondream3.1-9B-A2B',
-      '@cf/moonshotai/kimi-k2.6',
       '@cf/google/gemma-4-26b-a4b-it',
       '@cf/moonshotai/kimi-k2.5',
       '@cf/meta/llama-3.2-11b-vision-instruct',
@@ -133,13 +131,12 @@ const DEFAULTS: Record<string, ProviderDefault> = {
     envKeys: ['GEMINI_API_KEY'],
     visionCapable: true,
     fallbackModels: [
-      // v2.5 series — mature, stable free-tier models
-      'gemini-2.5-flash-lite',
-      'gemini-2.5-pro',
       // v3 series — next-gen, higher RPM limits on free tier
       'gemini-3-flash',
       'gemini-3.1-pro',
       'gemini-3.1-flash-lite',
+      // v2.5 stable fallback
+      'gemini-2.5-pro',
       // Legacy fallbacks (still free, lower rate limits)
       'gemini-2.0-flash',
       'gemini-1.5-flash',
@@ -147,13 +144,14 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'OpenRouter': {
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
-    model: 'google/gemma-3-27b-it',
+    model: 'google/gemma-4-31b-it:free',
     envKeys: ['OPENROUTER_API_KEY'],
     visionCapable: true,
     fallbackModels: [
-      'google/gemma-4-31b-it',
-      'nvidia/nemotron-nano-12b-2-vl',
-      'qwen/qwen3-0.6b',
+      'qwen/qwen2.5-vl-72b-instruct:free',
+      'google/gemma-3-12b-it:free',
+      'nvidia/nemotron-3-super-120b:free',
+      'deepseek/deepseek-r1-distill-llama-70b:free',
     ],
   },
 };
