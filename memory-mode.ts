@@ -300,10 +300,12 @@ function checkAutoDowngrade(heapMB: number, rssMB: number): boolean {
   } else if (rssMB > AUTO_DOWNGRADE_RSS_MB) {
     shouldDowngrade = true;
     reason = `rss=${rssMB.toFixed(0)}MB > ${AUTO_DOWNGRADE_RSS_MB}MB`;
-  } else if (persistConfig.wasRecentlyOOMKilled()) {
-    shouldDowngrade = true;
-    reason = 'recent_OOM_crash_detected';
   }
+  // NOTE: wasRecentlyOOMKilled() is NOT checked here. It is a startup-time
+  // heuristic (file-gap, RSS, missing-persist-file) that only makes sense at
+  // boot. It is already called in init(). Calling it on every monitor tick
+  // caused an oscillation loop: auto-promote → immediate downgrade → repeat.
+  // Mid-run OOM detection is handled by checkAfterTursoSync() via the DB.
 
   if (shouldDowngrade) {
     _applyMode('memory_protection', `auto:${reason}`);
