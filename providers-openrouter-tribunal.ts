@@ -38,10 +38,9 @@ function _getRegistry() { if (!_registry) _registry = require('./providers-regis
  * when no image is present, or when vision providers all fail.
  */
 const VISION_FALLBACK_MODELS = [
-  'google/gemma-3-27b-it:free',           // (V) Best free vision model on OpenRouter
-  'nvidia/nemotron-nano-12b-2-vl:free',   // (V) NVIDIA Nemotron vision — OCR-optimized
-  'google/gemma-3-12b-it:free',           // (V) Smaller Gemma, still good vision
+  'google/gemma-4-31b-it:free',           // (V) Best free vision model on OpenRouter
   'qwen/qwen2.5-vl-72b-instruct:free',   // (V) Qwen vision — excellent at math OCR
+  'google/gemma-3-12b-it:free',           // (V) Smaller Gemma, still good vision
 ];
 
 /**
