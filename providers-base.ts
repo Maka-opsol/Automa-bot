@@ -461,8 +461,10 @@ async function retryWithBackoff(
     maxRetries?: number;
     baseDelayMs?: number;
     providerName?: string;
+    signal?: AbortSignal;
   } = {}
 ): Promise<any> {
+  const { signal } = options;
   const { maxRetries = 3, baseDelayMs = 1000, providerName } = options;
   const log = _getLog().log;
 
@@ -491,6 +493,12 @@ async function retryWithBackoff(
       // (even from different code paths) won't hammer the same provider
       if (classified.category === 'rate_limited' && providerName) {
         setProviderCooldown(providerName, classified.retryAfterMs);
+      }
+
+      // FIX: Check if the caller (e.g. tribunal) has already aborted.
+      // Don't waste time retrying when the parent request is dead.
+      if (signal?.aborted) {
+        throw new DOMException('Aborted due to parent signal', 'AbortError');
       }
 
       if (!classified.retryable || attempt >= maxRetries) {
@@ -637,4 +645,4 @@ module.exports = {
   // FIX: Export cooldown functions so providers can check before calling
   setProviderCooldown,
   getProviderCooldownRemainingMs,
-};
+}
