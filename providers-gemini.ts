@@ -242,7 +242,7 @@ async function _callWithModel(
         try { signal.removeEventListener('abort', _abortHandler); } catch {}
       }
     }
-  }, { providerName: 'Gemini' });
+  }, { providerName: 'Gemini', signal });
 
   const response = result.response;
   if (!response) throw new Error('Gemini: Empty SDK result');
