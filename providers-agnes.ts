@@ -26,7 +26,7 @@ function AgnesProvider() {
         config.endpoint, apiKey, config.model, base64Image, prompt, 'Agnes',
         { signal }
       ),
-      { providerName: 'Agnes' }
+      { providerName: 'Agnes', signal }
     );
 
     if (options.validate === false) return rawContent;
