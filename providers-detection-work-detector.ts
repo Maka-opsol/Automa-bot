@@ -9,7 +9,7 @@ const { runVisionPipeline } = require('./providers-vision-pipeline');
 const { log } = require('./logger');
 
 // BUG FIX (Response 19): Timeout for vision pipeline
-const VISION_TIMEOUT_MS = 15000;
+const VISION_TIMEOUT_MS = 120000;
 
 const DETECTION_PROMPT = `
 You are a scanner for an educational platform assignments page.
