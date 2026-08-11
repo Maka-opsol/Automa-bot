@@ -181,6 +181,12 @@ function OpenRouterTribunalProvider() {
           } catch (err: any) {
             const errMsg = err?.message || String(err);
 
+            // Daily limit exhausted — forceExhaust and stop all OR attempts
+            if (_checkDailyLimit429(err)) {
+              log('OpenRouter: daily limit exhausted during fallback, stopping', 'ERROR', 'openrouter');
+              throw err;
+            }
+
             // Permanent = stop entirely
             if (errMsg.includes('HTTP_ERROR_400') || errMsg.includes('HTTP_ERROR_401') || errMsg.includes('HTTP_ERROR_403')) {
               throw err;
