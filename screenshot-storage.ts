@@ -110,8 +110,8 @@ function init(): { enabled: boolean; backend: string } {
   const apiSecret = process.env.CLOUDINARY_API_SECRET || '';
 
   if (!apiKey || !apiSecret) {
-    _log('CLOUDINARY_API_KEY and/or CLOUDINARY_API_SECRET not set. Screenshots will NOT be uploaded.', 'DEBUG');
-    _log('Set CLOUDINARY_API_SECRET in Render dashboard (sensitive).', 'DEBUG');
+    _log('CLOUDINARY_API_KEY and/or CLOUDINARY_API_SECRET not set. Screenshots will NOT be uploaded.', 'WARN');
+    _log('Set CLOUDINARY_API_SECRET in Render dashboard (sensitive).', 'WARN');
     _initialized = true;
     return { enabled: false, backend: 'none' };
   }
@@ -200,7 +200,8 @@ async function _doUpload(
         public_id: key.replace(/\.[^.]+$/, ''), // Remove extension for Cloudinary
         tags,
         resource_type: 'image',
-        format: metadata?.format === 'jpeg' ? 'jpg' : 'auto',
+        // format omitted — let Cloudinary auto-detect from the data URI
+        // ('auto' is only valid for fetch_format transformations, not the upload format parameter)
         overwrite: false,
         // Eager thumbnail for quick preview
         eager: [{ width: 300, crop: 'limit', fetch_format: 'auto', quality: 'auto' }],
