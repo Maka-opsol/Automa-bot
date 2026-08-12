@@ -186,6 +186,8 @@ async function shutdown() {
   try { const { _markShuttingDown } = require('./error-handler'); _markShuttingDown(); } catch { /* error-handler may not expose it in all paths */ }
   updateStats({ currentStatus: 'shutting_down' });
   log('Shutting down gracefully...', 'INFO', 'agent');
+  // Record process stop in lifecycle table (enables OOM kill detection)
+  try { require('./self-heal-oom-trigger').recordProcessStop('graceful_shutdown'); } catch { /* best-effort */ }
   requestStop();
   try {
     const { gracefulShutdown: runHooks } = require('./cycle-shutdown');
@@ -390,6 +392,28 @@ startSelfHealV2Subsystems(CONFIG);
 
 // ─── Resilience subsystems ───
 startResilienceSubsystems();
+
+// ─── OOM Self-Heal Trigger (boot-time) ───
+// Detects OOM loops from process_lifecycle DB table and triggers
+// self-heal at boot if needed. Falls back to DB-only detection
+// since agent.ts doesn't use the restart guardian.
+try {
+  const oomTrigger = require('./self-heal-oom-trigger');
+  oomTrigger._injectDependencies({
+    logger: container.get('logger', { required: false }),
+    database: container.get('database', { required: false }),
+  });
+  const oomResult = oomTrigger.init({
+    wasUnexpected: false, // agent.ts doesn't use restart guardian
+    emergencyMode: false,
+    recentRestartCount: oomTrigger.getRecentOOMKillCount(),
+  });
+  if (oomResult.healScheduled) {
+    log(`OOM self-heal TRIGGERED at boot (${oomResult.oomKillCount} OOM kills detected)`, 'ERROR', 'agent');
+  }
+} catch (oomTriggerErr: any) {
+  log(`OOM trigger init failed (non-fatal): ${oomTriggerErr.message}`, 'WARN', 'agent');
+}
 
 // B6: Prompt evolution
 if (CONFIG.PROMPT_EVOLUTION_ENABLED) {
