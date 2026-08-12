@@ -168,9 +168,13 @@ function getRecentOOMKillCount(windowMs: number = 30 * 60 * 1000): number {
  */
 function shouldScheduleBootHeal(): boolean {
   // Check 1: Is there an active OOM loop? (restart guardian knows)
+  // Also get the OOM kill count — if it's high enough, skip cooldown.
+  let oomKillCount = 0;
+  let isEmergencyMode = false;
   try {
     const guardian = require('./survival-restart-guardian');
-    if (!guardian.isEmergencyMode?.()) {
+    isEmergencyMode = !!guardian.isEmergencyMode?.();
+    if (!isEmergencyMode) {
       // Not in emergency mode — but check moderate restart count
       const status = guardian.getStatus?.();
       if (!status || status.recentUnexpectedRestarts < 2) {
@@ -179,23 +183,35 @@ function shouldScheduleBootHeal(): boolean {
     }
   } catch {
     // Restart guardian not available — use our own DB check
-    if (getRecentOOMKillCount() < 2) return false;
+    oomKillCount = getRecentOOMKillCount();
+    if (oomKillCount < 2) return false;
   }
 
   // Check 2: Cooldown — don't schedule if we recently tried
-  try {
-    const db = getDb();
-    if (db) {
-      const row = db.prepare('SELECT value, updated_at FROM calibration WHERE key = ?').get(DB_KEY_LAST_BOOT_HEAL);
-      if (row) {
-        const lastHealTime = parseInt(row.value, 10);
-        if (Date.now() - lastHealTime < BOOT_HEAL_COOLDOWN_MS) {
-          log(`Boot heal in cooldown (last scheduled ${Math.round((Date.now() - lastHealTime) / 60000)}min ago)`, 'DEBUG');
-          return false;
+  // EXCEPTION: If 3+ OOM kills in 30min, we're in an active death spiral.
+  // The cooldown marker persists across OOM restarts (it's in DB/Turso),
+  // so each new boot sees "cooldown active" and skips the heal forever.
+  // In a death spiral, the cooldown must be bypassed.
+  if (oomKillCount === 0) oomKillCount = getRecentOOMKillCount();
+  const isDeathSpiral = oomKillCount >= 3 || isEmergencyMode;
+
+  if (!isDeathSpiral) {
+    try {
+      const db = getDb();
+      if (db) {
+        const row = db.prepare('SELECT value, updated_at FROM calibration WHERE key = ?').get(DB_KEY_LAST_BOOT_HEAL);
+        if (row) {
+          const lastHealTime = parseInt(row.value, 10);
+          if (Date.now() - lastHealTime < BOOT_HEAL_COOLDOWN_MS) {
+            log(`Boot heal in cooldown (last scheduled ${Math.round((Date.now() - lastHealTime) / 60000)}min ago)`, 'DEBUG');
+            return false;
+          }
         }
       }
-    }
-  } catch { /* non-critical */ }
+    } catch { /* non-critical */ }
+  } else {
+    log(`Cooldown BYPASSED — OOM death spiral detected (${oomKillCount} kills, emergency=${isEmergencyMode})`, 'WARN');
+  }
 
   return true;
 }
