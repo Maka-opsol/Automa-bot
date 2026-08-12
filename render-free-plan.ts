@@ -968,6 +968,34 @@ try {
     // but Turso restores calibration entries including OOM markers and mode state.
     // v5 FIX: checkAfterTursoSync is now async (awaits browser cleanup)
     try {
+      // v6 FIX: Re-run restart guardian after Turso sync.
+      // init() runs BEFORE Turso sync, so on ephemeral disks it sees an
+      // empty DB and misses all OOM history. Now that Turso has restored
+      // the calibration table (including restart_guardian_history), re-check.
+      try {
+        const guardianRecheck = restartGuardian.recheckAfterTursoSync();
+        if (guardianRecheck.activated) {
+          log(`Post-Turso: restart guardian activated EMERGENCY MODE (${guardianRecheck.recentCount} restarts)`, 'ERROR', 'render-free-plan');
+        } else if (guardianRecheck.recentCount > 0) {
+          log(`Post-Turso: restart guardian found ${guardianRecheck.recentCount} unexpected restart(s)`, 'WARN', 'render-free-plan');
+        }
+      } catch (reErr: any) {
+        log(`Post-Turso restart guardian recheck failed: ${reErr.message}`, 'WARN', 'render-free-plan');
+      }
+
+      // v6 FIX: Re-run OOM self-heal trigger after Turso sync.
+      // Same boot-order problem: init() saw empty DB, now Turso has
+      // restored process_lifecycle and restart history.
+      try {
+        const oomTrigger = require('./self-heal-oom-trigger');
+        const oomRecheck = oomTrigger.recheckAfterTursoSync();
+        if (oomRecheck.healScheduled) {
+          log(`Post-Turso: OOM self-heal TRIGGERED (${oomRecheck.oomKillCount} OOM kills detected)`, 'ERROR', 'render-free-plan');
+        }
+      } catch (oomReErr: any) {
+        log(`Post-Turso OOM trigger recheck failed: ${oomReErr.message}`, 'WARN', 'render-free-plan');
+      }
+
       memoryMode.checkAfterTursoSync(selectCalibration, upsertCalibration).then(() => {
         if (memoryMode.isMemoryProtection()) {
           log(`Post-Turso OOM check: switched to ${memoryMode.getMode()} mode`, 'WARN', 'render-free-plan');
