@@ -13,9 +13,9 @@
 //   - Per-model cooldown tracking for 429 rate limits
 //
 // Current primary model: @cf/meta/llama-4-scout-17b-16e-instruct
-// Fallback chain: moondream3.1 → kimi-k2.6 → gemma-4-26b → kimi-k2.5 → llama-3.2-11b-vision
+// Fallback chain: gemma-4-26b → kimi-k2.5 → llama-3.2-11b-vision
 //
-// Vision: All 6 models are vision-capable. Images are sent as multimodal
+// Vision: All models are vision-capable. Images are sent as multimodal
 // content parts in the user message (type: "image_url" + type: "text").
 //
 // P7: providerName passed to retryWithBackoff for health-aware retries.
@@ -126,28 +126,19 @@ function CloudflareProvider() {
           log(`Cloudflare model ${modelId} returned empty response, trying next fallback`, 'WARN', 'cloudflare');
           continue;
         }
-        // Non-429 error (401/403/404/500) — attempt rollback before giving up
-        if (err.message && (
-          err.message.includes('HTTP_ERROR_404') ||
-          err.message.includes('HTTP_ERROR_401') ||
-          err.message.includes('HTTP_ERROR_403')
-        )) {
-          try {
-            const { rollbackProvider } = require('./providers-config-loader');
-            log(`Cloudflare model ${modelId} returned config error (${err.message}) -- attempting rollback...`, 'WARN', 'cloudflare');
-            const rolledBack = rollbackProvider('Cloudflare');
-            if (rolledBack) {
-              log(`Rolled back Cloudflare model config.`, 'INFO', 'cloudflare');
-              const newConfig = getProviderConfig('Cloudflare');
-              if (newConfig.model && newConfig.model !== modelId) {
-                const retryResult = await _callWithModel(accountId, apiKey, newConfig.model, base64Image, prompt, signal, options);
-                _clearModel429(newConfig.model);
-                return retryResult;
-              }
-            }
-          } catch (rollbackErr: any) {
-            log(`Cloudflare rollback failed: ${rollbackErr.message || rollbackErr}`, 'WARN', 'cloudflare');
-          }
+        // 404 = model doesn't exist, skip to next in chain
+        if (err.message && err.message.includes('HTTP_ERROR_404')) {
+          log(`Cloudflare model ${modelId} not found (404), trying next fallback`, 'WARN', 'cloudflare');
+          continue;
+        }
+        // 403 = model not available on this plan (e.g. free plan), skip to next
+        if (err.message && err.message.includes('HTTP_ERROR_403')) {
+          log(`Cloudflare model ${modelId} forbidden (403), trying next fallback`, 'WARN', 'cloudflare');
+          continue;
+        }
+        // 401 = auth error — all models will fail, don't bother trying others
+        if (err.message && err.message.includes('HTTP_ERROR_401')) {
+          throw err;
         }
         // Model returned non-JSON / unparseable response — try next model in chain
         const parseErr = err?.message || '';
@@ -160,8 +151,8 @@ function CloudflareProvider() {
       }
     }
 
-    // All models exhausted (all on cooldown)
-    throw new Error('Cloudflare: All models rate-limited, waiting for cooldown');
+    // All models exhausted (cooldown, 404, or 403)
+    throw new Error('Cloudflare: All models exhausted (rate-limited, not found, or forbidden)');
   };
 }
 
