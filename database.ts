@@ -96,7 +96,7 @@ function runMigrations() {
   // FIX: Bumped from 22 to 28 to include action_cache table (migration 27)
   // and banned_actions table (migration 22). Without this, action_cache
   // table is never created locally, causing "no such table" errors.
-  const target = 28;
+  const target = 29;
   if (current === target) { log(`Database schema version ${target} ready.`, 'INFO', 'database'); return; }
   if (current > target) { log(`Database schema version ${current} is ahead of expected ${target}`, 'WARN', 'database'); return; }
   const backupPath = CONFIG.DB_PATH + '.backup.' + Date.now();
@@ -128,6 +128,10 @@ function runMigrations() {
     () => {},
     () => { try { db.exec(`ALTER TABLE session_pool ADD COLUMN last_validated_at INTEGER;`); } catch (_e: any) { /* column may already exist */ } },
     () => { db.exec(`CREATE TABLE IF NOT EXISTS action_cache ( context_sig TEXT PRIMARY KEY, action_type TEXT NOT NULL, target_x REAL NOT NULL, target_y REAL NOT NULL, value TEXT DEFAULT '', keypad_sequence TEXT, current_state TEXT NOT NULL, reasoning TEXT DEFAULT '', success_count INTEGER DEFAULT 0, failure_count INTEGER DEFAULT 0, hit_count INTEGER DEFAULT 0, created_at INTEGER NOT NULL, last_used INTEGER NOT NULL, evicted INTEGER DEFAULT 0 ); CREATE INDEX IF NOT EXISTS idx_action_cache_state ON action_cache(current_state); CREATE INDEX IF NOT EXISTS idx_action_cache_last_used ON action_cache(last_used);`); },
+    // v29: process_lifecycle — tracks process starts/stops to detect OOM kills.
+    // A 'start' without a matching 'stop' from the same PID = OOM/SIGKILL.
+    // This table is the foundation for boot-time self-heal triggering.
+    () => { db.exec(`CREATE TABLE IF NOT EXISTS process_lifecycle ( id INTEGER PRIMARY KEY AUTOINCREMENT, pid INTEGER NOT NULL, event TEXT NOT NULL CHECK(event IN ('start', 'stop')), timestamp INTEGER NOT NULL, heap_mb REAL DEFAULT 0, rss_mb REAL DEFAULT 0, extra TEXT ); CREATE INDEX IF NOT EXISTS idx_lifecycle_timestamp ON process_lifecycle(timestamp); CREATE INDEX IF NOT EXISTS idx_lifecycle_pid ON process_lifecycle(pid); CREATE INDEX IF NOT EXISTS idx_lifecycle_event ON process_lifecycle(event);`); },
   ];
 
   const transaction = db.transaction(() => {
@@ -195,18 +199,17 @@ function createSafeStatement(sql: string, paramValidator: ((...args: any[]) => s
   };
 }
 
-// Wrap a prepared statement so its .run() marks the corresponding Turso
-// table as dirty. This ensures database-turso.ts re-pushes to Turso only when
-// local data actually changes. Without this, the sync skips every push
-// (dirty=false) and never syncs writes.
-function _wrapForTursoSync(stmt: any, tableName: string): any {
+// FIX: Wrap a prepared statement so its .run() marks Turso dirty.
+// This ensures database-turso.ts re-pushes to Turso only when local data actually changes.
+// Without this, the sync skips every push (dirty=false) and never syncs writes.
+function _wrapForTursoSync(stmt: any): any {
   if (!stmt || typeof stmt.run !== 'function') return stmt;
   const originalRun = stmt.run.bind(stmt);
   return {
     ...stmt,
     run: (...args: any[]) => {
       const result = originalRun(...args);
-      try { require('./database-turso').markTableDirty(tableName); } catch { /* turso not loaded yet */ }
+      try { require('./database-turso').markDirty(); } catch { /* turso not loaded yet */ }
       return result;
     },
   };
@@ -330,17 +333,19 @@ function createPreparedStatements() {
   listBannedActions = db.prepare('SELECT * FROM banned_actions ORDER BY banned_at DESC');
   selectBannedAction = db.prepare('SELECT 1 FROM banned_actions WHERE action_type = ?');
 
-  // Wrap all statements that write to Turso-synced tables.
-  // Each .run() call marks the specific table dirty so Turso re-pushes.
-  upsertCalibration = _wrapForTursoSync(upsertCalibration, 'calibration');
-  insertModule = _wrapForTursoSync(insertModule, 'completed_modules');
-  upsertLastState = _wrapForTursoSync(upsertLastState, 'last_state');
-  upsertProvider = _wrapForTursoSync(upsertProvider, 'provider_registry');
-  updateProviderStats = _wrapForTursoSync(updateProviderStats, 'provider_registry');
-  upsertModel = _wrapForTursoSync(upsertModel, 'model_registry');
-  setModelRole = _wrapForTursoSync(setModelRole, 'model_registry');
-  insertBannedAction = _wrapForTursoSync(insertBannedAction, 'banned_actions');
-  deleteBannedAction = _wrapForTursoSync(deleteBannedAction, 'banned_actions');
+  // FIX: Wrap all statements that write to Turso-synced tables.
+  // This makes their .run() call markDirty() so Turso re-pushes changed data.
+  // Tables synced: calibration, completed_modules, last_state, banned_actions,
+  //   provider_registry, model_registry. (action_cache is managed directly by Turso.)
+  upsertCalibration = _wrapForTursoSync(upsertCalibration);
+  insertModule = _wrapForTursoSync(insertModule);
+  upsertLastState = _wrapForTursoSync(upsertLastState);
+  upsertProvider = _wrapForTursoSync(upsertProvider);
+  updateProviderStats = _wrapForTursoSync(updateProviderStats);
+  upsertModel = _wrapForTursoSync(upsertModel);
+  setModelRole = _wrapForTursoSync(setModelRole);
+  insertBannedAction = _wrapForTursoSync(insertBannedAction);
+  deleteBannedAction = _wrapForTursoSync(deleteBannedAction);
 }
 
 function safeInsertModule(name: string) {  if (!name || typeof name !== 'string' || name.length > 500) { getLog()(`Invalid module name: ${typeof name}`, 'WARN', 'database'); return; } try { insertModule.run(name, Date.now()); } catch (err: any) { getLogError()('Failed to insert module', err, { moduleName: name.substring(0, 50) }); } }
