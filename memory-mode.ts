@@ -127,109 +127,220 @@ function isMemoryProtection(): boolean {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// v3: EMERGENCY MEMORY SHED — actually frees memory
+// v6: GRADUATED MEMORY SHED — browser-safe memory recovery
 // ═══════════════════════════════════════════════════════════════════════
-// This is the core fix. Previously _applyMode only set env vars.
-// Now it calls this to immediately reduce memory pressure.
-// Can also be called standalone by the heap guardian or cycle manager.
+// On Render 512MB, the browser is the biggest memory consumer (~100-200MB).
+// But closing it during a quiz destroys the current question state.
+//
+// Shed levels (higher = more aggressive, more memory freed):
+//   L0 (caches+GC):        ~5-15MB   — always safe, no browser impact
+//   L1 (page blank+restore): ~30-80MB  — navigates to about:blank, GC, then back
+//   L2 (page reload):      ~20-50MB  — reloads page, may lose unsaved form state
+//   L3 (close browser):    ~100-200MB — last resort, destroys quiz state
+//
+// When preserveBrowser=true (mid-quiz), L0→L1→L2 are tried in sequence.
+// The function stops at the first level that brings heap below targetMB,
+// or after exhausting all browser-safe levels.
+//
+// When preserveBrowser=false (between quizzes, startup, etc.), jumps
+// straight to L3 for maximum recovery.
+// ═══════════════════════════════════════════════════════════════════════
 
 /**
- * Shed memory immediately. Closes browser, clears caches, forces GC.
- * Returns the approximate heap after shedding (MB).
+ * Shed memory using graduated levels. Returns the approximate heap after shedding (MB).
  *
- * Order matters: browser first (biggest consumer ~100-200MB),
- * then caches, then GC to reclaim freed objects.
+ * @param reason - Why we're shedding (for logging)
+ * @param options.preserveBrowser - If true, avoid closing the browser (use L0-L2 only).
+ *   Use this when mid-quiz to avoid losing the current question state.
+ * @param options.targetMB - Stop shedding once heap is below this value.
+ *   If undefined, tries all levels up to maxLevel.
+ * @param options.maxLevel - Maximum shed level to use (0-3). Default: 3 (full).
+ *   If preserveBrowser is true, maxLevel is clamped to 2.
  */
-function shedMemory(reason: string = 'unknown'): number {
+async function shedMemory(reason: string = 'unknown', options?: {
+  preserveBrowser?: boolean;
+  targetMB?: number;
+  maxLevel?: number;
+}): Promise<number> {
   const beforeMB = process.memoryUsage().heapUsed / 1024 / 1024;
-  _log(`shedMemory(${reason}): starting at heap=${beforeMB.toFixed(1)}MB`, 'WARN');
+  const preserveBrowser = options?.preserveBrowser ?? false;
+  const targetMB = options?.targetMB;
+  // Clamp maxLevel to 2 if preserveBrowser
+  let maxLevel = options?.maxLevel ?? 3;
+  if (preserveBrowser && maxLevel > 2) {
+    maxLevel = 2;
+  }
 
-  // Step 1: Close browser — the single biggest memory consumer
-  // Playwright/Chromium holds ~100-200MB of shared memory
-  if (!_browserClosedByProtection) {
-    try {
-      const { container } = require('./container');
-      const browserMod = container.get('browser', { required: false });
-      if (browserMod?.browserManager?.pageInstance && !browserMod.browserManager.pageInstance.isClosed()) {
-        browserMod.browserManager.cleanup().catch((e: any) => {
-          _log(`Browser cleanup during shed: ${e.message}`, 'DEBUG');
-        });
-        _browserClosedByProtection = true;
-        _log('shedMemory: browser closed (~100-200MB freed)', 'WARN');
-      }
-    } catch (e: any) {
-      _log(`shedMemory browser close error: ${e.message}`, 'DEBUG');
+  _log(`shedMemory(${reason}): starting at heap=${beforeMB.toFixed(1)}MB, preserveBrowser=${preserveBrowser}, maxLevel=L${maxLevel}${targetMB ? `, target=${targetMB}MB` : ''}`, 'WARN');
+
+  // Helper: check if we've freed enough
+  function heapBelowTarget(): boolean {
+    if (targetMB === undefined) return false;
+    return process.memoryUsage().heapUsed / 1024 / 1024 < targetMB;
+  }
+
+  // ── L0: Clear all caches + GC (no browser impact) ──
+  // Frees ~5-15MB. Always safe — never touches the browser.
+  if (maxLevel >= 0) {
+    _clearAllCaches();
+    if (global.gc) { try { global.gc(); } catch {} }
+
+    if (heapBelowTarget()) {
+      const afterMB = process.memoryUsage().heapUsed / 1024 / 1024;
+      _log(`shedMemory L0 sufficient: ${beforeMB.toFixed(1)}MB → ${afterMB.toFixed(1)}MB`, 'INFO');
+      return afterMB;
     }
   }
 
-  // Step 2: Clear providers-base coalescer cache
-  try {
-    const base = require('./providers-base');
-    if (base?.coalescer?.clear) {
-      base.coalescer.clear();
-      _log('shedMemory: coalescer cache cleared', 'DEBUG');
+  // ── L1: Navigate page to about:blank, GC, navigate back ──
+  // Frees ~30-80MB by releasing page-level JS heap, DOM nodes, images,
+  // CSS computed styles, and rendering tree. The browser process stays
+  // alive, so re-navigation is fast (~1-2s). The quiz page should
+  // restore its state from its framework (e.g. Flutter/React router).
+  if (maxLevel >= 1 && preserveBrowser) {
+    try {
+      const { container } = require('./container');
+      const browserMod = container.get('browser', { required: false });
+      const page = browserMod?.browserManager?.pageInstance;
+      if (page && !page.isClosed()) {
+        const currentUrl = page.url();
+        if (currentUrl && currentUrl !== 'about:blank') {
+          _log(`shedMemory L1: navigating to about:blank (was: ${currentUrl})`, 'WARN');
+          try {
+            await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 5000 });
+          } catch { /* timeout ok — blank page is fine */ }
+          // GC while page is blank — JS heap for the old page is now unreachable
+          if (global.gc) { try { global.gc(); } catch {} }
+          await new Promise(r => setTimeout(r, 500)); // brief pause for async frees
+          if (global.gc) { try { global.gc(); } catch {} }
+
+          if (heapBelowTarget()) {
+            const afterMB = process.memoryUsage().heapUsed / 1024 / 1024;
+            _log(`shedMemory L1 sufficient (page at about:blank): ${beforeMB.toFixed(1)}MB → ${afterMB.toFixed(1)}MB`, 'INFO');
+            return afterMB;
+          }
+
+          // Didn't free enough — navigate back to restore quiz state
+          _log(`shedMemory L1: heap still above target, navigating back to ${currentUrl}`, 'WARN');
+          try {
+            await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+          } catch (navErr: any) {
+            _log(`shedMemory L1: navigate back failed: ${navErr.message || navErr}`, 'ERROR');
+          }
+          // Second GC after page reloads
+          if (global.gc) { try { global.gc(); } catch {} }
+        }
+      }
+    } catch (e: any) {
+      _log(`shedMemory L1 error: ${e.message}`, 'DEBUG');
     }
-  } catch { /* not loaded yet */ }
+  }
 
-  // Step 3: Clear Gemini model cooldowns (unbounded Map)
-  try {
-    // The cooldowns are module-scoped, but we can trigger a full clear
-    // by requiring the module and calling its clear if exported
-    const gemini = require('./providers-gemini');
-    // Model cooldowns are internal — we can't directly clear them.
-    // But we can force a GC which will collect orphaned entries.
-  } catch { /* not loaded */ }
+  // ── L2: Page reload (in-place, same URL) ──
+  // Frees ~20-50MB. Preserves the URL so the app reloads at the same route.
+  // May lose in-memory app state (e.g. partially typed answer), but the
+  // question number/position should be restored by the app's state management.
+  if (maxLevel >= 2 && preserveBrowser) {
+    try {
+      const { container } = require('./container');
+      const browserMod = container.get('browser', { required: false });
+      const page = browserMod?.browserManager?.pageInstance;
+      if (page && !page.isClosed()) {
+        const currentUrl = page.url();
+        if (currentUrl && currentUrl !== 'about:blank') {
+          _log(`shedMemory L2: reloading page ${currentUrl}`, 'WARN');
+          try {
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+          } catch (reloadErr: any) {
+            _log(`shedMemory L2: reload failed: ${reloadErr.message || reloadErr}`, 'ERROR');
+          }
+          // Aggressive GC after reload
+          if (global.gc) { try { global.gc(); } catch {} }
+          await new Promise(r => setTimeout(r, 500));
+          if (global.gc) { try { global.gc(); } catch {} }
 
-  // Step 4: Clear the main in-memory cache
+          if (heapBelowTarget()) {
+            const afterMB = process.memoryUsage().heapUsed / 1024 / 1024;
+            _log(`shedMemory L2 sufficient (page reloaded): ${beforeMB.toFixed(1)}MB → ${afterMB.toFixed(1)}MB`, 'INFO');
+            return afterMB;
+          }
+        }
+      }
+    } catch (e: any) {
+      _log(`shedMemory L2 error: ${e.message}`, 'DEBUG');
+    }
+  }
+
+  // ── L3: Close browser entirely (last resort) ──
+  // Frees ~100-200MB. DESTROYS quiz state — only when NOT preserving browser.
+  if (maxLevel >= 3 && !preserveBrowser) {
+    if (!_browserClosedByProtection) {
+      try {
+        const { container } = require('./container');
+        const browserMod = container.get('browser', { required: false });
+        if (browserMod?.browserManager?.pageInstance && !browserMod.browserManager.pageInstance.isClosed()) {
+          await browserMod.browserManager.cleanup().catch((e: any) => {
+            _log(`Browser cleanup during shed: ${e.message}`, 'DEBUG');
+          });
+          _browserClosedByProtection = true;
+          _log('shedMemory L3: browser closed (~100-200MB freed)', 'WARN');
+        }
+      } catch (e: any) {
+        _log(`shedMemory L3 browser close error: ${e.message}`, 'DEBUG');
+      }
+    }
+    // Extra GC after browser close
+    if (global.gc) { try { global.gc(); } catch {} }
+    await new Promise(r => setTimeout(r, 500));
+    if (global.gc) { try { global.gc(); } catch {} }
+  }
+
+  const afterMB = process.memoryUsage().heapUsed / 1024 / 1024;
+  _log(`shedMemory(${reason}): ${beforeMB.toFixed(1)}MB → ${afterMB.toFixed(1)}MB (${(beforeMB - afterMB).toFixed(1)}MB freed, maxLevel=L${maxLevel})`, afterMB < beforeMB ? 'INFO' : 'ERROR');
+
+  return afterMB;
+}
+
+/**
+ * Clear all in-memory caches without touching the browser.
+ * This is L0 of the graduated shed — always safe, ~5-15MB freed.
+ */
+function _clearAllCaches(): void {
+  // Clear the main in-memory cache
   try {
     const { container } = require('./container');
     const cache = container.get('cache', { required: false });
     if (cache?.clearCache) {
       cache.clearCache();
-      _log('shedMemory: main cache cleared', 'DEBUG');
+      _log('L0: main cache cleared', 'DEBUG');
     }
   } catch { /* not available */ }
 
-  // Step 5: Clear pixel training in-memory cache (bounded LRU, but free it)
+  // Clear pixel training in-memory cache
   try {
     const pt = require('./pixel-training');
     if (pt?.clearCache) {
       pt.clearCache();
-      _log('shedMemory: pixel training cache cleared', 'DEBUG');
+      _log('L0: pixel training cache cleared', 'DEBUG');
     }
   } catch { /* not loaded */ }
 
-  // Step 6: Clear screenshot storage in-memory caches
+  // Clear screenshot storage in-memory caches
   try {
     const ss = require('./screenshot-storage');
     if (ss?.clearCache) {
       ss.clearCache();
-      _log('shedMemory: screenshot storage cache cleared', 'DEBUG');
+      _log('L0: screenshot storage cache cleared', 'DEBUG');
     }
   } catch { /* not loaded */ }
 
-  // Step 7: Force GC — twice with a small delay for async cleanup
-  if (global.gc) {
-    try { global.gc(); } catch { /* ignore */ }
-  }
-  setTimeout(() => {
-    if (global.gc) {
-      try { global.gc(); } catch { /* ignore */ }
-    }
-  }, 3000).unref();
-
-  // Step 8: Clear the dashboard screenshot buffer (global)
+  // Clear the dashboard screenshot buffer (global)
   try {
     if ((globalThis as any).__setLatestScreenshot) {
       (globalThis as any).__setLatestScreenshot('');
-      _log('shedMemory: dashboard screenshot buffer cleared', 'DEBUG');
+      _log('L0: dashboard screenshot buffer cleared', 'DEBUG');
     }
   } catch { /* ignore */ }
-
-  const afterMB = process.memoryUsage().heapUsed / 1024 / 1024;
-  _log(`shedMemory(${reason}): ${beforeMB.toFixed(1)}MB → ${afterMB.toFixed(1)}MB (${(beforeMB - afterMB).toFixed(1)}MB freed)`, afterMB < beforeMB ? 'INFO' : 'ERROR');
-
-  return afterMB;
 }
 
 /**
@@ -249,7 +360,7 @@ function clearBrowserClosedFlag(): void {
 }
 
 // ── Apply mode: set env vars, persist, AND shed memory ──
-function _applyMode(mode: 'full_power' | 'memory_protection', reason: string): void {
+async function _applyMode(mode: 'full_power' | 'memory_protection', reason: string): Promise<void> {
   const prev = _currentMode;
   _currentMode = mode;
   const thresholds = MODE_THRESHOLDS[mode];
@@ -262,9 +373,10 @@ function _applyMode(mode: 'full_power' | 'memory_protection', reason: string): v
     _log(`MEMORY PROTECTION mode activated: ${reason}. Disabled ${HEAVY_SELF_HEAL_KEYS.length + HEAVY_RESILIENCE_KEYS.length} heavy modules. Thresholds: warn=${thresholds.warnHeapMB}MB restart=${thresholds.restartHeapMB}MB GC=${thresholds.gcIntervalMs / 1000}s`, 'WARN');
 
     // v3 FIX: Actually shed memory instead of just logging about it
+    // v5 FIX: await the async shedMemory
     if (prev !== mode) {
       // Only shed on actual mode transition, not on re-init
-      const afterMB = shedMemory(`mode_activate:${reason}`);
+      const afterMB = await shedMemory(`mode_activate:${reason}`);
       _log(`Memory shed complete: now at ${afterMB.toFixed(1)}MB`, 'WARN');
     }
   } else {
@@ -296,13 +408,14 @@ function _applyMode(mode: 'full_power' | 'memory_protection', reason: string): v
 }
 
 // ── Manual mode switch (from dashboard) ──
-function switchMode(mode: 'full_power' | 'memory_protection', reason: string): void {
-  _applyMode(mode, `manual:${reason}`);
+async function switchMode(mode: 'full_power' | 'memory_protection', reason: string): Promise<void> {
+  await _applyMode(mode, `manual:${reason}`);
   _restartTimers();
 }
 
 // ── Auto-downgrade check ──
-function checkAutoDowngrade(heapMB: number, rssMB: number): boolean {
+// v5 FIX: Now async because _applyMode is async (awaits browser cleanup)
+async function checkAutoDowngrade(heapMB: number, rssMB: number): Promise<boolean> {
   if (_currentMode === 'memory_protection') return false;
 
   let shouldDowngrade = false;
@@ -321,7 +434,7 @@ function checkAutoDowngrade(heapMB: number, rssMB: number): boolean {
   // Mid-run OOM detection is handled by checkAfterTursoSync() via the DB.
 
   if (shouldDowngrade) {
-    _applyMode('memory_protection', `auto:${reason}`);
+    await _applyMode('memory_protection', `auto:${reason}`);
     _restartTimers();
   }
 
@@ -372,7 +485,8 @@ function _checkForActiveSelfHealSession(): void {
     // Session still valid — grant full power again to continue healing
     _log(`Resuming self-heal session (elapsed: ${Math.round(elapsed / 60000)}min, timeout: ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min). Granting FULL POWER.`, 'WARN');
     _selfHealSessionActive = true;
-    _applyMode('full_power', `self_heal_resume:elapsed_${Math.round(elapsed / 60000)}min`);
+    // Fire-and-forget: at startup, no browser to close anyway
+    _applyMode('full_power', `self_heal_resume:elapsed_${Math.round(elapsed / 60000)}min`).catch(() => {});
     _startSelfHealSessionTimeout(SELF_HEAL_SESSION_TIMEOUT_MS - elapsed);
   } catch (e: any) {
     _log(`Self-heal session restore check failed: ${e.message}`, 'DEBUG');
@@ -420,7 +534,7 @@ function _startSelfHealSessionTimeout(remainingMs: number): void {
  * Returns true if the session was started, false if one is already active
  * or the bot isn't in memory_protection mode.
  */
-function beginSelfHealSession(reason: string): boolean {
+async function beginSelfHealSession(reason: string): Promise<boolean> {
   if (_selfHealSessionActive) {
     _log(`Self-heal session already active — ignoring beginSelfHealSession('${reason}')`, 'WARN');
     return false;
@@ -449,7 +563,8 @@ function beginSelfHealSession(reason: string): boolean {
   } catch { /* non-critical */ }
 
   // Switch to full power
-  _applyMode('full_power', `self_heal_begin:${reason}`);
+  // v5 FIX: await the mode switch (it's async now)
+  await _applyMode('full_power', `self_heal_begin:${reason}`);
   _log(`SELF-HEAL SESSION STARTED: ${reason}. Full power granted for up to ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min. SAVE ALL PROGRESS TO DB.`, 'WARN');
 
   // Start timeout
@@ -509,7 +624,7 @@ function promoteAfterSelfHealFix(filesFixed: string[]): void {
  * Finalize the self-heal session: delete patch drafts, return to MEMORY PROTECTION.
  * This MUST be called after promoteAfterSelfHealFix() once the fix is verified.
  */
-function finalizeSelfHealSession(): void {
+async function finalizeSelfHealSession(): Promise<void> {
   if (!_selfHealSessionActive) return;
 
   // Clear the session timeout
@@ -537,8 +652,9 @@ function finalizeSelfHealSession(): void {
   } catch { /* non-critical */ }
 
   // Return to memory protection
+  // v5 FIX: await so browser is actually closed before returning
   if (_currentMode !== 'memory_protection') {
-    _applyMode('memory_protection', 'self_heal_finalize:fix_verified');
+    await _applyMode('memory_protection', 'self_heal_finalize:fix_verified');
     _restartTimers();
   }
 
@@ -549,7 +665,7 @@ function finalizeSelfHealSession(): void {
  * Abort the self-heal session (e.g., on failure, timeout, or OOM).
  * Returns to MEMORY PROTECTION immediately.
  */
-function abortSelfHealSession(reason: string): void {
+async function abortSelfHealSession(reason: string): Promise<void> {
   if (!_selfHealSessionActive) return;
 
   // Clear the session timeout
@@ -565,8 +681,9 @@ function abortSelfHealSession(reason: string): void {
   });
 
   // Return to memory protection immediately
+  // v5 FIX: await so browser is actually closed
   if (_currentMode !== 'memory_protection') {
-    _applyMode('memory_protection', `self_heal_abort:${reason}`);
+    await _applyMode('memory_protection', `self_heal_abort:${reason}`);
     _restartTimers();
   }
 
@@ -614,7 +731,7 @@ function _restartTimers(): void {
 /**
  * Post-Turso-sync OOM check. Called after Turso pulls calibration data.
  */
-function checkAfterTursoSync(selectCalibration: any, upsertCalibration: any): void {
+async function checkAfterTursoSync(selectCalibration: any, upsertCalibration: any): Promise<void> {
   if (!selectCalibration || !upsertCalibration) return;
 
   try {
@@ -624,7 +741,7 @@ function checkAfterTursoSync(selectCalibration: any, upsertCalibration: any): vo
       try {
         const parsed = JSON.parse(modeRow.value);
         if (parsed.mode === 'memory_protection' && _currentMode !== 'memory_protection') {
-          _applyMode('memory_protection', `db_restored:${parsed.reason || 'unknown'}`);
+          await _applyMode('memory_protection', `db_restored:${parsed.reason || 'unknown'}`);
           _restartTimers();
           _log('Restored MEMORY PROTECTION mode from database (Turso recovery)', 'WARN');
           return;
@@ -638,7 +755,7 @@ function checkAfterTursoSync(selectCalibration: any, upsertCalibration: any): vo
       const oomTs = parseInt(oomRow.value, 10);
       if (!isNaN(oomTs) && Date.now() - oomTs < OOM_RECOVERY_WINDOW_MS) {
         if (_currentMode !== 'memory_protection') {
-          _applyMode('memory_protection', `db_oom_recovery:exit_${Math.round((Date.now() - oomTs) / 1000)}s_ago`);
+          await _applyMode('memory_protection', `db_oom_recovery:exit_${Math.round((Date.now() - oomTs) / 1000)}s_ago`);
           _restartTimers();
           _log(`Detected OOM exit ${Math.round((Date.now() - oomTs) / 1000)}s ago in database — switching to MEMORY PROTECTION`, 'WARN');
         }
@@ -658,7 +775,7 @@ function checkAfterTursoSync(selectCalibration: any, upsertCalibration: any): vo
           const ageSeconds = Math.round((Date.now() - hb.ts) / 1000);
           if (hb.heapMB > 300 && ageSeconds < HEARTBEAT_RECOVERY_WINDOW_MS / 1000) {
             if (_currentMode !== 'memory_protection') {
-              _applyMode('memory_protection', `db_heartbeat:heap_${hb.heapMB.toFixed(0)}MB_${ageSeconds}s_ago`);
+              await _applyMode('memory_protection', `db_heartbeat:heap_${hb.heapMB.toFixed(0)}MB_${ageSeconds}s_ago`);
               _restartTimers();
               _log(`Detected high memory heartbeat (${hb.heapMB.toFixed(0)}MB heap, ${ageSeconds}s ago) — switching to MEMORY PROTECTION`, 'WARN');
             }
@@ -715,24 +832,28 @@ function recordOOMExit(heapMB: number, rssMB: number): void {
   _log(`OOM exit recorded: heap=${heapMB.toFixed(0)}MB rss=${rssMB.toFixed(0)}MB`, 'WARN');
 }
 
-// ── Initialize: restore persisted mode + check for OOM history ──
+// ── Initialize: restore persisted mode + check for OOM history ──// v5 FIX: init() is intentionally sync (called at module load time).
+// At init, no browser exists yet, so _applyMode's shedMemory is a no-op for
+// the browser step — only sets env vars and persists. The real memory shed
+// happens later when checkAfterTursoSync() or the monitor triggers it.
+// We fire-and-forget the _applyMode promise to avoid changing the init API.
 function init(): void {
   try {
     const persisted = persistConfig.getMode();
     if (persisted.current === 'memory_protection') {
-      _applyMode('memory_protection', `restored:${persisted.reason}`);
+      _applyMode('memory_protection', `restored:${persisted.reason}`).catch(() => {});
       _log('Restored MEMORY PROTECTION mode from persistent storage', 'INFO');
     } else if (persistConfig.wasRecentlyOOMKilled()) {
-      _applyMode('memory_protection', 'auto:OOM_kill_recovery');
+      _applyMode('memory_protection', 'auto:OOM_kill_recovery').catch(() => {});
       _log('Detected recent OOM kill — starting in MEMORY PROTECTION mode', 'WARN');
     } else {
       // v4: Default to memory_protection. Full power requires self-heal session
       // or manual dashboard switch. This is the safe default on 512MB.
-      _applyMode('memory_protection', 'init_default_safe');
+      _applyMode('memory_protection', 'init_default_safe').catch(() => {});
       _log('Starting in MEMORY PROTECTION mode (safe default). Full power requires self-heal session or manual switch.', 'INFO');
     }
   } catch (e: any) {
-    _applyMode('memory_protection', 'init_fallback');
+    _applyMode('memory_protection', 'init_fallback').catch(() => {});
     _log('Init fallback — MEMORY PROTECTION mode', 'WARN');
   }
 
@@ -760,6 +881,23 @@ function shutdown(): void {
   }
 }
 
+let _isMidQuiz = false; // v6: set by cycle-manager, read by render-free-plan monitor
+
+/**
+ * v6: Set whether the bot is currently mid-quiz.
+ * When true, the render-free-plan monitor and heap guardian will
+ * use browser-safe memory shedding (L0-L2) instead of closing
+ * the browser (L3) which would destroy quiz state.
+ */
+function setMidQuiz(midQuiz: boolean): void {
+  _isMidQuiz = midQuiz;
+}
+
+/** v6: Check if the bot is currently mid-quiz. */
+function isMidQuiz(): boolean {
+  return _isMidQuiz;
+}
+
 module.exports = {
   init,
   shutdown,
@@ -774,6 +912,8 @@ module.exports = {
   shedMemory,                    // v3: standalone emergency memory shed
   wasBrowserClosedByProtection,  // v3: for cycle manager to check
   clearBrowserClosedFlag,       // v3: for cycle manager to reset
+  setMidQuiz,                   // v6: set mid-quiz flag for browser-safe shedding
+  isMidQuiz,                    // v6: query mid-quiz flag
   // v4: Self-heal session lifecycle
   beginSelfHealSession,
   appendSelfHealProgress,
