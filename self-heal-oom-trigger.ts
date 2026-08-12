@@ -332,35 +332,85 @@ async function triggerBootHeal(): Promise<void> {
   } catch { /* non-critical */ }
 
   // Attempt self-heal — wrapped in try/catch so we don't crash the boot
+  //
+  // CRITICAL FIX: Call performRuntimeHeal() DIRECTLY, not performSelfHeal().
+  // performSelfHeal() is wrapped by the circuit breaker which may be OPEN
+  // from previous failed heals (exponential backoff up to 8 hours).
+  // performRuntimeHeal() is exported as a raw function with NO circuit
+  // breaker, NO daily limits, NO /tmp overlay requirement — it just runs
+  // the 7 runtime avenues (DB repair, provider reset, cache flush, etc.)
+  // which is exactly what an OOM loop needs: clear stuck state.
+  //
+  // Only fall through to the full performSelfHeal() (code patches) if
+  // runtime heal succeeds and we want to try for a deeper fix too.
+  let anyHealed = false;
   try {
     const selfHealMod = require('./self-heal');
-    const performSelfHeal = selfHealMod.performSelfHeal;
 
-    if (typeof performSelfHeal === 'function') {
-      log('Calling performSelfHeal() from OOM boot trigger...', 'WARN');
-      const healed = await performSelfHeal();
-
-      if (healed) {
-        log('Boot-time OOM self-heal SUCCEEDED', 'INFO');
-        // Record success
+    // ── STEP 1: Runtime heal (bypasses ALL guards) ──
+    const performRuntimeHeal = selfHealMod.performRuntimeHeal;
+    if (typeof performRuntimeHeal === 'function') {
+      log('Calling performRuntimeHeal() directly (bypasses circuit breaker)...', 'WARN');
+      const rtResult = await performRuntimeHeal();
+      if (rtResult?.healed) {
+        const successes = rtResult.results?.filter((r: any) => r.healed);
+        log(`Boot-time OOM runtime heal SUCCEEDED via: ${successes?.map((r: any) => r.avenue).join(', ')}`, 'INFO');
+        anyHealed = true;
+        // Reset the circuit breaker so the cycle loop can also use self-heal
         try {
-          getInsertSelfHealEvent()?.(
-            Date.now(), 'oom_boot_trigger', 'completed', 'oom_loop_boot_heal_success',
-            null, 0, 0, 0, 'success', Date.now() - parseInt(diagnostics.substring(0, 20), 10) || 0, null
-          );
+          const cb = require('./self-heal-circuit-breaker');
+          const breaker = cb.healerCircuitBreaker || cb;
+          if (typeof breaker.reset === 'function') {
+            breaker.reset();
+            log('Circuit breaker RESET after successful OOM runtime heal', 'INFO');
+          }
         } catch {}
       } else {
-        log('Boot-time OOM self-heal found no fixable issues', 'WARN');
-        try {
-          getInsertSelfHealEvent()?.(
-            Date.now(), 'oom_boot_trigger', 'completed', 'oom_loop_boot_heal_no_fix',
-            null, 0, 0, 0, 'no_fix_found', 0, null
-          );
-        } catch {}
+        log('Boot-time OOM runtime heal found no fixable issues', 'WARN');
       }
     } else {
-      log('performSelfHeal not available — self-heal module not loaded yet', 'WARN');
+      log('performRuntimeHeal not available — self-heal module not loaded yet', 'WARN');
     }
+
+    // ── STEP 2: Full self-heal (with circuit breaker) for code-patch fix ──
+    // Only attempt if runtime heal didn't help AND we're not in an OOM
+    // death spiral (the full pipeline uses more memory — risky when OOMing).
+    // Request a self-heal session for full power if in memory_protection.
+    if (!anyHealed) {
+      try {
+        const memoryMode = require('./memory-mode');
+        if (memoryMode.isMemoryProtection?.()) {
+          memoryMode.beginSelfHealSession?.('oom_boot_trigger');
+        }
+      } catch {}
+
+      const performSelfHeal = selfHealMod.performSelfHeal;
+      if (typeof performSelfHeal === 'function') {
+        log('Runtime heal didn\'t help — attempting full performSelfHeal()...', 'WARN');
+        const fullHealed = await performSelfHeal();
+        if (fullHealed) {
+          log('Boot-time OOM full self-heal SUCCEEDED', 'INFO');
+          anyHealed = true;
+        } else {
+          log('Boot-time OOM full self-heal found no fixable issues', 'WARN');
+        }
+      }
+    }
+
+    // Record outcome
+    try {
+      if (anyHealed) {
+        getInsertSelfHealEvent()?.(
+          Date.now(), 'oom_boot_trigger', 'completed', 'oom_loop_boot_heal_success',
+          null, 0, 0, 0, 'success', 0, null
+        );
+      } else {
+        getInsertSelfHealEvent()?.(
+          Date.now(), 'oom_boot_trigger', 'completed', 'oom_loop_boot_heal_no_fix',
+          null, 0, 0, 0, 'no_fix_found', 0, null
+        );
+      }
+    } catch {}
   } catch (err: any) {
     logError('Boot-time OOM self-heal FAILED', err);
     try {
