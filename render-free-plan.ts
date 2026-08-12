@@ -477,12 +477,23 @@ function _startMemoryMonitor(): void {
     }
 
     // Auto-downgrade check (before applying mode-specific thresholds)
-    if (memoryMode.checkAutoDowngrade(used, rss)) {
-      // Mode switched to memory_protection — shedMemory was already called
-      // by _applyMode. Restart the monitor with the new (faster) interval.
-      _memoryWarningCount = 0;
-      _lastRss = rss;
-      _startMemoryMonitor(); // Restart with new interval
+    // v5 FIX: checkAutoDowngrade is now async (awaits browser cleanup).
+    // Don't use .then() — if downgrade happens, the callback restarted the
+    // monitor and we should NOT run the stale-threshold code below.
+    // We do a synchronous pre-check (heap/RSS) to avoid awaiting when
+    // we're clearly not in danger zone.
+    const thresholds_before = memoryMode.getThresholds();
+    const needDowngrade = used > (memoryMode.AUTO_DOWNGRADE_HEAP_MB || 320) || rss > (memoryMode.AUTO_DOWNGRADE_RSS_MB || 440);
+    if (needDowngrade && memoryMode.getMode() !== 'memory_protection') {
+      // Actually trigger the async downgrade; fire-and-forget because
+      // _applyMode will restart the monitor interval from the .then()
+      memoryMode.checkAutoDowngrade(used, rss).then((downgraded: boolean) => {
+        if (downgraded) {
+          _memoryWarningCount = 0;
+          _lastRss = rss;
+          _startMemoryMonitor();
+        }
+      }).catch(() => {});
       return;
     }
 
@@ -494,19 +505,32 @@ function _startMemoryMonitor(): void {
     const activeStreak = thresholds.warningStreak;
 
     // Critical: immediate comprehensive memory shed
+    // v5 FIX: shedMemory is now async — fire-and-forget in interval context
+    // (we can't await inside setInterval). The browser cleanup will complete
+    // within ~2-3s. A follow-up GC is scheduled.
+    // v6 FIX: Read isMidQuiz() to preserve browser if mid-quiz
     if (used > activeRestart || rss > activeRssHard) {
-      log(`Memory CRITICAL (${memoryMode.getMode()}): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed`, 'ERROR', 'render-free-plan');
-      try { memoryMode.shedMemory('render-monitor-critical'); } catch { /* best effort */ }
+      log(`Memory CRITICAL (${memoryMode.getMode()}): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'ERROR', 'render-free-plan');
+      memoryMode.shedMemory('render-monitor-critical', {
+        preserveBrowser: memoryMode.isMidQuiz?.() ?? false,
+      }).then(() => {
+        // v5 FIX: Second GC AFTER browser cleanup actually completes
+        if (global.gc) { try { global.gc(); } catch {} }
+      }).catch(() => {});
       if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
-      setTimeout(() => { if (global.gc) try { global.gc(); } catch {} }, 3000).unref();
       _memoryWarningCount = 0;
       _lastRss = rss;
     } else if (used > activeWarn) {
       _memoryWarningCount++;
       if (_memoryWarningCount >= activeStreak) {
-        log(`Memory warning persistent (${_memoryWarningCount}/${activeStreak}, mode=${memoryMode.getMode()}): heap=${used.toFixed(0)}MB — memory shed`, 'WARN', 'render-free-plan');
-        // v3 FIX: Use shedMemory instead of manual browser close
-        try { memoryMode.shedMemory('render-monitor-warning'); } catch { /* best effort */ }
+        log(`Memory warning persistent (${_memoryWarningCount}/${activeStreak}, mode=${memoryMode.getMode()}): heap=${used.toFixed(0)}MB — memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'WARN', 'render-free-plan');
+        // v5 FIX: shedMemory is async now
+        // v6 FIX: preserve browser if mid-quiz
+        memoryMode.shedMemory('render-monitor-warning', {
+          preserveBrowser: memoryMode.isMidQuiz?.() ?? false,
+        }).then(() => {
+          if (global.gc) { try { global.gc(); } catch {} }
+        }).catch(() => {});
         if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
         _memoryWarningCount = 0;
         _lastRss = rss;
@@ -915,11 +939,13 @@ try {
     // After Turso pulls calibration data, check for OOM history.
     // On Render free plan, /tmp is wiped on restart so persistent-config is empty,
     // but Turso restores calibration entries including OOM markers and mode state.
+    // v5 FIX: checkAfterTursoSync is now async (awaits browser cleanup)
     try {
-      memoryMode.checkAfterTursoSync(selectCalibration, upsertCalibration);
-      if (memoryMode.isMemoryProtection()) {
-        log(`Post-Turso OOM check: switched to ${memoryMode.getMode()} mode`, 'WARN', 'render-free-plan');
-      }
+      memoryMode.checkAfterTursoSync(selectCalibration, upsertCalibration).then(() => {
+        if (memoryMode.isMemoryProtection()) {
+          log(`Post-Turso OOM check: switched to ${memoryMode.getMode()} mode`, 'WARN', 'render-free-plan');
+        }
+      }).catch(() => {});
     } catch (e: any) {
       log(`Post-Turso OOM check failed: ${e.message}`, 'WARN', 'render-free-plan');
     }
