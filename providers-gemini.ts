@@ -20,8 +20,7 @@
 //   When a model hits 429 (RESOURCE_EXHAUSTED), the provider automatically
 //   tries the next model in the fallback chain. Uses all available
 //   Google free-tier TEXT-OUT models for maximum throughput:
-//     gemini-2.5-flash → gemini-2.5-flash-lite → gemini-2.5-pro
-//     → gemini-3-flash → gemini-3.1-pro → gemini-3.1-flash-lite
+//     gemini-2.5-flash → gemini-2.5-pro
 //     → gemini-2.0-flash → gemini-1.5-flash
 //   NOTE: Image generation (Nano Banana) and TTS models are excluded —
 //   they produce non-text output incompatible with the action pipeline.
@@ -196,14 +195,18 @@ function GeminiProvider() {
           // Continue to next model in chain
           continue;
         }
-        // Non-429 error (400, 403, 404, 503) — don't retry with another model,
-        // let the outer retry system handle it
+        // 404 = model doesn't exist, skip to next in chain
+        if (err.message && err.message.includes('HTTP_ERROR_404')) {
+          log(`Gemini model ${modelId} not found (404), trying next fallback`, 'WARN', 'gemini');
+          continue;
+        }
+        // Other non-429 error (400, 403, 503) — let the outer retry system handle it
         throw err;
       }
     }
 
-    // All models exhausted (all on cooldown)
-    throw new Error('Gemini: All models rate-limited, waiting for cooldown');
+    // All models exhausted (all on cooldown or 404)
+    throw new Error('Gemini: All models exhausted (rate-limited or not found)');
   };
 }
 
