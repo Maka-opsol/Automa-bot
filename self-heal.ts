@@ -558,6 +558,28 @@ let _healInProgress = false;
 
 async function performSelfHeal() {
   if (_healInProgress) { log('Self-heal already in progress, skipping', 'DEBUG', 'self-heal'); return false; }
+
+  // v9: FAST PASS — runtime healing avenues (no /tmp, no code patches, no AI).
+  // These fix the most common runtime issues in seconds. Only if ALL fail do
+  // we fall through to the heavy code-patch pipeline.
+  // Importantly, runtime heals bypass the daily patch limit and cooldown —
+  // they're safe, non-destructive, and can run every time if needed.
+  try {
+    log('Attempting runtime heal (fast pass)...', 'INFO', 'self-heal');
+    const runtimeResult = await performRuntimeHeal();
+    if (runtimeResult.healed) {
+      const successes = runtimeResult.results.filter(r => r.healed);
+      log(`Runtime heal SUCCEEDED via: ${successes.map(r => r.avenue).join(', ')}`, 'INFO', 'self-heal');
+      logAudit(`Runtime heal succeeded: ${successes.map(r => r.avenue).join(', ')}`, 'self-heal');
+      _lastFailureTime = 0; // Reset cooldown on any successful heal
+      return true;
+    }
+    log('Runtime heal found no fixable issues — falling through to code-patch pipeline', 'INFO', 'self-heal');
+  } catch (rtErr: any) {
+    logError('Runtime heal fast pass threw error (falling through)', rtErr);
+  }
+
+  // ── SLOW PATH: Code-patch pipeline (original behavior) ──
   // v8-fix: On Render/ephemeral disks, source files are read-only (deployed from git).
   // Use the /tmp overlay system: patches are written to /tmp/self-heal-overlay/,
   // and a require() interceptor makes Node load them instead of the read-only
@@ -597,8 +619,8 @@ async function performSelfHeal() {
     log('Self-heal session STARTED — full power granted for healing. All progress will be saved to DB.', 'WARN', 'self-heal');
   }
 
-  log('Starting self-heal process...', 'INFO', 'self-heal');
-  logAudit('Self-heal process started', 'self-heal');
+  log('Starting self-heal code-patch process...', 'INFO', 'self-heal');
+  logAudit('Self-heal code-patch process started', 'self-heal');
   const healStartTime = Date.now();
   const backupPath = await backupCode();
 
@@ -799,6 +821,71 @@ async function performSelfHeal() {
       log('Post-promotion verification passed', 'INFO', 'self-heal');
     }
 
+    // v10: HOT-SWAP — Make patches take effect IMMEDIATELY for already-loaded code.
+    // The /tmp overlay + require interceptor only affects FUTURE require() calls.
+    // Hot-swap uses Module._compile to overwrite old module exports in-place,
+    // so every existing `const foo = require('./foo')` sees the new code NOW.
+    // This is the reliability fix for Render: patches work instantly, not
+    // just after restart or re-require.
+    if (isReadOnlyFs && promotedDirectly) {
+      try {
+        const hotSwap = require('./self-heal-hot-swap');
+        const swapFiles = safeFixes.map((f: any) => f.file);
+        const swapSummary = hotSwap.hotSwapModules(swapFiles);
+        if (swapSummary.totalSwapped > 0) {
+          log(`Hot-swap applied ${swapSummary.totalSwapped}/${swapFiles.length} module(s) instantly`, 'INFO', 'self-heal');
+          // Verify the swaps are still good
+          const verifyResult = hotSwap.verifyRecentSwaps();
+          if (verifyResult.invalid > 0) {
+            log(`Hot-swap verification: ${verifyResult.invalid} module(s) have issues after swap`, 'WARN', 'self-heal');
+            // Rollback the invalid ones
+            for (const detail of verifyResult.details) {
+              if (!detail.valid) {
+                const rolledBack = hotSwap.rollbackSwap(detail.file);
+                log(`Hot-swap rollback for ${detail.file}: ${rolledBack ? 'OK' : 'FAILED'}`, rolledBack ? 'WARN' : 'ERROR', 'self-heal');
+              }
+            }
+          } else {
+            log(`Hot-swap verification: all ${verifyResult.valid} module(s) healthy`, 'INFO', 'self-heal');
+          }
+        } else if (swapSummary.totalFailed > 0) {
+          log(`Hot-swap failed for ${swapSummary.totalFailed} module(s) — overlay interceptor still active as fallback`, 'WARN', 'self-heal');
+        } else {
+          log(`Hot-swap: ${swapSummary.totalSkipped} module(s) skipped (blacklisted or not in cache) — overlay interceptor handles those`, 'DEBUG', 'self-heal');
+        }
+      } catch (hsErr: any) {
+        log(`Hot-swap module failed (non-fatal, overlay interceptor is fallback): ${hsErr.message}`, 'WARN', 'self-heal');
+      }
+    }
+
+    // v11: GIT DEPLOY — Queue patches for permanent GitHub commit + Render deploy.
+    // The overlay + hot-swap heal the RUNNING instance, but are lost on OOM/crash.
+    // Git deploy bakes the fix into the repo so new instances boot with it.
+    // After VERIFICATION_CYCLES (5) error-free cycles, the git-deploy module
+    // auto-commits to GitHub, creates a PR, auto-merges, and triggers a
+    // Render deploy via API — fully instance-independent healing.
+    if (isReadOnlyFs) {
+      try {
+        const gitDeploy = require('./self-heal-git-deploy');
+        // Inject deps if git-deploy hasn't been initialized with them yet
+        if (_deps.logger || _deps.database) {
+          try { gitDeploy._injectDependencies({ logger: _deps.logger, database: _deps.database, config: _deps.config }); } catch {}
+        }
+        let queuedCount = 0;
+        for (const fix of safeFixes) {
+          if (gitDeploy.isDeployAllowed(fix.file)) {
+            gitDeploy.recordPatchForVerification(fix.id || String(Date.now()), fix.file);
+            queuedCount++;
+          }
+        }
+        if (queuedCount > 0) {
+          log(`${queuedCount}/${safeFixes.length} patch(es) queued for git deploy verification (instance-independent healing)`, 'INFO', 'self-heal');
+        }
+      } catch (gdErr: any) {
+        log(`Git deploy recording failed (non-fatal): ${gdErr.message}`, 'WARN', 'self-heal');
+      }
+    }
+
     // 12. Post-heal bookkeeping
     // B1: Generate regression tests
     try {
@@ -875,6 +962,332 @@ async function performSelfHeal() {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  RUNTIME HEALING AVENUES (non-code-fix)
+//
+//  These don't write to /tmp or patch source files. They fix runtime state:
+//    DB corruption, stale config, selector drift, module quarantine,
+//    provider discovery, degraded mode escalation, and auth refresh.
+//
+//  Each returns { healed: boolean, avenue: string, detail: string }.
+//  They run in parallel for speed. If ANY succeeds, the heal is a win.
+// ═══════════════════════════════════════════════════════════════════════════
+
+interface RuntimeHealResult {
+  healed: boolean;
+  avenue: string;
+  detail: string;
+}
+
+/**
+ * Avenue 1: Database integrity repair.
+ * Checks critical tables exist, WAL isn't corrupted, and calibrations are readable.
+ * Many runtime failures stem from subtle DB corruption after OOM kills.
+ */
+async function runtimeHealDatabase(): Promise<RuntimeHealResult> {
+  try {
+    const db = getDb();
+    if (!db) return { healed: false, avenue: 'db_repair', detail: 'no db' };
+
+    let repairs = 0;
+
+    // Check WAL integrity
+    try {
+      const walResult = db.pragma('integrity_check');
+      if (walResult?.[0]?.integrity_check !== 'ok') {
+        log('DB integrity check failed — running emergency repair', 'WARN', 'self-heal');
+        // Dump and reimport is the safest repair for SQLite
+        try { db.pragma('wal_checkpoint(TRUNCATE)'); repairs++; } catch {}
+      }
+    } catch (e: any) {
+      log(`DB integrity check error: ${e.message}`, 'WARN', 'self-heal');
+      try { db.pragma('wal_checkpoint(TRUNCATE)'); repairs++; } catch {}
+    }
+
+    // Ensure critical tables exist
+    const criticalTables = ['calibration', 'patch_history', 'self_heal_events', 'progress_log'];
+    for (const table of criticalTables) {
+      try {
+        db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get();
+      } catch {
+        log(`Critical table '${table}' missing — attempting recreate`, 'WARN', 'self-heal');
+        try {
+          if (table === 'calibration') {
+            db.exec(`CREATE TABLE IF NOT EXISTS calibration (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER)`);
+          } else if (table === 'progress_log') {
+            db.exec(`CREATE TABLE IF NOT EXISTS progress_log (ts INTEGER, questions_completed INTEGER, provider TEXT, model TEXT, action TEXT, success INTEGER)`);
+          }
+          repairs++;
+        } catch (createErr: any) {
+          log(`Failed to recreate table '${table}': ${createErr.message}`, 'ERROR', 'self-heal');
+        }
+      }
+    }
+
+    // Vacuum if fragmented (page count > 100 and free pages > 20%)
+    try {
+      const pageCount = db.pragma('page_count')?.[0]?.page_count || 0;
+      const freePages = db.pragma('freelist_count')?.[0]?.freelist_count || 0;
+      if (pageCount > 100 && freePages / pageCount > 0.2) {
+        db.pragma('incremental_vacuum');
+        repairs++;
+        log(`DB vacuumed (${freePages} free pages reclaimed)`, 'INFO', 'self-heal');
+      }
+    } catch {}
+
+    if (repairs > 0) {
+      return { healed: true, avenue: 'db_repair', detail: `${repairs} repair(s) applied` };
+    }
+    return { healed: false, avenue: 'db_repair', detail: 'db healthy' };
+  } catch (e: any) {
+    return { healed: false, avenue: 'db_repair', detail: e.message };
+  }
+}
+
+/**
+ * Avenue 2: Config reconciliation.
+ * Reloads config from env/database and pushes updated values into runtime.
+ * Fixes stale config after OOM (env vars lost) or config drift.
+ */
+async function runtimeHealConfig(): Promise<RuntimeHealResult> {
+  try {
+    const configReconciler = require('./self-heal-config-reconciler')?.configReconciler;
+    if (!configReconciler?.reconcileAll) {
+      return { healed: false, avenue: 'config_reconcile', detail: 'module unavailable' };
+    }
+
+    const result = await configReconciler.reconcileAll();
+    if (result?.fixesApplied > 0) {
+      return { healed: true, avenue: 'config_reconcile', detail: `${result.fixesApplied} config fix(es)` };
+    }
+    return { healed: false, avenue: 'config_reconcile', detail: 'config in sync' };
+  } catch (e: any) {
+    return { healed: false, avenue: 'config_reconcile', detail: e.message };
+  }
+}
+
+/**
+ * Avenue 3: Selector drift hot-fix.
+ * Reloads selector JSON files and re-parses them. If selectors changed
+ * on the website, this picks up the latest committed versions.
+ */
+async function runtimeHealSelectors(): Promise<RuntimeHealResult> {
+  try {
+    // Clear the cached selectors so they reload from disk on next use
+    const selectorModule = require('./selectors');
+    if (selectorModule._clearCache && typeof selectorModule._clearCache === 'function') {
+      selectorModule._clearCache();
+      return { healed: true, avenue: 'selector_reload', detail: 'selector cache cleared' };
+    }
+    // If no explicit cache clear, try deleting from require.cache
+    const selectorPath = require.resolve('./selectors');
+    if (require.cache[selectorPath]) {
+      delete require.cache[selectorPath];
+      return { healed: true, avenue: 'selector_reload', detail: 'selector module evicted from require.cache' };
+    }
+    return { healed: false, avenue: 'selector_reload', detail: 'no selector cache found' };
+  } catch (e: any) {
+    return { healed: false, avenue: 'selector_reload', detail: e.message };
+  }
+}
+
+/**
+ * Avenue 4: Module quarantine reset.
+ * If a module was quarantined by runtime-module-quarantine.ts due to
+ * repeated failures, this resets its failure count so it can be retried.
+ */
+async function runtimeHealModuleQuarantine(): Promise<RuntimeHealResult> {
+  try {
+    const quarantine = require('./runtime-module-quarantine');
+    if (quarantine.resetAll?.()) {
+      const status = quarantine.getStatus?.();
+      const count = status?.quarantinedCount ?? 'unknown';
+      return { healed: true, avenue: 'quarantine_reset', detail: `reset ${count} quarantined module(s)` };
+    }
+    return { healed: false, avenue: 'quarantine_reset', detail: 'no modules quarantined' };
+  } catch (e: any) {
+    return { healed: false, avenue: 'quarantine_reset', detail: 'module unavailable' };
+  }
+}
+
+/**
+ * Avenue 5: Provider rediscovery & rate-limit reset.
+ * Forces a full provider model refresh and clears any stuck rate-limits.
+ * This is the most common runtime fix — providers go down and come back,
+ * but the bot's cached availability state is stale.
+ */
+async function runtimeHealProviders(): Promise<RuntimeHealResult> {
+  try {
+    let fixes = 0;
+
+    // 5a: Force provider model rediscovery
+    const providerDiscovery = require('./providers-provider-discovery');
+    if (providerDiscovery.refreshAllProviderModels) {
+      await providerDiscovery.refreshAllProviderModels();
+      fixes++;
+      log('Provider rediscovery forced', 'INFO', 'self-heal');
+    }
+
+    // 5b: Clear rate-limiter state (stuck rate-limits block providers permanently)
+    try {
+      const rateLimiter = require('./openrouter-rate-limiter');
+      if (rateLimiter.resetAll?.) {
+        rateLimiter.resetAll();
+        fixes++;
+        log('Rate limiter reset', 'INFO', 'self-heal');
+      }
+    } catch {}
+
+    // 5c: Reset provider fallback chain (sometimes it gets stuck on a dead provider)
+    try {
+      const fallback = require('./providers-fallback');
+      if (fallback.resetFallbackIndex?.) {
+        fallback.resetFallbackIndex();
+        fixes++;
+        log('Provider fallback index reset', 'INFO', 'self-heal');
+      }
+    } catch {}
+
+    // 5d: Clear provider stats error counters (let the bot retry with clean slate)
+    try {
+      const stats = getProvidersStats();
+      if (stats.resetErrorCounts) {
+        stats.resetErrorCounts();
+        fixes++;
+        log('Provider error counters reset', 'INFO', 'self-heal');
+      }
+    } catch {}
+
+    if (fixes > 0) {
+      return { healed: true, avenue: 'provider_reset', detail: `${fixes} provider fix(es)` };
+    }
+    return { healed: false, avenue: 'provider_reset', detail: 'providers healthy' };
+  } catch (e: any) {
+    return { healed: false, avenue: 'provider_reset', detail: e.message };
+  }
+}
+
+/**
+ * Avenue 6: Auth token refresh.
+ * Forces an immediate auth token refresh. Stale tokens cause 401s
+ * that look like provider failures but aren't.
+ */
+async function runtimeHealAuth(): Promise<RuntimeHealResult> {
+  try {
+    const authHealer = require('./self-heal-auth-healer')?.authHealer;
+    if (!authHealer?.forceRefresh) {
+      return { healed: false, avenue: 'auth_refresh', detail: 'module unavailable' };
+    }
+
+    const result = await authHealer.forceRefresh();
+    if (result?.refreshed) {
+      return { healed: true, avenue: 'auth_refresh', detail: 'auth token refreshed' };
+    }
+    return { healed: false, avenue: 'auth_refresh', detail: 'token still valid' };
+  } catch (e: any) {
+    return { healed: false, avenue: 'auth_refresh', detail: e.message };
+  }
+}
+
+/**
+ * Avenue 7: Cache & memory flush.
+ * Aggressively clears all in-memory caches (not code changes, pure runtime).
+ * This frees stale references and corrupted cache entries that accumulate.
+ */
+async function runtimeHealCacheFlush(): Promise<RuntimeHealResult> {
+  try {
+    let flushed = 0;
+
+    // Clear the main action cache
+    try {
+      const actionCache = require('./services-action-cache');
+      if (actionCache.clear) { actionCache.clear(); flushed++; }
+    } catch {}
+
+    // Clear math solution cache
+    try {
+      const mathCache = require('./math-solution-cache');
+      if (mathCache.clear) { mathCache.clear(); flushed++; }
+    } catch {}
+
+    // Clear module require.cache for hot-reloadable modules
+    const hotReloadable = [
+      'providers-config-loader', 'providers-registry', 'providers-fallback',
+      'selectors', 'state-machine', 'config', 'get-config',
+    ];
+    for (const mod of hotReloadable) {
+      try {
+        const resolved = require.resolve('./' + mod);
+        if (require.cache[resolved]) {
+          delete require.cache[resolved];
+          flushed++;
+        }
+      } catch {}
+    }
+
+    // Force GC
+    if (global.gc) { global.gc(); flushed++; }
+
+    if (flushed > 0) {
+      return { healed: true, avenue: 'cache_flush', detail: `${flushed} cache(s) cleared` };
+    }
+    return { healed: false, avenue: 'cache_flush', detail: 'nothing to flush' };
+  } catch (e: any) {
+    return { healed: false, avenue: 'cache_flush', detail: e.message };
+  }
+}
+
+/**
+ * Run all runtime healing avenues in parallel.
+ * Returns the first successful result, or null if all failed.
+ * These are much faster than code-patch healing (seconds vs minutes)
+ * and don't require /tmp overlay or code generation.
+ */
+async function performRuntimeHeal(): Promise<{ healed: boolean; results: RuntimeHealResult[] }> {
+  const avenues: Array<() => Promise<RuntimeHealResult>> = [
+    runtimeHealDatabase,
+    runtimeHealConfig,
+    runtimeHealSelectors,
+    runtimeHealModuleQuarantine,
+    runtimeHealProviders,
+    runtimeHealAuth,
+    runtimeHealCacheFlush,
+  ];
+
+  log(`Running ${avenues.length} runtime healing avenues in parallel...`, 'INFO', 'self-heal');
+
+  const results = await Promise.allSettled(avenues.map(fn => fn()));
+  const healed: RuntimeHealResult[] = [];
+  let anySuccess = false;
+
+  for (const result of results) {
+    if (result.status === 'fulfilled') {
+      healed.push(result.value);
+      if (result.value.healed) {
+        anySuccess = true;
+        log(`Runtime heal SUCCESS: ${result.value.avenue} — ${result.value.detail}`, 'INFO', 'self-heal');
+      } else {
+        log(`Runtime heal skip: ${result.value.avenue} — ${result.value.detail}`, 'DEBUG', 'self-heal');
+      }
+    } else {
+      healed.push({ healed: false, avenue: 'unknown', detail: result.reason?.message || 'rejected' });
+    }
+  }
+
+  // Record in DB
+  try {
+    const successes = healed.filter(r => r.healed);
+    getInsertSelfHealEvent()?.(
+      Date.now(), 'runtime_heal', anySuccess ? 'completed' : 'failed',
+      `${successes.length}/${avenues.length} avenues succeeded`,
+      null, 0, 0, 0, anySuccess ? 'success' : null,
+      0, JSON.stringify(healed.map(r => ({ a: r.avenue, h: r.healed, d: r.detail })))
+    );
+  } catch {}
+
+  return { healed: anySuccess, results: healed };
+}
+
 // ═══════════════════════════════════════════════════════════
 //  SAFETY LIMITS
 // ═══════════════════════════════════════════════════════════
@@ -937,5 +1350,8 @@ module.exports = {
     _maybeWrapWithCircuitBreaker();
     return _exportedPerformSelfHeal;
   },
+  // v9: Expose runtime heal separately for fast-path use from cycle-manager
+  // (bypasses /tmp overlay, code patches, daily limits, and cooldown).
+  performRuntimeHeal,
   _injectDependencies
 };
