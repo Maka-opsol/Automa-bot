@@ -83,16 +83,57 @@ async function _checkOrPark(log: any): Promise<boolean> {
     const budgetPct = orLimiter.getBudgetPct?.();
     if (budgetPct === undefined || budgetPct > 0) return false; // Budget available
 
-    // Budget is 0 — check if other providers exist
+    // Budget is 0 — check if other providers are FUNCTIONAL (not just configured)
     const registry = require('./providers-registry');
     const providers = await registry.getAvailableProviders?.();
-    const hasOthers = Array.isArray(providers) && providers.some((p: any) => p.name !== 'OpenRouter');
-    if (hasOthers) {
-      log('OR budget exhausted but other providers available — not parking', 'INFO', 'cycle');
-      return false;
+    const nonOrProviders = Array.isArray(providers) ? providers.filter((p: any) => p.name !== 'OpenRouter') : [];
+
+    if (nonOrProviders.length > 0) {
+      // Other providers exist — but are they actually functional?
+      // Check if all of them have very low health (recent 429s)
+      let anyHealthy = false;
+      try {
+        const health = require('./providers-health');
+        for (const p of nonOrProviders) {
+          const snapshot = health.getHealthSnapshot?.(p.name);
+          // If provider has been called recently and has decent health, it's functional
+          if (snapshot && snapshot.totalCalls >= 1 && snapshot.healthScore >= 0.3) {
+            anyHealthy = true;
+            break;
+          }
+          // If no calls recorded yet, assume potentially healthy (new provider)
+          if (snapshot && snapshot.totalCalls === 0) {
+            anyHealthy = true;
+            break;
+          }
+        }
+      } catch {}
+
+      // Check Cloudflare model cooldowns — if ALL models on cooldown, CF is dead too
+      let cfAllOnCooldown = false;
+      if (!anyHealthy) {
+        try {
+          const cfProvider = require('./providers-cloudflare');
+          const modelChain = cfProvider._getModelChain?.();
+          if (Array.isArray(modelChain) && modelChain.length > 0) {
+            // We can't directly check cooldowns, but if no provider is healthy, CF is likely dead
+            cfAllOnCooldown = true;
+          }
+        } catch {}
+      }
+
+      if (anyHealthy) {
+        log('OR budget exhausted but other healthy providers available — not parking', 'INFO', 'cycle');
+        return false;
+      }
+
+      // All non-OR providers are also down — enter park
+      log('OR budget exhausted AND all other providers are down (all 429). Parking until midnight UTC.', 'WARN', 'cycle');
+    } else {
+      log('OR daily limit exhausted, no other providers configured. Parking until midnight UTC.', 'WARN', 'cycle');
     }
 
-    // No other providers — enter park
+    // Enter park (either no other providers, or all are 429'd)
     _orParked = true;
     _orParkedDate = new Date().toISOString().slice(0, 10);
 
@@ -1637,4 +1678,4 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   }
 }
 
-module.exports = { runCycle, requestStop, _injectDependencies };
+module.exports = { runCycle, requestStop, isOrParked: () => _orParked, _injectDependencies };
