@@ -163,6 +163,23 @@ const TRANSIENT_ERROR_CODES = new Set([
   'E_CONNECTION_FAILED', // ECONNREFUSED/ENOTFOUND
 ]);
 
+// v6: Error codes that indicate the bot is structurally stuck and self-heal
+// should investigate. These bypass the normal "consecutiveFailures >= threshold"
+// gate because the bot may not be "failing" in the traditional sense —
+// it's running but making no progress (worse than failing).
+const PROGRESS_STALL_CODES = new Set([
+  'E_PROGRESS_STALL',   // 0 questions in PROGRESS_TIMEOUT_MS
+  'E_SLOW_PROGRESS',    // questions completed but then stalled for 2x timeout
+]);
+
+// v6: Healable codes — self-heal should fire for these even at lower thresholds.
+// Expanded to include progress stalls and restart loops.
+const HEALABLE_ERROR_CODES = new Set([
+  'E_SELECTOR_DRIFT', 'E_UI_CHANGED', 'E_PROVIDER_PERMANENT',
+  'E_STATE_DEADLOCK', 'E_PATCH_FAILED',
+  'E_PROGRESS_STALL', 'E_SLOW_PROGRESS', 'E_RESTART_LOOP',
+]);
+
 /**
  * Record an error code in the rotating buffer. Called after every cycle error.
  */
@@ -180,35 +197,117 @@ function _recordErrorForDesperation(code: string) {
 }
 
 /**
- * v4: Assess whether the bot is DESPERATELY in need of self-heal.
+ * v6: Return a human-readable reason for WHY self-heal is triggering.
+ * Used in log messages so operators can quickly understand the cause.
+ */
+function _getSelfHealReason(CONFIG: any): string {
+  // Check progress stall first (most likely new trigger)
+  if (_recentErrorCodes.length > 0) {
+    const stallCode = _recentErrorCodes.find(e => PROGRESS_STALL_CODES.has(e.code));
+    if (stallCode) {
+      if (stallCode.code === 'E_PROGRESS_STALL') return 'no progress in 30min';
+      if (stallCode.code === 'E_SLOW_PROGRESS') return 'slow progress (stalled after initial questions)';
+    }
+  }
+
+  // Check restart loop
+  try {
+    const guardian = require('./survival-restart-guardian');
+    if (guardian.isEmergencyMode?.()) return 'OOM loop detected by restart guardian';
+    const status = guardian.getStatus?.();
+    if (status) {
+      const recent = status.recentUnexpectedRestarts || 0;
+      if (recent >= 2) return `${recent} unexpected restarts in 30min`;
+      if ((status.totalRestartsRecorded || 0) >= 5) return `${status.totalRestartsRecorded} total unexpected restarts`;
+    }
+  } catch {}
+
+  // Check error pattern
+  if (_recentErrorCodes.length >= 3) {
+    const healableCodes = new Set(
+      _recentErrorCodes.filter(e => HEALABLE_ERROR_CODES.has(e.code)).map(e => e.code)
+    );
+    if (healableCodes.size > 0) return `healable errors: ${[...healableCodes].join(', ')}`;
+    const nonTransient = new Set(
+      _recentErrorCodes.filter(e => !TRANSIENT_ERROR_CODES.has(e.code)).map(e => e.code)
+    );
+    if (nonTransient.size >= 3) return `${nonTransient.size} different non-transient error codes`;
+  }
+
+  return `${consecutiveFailures} consecutive failures >= threshold ${CONFIG.SELF_HEAL_FAILURE_THRESHOLD}`;
+}
+
+/**
+ * v6: Assess whether the bot is DESPERATELY in need of self-heal.
  *
- * Returns true ONLY when:
- *   1. The error is classified as healable (selector drift, UI change, etc.)
- *      AND consecutive failures >= threshold, OR
- *   2. There are 3+ DIFFERENT non-transient error codes in the recent window
- *      (suggests cascading structural failure, not a single transient issue), OR
- *   3. The survival-restart-guardian has emergency mode active (OOM loop).
+ * Returns true when ANY of these conditions are met:
+ *
+ *   1. PROGRESS STALL: A progress stall error (E_PROGRESS_STALL or
+ *      E_SLOW_PROGRESS) was thrown. These are ALWAYS desperate — the bot
+ *      is running but not making progress, which is worse than failing.
+ *      Self-heal should investigate why (bad selectors, UI change, logic bug).
+ *
+ *   2. RESTART LOOP: The survival-restart-guardian has recorded multiple
+ *      unexpected restarts (OOM kills, crashes) in a short window. This
+ *      means the bot is in a crash loop that self-heal should try to fix
+ *      (e.g., memory leak, infinite loop, broken dependency).
+ *
+ *   3. OOM EMERGENCY: The survival guardian has activated emergency mode.
+ *
+ *   4. HEALABLE ERRORS: The error is classified as healable (selector drift,
+ *      UI change, etc.) AND consecutive failures >= threshold.
+ *
+ *   5. CASCADING FAILURES: 3+ DIFFERENT non-transient error codes in the
+ *      recent window (suggests cascading structural failure).
+ *
+ *   6. DIVERSE FAILURE MIX: 2+ different non-transient codes AND very
+ *      high failure count (2x threshold).
  *
  * Returns false when:
  *   - All recent errors are transient (rate limits, timeouts, captchas)
  *   - Same transient error repeating (provider outage, not code breakage)
- *   - Fewer than threshold consecutive failures
+ *   - Fewer than threshold consecutive failures (and no stall/restart trigger)
  *   - A self-heal session is already active
  */
 function _isDesperatelyBroken(CONFIG: any): boolean {
-  // Must have enough consecutive failures
-  if (consecutiveFailures < CONFIG.SELF_HEAL_FAILURE_THRESHOLD) return false;
+  // ── Trigger 1: Progress stall — ALWAYS desperate regardless of failure count ──
+  // The bot is running but achieving nothing. This is the most insidious
+  // failure mode because it doesn't throw errors — it just wastes time.
+  if (_recentErrorCodes.length > 0) {
+    const hasStall = _recentErrorCodes.some(e => PROGRESS_STALL_CODES.has(e.code));
+    if (hasStall) {
+      // Only require 1 consecutive failure (the stall itself) to trigger self-heal
+      return consecutiveFailures >= 1;
+    }
+  }
 
-  // Check if survival guardian has detected an OOM loop
+  // ── Trigger 2: Restart loop — crash count is high ──
+  // Even if the current cycle hasn't failed, if the bot has been restarting
+   // frequently, something structural is wrong that self-heal should investigate.
   try {
     const guardian = require('./survival-restart-guardian');
     if (guardian.isEmergencyMode?.()) return true;
+    // Also check for moderate restart count — don't wait for full emergency mode
+    const status = guardian.getStatus?.();
+    if (status) {
+      const recentRestarts = status.recentUnexpectedRestarts || 0;
+      const totalRestarts = status.totalRestartsRecorded || 0;
+      // 2+ unexpected restarts in 30min = likely a fixable crash loop
+      if (recentRestarts >= 2) {
+        return true;
+      }
+      // 5+ total unexpected restarts since boot = accumulated instability
+      if (totalRestarts >= 5 && consecutiveFailures >= 2) {
+        return true;
+      }
+    }
   } catch {}
 
+  // ── Original triggers (v4): require consecutive failure threshold ──
+  if (consecutiveFailures < CONFIG.SELF_HEAL_FAILURE_THRESHOLD) return false;
+
   // If we have very few recent errors recorded, fall back to count-only check
-  // (first few cycles — not enough data for pattern analysis)
   if (_recentErrorCodes.length < 3) {
-    // With no error classification data, require higher threshold
     return consecutiveFailures >= Math.max(CONFIG.SELF_HEAL_FAILURE_THRESHOLD, 10);
   }
 
@@ -218,31 +317,25 @@ function _isDesperatelyBroken(CONFIG: any): boolean {
     _recentErrorCodes.filter(e => !TRANSIENT_ERROR_CODES.has(e.code)).map(e => e.code)
   );
   const healableCodes = new Set(
-    _recentErrorCodes.filter(e => {
-      // Healable codes from errors.ts
-      const h = ['E_SELECTOR_DRIFT', 'E_UI_CHANGED', 'E_PROVIDER_PERMANENT', 'E_STATE_DEADLOCK', 'E_PATCH_FAILED'];
-      return h.includes(e.code);
-    }).map(e => e.code)
+    _recentErrorCodes.filter(e => HEALABLE_ERROR_CODES.has(e.code)).map(e => e.code)
   );
 
-  // Case 1: Explicitly healable errors with enough consecutive failures
+  // Case 4: Explicitly healable errors with enough consecutive failures
   if (healableCodes.size > 0 && consecutiveFailures >= CONFIG.SELF_HEAL_FAILURE_THRESHOLD) {
     return true;
   }
 
-  // Case 2: ALL errors are transient — NOT desperate, just unlucky
+  // Case 5: ALL errors are transient — NOT desperate, just unlucky
   if (transientCount === _recentErrorCodes.length) {
-    // Same transient error repeating? Definitely not structural.
     if (nonTransientCodes.size === 0) return false;
   }
 
-  // Case 3: 3+ DIFFERENT non-transient error codes = cascading structural failure
+  // Case 6: 3+ DIFFERENT non-transient error codes = cascading structural failure
   if (nonTransientCodes.size >= 3) {
     return true;
   }
 
-  // Case 4: Mix of transient and non-transient, but non-transient are diverse
-  // (2+ different non-transient codes) AND failures are very high
+  // Case 7: Mix of transient and non-transient, but non-transient are diverse
   if (nonTransientCodes.size >= 2 && consecutiveFailures >= CONFIG.SELF_HEAL_FAILURE_THRESHOLD * 2) {
     return true;
   }
@@ -1647,8 +1740,35 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           continue; // Re-evaluate on next iteration
         }
       } catch { /* non-critical: persistent-config not available */ }
-      if (questionsCompleted > 0) lastProgressTime = Date.now();
-      else if (Date.now() - lastProgressTime > CONFIG.PROGRESS_TIMEOUT_MS) { throw new Error('Progress timeout'); }
+      if (questionsCompleted > 0) {
+        lastProgressTime = Date.now();
+      } else if (Date.now() - lastProgressTime > CONFIG.PROGRESS_TIMEOUT_MS) {
+        // v6: Progress timeout — throw a CLASSIFIED error so self-heal can trigger.
+        // Previously this was a plain Error which fell through as 'fatal' (not retryable,
+        // not healable), so self-heal NEVER fired on progress stalls. The bot just
+        // retried the cycle endlessly. Now we throw a structured error with a
+        // healable code so _isDesperatelyBroken recognizes it.
+        const progressErr: any = new Error(`Progress timeout: 0 questions completed in ${Math.round(CONFIG.PROGRESS_TIMEOUT_MS / 60000)}min`);
+        progressErr.code = 'E_PROGRESS_STALL';
+        progressErr.retryable = false;
+        progressErr.healable = true;
+        throw progressErr;
+      }
+
+      // v6: Slow progress detection — even if some questions completed, if we
+      // haven't completed ANY in PROGRESS_SLOW_TIMEOUT_MS, the bot is likely
+      // stuck in a loop (answering the same question wrong, clicking the wrong
+      // button, etc.). This is structurally broken behavior that self-heal should
+      // investigate. Uses a separate, longer timeout than the zero-progress case.
+      // Default: 2x PROGRESS_TIMEOUT_MS (60min with default 30min config).
+      const SLOW_PROGRESS_MS = (CONFIG.PROGRESS_SLOW_TIMEOUT_MS || CONFIG.PROGRESS_TIMEOUT_MS * 2);
+      if (questionsCompleted > 0 && Date.now() - lastProgressTime > SLOW_PROGRESS_MS) {
+        const slowErr: any = new Error(`Slow progress: last question completion was ${Math.round((Date.now() - lastProgressTime) / 60000)}min ago`);
+        slowErr.code = 'E_SLOW_PROGRESS';
+        slowErr.retryable = false;
+        slowErr.healable = true;
+        throw slowErr;
+      }
 
       // Save session to pool
       if (humanCaptcha) {
@@ -1678,9 +1798,13 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     }
   } catch (err: any) {
     const errorType = classifyProviderError?.(err);
-    const isRetryable = errorType?.retryable ?? false;
-    const isHealable = errorType?.healable ?? false;
-    const errorCode = errorType?.code || 'E_UNKNOWN';
+    // v6: Fall back to properties set directly on the error object.
+    // classifyProviderError only recognizes MathUBotError instances and
+    // common Node/Playwright patterns. Custom structured errors (like
+    // progress stalls) carry their own code/retryable/healable.
+    const isRetryable = errorType?.retryable ?? err.retryable ?? false;
+    const isHealable = errorType?.healable ?? err.healable ?? false;
+    const errorCode = errorType?.code || err.code || 'E_UNKNOWN';
     logError(`Cycle error (${errorCode})`, err);
     // Resilience: report failure to cascade breaker
     cascadeBreaker?.recordFailure?.('cycleManager', err);
@@ -1704,7 +1828,9 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // v4: Only attempt self-heal when the bot is DESPERATELY broken.
       // See _isDesperatelyBroken() for the full criteria.
       if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning && performSelfHeal && _isDesperatelyBroken(CONFIG)) {
-        log(`${consecutiveFailures} consecutive failures (DESPERATE: error pattern analysis passed). Attempting self-heal...`, 'WARN', 'cycle');
+        // Build a human-readable reason for WHY self-heal triggered
+        const healReason = _getSelfHealReason(CONFIG);
+        log(`${consecutiveFailures} consecutive failures (DESPERATE: ${healReason}). Attempting self-heal...`, 'WARN', 'cycle');
         selfHealRunning = true;
         performSelfHeal().then((healed: any) => { 
           selfHealRunning = false;
