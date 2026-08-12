@@ -518,38 +518,6 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const info = cs.getColdStartInfo();
       log(`Cold start recovery: ${info?.reason || 'unknown'}. Using fast startup path.`, 'INFO', 'cycle');
       cs._recoveryLogged = true;
-
-      // v12: CHECKPOINT RESUME — if the previous instance was OOM-killed mid-heal,
-      // there's a checkpoint in the DB. Log it and schedule an immediate self-heal
-      // to resume from where we left off. This is the key to restart-proof healing:
-      // the bot doesn't start from scratch, it CONTINUES the interrupted pipeline.
-      try {
-        const ckptModule = require('./self-heal-checkpoint');
-        const ckptStatus = ckptModule.getStatus();
-        if (ckptStatus.hasCheckpoint) {
-          log(`HEAL CHECKPOINT FOUND: phase=${ckptStatus.phase}, age=${Math.round((ckptStatus.age || 0) / 60000)}min, mem_at_save=${Math.round((ckptStatus.memoryAtSave || 0) / 1024 / 1024)}MB — will resume on next self-heal trigger`, 'WARN', 'cycle');
-          // Trigger self-heal immediately (after a brief 10s delay for bot stabilization)
-          const performSelfHeal = getDep('selfHeal')?.performSelfHeal;
-          if (performSelfHeal && CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
-            log('Scheduling immediate self-heal to resume from checkpoint (10s delay)...', 'INFO', 'cycle');
-            setTimeout(() => {
-              if (selfHealRunning) return; // Already healing
-              selfHealRunning = true;
-              performSelfHeal().then((healed: any) => {
-                selfHealRunning = false;
-                if (healed) {
-                  log('Checkpoint resume self-heal SUCCEEDED. Clearing checkpoint.', 'INFO', 'cycle');
-                  consecutiveFailures = 0;
-                } else {
-                  log('Checkpoint resume self-heal paused (more phases remaining). Will retry next cycle.', 'WARN', 'cycle');
-                }
-              }).catch((e: any) => { selfHealRunning = false; logError('Checkpoint resume self-heal threw error', e); });
-            }, 10 * 1000).unref?.();
-          }
-        }
-      } catch (ckptErr: any) {
-        // Non-critical — checkpoint module may not exist
-      }
     }
   } catch { /* non-critical */ }
   try {
@@ -762,6 +730,44 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
     while (questionsCompleted < CONFIG.MAX_QUESTIONS && !stopRequested) {
       try { fs.writeFileSync(CONFIG.HEARTBEAT_FILE, String(Date.now())); } catch (_e: any) { /* best-effort heartbeat write */ }
+
+      // v11: OOM EMERGENCY PERIODIC HEAL — check at the top of every cycle
+      // iteration. If the restart guardian is in emergency mode (OOM loop
+      // detected), fire performRuntimeHeal directly. This runs even when
+      // cycles succeed (no errors) or when all errors are transient (429s).
+      // Without this, self-heal only fires inside error handlers which
+      // require specific error classifications.
+      if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
+        try {
+          const guardian = require('./survival-restart-guardian');
+          if (guardian.isEmergencyMode?.()) {
+            const cycleNum = getStats().cycleCount || 0;
+            // Only attempt every 3rd cycle to avoid healing on every single iteration
+            if (cycleNum % 3 === 0) {
+              log('OOM emergency: periodic runtime heal at cycle top', 'WARN', 'cycle');
+              selfHealRunning = true;
+              const directHeal = require('./self-heal').performRuntimeHeal;
+              if (typeof directHeal === 'function') {
+                directHeal().then((rtResult: any) => {
+                  selfHealRunning = false;
+                  if (rtResult?.healed) {
+                    const avenues = rtResult.results?.filter((r: any) => r.healed).map((r: any) => r.avenue).join(', ');
+                    log(`OOM emergency periodic heal SUCCEEDED: ${avenues}`, 'INFO', 'cycle');
+                    // Reset circuit breaker
+                    try {
+                      const cb = require('./self-heal-circuit-breaker');
+                      const breaker = cb.healerCircuitBreaker || cb;
+                      if (typeof breaker.reset === 'function') breaker.reset();
+                    } catch {}
+                  }
+                }).catch(() => { selfHealRunning = false; });
+              } else {
+                selfHealRunning = false;
+              }
+            }
+          }
+        } catch {}
+      }
 
       // ── OR Budget Park: skip everything when OR is exhausted ──
       // When parked, we skip screenshots, tribunal, and all actions.
@@ -2000,22 +2006,46 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // v10: Error-rate spike override — even transient errors trigger runtime
       // heal if they're coming in fast enough. 6+ errors in 2min suggests
       // something systemic (broken network interceptor, stuck rate limiter).
-      if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning && _isErrorRateSpiking()) {
-        const performRuntimeHeal = getDep('selfHeal')?.performRuntimeHeal;
-        if (performRuntimeHeal) {
-          log(`Error-rate spike detected (${_recentErrorCodes.filter(e => Date.now() - e.ts < 120000).length} errors in 2min) — triggering runtime heal despite transient classification`, 'WARN', 'cycle');
+      //
+      // v11: OOM EMERGENCY OVERRIDE — when the restart guardian is in
+      // emergency mode (detected OOM loop), self-heal MUST fire regardless
+      // of error classification. Without this, a cycle that only sees 429s
+      // (transient) never reaches _isDesperatelyBroken() because it's in
+      // the wrong branch of the if/else chain. The bot knows it's in an
+      // OOM loop but self-heal never runs.
+      const isEmergencyMode = (() => { try { return require('./survival-restart-guardian').isEmergencyMode?.(); } catch { return false; } })();
+      if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning && (_isErrorRateSpiking() || isEmergencyMode)) {
+        const reason = isEmergencyMode ? 'OOM emergency mode' : 'error-rate spike';
+        // In OOM emergency, call performRuntimeHeal DIRECTLY (bypasses circuit
+        // breaker). The normal getDep path goes through the circuit breaker
+        // wrapper which may be OPEN from previous failed heals.
+        const healFn = isEmergencyMode
+          ? (() => { try { return require('./self-heal').performRuntimeHeal; } catch { return null; } })()
+          : getDep('selfHeal')?.performRuntimeHeal;
+        if (healFn) {
+          log(`${reason} detected — triggering runtime heal despite transient classification`, 'WARN', 'cycle');
           try {
             const memoryMode = require('./memory-mode');
             if (memoryMode.isMemoryProtection?.()) {
-              memoryMode.beginSelfHealSession?.('error_rate_spike');
+              memoryMode.beginSelfHealSession?.(isEmergencyMode ? 'oom_emergency_transient' : 'error_rate_spike');
             }
           } catch {}
-          performRuntimeHeal().then((rtResult: any) => {
+          selfHealRunning = true;
+          healFn().then((rtResult: any) => {
+            selfHealRunning = false;
             if (rtResult?.healed) {
-              log(`Error-rate spike: runtime heal succeeded`, 'INFO', 'cycle');
-              consecutiveFailures = Math.max(0, consecutiveFailures - 1);
+              log(`${reason}: runtime heal succeeded`, 'INFO', 'cycle');
+              consecutiveFailures = Math.max(0, consecutiveFailures - 2);
+              // Reset circuit breaker on successful OOM emergency heal
+              if (isEmergencyMode) {
+                try {
+                  const cb = require('./self-heal-circuit-breaker');
+                  const breaker = cb.healerCircuitBreaker || cb;
+                  if (typeof breaker.reset === 'function') breaker.reset();
+                } catch {}
+              }
             }
-          }).catch(() => {});
+          }).catch(() => { selfHealRunning = false; });
         }
       }
     } else if (isErrorFatal) {
