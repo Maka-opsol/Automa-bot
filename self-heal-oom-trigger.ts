@@ -443,10 +443,71 @@ function init(options: {
   return { healScheduled: false, oomKillCount };
 }
 
+/**
+ * Re-check OOM loop detection AFTER Turso sync has populated the local DB.
+ *
+ * On Render free tier, init() runs before Turso sync. The local SQLite
+ * is empty (ephemeral disk wiped by OOM restart), so both the restart
+ * guardian and this module see 0 restart/OOM records. After Turso pulls
+ * data from the cloud, this function re-checks and triggers self-heal
+ * if an OOM loop is now visible.
+ *
+ * Also records the process_lifecycle start event (which may have failed
+ * during init() if the table didn't exist yet — Turso sync creates it).
+ */
+function recheckAfterTursoSync(): { healScheduled: boolean; oomKillCount: number } {
+  // Re-record process start — the table might not have existed during init()
+  // Now that Turso has synced, the table exists and the start is persisted.
+  try {
+    const db = getDb();
+    if (db) {
+      // Check if we already recorded a start for this PID
+      const existing = db.prepare(
+        'SELECT id FROM process_lifecycle WHERE pid = ? AND event = ? ORDER BY timestamp DESC LIMIT 1'
+      ).get(process.pid, 'start');
+      if (!existing) {
+        recordProcessStart(false, 0);
+        log('Recorded process start in process_lifecycle (table now available post-Turso)', 'DEBUG');
+      }
+    }
+  } catch { /* non-critical */ }
+
+  // Now re-check OOM conditions with the restored DB data
+  const oomKillCount = getRecentOOMKillCount();
+
+  // Also re-check via the restart guardian (which also re-reads DB)
+  let guardianSeesLoop = false;
+  try {
+    const guardian = require('./survival-restart-guardian');
+    const status = guardian.getStatus?.();
+    if (status && (status.recentUnexpectedRestarts >= 2 || status.emergencyModeActive)) {
+      guardianSeesLoop = true;
+    }
+  } catch { /* guardian not available */ }
+
+  if (guardianSeesLoop || oomKillCount >= 2) {
+    log(`Post-Turso recheck: OOM loop CONFIRMED (guardian=${guardianSeesLoop}, lifecycle_ooms=${oomKillCount})`, 'ERROR');
+
+    if (shouldScheduleBootHeal()) {
+      log(`Post-Turso OOM self-heal TRIGGERED`, 'ERROR');
+      const timer = setTimeout(() => {
+        triggerBootHeal().catch(() => {});
+      }, 5000); // Shorter delay — subsystems already running
+      if (timer?.unref) timer.unref();
+      return { healScheduled: true, oomKillCount };
+    } else {
+      log(`Post-Turso: OOM loop confirmed but boot heal in cooldown`, 'WARN');
+    }
+  }
+
+  return { healScheduled: false, oomKillCount };
+}
+
 module.exports = {
   init,
   recordProcessStop,
   getRecentOOMKillCount,
   gatherOOMDiagnostics,
+  recheckAfterTursoSync,
   _injectDependencies,
 };
