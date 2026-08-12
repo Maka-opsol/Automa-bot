@@ -103,18 +103,26 @@ function getMemorySnapshot(): string {
 
 /**
  * Attempt to free memory: GC, close browser, clear caches, shed.
- * v3: Now also calls memoryMode.shedMemory() for comprehensive cleanup.
+ * v5 FIX: Now async — awaits shedMemory so browser cleanup actually completes.
+ * v5 FIX: Does a second GC after 1s delay to reclaim objects freed by async cleanup.
+ * v6 FIX: Accepts preserveBrowser option to avoid closing browser mid-quiz.
  * Returns true if memory dropped below soft threshold after recovery.
  */
-function attemptMemoryRecovery(): boolean {
+async function attemptMemoryRecovery(options?: { preserveBrowser?: boolean }): Promise<boolean> {
+  const preserveBrowser = options?.preserveBrowser ?? false;
   const beforeMB = getHeapUsedMB();
-  log(`Memory recovery started at ${beforeMB.toFixed(1)}MB`, 'WARN');
+  log(`Memory recovery started at ${beforeMB.toFixed(1)}MB, preserveBrowser=${preserveBrowser}`, 'WARN');
 
-  // Step 1: Use memory-mode's comprehensive shed (browser, caches, GC, etc.)
+  // Step 1: Use memory-mode's graduated shed
+  // v6: Pass preserveBrowser and targetMB to stop early if we free enough
+  const thresholds = _getThresholds();
   try {
     const memoryMode = require('./memory-mode');
     if (memoryMode.shedMemory) {
-      memoryMode.shedMemory('heap-guardian-soft');
+      await memoryMode.shedMemory('heap-guardian-soft', {
+        preserveBrowser,
+        targetMB: thresholds.softMB - 20, // aim 20MB below soft threshold
+      });
     }
   } catch { /* memory-mode not available, fall through to manual steps */ }
 
@@ -127,6 +135,19 @@ function attemptMemoryRecovery(): boolean {
   } catch (e: any) {
     logError('GC failed', e);
   }
+
+  // Step 3: v5 FIX — Second GC after brief pause.
+  // Browser cleanup and cache clearing free objects asynchronously.
+  // A second GC pass after 1s catches stragglers that the first pass missed.
+  // This replaces the old 3s .unref() timeout that NEVER fired on the
+  // hard-threshold exit path.
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  try {
+    if (global.gc) {
+      global.gc();
+      log('Second GC pass (post-async-cleanup)', 'DEBUG');
+    }
+  } catch { /* ignore */ }
 
   const afterMB = getHeapUsedMB();
   const thresholds = _getThresholds();
@@ -153,9 +174,12 @@ async function pushTombstoneBeforeDeath(): Promise<void> {
 
 /**
  * Check memory and take action. Called by interval monitor AND cycle loop.
+ * v5 FIX: Now async — awaits memory recovery so browser is actually freed.
+ * v6 FIX: Accepts preserveBrowser option for mid-quiz protection.
  * Returns true if hard threshold was hit (caller should abort).
  */
-function checkMemory(): boolean {
+async function checkMemory(options?: { preserveBrowser?: boolean }): Promise<boolean> {
+  const preserveBrowser = options?.preserveBrowser ?? false;
   const heapMB = getHeapUsedMB();
   const thresholds = _getThresholds();
   const softThreshold = (getCONFIG().HEAP_GUARDIAN_SOFT_THRESHOLD_MB as number) || thresholds.softMB;
@@ -192,7 +216,14 @@ function checkMemory(): boolean {
       origExit(137);
     }
 
-    attemptMemoryRecovery();
+    // v5 FIX: await the recovery so browser actually closes BEFORE we check
+    // if memory is still critical. Old code fire-and-forget'd this, so heap
+    // was still at 300MB+ when the "still critical" check ran.
+    // v6 FIX: pass preserveBrowser — on hard threshold, still try to save the page
+    // unless the caller explicitly said not to. But if we're on the 3rd
+    // hard trigger, preserveBrowser is overridden (bot is dying anyway).
+    const hardPreserve = _hardTriggerCount >= MAX_HARD_TRIGGERS - 1 ? false : preserveBrowser;
+    await attemptMemoryRecovery({ preserveBrowser: hardPreserve });
 
     const afterRecoveryMB = getHeapUsedMB();
     if (afterRecoveryMB >= hardThreshold) {
@@ -224,7 +255,9 @@ function checkMemory(): boolean {
   if (heapMB >= softThreshold && !_softTriggered) {
     _softTriggered = true;
     log(`SOFT OOM THRESHOLD HIT: ${getMemorySnapshot()} (mode=${_getModeName()})`, 'WARN');
-    const recovered = attemptMemoryRecovery();
+    // v5 FIX: await the recovery
+    // v6 FIX: pass preserveBrowser for soft threshold too
+    const recovered = await attemptMemoryRecovery({ preserveBrowser });
     if (!recovered) {
       log('Memory still above soft threshold after recovery. Continuing with reduced operations.', 'WARN');
     } else {
@@ -263,7 +296,7 @@ function start(): void {
 
   _monitorInterval = setInterval(() => {
     try {
-      checkMemory();
+      checkMemory().catch((e: any) => logError('Async heap guardian check failed', e));
     } catch (e: any) {
       logError('Heap guardian check failed', e);
     }
