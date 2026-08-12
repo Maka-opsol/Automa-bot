@@ -673,7 +673,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         } catch { /* retry failed — proceed with original */ }
       }
 
-      const base64 = screenshot.toString('base64');
+      let base64 = screenshot.toString('base64');
       // Feed screenshot to dashboard cache (non-blocking)
 
       // ─── Cloudinary: upload cycle screenshot (fire-and-forget) ───
