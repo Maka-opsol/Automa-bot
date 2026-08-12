@@ -719,6 +719,36 @@ function clearRestartHistory(): void {
   _log('Restart history cleared', 'INFO');
 }
 
+/**
+ * Re-check restart history AFTER Turso sync has populated the local DB.
+ *
+ * On Render free tier, the local SQLite is empty after an OOM restart
+ * (ephemeral disk wiped). init() runs before Turso sync, so it sees 0
+ * restart records. This function is called after Turso pulls data from
+ * the cloud, so the restart_guardian_history calibration entry is now
+ * available.
+ *
+ * Returns true if emergency mode was activated by this recheck.
+ */
+function recheckAfterTursoSync(): { activated: boolean; recentCount: number } {
+  // Force reload from DB (bypass _stateLoaded cache)
+  _stateLoaded = false;
+  _loadState();
+
+  const recent = _getRecentUnexpectedRestarts();
+  if (recent.length >= RESTART_THRESHOLD) {
+    _log(`Post-Turso recheck: ${recent.length} unexpected restarts found in DB — activating emergency mode`, 'ERROR');
+    _activateEmergencyMode(recent);
+    return { activated: true, recentCount: recent.length };
+  } else if (recent.length >= 1) {
+    _log(`Post-Turso recheck: ${recent.length} unexpected restart(s) found — memory_protection as precaution`, 'WARN');
+    _switchToMemoryProtection(`post_turso_recheck:${recent.length}_restart(s)`);
+    return { activated: false, recentCount: recent.length };
+  }
+
+  return { activated: false, recentCount: 0 };
+}
+
 module.exports = {
   // Lifecycle
   init,
@@ -733,6 +763,9 @@ module.exports = {
   preserveBeforeExit,
   isEmergencyMode,
   activateEmergencyMode: () => _activateEmergencyMode(_getRecentUnexpectedRestarts()),
+
+  // Post-Turso recheck
+  recheckAfterTursoSync,
 
   // Status
   getStatus,
