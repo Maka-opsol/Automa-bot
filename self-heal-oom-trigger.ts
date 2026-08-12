@@ -188,7 +188,7 @@ function shouldScheduleBootHeal(): boolean {
   }
 
   // Check 2: Cooldown — don't schedule if we recently tried
-  // EXCEPTION: If 3+ OOM kills in 30min, we're in an active death spiral.
+  // EXCEPTION: If 2+ OOM kills in 30min, we're in an active death spiral.
   // The cooldown marker persists across OOM restarts (it's in DB/Turso),
   // so each new boot sees "cooldown active" and skips the heal forever.
   // In a death spiral, the cooldown must be bypassed.
