@@ -224,6 +224,32 @@ if (memoryMode.isMemoryProtection()) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// OOM SELF-HEAL TRIGGER — Connect OOM loop detection to self-heal
+// ═══════════════════════════════════════════════════════════════════════
+// The restart guardian detects OOM loops but only switches to
+// memory_protection mode (symptom treatment). This module triggers
+// self-heal at boot time to fix the ROOT CAUSE.
+// It runs after a 15s delay (gives subsystems time to init) and
+// records everything to DB so progress accumulates across OOMs.
+try {
+  const oomTrigger = require('./self-heal-oom-trigger');
+  oomTrigger._injectDependencies({
+    logger: container.get('logger', { required: false }),
+    database: container.get('database', { required: false }),
+  });
+  const oomResult = oomTrigger.init({
+    wasUnexpected: guardianResult.wasUnexpected,
+    emergencyMode: guardianResult.emergencyMode,
+    recentRestartCount: guardianResult.recentRestartCount,
+  });
+  if (oomResult.healScheduled) {
+    log(`OOM self-heal TRIGGERED at boot (detected ${oomResult.oomKillCount} OOM kills in process_lifecycle)`, 'ERROR', 'render-free-plan');
+  }
+} catch (oomTriggerErr: any) {
+  log(`OOM trigger init failed (non-fatal): ${oomTriggerErr.message}`, 'WARN', 'render-free-plan');
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // SUBSYSTEMS: Start ALL of them (respecting mode-specific env vars above)
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -379,6 +405,8 @@ async function gracefulShutdown(signal: string) {
   requestStop();
   // v4: Write clean shutdown marker so restart guardian knows this was intentional
   try { restartGuardian.writeCleanShutdownMarker(); } catch { /* best-effort */ }
+  // v5: Record process stop in lifecycle table (enables OOM kill detection)
+  try { require('./self-heal-oom-trigger').recordProcessStop(signal); } catch { /* best-effort */ }
   // Flush persistent config to disk before dying
   try { require('./persistent-config').flush(); } catch { /* best-effort */ }
   // Flush screenshot upload queue
