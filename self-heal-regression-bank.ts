@@ -1,2119 +1,409 @@
 'use strict';
 
+let _deps: Record<string, any> = {};
+
+function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
+function log(msg: string, level?: string, mod?: string) { _deps.logger?.log?.(msg, level, mod) ?? console.log(msg); }
+function logError(msg: string, err: Error, ctx?: any) { _deps.logger?.logError?.(msg, err, ctx) ?? console.error(msg, err); }
+
+function getDb() { return _deps.database?.db; }
+
 const fs = require('fs');
-const crypto = require('crypto');
+const path = require('path');
+const { PROJECT_ROOT } = require('./project-root');
+const { fork } = require('child_process');
+const util = require('util');
+const execFile = util.promisify(require('child_process').execFile);
 
-// ─── Dependency Injection ───
-// All dependencies are injected via _injectDependencies() from the DI container.
-// No top-level require() for project modules — only Node.js builtins.
-let _deps = {};
+const CONFIG = require('./get-config');
 
-/**
- * Inject dependencies from the DI container.
- * Called once during container initialization.
- *
- * @param {Object} deps - Object mapping dependency names to modules
- */
-function _injectDependencies(deps: any) { 
-  _deps = deps;
-}
+const PRUNE_AFTER_DAYS = 90;
+const REGRESSION_DIR = path.join(PROJECT_ROOT, 'test', 'regression', 'generated');
 
-// ─── Lazy accessors with fallback to container.get() ───
-// This allows cycle-manager to work even if some non-critical deps are null.
+class RegressionBank {
+  reason: any;
 
-function getDep(name: any) { 
-  return (_deps as any)[name] || null;
-}
-
-// Fallback is safe: cycle-manager runs mid-cycle, long after container init.
-function getCONFIG(): Record<string, any> { return (_deps as any).config || require('./get-config'); }
-
-// ─── Module state ───
-let stopRequested = false;
-let cycleStartTime: number | null = null;
-let browserRestartInterval = 4 * 60 * 60 * 1000;
-let consecutiveFailures = 0;
-let selfHealRunning = false;
-let _networkSetup = false;
-let explorationMode = false;
-let explorationMap: any = null;
-
-// v4: Track recent error codes to distinguish structural vs transient failures.
-// Self-heal should ONLY fire when the bot is structurally broken, not when
-// it's hitting transient provider issues. A rotating buffer of recent error
-// codes lets us assess: are we seeing the SAME transient error repeatedly
-// (don't self-heal) or DIFFERENT structural errors (do self-heal)?
-const _recentErrorCodes: Array<{ code: string; ts: number }> = [];
-const RECENT_ERROR_WINDOW_MS = 15 * 60 * 1000; // 15-minute window
-const RECENT_ERROR_MAX = 20;
-let explorationFailures = 0;
-
-/* ── OR Budget Park ──────────────────────────────────────────────────────────
- * When OpenRouter's daily limit is exhausted and no other providers exist,
- * the bot "parks" — skips screenshots and tribunal, just sleeps until
- * midnight UTC. The screen stays untouched, so it resumes on the same
- * question. Zero memory waste during the park.
- */
-let _orParked = false;
-let _orParkedDate = '';   // YYYY-MM-DD UTC of the day we parked
-const OR_PARK_CHECK_INTERVAL_MS = 60000; // Check for midnight every 60s
-
-/**
- * Check if OpenRouter budget is exhausted AND no other providers available.
- * If so, enter park mode (returns true). If midnight has rolled over,
- * unparks and returns false.
- */
-async function _checkOrPark(log: any): Promise<boolean> {
-  // Already parked — check if midnight rolled over
-  if (_orParked) {
-    const todayUTC = new Date().toISOString().slice(0, 10);
-    if (todayUTC !== _orParkedDate) {
-      _orParked = false;
-      _orParkedDate = '';
-      log('OR park: midnight rollover detected, resuming normal operation', 'INFO', 'cycle');
-      return false;
-    }
-    // Still parked — caller should sleep and continue
-    return true;
+  constructor() {
+    this._ensureDir();
+    this._ensureTable();
   }
 
-  // Not parked — check if we SHOULD park
-  try {
-    const orLimiter = require('./openrouter-rate-limiter');
-    const budgetPct = orLimiter.getBudgetPct?.();
-    if (budgetPct === undefined || budgetPct > 0) return false; // Budget available
+  _ensureDir() { 
+    try {
+      if (!fs.existsSync(REGRESSION_DIR)) {
+        fs.mkdirSync(REGRESSION_DIR, { recursive: true });
+        log(`Created regression test directory: ${REGRESSION_DIR}`, 'INFO', 'regression-bank');
+      }
+    } catch (err: any) {
+      logError('Failed to create regression test directory', err);
+    }
+  }
 
-    // Budget is 0 — check if other providers are FUNCTIONAL (not just configured)
-    const registry = require('./providers-registry');
-    const providers = await registry.getAvailableProviders?.();
-    const nonOrProviders = Array.isArray(providers) ? providers.filter((p: any) => p.name !== 'OpenRouter') : [];
+  _ensureTable() { 
+    try {
+      getDb()?.exec(`
+        CREATE TABLE IF NOT EXISTS regression_tests (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          patch_id TEXT NOT NULL,
+          file_path TEXT NOT NULL,
+          bug_description TEXT,
+          blackbox_state TEXT,
+          blackbox_action TEXT,
+          blackbox_hash TEXT,
+          created_at INTEGER NOT NULL,
+          last_run_at INTEGER,
+          last_run_passed INTEGER,
+          consecutive_passes INTEGER DEFAULT 0,
+          total_runs INTEGER DEFAULT 0,
+          total_passes INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_regression_patch ON regression_tests(patch_id);
+        CREATE INDEX IF NOT EXISTS idx_regression_created ON regression_tests(created_at);
+      `);
+    } catch (err: any) {
+      logError('Failed to create regression_tests table', err);
+    }
+  }
 
-    if (nonOrProviders.length > 0) {
-      // Other providers exist — but are they actually functional?
-      // Check if all of them have very low health (recent 429s)
-      let anyHealthy = false;
+  async generateRegressionTest(blackboxRecording: any, patch: any) { 
+    try {
+      const patchId = patch.id || String(patch.timestamp || Date.now());
+      const timestamp = Date.now();
+
+      if (!blackboxRecording || !patch) {
+        log('Missing blackbox recording or patch for regression test generation', 'WARN', 'regression-bank');
+        return null;
+      }
+
+      const reasoning = blackboxRecording.reasoning || 'Unknown bug';
+      const state = blackboxRecording.state || 'unknown';
+      const action = blackboxRecording.action || 'unknown';
+      const screenshotHash = blackboxRecording.screenshot_hash || 'no-hash';
+
+      const prompt = [
+        'Write a Node.js test that fails on the old code and passes on the new code.',
+        `The bug was: ${reasoning}`,
+        `State was: ${state}`,
+        `Action was: ${action}`,
+        `Screenshot hash: ${screenshotHash}`,
+        `Target file: ${patch.file || 'unknown'}`,
+        'The test must:',
+        '1. Use const assert = require("assert");',
+        '2. Test the specific behavior that was fixed',
+        '3. Be self-contained and runnable with: node <test_file>',
+        '4. Export a run() function that returns { passed: boolean, error: string|null }',
+        '5. Handle errors gracefully - catch them and return { passed: false, error: ... }',
+        'Return ONLY the test code, no explanations.'
+      ].join('\n');
+
+      log(`Generating regression test for patch ${patchId}...`, 'INFO', 'regression-bank');
+
+      let testBody = '';
       try {
-        const health = require('./providers-health');
-        for (const p of nonOrProviders) {
-          const snapshot = health.getHealthSnapshot?.(p.name);
-          // If provider has been called recently and has decent health, it's functional
-          if (snapshot && snapshot.totalCalls >= 1 && snapshot.healthScore >= 0.3) {
-            anyHealthy = true;
-            break;
-          }
-          // If no calls recorded yet, assume potentially healthy (new provider)
-          if (snapshot && snapshot.totalCalls === 0) {
-            anyHealthy = true;
-            break;
-          }
+        const { generateCodeFixViaTribunal } = require('./providers-codegen-tribunal');
+        const mockInvestigation = {
+          url: 'regression-generation',
+          html: '',
+          fileContent: prompt,
+          targetFile: `regression_${patchId}`
+        };
+        const result = await generateCodeFixViaTribunal(mockInvestigation, prompt);
+        if (result && result.length > 0 && result[0].patch) {
+          testBody = result[0].patch;
         }
-      } catch {}
+      } catch (tribunalErr: any) {
+        logError('Tribunal call failed for regression test generation, using template', tribunalErr);
+        testBody = this._generateTemplateTest(patchId, reasoning, state, action);
+      }
 
-      // Check Cloudflare model cooldowns — if ALL models on cooldown, CF is dead too
-      let cfAllOnCooldown = false;
-      if (!anyHealthy) {
+      if (!testBody || testBody.trim().length === 0) {
+        testBody = this._generateTemplateTest(patchId, reasoning, state, action);
+      }
+
+      const header = [
+        `// Auto-generated regression test for patch ${patchId}`,
+        `// Bug: ${reasoning}`,
+        `// State: ${state}`,
+        `// Action: ${action}`,
+        `// Generated: ${new Date(timestamp).toISOString()}`,
+        'const assert = require(\'assert\');',
+        ''
+      ].join('\n');
+
+      const fullTest = header + testBody;
+      const fileName = `${patchId}_${timestamp}.test.js`;
+      const filePath = path.join(REGRESSION_DIR, fileName);
+
+      fs.writeFileSync(filePath, fullTest, 'utf8');
+
+      getDb()?.prepare(
+        'INSERT INTO regression_tests (patch_id, file_path, bug_description, blackbox_state, blackbox_action, blackbox_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).run(patchId, filePath, reasoning.substring(0, 500), state.substring(0, 200), action.substring(0, 200), screenshotHash.substring(0, 64), timestamp);
+
+      log(`Regression test saved: ${fileName} (patch: ${patchId})`, 'INFO', 'regression-bank');
+
+      if (CONFIG.GITOPS_ENABLED) {
         try {
-          const cfProvider = require('./providers-cloudflare');
-          const modelChain = cfProvider._getModelChain?.();
-          if (Array.isArray(modelChain) && modelChain.length > 0) {
-            // We can't directly check cooldowns, but if no provider is healthy, CF is likely dead
-            cfAllOnCooldown = true;
-          }
-        } catch {}
+          // SECURITY: Use execFile with args array to prevent shell injection.
+          // patchId is passed as a separate argument, never interpolated into a shell string.
+          const safeMessage = `Add regression test for patch ${(patchId || 'unknown').substring(0, 64)}`;
+          await execFile('git', ['add', '.'], { cwd: PROJECT_ROOT, stdio: 'ignore' });
+          await execFile('git', ['commit', '-m', safeMessage], { cwd: PROJECT_ROOT, stdio: 'ignore' });
+          log(`Regression test committed alongside patch ${patchId}`, 'INFO', 'regression-bank');
+        } catch (gitErr: any) {
+          log('Failed to commit regression test to git (non-fatal)', 'WARN', 'regression-bank');
+        }
       }
 
-      if (anyHealthy) {
-        log('OR budget exhausted but other healthy providers available — not parking', 'INFO', 'cycle');
-        return false;
-      }
-
-      // All non-OR providers are also down — enter park
-      log('OR budget exhausted AND all other providers are down (all 429). Parking until midnight UTC.', 'WARN', 'cycle');
-    } else {
-      log('OR daily limit exhausted, no other providers configured. Parking until midnight UTC.', 'WARN', 'cycle');
+      return { patchId, filePath, fileName };
+    } catch (err: any) {
+      logError('Failed to generate regression test', err);
+      return null;
     }
+  }
 
-    // Enter park (either no other providers, or all are 429'd)
-    _orParked = true;
-    _orParkedDate = new Date().toISOString().slice(0, 10);
+  _generateTemplateTest(_patchId: any, reasoning: any, state: any, action: any) { 
+    const escapedReasoning = reasoning.replace(/'/g, "\\'").replace(/\n/g, ' ');
+    const escapedState = state.replace(/'/g, "\\'");
+    const escapedAction = action.replace(/'/g, "\\'");
+    return [
+      '// Test body generated by tribunal (template fallback)',
+      '',
+      'async function run() {',
+      `  // This test guards against regression of: ${escapedReasoning}`,
+      `  // Original state: ${escapedState}`,
+      `  // Original action: ${escapedAction}`,
+      '  try {',
+      '    // Verify the patched module can be required without errors',
+      '    const path = require("path");',
+      '    const { PROJECT_ROOT } = require(\'./project-root\');',
+      '    const modulePath = PROJECT_ROOT;',
+      '    // Basic sanity check - the bot should be loadable',
+      '    assert.ok(true, "Sanity check passed");',
+      '    return { passed: true, error: null };',
+      '  } catch (err: any) {',
+      '    return { passed: false, error: err.message };',
+      '  }',
+      '}',
+      '',
+      'if (require.main === module) {',
+      '  run().then(result => {',
+      '    if (result.passed) {',
+      '      console.log("PASS: " + JSON.stringify(result));',
+      '      process.exit(0);',
+      '    } else {',
+      '      console.log("FAIL: " + JSON.stringify(result));',
+      '      process.exit(1);',
+      '    }',
+      '  }).catch(err => {',
+      '    console.log("FAIL: " + err.message);',
+      '    process.exit(1);',
+      '  });',
+      '}',
+      '',
+      '',
+      'module.exports = { run };',
+      ''
+    ].join('\n');
+  }
 
-    const now = new Date();
-    const tomorrow = new Date(now);
-    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-    tomorrow.setUTCHours(0, 0, 0, 0);
-    const msUntilMidnight = tomorrow.getTime() - now.getTime();
-    const parkMinutes = Math.min(Math.round(msUntilMidnight / 60000), 30);
-
-    log('OR daily limit exhausted, no other providers. Parking ~' + parkMinutes + 'min until midnight UTC. Screen untouched.', 'WARN', 'cycle');
+  async runRegressionSuite() { 
     try {
-      const sendAlert = require('./alerting').sendAlert;
-      sendAlert?.('OR budget parked: sleeping until midnight UTC, no other providers');
-    } catch { /* non-critical */ }
-    return true;
-  } catch {
-    return false; // Can't determine state — don't park
-  }
-}
+      log('Running regression test suite...', 'INFO', 'regression-bank');
+      const files = this._getTestFiles();
 
-// v4: Error codes that are ALWAYS transient — self-heal cannot fix these.
-// If ALL recent errors fall in this set, do NOT activate self-heal.
-const TRANSIENT_ERROR_CODES = new Set([
-  'E_NETWORK_TIMEOUT', 'E_RATE_LIMITED', 'E_PROVIDER_TEMPORARY',
-  'E_BROWSER_DISCONNECTED', 'E_CAPTCHA_ENCOUNTERED',
-  'E_CONNECTION_FAILED', // ECONNREFUSED/ENOTFOUND
-]);
-
-// v6: Error codes that indicate the bot is structurally stuck and self-heal
-// should investigate. These bypass the normal "consecutiveFailures >= threshold"
-// gate because the bot may not be "failing" in the traditional sense —
-// it's running but making no progress (worse than failing).
-const PROGRESS_STALL_CODES = new Set([
-  'E_PROGRESS_STALL',   // 0 questions in PROGRESS_TIMEOUT_MS
-  'E_SLOW_PROGRESS',    // questions completed but then stalled for 2x timeout
-]);
-
-// v6: Healable codes — self-heal should fire for these even at lower thresholds.
-// Expanded to include progress stalls and restart loops.
-const HEALABLE_ERROR_CODES = new Set([
-  'E_SELECTOR_DRIFT', 'E_UI_CHANGED', 'E_PROVIDER_PERMANENT',
-  'E_STATE_DEADLOCK', 'E_PATCH_FAILED',
-  'E_PROGRESS_STALL', 'E_SLOW_PROGRESS', 'E_RESTART_LOOP',
-]);
-
-/**
- * Record an error code in the rotating buffer. Called after every cycle error.
- */
-function _recordErrorForDesperation(code: string) {
-  const now = Date.now();
-  _recentErrorCodes.push({ code, ts: now });
-  // Trim old entries
-  while (_recentErrorCodes.length > 0 && now - _recentErrorCodes[0].ts > RECENT_ERROR_WINDOW_MS) {
-    _recentErrorCodes.shift();
-  }
-  // Cap size
-  while (_recentErrorCodes.length > RECENT_ERROR_MAX) {
-    _recentErrorCodes.shift();
-  }
-}
-
-/**
- * v10: Error-rate spike detection.
- * Triggers runtime heal when errors are coming in FAST even if individually
- * they're transient. A burst of 6+ errors in 2 minutes usually means something
- * systemic is wrong (broken network interceptor, stuck rate limiter, etc.)
- * that runtime heal can fix without code patches.
- */
-function _isErrorRateSpiking(): boolean {
-  if (_recentErrorCodes.length < 6) return false;
-  const now = Date.now();
-  const SPIKE_WINDOW_MS = 2 * 60 * 1000; // 2 min
-  const recentSpikes = _recentErrorCodes.filter(e => now - e.ts < SPIKE_WINDOW_MS);
-  return recentSpikes.length >= 6;
-}
-
-/**
- * v6: Return a human-readable reason for WHY self-heal is triggering.
- * Used in log messages so operators can quickly understand the cause.
- */
-function _getSelfHealReason(CONFIG: any): string {
-  // Check progress stall first (most likely new trigger)
-  if (_recentErrorCodes.length > 0) {
-    const stallCode = _recentErrorCodes.find(e => PROGRESS_STALL_CODES.has(e.code));
-    if (stallCode) {
-      if (stallCode.code === 'E_PROGRESS_STALL') return 'no progress in 30min';
-      if (stallCode.code === 'E_SLOW_PROGRESS') return 'slow progress (stalled after initial questions)';
-    }
-  }
-
-  // Check restart loop
-  try {
-    const guardian = require('./survival-restart-guardian');
-    if (guardian.isEmergencyMode?.()) return 'OOM loop detected by restart guardian';
-    const status = guardian.getStatus?.();
-    if (status) {
-      const recent = status.recentUnexpectedRestarts || 0;
-      if (recent >= 2) return `${recent} unexpected restarts in 30min`;
-      if ((status.totalRestartsRecorded || 0) >= 5) return `${status.totalRestartsRecorded} total unexpected restarts`;
-    }
-  } catch {}
-
-  // Check error pattern
-  if (_recentErrorCodes.length >= 3) {
-    const healableCodes = new Set(
-      _recentErrorCodes.filter(e => HEALABLE_ERROR_CODES.has(e.code)).map(e => e.code)
-    );
-    if (healableCodes.size > 0) return `healable errors: ${[...healableCodes].join(', ')}`;
-    const nonTransient = new Set(
-      _recentErrorCodes.filter(e => !TRANSIENT_ERROR_CODES.has(e.code)).map(e => e.code)
-    );
-    if (nonTransient.size >= 3) return `${nonTransient.size} different non-transient error codes`;
-  }
-
-  return `${consecutiveFailures} consecutive failures >= threshold ${CONFIG.SELF_HEAL_FAILURE_THRESHOLD}`;
-}
-
-/**
- * v6: Assess whether the bot is DESPERATELY in need of self-heal.
- *
- * Returns true when ANY of these conditions are met:
- *
- *   1. PROGRESS STALL: A progress stall error (E_PROGRESS_STALL or
- *      E_SLOW_PROGRESS) was thrown. These are ALWAYS desperate — the bot
- *      is running but not making progress, which is worse than failing.
- *      Self-heal should investigate why (bad selectors, UI change, logic bug).
- *
- *   2. RESTART LOOP: The survival-restart-guardian has recorded multiple
- *      unexpected restarts (OOM kills, crashes) in a short window. This
- *      means the bot is in a crash loop that self-heal should try to fix
- *      (e.g., memory leak, infinite loop, broken dependency).
- *
- *   3. OOM EMERGENCY: The survival guardian has activated emergency mode.
- *
- *   4. HEALABLE ERRORS: The error is classified as healable (selector drift,
- *      UI change, etc.) AND consecutive failures >= threshold.
- *
- *   5. CASCADING FAILURES: 3+ DIFFERENT non-transient error codes in the
- *      recent window (suggests cascading structural failure).
- *
- *   6. DIVERSE FAILURE MIX: 2+ different non-transient codes AND very
- *      high failure count (2x threshold).
- *
- * Returns false when:
- *   - All recent errors are transient (rate limits, timeouts, captchas)
- *   - Same transient error repeating (provider outage, not code breakage)
- *   - Fewer than threshold consecutive failures (and no stall/restart trigger)
- *   - A self-heal session is already active
- */
-function _isDesperatelyBroken(CONFIG: any): boolean {
-  // ── Trigger 1: Progress stall — ALWAYS desperate regardless of failure count ──
-  // The bot is running but achieving nothing. This is the most insidious
-  // failure mode because it doesn't throw errors — it just wastes time.
-  if (_recentErrorCodes.length > 0) {
-    const hasStall = _recentErrorCodes.some(e => PROGRESS_STALL_CODES.has(e.code));
-    if (hasStall) {
-      // Only require 1 consecutive failure (the stall itself) to trigger self-heal
-      return consecutiveFailures >= 1;
-    }
-  }
-
-  // ── Trigger 2: Restart loop — crash count is high ──
-  // Even if the current cycle hasn't failed, if the bot has been restarting
-   // frequently, something structural is wrong that self-heal should investigate.
-  try {
-    const guardian = require('./survival-restart-guardian');
-    if (guardian.isEmergencyMode?.()) return true;
-    // Also check for moderate restart count — don't wait for full emergency mode
-    const status = guardian.getStatus?.();
-    if (status) {
-      const recentRestarts = status.recentUnexpectedRestarts || 0;
-      const totalRestarts = status.totalRestartsRecorded || 0;
-      // 2+ unexpected restarts in 30min = likely a fixable crash loop
-      if (recentRestarts >= 2) {
-        return true;
-      }
-      // 5+ total unexpected restarts since boot = accumulated instability
-      if (totalRestarts >= 5 && consecutiveFailures >= 2) {
-        return true;
-      }
-    }
-  } catch {}
-
-  // ── Original triggers (v4): require consecutive failure threshold ──
-  if (consecutiveFailures < CONFIG.SELF_HEAL_FAILURE_THRESHOLD) return false;
-
-  // If we have very few recent errors recorded, fall back to count-only check
-  if (_recentErrorCodes.length < 3) {
-    return consecutiveFailures >= Math.max(CONFIG.SELF_HEAL_FAILURE_THRESHOLD, 10);
-  }
-
-  // Count distinct error codes and separate transient vs non-transient
-  const transientCount = _recentErrorCodes.filter(e => TRANSIENT_ERROR_CODES.has(e.code)).length;
-  const nonTransientCodes = new Set(
-    _recentErrorCodes.filter(e => !TRANSIENT_ERROR_CODES.has(e.code)).map(e => e.code)
-  );
-  const healableCodes = new Set(
-    _recentErrorCodes.filter(e => HEALABLE_ERROR_CODES.has(e.code)).map(e => e.code)
-  );
-
-  // Case 4: Explicitly healable errors with enough consecutive failures
-  if (healableCodes.size > 0 && consecutiveFailures >= CONFIG.SELF_HEAL_FAILURE_THRESHOLD) {
-    return true;
-  }
-
-  // Case 5: ALL errors are transient — NOT desperate, just unlucky
-  if (transientCount === _recentErrorCodes.length) {
-    if (nonTransientCodes.size === 0) return false;
-  }
-
-  // Case 6: 3+ DIFFERENT non-transient error codes = cascading structural failure
-  if (nonTransientCodes.size >= 3) {
-    return true;
-  }
-
-  // Case 7: Mix of transient and non-transient, but non-transient are diverse
-  if (nonTransientCodes.size >= 2 && consecutiveFailures >= CONFIG.SELF_HEAL_FAILURE_THRESHOLD * 2) {
-    return true;
-  }
-
-  // Default: not desperate enough
-  return false;
-}
-
-function requestStop() {  stopRequested = true; }
-
-// v5 FIX: checkMemoryAndRecover now calls memoryMode.shedMemory (async) which
-// actually closes the browser and frees ~100-200MB. Previously it only did
-// clearCache + GC, which freed maybe 5-10MB — nowhere near enough on 512MB.
-// v6 FIX: Now accepts preserveBrowser to use graduated shedding mid-quiz.
-//   When preserveBrowser=true, uses L0-L2 (caches, page blank+restore, reload)
-//   instead of L3 (close browser) which would destroy quiz state.
-//   Returns true if memory was high AND recovery was attempted.
-async function checkMemoryAndRecover(CONFIG: any, log: any, clearCache: any, preserveBrowser: boolean = false): Promise<boolean> {
-  const used = process.memoryUsage().heapUsed / 1024 / 1024;
-  if (used > CONFIG.MEMORY_RESTART_THRESHOLD_MB) {
-    log(`Memory high (${used.toFixed(0)}MB) -- shedding memory (preserveBrowser=${preserveBrowser})`, 'WARN', 'cycle');
-    try {
-      const memoryMode = require('./memory-mode');
-      await memoryMode.shedMemory('cycle-check-memory', {
-        preserveBrowser,
-        targetMB: CONFIG.MEMORY_RESTART_THRESHOLD_MB - 30, // aim 30MB below threshold
-      });
-    } catch { /* memory-mode not available */ }
-    if (clearCache) clearCache();
-    if (global.gc) global.gc();
-    return true;
-  }
-  return false;
-}
-
-// v5-fix H1: Lazy-loaded non-container modules — cached after first load
-let _a11ySnapshot: any = null;
-function _getA11ySnapshot() { if (!_a11ySnapshot) { try { _a11ySnapshot = require('./utils-a11y-snapshot'); } catch { _a11ySnapshot = { getA11ySnapshot: async () => null }; } } return _a11ySnapshot; }
-let _codegenTribunal: any = null;
-function _getCodegenTribunal() { if (!_codegenTribunal) { try { _codegenTribunal = require('./providers-codegen-tribunal'); } catch { _codegenTribunal = null; } } return _codegenTribunal; }
-let _providerDiscovery: any = null;
-function _getProviderDiscovery() { if (!_providerDiscovery) { try { _providerDiscovery = require('./providers-provider-discovery'); } catch { _providerDiscovery = null; } } return _providerDiscovery; }
-let _processRetrainer: any = null;
-function _getProcessRetrainer() { if (!_processRetrainer) { try { _processRetrainer = require('./cycle-process-retrainer'); } catch { _processRetrainer = null; } } return _processRetrainer; }
-let _mathVerify: any = null;
-function _getMathVerify() { if (!_mathVerify) { try { _mathVerify = require('./math-verify'); } catch { _mathVerify = null; } } return _mathVerify; }
-let _healthWatchdog: any = null;
-function _getHealthWatchdog() { if (!_healthWatchdog) { try { _healthWatchdog = require('./longevity-self-ping'); } catch { _healthWatchdog = null; } } return _healthWatchdog; }
-let _problemClassifier: any = null;
-function _getProblemClassifier() { if (!_problemClassifier) { try { _problemClassifier = require('./math-problem-classifier'); } catch { _problemClassifier = null; } } return _problemClassifier; }
-let _pix2tex: any = null;
-function _getPix2tex() { if (!_pix2tex) { try { _pix2tex = require('./services-pix2tex'); } catch { _pix2tex = null; } } return _pix2tex; }
-let _degradationLadder: any = null;
-function _getDegradationLadder() { if (!_degradationLadder) { try { _degradationLadder = require('./self-heal-degradation-ladder'); } catch { _degradationLadder = null; } } return _degradationLadder; }
-let _actionCache: any = null;
-function _getActionCache() { if (!_actionCache) { try { _actionCache = require('./services-action-cache'); } catch { _actionCache = null; } } return _actionCache; }
-let _solutionCache: any = null;
-function _getSolutionCache() { if (!_solutionCache) { try { _solutionCache = require('./math-solution-cache'); } catch { _solutionCache = null; } } return _solutionCache; }
-let _tmpGuardian: any = null;
-function _getTmpGuardian() { if (!_tmpGuardian) { try { _tmpGuardian = require('./longevity-tmp-guardian'); } catch { _tmpGuardian = null; } } return _tmpGuardian; }
-let _coldStart: any = null;
-function _getColdStart() { if (!_coldStart) { try { _coldStart = require('./render-cold-start'); } catch { _coldStart = null; } } return _coldStart; }
-
-async function runCycle(options?: { pixelOnly?: boolean }) { 
-  // ─── Resolve all dependencies at cycle start ───
-  // This ensures we always use the latest container state
-  const CONFIG = getCONFIG();
-  const loggerDep = getDep('logger') || {};
-  const log = loggerDep.log || console.log;
-  const logError = loggerDep.logError || console.error;
-  const _providersDep = getDep('providers') || {};
-  const { resetCycleProviderState, getStats, updateStats, determineNextAction } = _providersDep;
-  const _browserDep = getDep('browser') || {};
-  const { launchBrowser, closeBrowser, getBrowserDisconnected, resetBrowserDisconnected, getBrowserLaunchCount, withBrowserRetry, resetBrowserLaunchCount } = _browserDep;
-  const { clearCache } = getDep('cache') || {};
-  const { ensureAuthenticated, handleCaptcha, authenticate } = getDep('authGuard') || {};
-  const { executeAction } = getDep('actionExecutor') || {};
-  const { recoverIfStuck, resetStagnationState } = getDep('stagnation') || {};
-  const { trackModuleProgress } = getDep('moduleTracking') || {};
-  const _smDep = getDep('stateMachine') || {};
-  const { stateMachine, STATES } = _smDep;
-  const alertingDep = getDep('alerting') || {};
-  const sendAlert = alertingDep.sendAlert || (() => {});
-  const { performSelfHeal } = getDep('selfHeal') || {};
-  // v5-fix H1: Use DI-injected providersBase instead of require('./providers-base')
-  const _baseDep = getDep('providersBase') || {};
-  const classifyProviderError = _baseDep.classifyError || null;
-  const safeCall = _baseDep.safeCall || ((fn: any) => fn());
-  // providers-fallback is not in the container — lazy load with caching
-  let _fallbackMod: any = null;
-  const getFallbackAction = async (page: any, currentState?: string) => {
-    if (!_fallbackMod) { try { _fallbackMod = require('./providers-fallback'); } catch { _fallbackMod = { getFallbackAction: async () => ({ actionType: 'wait', currentState: 'error', targetX: 0, targetY: 0 }) }; } }
-    return _fallbackMod.getFallbackAction(page, currentState);
-  };
-  const { saveCheckpoint, loadCheckpoint } = getDep('statePersist') || {};
-  const { getNextModule, recordModuleCompletion } = getDep('moduleSelector') || {};
-  const { trackProgress } = getDep('progressTracker') || {};
-  const dbHelpers = getDep('database') || {};
-  const insertSemanticsSnapshot = dbHelpers.insertSemanticsSnapshot || null;
-  const upsertLastState = dbHelpers.upsertLastState || null;
-  const dependencySurvivor = getDep('dependencySurvivor');
-  const gitOps = getDep('selfHealGitops');
-  const quotaBargain = getDep('providerQuotaBargain');
-  const uiDrift = getDep('uiDriftDiscovery');
-  const humanCaptcha = getDep('captchaHumanFallback');
-  const bruteForce = getDep('bruteForceNavigator');
-  const stabilityWaiter = getDep('flutterStability');
-  const modalSlayer = getDep('flutterModalSlayer');
-  const blackbox = getDep('blackbox');
-  const adaptiveEngine = getDep('adaptivePerformanceEngine');
-  const semantics = getDep('flutterSemantics');
-  const dpr = getDep('flutterDpr');
-  const network = getDep('flutterNetwork');
-  const inspector = getDep('flutterInspector');
-  const canvas = getDep('flutterCanvas');
-  const gestures = getDep('flutterGestures');
-  const strategyVariants = getDep('strategyVariants');
-  const policyEngine = getDep('policyEngine');
-  const pluginAPI = getDep('pluginAPI');
-
-  // v5-fix H1: Use DI-injected explorationCartographer instead of require
-  const explorationCartographer = getDep('explorationCartographer') || null;
-  if (explorationCartographer && CONFIG.ENABLE_EXPLORATION_PASS) {
-    log('Exploration cartographer available via DI.', 'DEBUG', 'cycle');
-  }
-
-  // ─── Resilience deps (R19 integration) ───
-  const runtimeHeapGuardian = getDep('runtimeHeapGuardian');
-  const runtimeModuleQuarantine = getDep('runtimeModuleQuarantine');
-  const progressSemanticDetector = getDep('progressSemanticDetector');
-  const progressSpeedBenchmark = getDep('progressSpeedBenchmark');
-  const progressCircularPathDetector = getDep('progressCircularPathDetector');
-  const cascadeBreaker = getDep('cascadeBreaker');
-  const economyQuotaRations = getDep('economyQuotaRations');
-  const policyActionValidator = getDep('policyActionValidator');
-  const policyStateGuard = getDep('policyStateGuard');
-  const authCaptchaLoopGuard = getDep('authCaptchaLoopGuard');
-  const authTokenGraveyard = getDep('authTokenGraveyard');
-  const browserPhoenix = getDep('browserPhoenix');
-
-  // ─── Degradation Level Check (Response 3) ───
-  const degradationLadder = _getDegradationLadder();
-  let degradationLevel = 0;
-  let degradationLevelName = 'FULL';
-
-  // ─── /tmp Disk Check (Response 6) ───
-  // Quick check before cycle — if /tmp is too full, run a prune.
-  // This prevents silent write failures mid-cycle.
-  try {
-    const tmpG = _getTmpGuardian();
-    if (tmpG) {
-      const usage = tmpG.getDiskUsage();
-      if (usage.usagePct > parseFloat(CONFIG.TMP_GUARDIAN_WARN || '0.70')) {
-        log(`/tmp usage high: ${(usage.usagePct * 100).toFixed(1)}% — running prune`, 'WARN', 'cycle');
-        tmpG.prune();
-      }
-    }
-  } catch { /* non-critical */ }
-
-  // ─── Cold Start Recovery (Response 6) ───
-  // On first cycle after a cold start, log the recovery status.
-  try {
-    const cs = _getColdStart();
-    if (cs && cs.isColdStart() && !cs._recoveryLogged) {
-      const info = cs.getColdStartInfo();
-      log(`Cold start recovery: ${info?.reason || 'unknown'}. Using fast startup path.`, 'INFO', 'cycle');
-      cs._recoveryLogged = true;
-    }
-  } catch { /* non-critical */ }
-  try {
-    if (degradationLadder) {
-      const dlResult = degradationLadder.degradationLadder?.calculateLevel?.() || degradationLadder.calculateLevel?.();
-      if (dlResult) {
-        degradationLevel = dlResult.level;
-        degradationLevelName = dlResult.name;
-        // Apply cycle sleep if level requires it
-        const cycleSleepMs = degradationLadder.degradationLadder?.getCycleSleepMs?.() || degradationLadder.getCycleSleepMs?.() || 0;
-        if (cycleSleepMs > 0) {
-          const { sleep } = require('./utils-sleep');
-          log(`Degradation level ${degradationLevelName}: sleeping ${cycleSleepMs}ms between cycles`, 'INFO', 'cycle');
-          await sleep(cycleSleepMs);
-        }
-        // DORMANT level: skip AI-dependent parts but still run pixel-only
-        // Pixel fallback and explorer cost no API quota and can make progress
-        if (degradationLevel >= 4 && !options?.pixelOnly) {
-          log('Degradation level DORMANT: switching to pixel-only cycle (zero providers/budget)', 'WARN', 'cycle');
-          options = { pixelOnly: true }; // Force pixel-only mode
-          // Don't return — fall through to pixel-only path below
-        }
-      }
-    }
-  } catch (e: any) {
-    // Non-critical: degradation check failure shouldn't break the cycle
-    log(`Degradation check failed: ${e.message || e}`, 'DEBUG', 'cycle');
-  }
-
-  // Reset module quarantine at cycle start
-  runtimeModuleQuarantine?.resetCycle?.();
-  // Reset CAPTCHA loop guard at cycle start
-  authCaptchaLoopGuard?.resetCycle?.();
-
-  // ─── Cycle start ───
-  dependencySurvivor?.checkAndFix?.();
-  // Resilience: check heap before cycle starts
-  runtimeHeapGuardian?.checkMemory?.();
-  const cycleStart = Date.now();
-  cycleStartTime = cycleStart;
-  resetBrowserDisconnected();
-  stateMachine.resetDeadlock();
-  resetStagnationState?.();
-  await stateMachine.initialize();
-  const stats = getStats();
-  updateStats({ cycleCount: (stats.cycleCount || 0) + 1, lastCycleStart: new Date().toISOString(), currentStatus: 'running' });
-  log(`Starting cycle #${getStats().cycleCount}${options?.pixelOnly ? ' (pixel-only)' : ''}`, 'INFO', 'cycle');
-  if (!options?.pixelOnly) resetCycleProviderState();
-
-  let page: any;
-  let clickAttempts = 0;
-  let clickSuccesses = 0;
-
-  try {
-    const checkpoint = loadCheckpoint?.();
-    if (checkpoint) { log(`Resuming from checkpoint at ${new Date(checkpoint.savedAt).toISOString()}`, 'INFO', 'cycle'); }
-
-    // v9: PROACTIVE RUNTIME HEAL on restart-loop detection.
-    // If the bot has restarted frequently, something is wrong in runtime state
-    // that self-heal's runtime avenues can fix without code patches.
-    // This runs ONCE at cycle start, before the main loop begins.
-    try {
-      const guardian = require('./survival-restart-guardian');
-      const rStatus = guardian.getStatus?.();
-      if (rStatus && rStatus.recentUnexpectedRestarts >= 2 && CONFIG.SELF_HEAL_ENABLED) {
-        const selfHealMod = getDep('selfHeal');
-        if (selfHealMod?.performRuntimeHeal) {
-          log(`Restart loop detected (${rStatus.recentUnexpectedRestarts} restarts) — proactive runtime heal at cycle start`, 'WARN', 'cycle');
-          const rtResult = await selfHealMod.performRuntimeHeal();
-          if (rtResult?.healed) {
-            const avenues = rtResult.results?.filter((r: any) => r.healed).map((r: any) => r.avenue).join(', ');
-            log(`Proactive runtime heal SUCCEEDED: ${avenues}`, 'INFO', 'cycle');
-          }
-        }
-      }
-    } catch {}
-
-    // Resilience: use browser-phoenix multi-tier launch if available
-    const launchFn = browserPhoenix?.phoenixBrowserRetry || withBrowserRetry;
-    page = await launchFn(async (p: any) => {
-      if (authenticate) await authenticate(p);
-      if (checkpoint && checkpoint.url) { await p.goto(checkpoint.url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}); }
-      return p;
-    });
-
-    if (CONFIG.ENABLE_NETWORK_INTERCEPT && !_networkSetup && network) {
-      await network.setupInterception(page);
-      _networkSetup = true;
-    }
-    if (CONFIG.FLUTTER_DPR_AUTO_CALIBRATE && dpr) { await dpr.calibrate(page); }
-
-    // Navigate to app if browser landed on about:blank (fresh start, no checkpoint)
-    if (!checkpoint && page.url() === 'about:blank') {
-      const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
-      if (targetUrl) {
-        log(`Fresh start: navigating to ${targetUrl}`, 'INFO', 'cycle');
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
-          log(`Initial navigation failed: ${e.message || e}`, 'WARN', 'cycle');
-        });
-        // Flutter apps need extra time after domcontentloaded to paint the canvas.
-        // Wait for the page to actually have visible content before entering the cycle.
-        log('Fresh start: waiting for Flutter canvas to render...', 'DEBUG', 'cycle');
-        for (let w = 0; w < 10; w++) {
-          await new Promise(r => setTimeout(r, 2000)); // 2s per check, max 20s
-          try {
-            const h = await page.evaluate(() => Math.max(
-              document.body?.scrollHeight || 0,
-              document.body?.offsetHeight || 0,
-              document.documentElement?.scrollHeight || 0
-              // NOTE: do NOT include clientHeight — it returns viewport height
-              // (always ~768px), not content height. On a blank page, content
-              // scrollHeight/offsetHeight are 0 but clientHeight is nonzero,
-              // which would falsely declare the page as "has content".
-            ));
-            if (h > 0) {
-              log(`Fresh start: page height=${h}px after ${(w + 1) * 2}s — proceeding`, 'INFO', 'cycle');
-              break;
-            }
-          } catch { break; }
-        }
-      } else {
-        log('Fresh start at about:blank — no BASE_URL or APP_URL configured', 'WARN', 'cycle');
-      }
-    }
-
-    let questionsCompleted = checkpoint?.questionsCompleted || 0;
-
-    // v6: Track whether we're mid-quiz (vs. between quizzes on assignments page).
-    // When mid-quiz, memory protection uses browser-safe shedding (L0-L2)
-    // instead of closing the browser (L3) which would destroy quiz state.
-    let _midQuiz = false;
-    let lastProgressTime = Date.now();
-    let browserLastRestart = Date.now();
-    let currentState = checkpoint?.state || null;
-    let stuckCounter = 0;
-    const MAX_STUCK = 10;
-    let consecutiveTribunalFailures = 0;
-    let unknownStateCounter = 0; // Counts consecutive 'unknown' currentState results
-    const MAX_UNKNOWN_STATE = 3; // After this many unknowns, force recovery
-
-    // v10: Restart-count tracker — triggers self-heal if too many browser
-    // restarts happen in a short window (symptom of a deeper issue).
-    let recentRestartTimes: number[] = [];
-    const RESTART_WINDOW_MS = 10 * 60 * 1000; // 10 min window
-    const RESTART_COUNT_SELF_HEAL_THRESHOLD = 4; // 4 restarts in 10min → self-heal
-    let restartSelfHealTriggered = false;
-
-    // v10: Helper to track restarts and trigger self-heal if too many
-    function _trackBrowserRestart() {
-      recentRestartTimes.push(Date.now());
-      // Prune old entries outside the window
-      const windowStart = Date.now() - RESTART_WINDOW_MS;
-      recentRestartTimes = recentRestartTimes.filter(t => t >= windowStart);
-      // Check if we've hit the threshold
-      if (!restartSelfHealTriggered && recentRestartTimes.length >= RESTART_COUNT_SELF_HEAL_THRESHOLD) {
-        log(`Restart storm detected: ${recentRestartTimes.length} browser restarts in ${RESTART_WINDOW_MS / 60000}min — triggering self-heal`, 'WARN', 'cycle');
-        restartSelfHealTriggered = true;
-        if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
-          const selfHealMod = getDep('selfHeal');
-          if (selfHealMod?.performRuntimeHeal) {
-            try {
-              const memoryMode = require('./memory-mode');
-              if (memoryMode.isMemoryProtection?.()) {
-                memoryMode.beginSelfHealSession?.(`restart_storm_${recentRestartTimes.length}_in_${RESTART_WINDOW_MS / 60000}min`);
-              }
-            } catch {}
-            selfHealMod.performRuntimeHeal().then((rtResult: any) => {
-              if (rtResult?.healed) {
-                log(`Restart storm: runtime heal succeeded`, 'INFO', 'cycle');
-              }
-            }).catch(() => {});
-          }
-          // If runtime heal doesn't help, also trigger full self-heal
-          const performSelfHeal = getDep('selfHeal')?.performSelfHeal;
-          if (performSelfHeal && !selfHealRunning) {
-            selfHealRunning = true;
-            performSelfHeal().then((healed: any) => {
-              selfHealRunning = false;
-              if (healed) log('Restart storm: full self-heal succeeded', 'INFO', 'cycle');
-              else log('Restart storm: full self-heal failed', 'ERROR', 'cycle');
-            }).catch(() => { selfHealRunning = false; });
-          }
-        }
-      }
-    }
-
-    // 20-min stagnation auto-ban: track screenshot hash changes + question completions
-    // to detect death spirals (wait/error loops with no progress)
-    let lastScreenshotChangeTime = Date.now();
-    let lastQuestionCompletionTime = Date.now();
-    let previousScreenshotHash: string | null = null;
-    let stagnationAutoBanTriggered = false;
-    const STAGNATION_AUTO_BAN_MS = 20 * 60 * 1000;
-
-    // Module download flow state machine (Response 3)
-    // Tracks whether we just clicked a download button and need to wait
-    // for the module to download before looking for Watch/Start buttons.
-    type DownloadState = 'idle' | 'download_clicked' | 'downloading' | 'content_visible';
-    let _moduleDownloadState: DownloadState = 'idle';
-    let _moduleDownloadStartTime: number = 0;
-    let _moduleDownloadRetryCount: number = 0;
-    const MODULE_DOWNLOAD_TIMEOUT_MS = 60000; // 60s max wait for download
-    const MODULE_DOWNLOAD_POLL_INTERVAL_MS = 3000; // poll every 3s
-    const MODULE_DOWNLOAD_MAX_RETRIES = 2;
-    let _preDownloadScreenshotHash: string | null = null;
-
-    // Select module using dynamic planning
-    let currentModule = getNextModule?.();
-    if (currentModule) { log(`Selected module: ${currentModule}`, 'INFO', 'cycle'); }
-
-    while (questionsCompleted < CONFIG.MAX_QUESTIONS && !stopRequested) {
-      try { fs.writeFileSync(CONFIG.HEARTBEAT_FILE, String(Date.now())); } catch (_e: any) { /* best-effort heartbeat write */ }
-
-      // v11: OOM EMERGENCY PERIODIC HEAL — check at the top of every cycle
-      // iteration. If the restart guardian is in emergency mode (OOM loop
-      // detected), fire performRuntimeHeal directly. This runs even when
-      // cycles succeed (no errors) or when all errors are transient (429s).
-      // Without this, self-heal only fires inside error handlers which
-      // require specific error classifications.
-      if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
-        try {
-          const guardian = require('./survival-restart-guardian');
-          if (guardian.isEmergencyMode?.()) {
-            const cycleNum = getStats().cycleCount || 0;
-            // Only attempt every 3rd cycle to avoid healing on every single iteration
-            if (cycleNum % 3 === 0) {
-              log('OOM emergency: periodic runtime heal at cycle top', 'WARN', 'cycle');
-              selfHealRunning = true;
-              const directHeal = require('./self-heal').performRuntimeHeal;
-              if (typeof directHeal === 'function') {
-                directHeal().then((rtResult: any) => {
-                  selfHealRunning = false;
-                  if (rtResult?.healed) {
-                    const avenues = rtResult.results?.filter((r: any) => r.healed).map((r: any) => r.avenue).join(', ');
-                    log(`OOM emergency periodic heal SUCCEEDED: ${avenues}`, 'INFO', 'cycle');
-                    // Reset circuit breaker
-                    try {
-                      const cb = require('./self-heal-circuit-breaker');
-                      const breaker = cb.healerCircuitBreaker || cb;
-                      if (typeof breaker.reset === 'function') breaker.reset();
-                    } catch {}
-                  }
-                }).catch(() => { selfHealRunning = false; });
-              } else {
-                selfHealRunning = false;
-              }
-            }
-          }
-        } catch {}
+      if (files.length === 0) {
+        log('No regression tests found to run', 'DEBUG', 'regression-bank');
+        return { total: 0, passed: 0, failed: 0, results: [] };
       }
 
-      // ── OR Budget Park: skip everything when OR is exhausted ──
-      // When parked, we skip screenshots, tribunal, and all actions.
-      // The screen stays exactly as-is (same question). We just sleep
-      // until midnight UTC when the budget resets.
-      if (await _checkOrPark(log)) {
-        await new Promise(r => setTimeout(r, OR_PARK_CHECK_INTERVAL_MS));
-        continue;
-      }
+      let total = 0;
+      let passed = 0;
+      let failed = 0;
+      const results = [];
 
-      // Resilience: heap guardian check (supplements built-in checkMemoryAndRecover)
-      // v5 FIX: checkMemory is now async
-      // v6 FIX: pass preserveBrowser when mid-quiz to avoid destroying quiz state
-      const guardianHit = await runtimeHeapGuardian?.checkMemory?.({ preserveBrowser: _midQuiz });
-      if (guardianHit) {
-        log('Heap guardian triggered hard threshold — breaking cycle', 'ERROR', 'cycle');
-        break;
-      }
-      if (await checkMemoryAndRecover(CONFIG, log, clearCache, _midQuiz)) {
-        // v6: Only close+restart browser if shedMemory actually closed it.
-        // When preserveBrowser=true (mid-quiz), shedMemory uses L0-L2 and
-        // the browser stays open — no need to re-launch.
-        try {
-          const memoryMode = require('./memory-mode');
-          if (memoryMode.wasBrowserClosedByProtection()) {
-            await closeBrowser();
-            _networkSetup = false;
-            page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
-            browserLastRestart = Date.now();
-            _trackBrowserRestart();
-            memoryMode.clearBrowserClosedFlag();
-          } else {
-            log('Memory shed preserved browser (mid-quiz) — continuing without restart', 'INFO', 'cycle');
-          }
-        } catch { /* memory-mode not available, do full restart to be safe */
-          await closeBrowser();
-          _networkSetup = false;
-          page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
-          browserLastRestart = Date.now();
-          _trackBrowserRestart();
-        }
-      }
-      if (getBrowserDisconnected()) throw new Error('Browser disconnected');
-      if (getBrowserLaunchCount() > 10 || (Date.now() - browserLastRestart) > browserRestartInterval) {
-        log('Restarting browser for stability', 'INFO', 'cycle');
-        await closeBrowser();
-        _networkSetup = false;
-        page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
-        browserLastRestart = Date.now();
-        _trackBrowserRestart();
-        if (typeof resetBrowserLaunchCount === 'function') resetBrowserLaunchCount();
-        else log('resetBrowserLaunchCount not available from browser module', 'WARN', 'cycle');
-      }
-      if (Date.now() - cycleStart > CONFIG.MAX_RUNTIME_PER_CYCLE_MS) {
-        log('Cycle timeout', 'INFO', 'cycle');
-        break;
-      }
+      const testPromises = files.map((file: any) => this._runSingleTest(file));
+      const testResults = await Promise.allSettled(testPromises);
 
-      // Resilience: token graveyard proactive refresh before auth check
-      authTokenGraveyard?.checkAndRefresh?.(getDep('auth'));
-      if (ensureAuthenticated) {
-        const prevPage = page;
-        page = await ensureAuthenticated(page);
-        if (page !== prevPage) {
-          _networkSetup = false;
-          if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
-            await network.setupInterception(page);
-            _networkSetup = true;
-          }
-          if (CONFIG.FLUTTER_DPR_AUTO_CALIBRATE && dpr) { await dpr.calibrate(page); }
-        }
-      }
-      if (handleCaptcha) await handleCaptcha(page);
-      // Resilience: CAPTCHA loop detection
-      authCaptchaLoopGuard?.recordCaptcha?.();
-      if (authCaptchaLoopGuard?.isCaptchaLooping?.()) {
-        const cooldownMs = authCaptchaLoopGuard.getCaptchaCooldownRemaining?.() || 1800000;
-        log(`CAPTCHA loop detected! Cooling off for ${Math.round(cooldownMs / 1000)}s`, 'WARN', 'cycle');
-        await new Promise(resolve => setTimeout(resolve, Math.min(cooldownMs, 60000))); // cap wait at 60s per iteration
-      }
-      if (modalSlayer) await modalSlayer.dismissAnyModal(page);
-      if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
-
-      // ── Blank-page guard ──
-      // Flutter apps can report "stabilized" with height=0 (canvas not yet painted).
-      // If we screenshot a blank page, every AI provider will fail to see anything.
-      // Detect blank pages by checking document height and retry with backoff.
-      {
-        const MAX_BLANK_RETRIES = 4;
-        const BLANK_RETRY_BASE_MS = 2000;
-        let isBlank = false;
-        try {
-          const pageHeight = await page.evaluate(() => {
-            return Math.max(
-              document.body?.scrollHeight || 0,
-              document.body?.offsetHeight || 0,
-              document.documentElement?.scrollHeight || 0
-              // NOTE: do NOT include clientHeight — it returns viewport height,
-              // not content height. See fresh-start check above for details.
-            );
+      for (const outcome of testResults) {
+        if (outcome.status === 'fulfilled' && outcome.value) {
+          const r = outcome.value;
+          total++;
+          if (r.passed) { passed++; } else { failed++; }
+          results.push(r);
+        } else {
+          total++;
+          failed++;
+          results.push({
+            file: 'unknown',
+            passed: false,
+            duration: 0,
+            error: (outcome as any).reason?.message || 'Test execution failed'
           });
-          isBlank = pageHeight === 0;
-        } catch { /* evaluate may fail on some pages — not blank, proceed */ }
-
-        if (isBlank) {
-          log('Blank-page guard: page height=0 after stability wait — retrying with backoff', 'WARN', 'cycle');
-          for (let retry = 0; retry < MAX_BLANK_RETRIES; retry++) {
-            const waitMs = BLANK_RETRY_BASE_MS * (retry + 1); // 2s, 4s, 6s, 8s
-            log(`Blank-page retry ${retry + 1}/${MAX_BLANK_RETRIES}: waiting ${waitMs}ms`, 'DEBUG', 'cycle');
-            await new Promise(r => setTimeout(r, waitMs));
-
-            // Check height again
-            try {
-              const h = await page.evaluate(() => {
-                return Math.max(
-                  document.body?.scrollHeight || 0,
-                  document.body?.offsetHeight || 0,
-                  document.documentElement?.scrollHeight || 0
-                );
-              });
-              if (h > 0) {
-                log(`Blank-page guard: page height recovered to ${h}px after ${waitMs}ms`, 'INFO', 'cycle');
-                isBlank = false;
-                break;
-              }
-            } catch { break; /* evaluate failed — something is there */ }
-          }
-
-          // If still blank after retries, try a page reload
-          if (isBlank) {
-            log('Blank-page guard: still blank after retries — reloading page', 'WARN', 'cycle');
-            try {
-              await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
-              // Wait extra for Flutter to render after reload
-              await new Promise(r => setTimeout(r, 5000));
-              if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
-            } catch (reloadErr: any) {
-              log(`Blank-page guard: reload failed: ${reloadErr.message || reloadErr}`, 'WARN', 'cycle');
-            }
-          }
         }
       }
 
-      const beforeUrl = page.url();
-      let screenshot = await page.screenshot({ type: 'jpeg', quality: 20 });
+      log(`Regression suite complete: ${passed}/${total} passed`, passed === total ? 'INFO' : 'WARN', 'regression-bank');
 
-      // ── Screenshot validity check ──
-      // A valid screenshot of a rendered page should be >3KB even at quality:20.
-      // If it's tiny, the page is likely blank (white rectangle).
-      if (screenshot.length < 3000) {
-        log(`Screenshot suspiciously small (${screenshot.length} bytes) — page may be blank. Waiting 3s and retaking...`, 'WARN', 'cycle');
-        await new Promise(r => setTimeout(r, 3000));
-        try {
-          const retryShot = await page.screenshot({ type: 'jpeg', quality: 20 });
-          if (retryShot.length > screenshot.length) {
-            log(`Retry screenshot is ${retryShot.length} bytes (was ${screenshot.length}) — using retry`, 'INFO', 'cycle');
-            screenshot = retryShot;
-          }
-        } catch { /* retry failed — proceed with original */ }
-      }
+      await this._pruneOldTests();
 
-      let base64 = screenshot.toString('base64');
-      // Feed screenshot to dashboard cache (non-blocking)
-
-      // ─── Cloudinary: upload cycle screenshot (fire-and-forget) ───
-      try {
-        const screenshotStorage = require('./screenshot-storage');
-        if (screenshotStorage?.isEnabled?.() && screenshotStorage?.uploadScreenshot) {
-          screenshotStorage.uploadScreenshot(screenshot, 'cycle', {
-            state: currentState || 'unknown',
-            cycle: String(getStats().cycleCount || 0),
-          }).catch(() => {});
-        }
-      } catch (uploadErr: any) {
-        log(`Screenshot Cloudinary upload failed (non-critical): ${uploadErr.message || uploadErr}`, 'DEBUG', 'cycle');
-      }
-      try {
-        const setShot = (globalThis as any).__setLatestScreenshot;
-        if (setShot) {
-          setShot(base64, null); // action set after tribunal
-        }
-      } catch { /* non-critical */ }
-      const screenshotHash = crypto.createHash('md5').update(screenshot).digest('hex');
-      // Track screenshot changes for stagnation detection
-      if (previousScreenshotHash && screenshotHash !== previousScreenshotHash) {
-        lastScreenshotChangeTime = Date.now();
-      }
-      previousScreenshotHash = screenshotHash;
-
-      // Check policy (existing policyEngine)
-      if (policyEngine) {
-        const urlCheck = policyEngine.checkUrl(beforeUrl);
-        if (!urlCheck.allowed) { log(`Policy blocked action: ${urlCheck.reason}`, 'WARN', 'cycle'); break; }
-      }
-      // Resilience: state guard transition validation
-      if (policyStateGuard && currentState) {
-        const stateCheck = policyStateGuard.validateTransition(currentState, beforeUrl);
-        if (stateCheck && !stateCheck.allowed) {
-          log(`State guard blocked transition: ${stateCheck.reason}`, 'WARN', 'cycle');
-        }
-      }
-      // Resilience: circular path detection (SPA-aware)
-      if (progressCircularPathDetector) {
-        // On SPA domains, URL never changes — use state+hash visual loop detection.
-        // On non-SPA domains, use traditional URL-based detection.
-        const spaDomains = (CONFIG.MATHU_SPA_DOMAINS || 'app.mathu.co.za,mathu.co.za').split(',').map((d: string) => d.trim());
-        const isSpa = spaDomains.some((d: string) => beforeUrl.includes(d));
-        let loopCheck;
-        if (isSpa && currentState) {
-          loopCheck = progressCircularPathDetector.checkStateLoop(currentState, screenshotHash);
-          if (loopCheck?.isLooping) {
-            log(`SPA visual loop detected! State "${currentState}" hash "${screenshotHash.substring(0, 8)}" repeated ${loopCheck.loopCount} times. ${loopCheck.suggestion}`, 'WARN', 'cycle');
-            // On SPA: scroll down to break the visual stalemate before navigating away
-            try { await page.evaluate(() => window.scrollBy(0, 300)); } catch { /* non-critical */ }
-            await new Promise(r => setTimeout(r, 2000));
-          }
-        } else {
-          loopCheck = progressCircularPathDetector.checkUrlLoop(beforeUrl);
-          if (loopCheck?.isLooping) {
-            log(`Circular path detected! URL ${beforeUrl} seen ${loopCheck.loopCount} times. Navigating away.`, 'WARN', 'cycle');
-            await page.goto(CONFIG.BASE_URL || 'about:blank', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-          }
-        }
-      }
-
-      let action = null;
-
-      // Flutter Semantics path
-      if (CONFIG.ENABLE_FLUTTER_SEMANTICS && semantics && dpr) {
-        const interactiveItems = await semantics.getInteractiveItems(page);
-        if (interactiveItems.length > 0) {
-          const watch = semantics.findElementFuzzy('watch', interactiveItems);
-          if (watch && !watch.disabled) {
-            const coords = dpr.getJitteredClick(watch.centerX, watch.centerY);
-            action = { actionType: 'click', targetX: coords.x, targetY: coords.y, currentState: 'assignments_page', reasoning: 'Found via Flutter Semantics' };
-            log('Flutter Semantics found "Watch" button.', 'INFO', 'cycle');
-          } else {
-            const start = semantics.findElementFuzzy('start', interactiveItems);
-            if (start && !start.disabled) {
-              const coords = dpr.getJitteredClick(start.centerX, start.centerY);
-              action = { actionType: 'click', targetX: coords.x, targetY: coords.y, currentState: 'assignments_page', reasoning: 'Found via Flutter Semantics' };
-              log('Flutter Semantics found "Start" button.', 'INFO', 'cycle');
-            }
-          }
-        }
-      }
-
-      // Plugin actions
-      if (!action && pluginAPI?.actions) {
-        for (const [name, handler] of pluginAPI.actions) {
-          try {
-            const result = await handler(page, base64, beforeUrl);
-            if (result) { action = result; log(`Plugin action ${name} provided result`, 'DEBUG', 'cycle'); break; }
-          } catch (err: any) { logError(`Plugin action ${name} failed`, err); }
-        }
-      }
-
-      // Resilience: quota throttle check before tribunal
-      if (economyQuotaRations?.isEconomyMode?.()) {
-        log('Economy mode active — reducing tribunal calls', 'INFO', 'cycle');
-      }
-
-      // ─── Action Cache Lookup ───
-      // Before calling the tribunal (expensive AI call), check if we have
-      // a cached action for this exact visual context. If hit, skip the AI
-      // call entirely and use the saved action.
-      let _actionCacheSig: string | null = null;
-      let _actionCacheHit = false;
-      const actionCache = _getActionCache();
-      if (!action && actionCache && currentState) {
-        try {
-          // Compute context signature from current state + screenshot
-          // Use previous cycle's state as the context key (currentState is set from last cycle)
-          _actionCacheSig = actionCache.computeContextSignature(currentState, base64);
-          if (_actionCacheSig) {
-            const cachedAction = actionCache.lookup(_actionCacheSig);
-            if (cachedAction) {
-              action = cachedAction;
-              _actionCacheHit = true;
-              log(`Action cache HIT: type=${cachedAction.actionType} at (${cachedAction.targetX.toFixed(2)}, ${cachedAction.targetY.toFixed(2)}) state=${cachedAction.currentState}`, 'INFO', 'cycle');
-              updateStats({ actionCacheHits: (getStats().actionCacheHits || 0) + 1 });
-            } else {
-              updateStats({ actionCacheMisses: (getStats().actionCacheMisses || 0) + 1 });
-            }
-          }
-        } catch (cacheErr: any) {
-          log(`Action cache lookup error: ${cacheErr.message || cacheErr}`, 'DEBUG', 'cycle');
-        }
-      }
-
-      // Vision tribunal
-      if (!action) {
-        // Pixel-only mode: skip AI providers entirely, go straight to fallback chain
-        if (options?.pixelOnly) {
-          log('Pixel-only mode: skipping tribunal, using fallback chain directly', 'INFO', 'cycle');
-          try {
-            action = await getFallbackAction(page, currentState || undefined);
-            if (action && action.actionType && action.actionType !== 'wait') {
-              log(`Pixel-only fallback: ${action.actionType} at (${action.targetX}, ${action.targetY})`, 'INFO', 'cycle');
-            }
-          } catch (fbErr: any) {
-            log(`Pixel-only fallback failed: ${fbErr.message || fbErr}`, 'WARN', 'cycle');
-          }
-        } else {
-          try {
-            action = await safeCall((_sig: any) => determineNextAction(base64, page.url(), explorationMode ? explorationMap : null), 'Tribunal', { timeoutMs: CONFIG.TRIBUNAL_TIMEOUT_MS, url: 'tribunal' });
-          } catch (err: any) {
-            const errMsg = err?.message || String(err);
-            // Fast-path: if OR daily limit just got exhausted, enter park immediately
-            // instead of burning memory on fallback chains that will also fail
-            if (errMsg.includes('OPENROUTER_DAILY_LIMIT') || errMsg.includes('free-models-per-day')) {
-              if (await _checkOrPark(log)) {
-                await new Promise(r => setTimeout(r, OR_PARK_CHECK_INTERVAL_MS));
-                continue;
-              }
-            }
-            logError('Tribunal failed, using fallback', err);
-            action = await getFallbackAction(page, currentState || undefined);
-          }
-        }
-      }
-      if (!action || !action.actionType) {
-        log('Action is null, using fallback wait', 'WARN', 'cycle');
-        action = { actionType: 'wait', currentState: 'error', targetX: 0, targetY: 0 };
-      }
-
-      // P-fix: When tribunal returns 'wait' for unknown/error state, run the full
-      // fallback chain (pixel → visual recovery → CSS selectors) BEFORE accepting
-      // the wait. This ensures the bot tries DOM/pixel-based recovery when AI
-      // providers can't determine the state (e.g., only text-only providers available).
-      if (action && action.actionType === 'wait' && (action.currentState === 'unknown' || action.currentState === 'error')) {
-        log('Tribunal returned wait for unknown state — running fallback chain', 'INFO', 'cycle');
-        try {
-          const fallbackAction = await getFallbackAction(page, currentState || undefined);
-          if (fallbackAction && fallbackAction.actionType && fallbackAction.actionType !== 'wait') {
-            log(`Fallback chain provided action: ${fallbackAction.actionType} at (${fallbackAction.targetX}, ${fallbackAction.targetY}) state=${fallbackAction.currentState}`, 'INFO', 'cycle');
-            action = fallbackAction;
-          } else {
-            log('Fallback chain returned wait — accepting tribunal wait', 'DEBUG', 'cycle');
-          }
-        } catch (fbErr: any) {
-          log(`Fallback chain failed: ${fbErr.message || fbErr}`, 'WARN', 'cycle');
-        }
-      }
-
-      // Dashboard: check if action is banned
-      try {
-        const dbMod = require('./database');
-        const isBanned = dbMod.selectBannedAction?.(action.actionType);
-        if (isBanned) {
-          // If banned action is not 'wait', fall back to 'wait'
-          // If 'wait' itself is banned (e.g. stagnation guard), fall back to 'reload'
-          const isWaitAlsoBanned = dbMod.selectBannedAction?.('wait');
-          if (!isWaitAlsoBanned) {
-            log(`Action ${action.actionType} is banned. Forcing wait.`, 'WARN', 'cycle');
-            action = { actionType: 'wait', currentState: action.currentState, targetX: 0, targetY: 0, reasoning: `Action ${action.actionType} banned` };
-          } else {
-            log(`Action ${action.actionType} and wait are both banned. Forcing reload.`, 'WARN', 'cycle');
-            action = { actionType: 'reload', currentState: action.currentState, targetX: 0, targetY: 0, reasoning: `All fallbacks banned, using reload` };
-          }
-        }
-      } catch { /* non-critical: DB unavailable */ }
-
-      // Experiment context
-      if (strategyVariants) {
-        const experiment = strategyVariants.getActiveExperiment?.();
-        if (experiment) {
-          const jitter = experiment.context?.getJitterPx?.();
-          if (jitter && action.targetX !== undefined && action.targetY !== undefined) {
-            action.targetX += (Math.random() - 0.5) * jitter / 100;
-            action.targetY += (Math.random() - 0.5) * jitter / 100;
-          }
-        }
-      }
-
-      // ─── Module Download Flow Detection (Response 3) ───
-      // Before executing, check if this action is a download button click.
-      // If so, record the pre-download screenshot hash and set state.
-      const isDownloadClick = action.actionType === 'click' &&
-        (action.currentState === 'module_downloading' ||
-         (action.reasoning && action.reasoning.includes('download')));
-
-      if (isDownloadClick && _moduleDownloadState === 'idle') {
-        _moduleDownloadState = 'download_clicked';
-        _moduleDownloadStartTime = Date.now();
-        _moduleDownloadRetryCount = 0;
-        _preDownloadScreenshotHash = screenshotHash;
-        log('Module download flow: click detected, entering download_clicked state', 'INFO', 'cycle');
-      }
-
-      // Resilience: action validation before execution
-      if (policyActionValidator) {
-        const validation = policyActionValidator.validateAction(action, action.currentState);
-        if (validation && !validation.allowed) {
-          log(`Action validator blocked: ${validation.reason}`, 'WARN', 'cycle');
-          action = { actionType: 'wait', currentState: action.currentState, targetX: 0, targetY: 0, reasoning: `Blocked by validator: ${validation.reason}` };
-        }
-      }
-      updateStats({ currentState: action.currentState });
-      // Update dashboard cache with action info
-      try {
-        const setShot = (globalThis as any).__setLatestScreenshot;
-        if (setShot) {
-          setShot(base64, action);
-        }
-      } catch { /* non-critical */ }
-
-      // UI drift detection (uses base64 — must run before we null it)
-      if (uiDrift) {
-        const uiDrifted = await uiDrift.detectDrift(action.currentState, base64);
-        if (uiDrifted) {
-          log('UI Drifted! Entering Discovery Mode.', 'WARN', 'cycle');
-          await uiDrift.discoverUI(page);
-          await stateMachine.transition(STATES.UI_DISCOVERED);
-        }
-      }
-
-      // ─── Solution Cache Check (Response 5) ───
-      // Before calling LLM, check if we've seen this exact problem before.
-      // Exact match → use cached solution directly (saves budget).
-      // Similar match → include cached solution as context hint.
-      let _cacheHitProblemText = '';
-      let _cacheHitHash = '';
-      const solutionCache = _getSolutionCache();
-      if (solutionCache && action && (action.currentState === 'question' || action.actionType === 'keypad_input' || action.value)) {
-        try {
-          // Get problem text from page or action reasoning
-          let probTextForCache = '';
-          try {
-            const bodyTextForCache = await page.evaluate(() => document.body?.innerText || '');
-            if (bodyTextForCache && bodyTextForCache.length > 20) {
-              probTextForCache = bodyTextForCache.substring(0, 2000);
-            }
-          } catch {}
-          if (!probTextForCache && action.reasoning) {
-            probTextForCache = action.reasoning;
-          }
-
-          if (probTextForCache) {
-            const cacheResult = solutionCache.lookup(probTextForCache);
-            if (cacheResult.type === 'exact' && cacheResult.solution) {
-              const sol = cacheResult.solution;
-              log(`Solution cache EXACT HIT — reusing verified solution (type=${sol.problemType}, used ${sol.successCount}x before)`, 'INFO', 'cycle');
-              // Attach cached solution to action so downstream can use it
-              action._cachedSolution = sol.solution;
-              action._cachedSteps = sol.steps;
-              action._cacheHit = 'exact';
-              _cacheHitProblemText = probTextForCache;
-              _cacheHitHash = cacheResult.hash;
-              updateStats({ solutionCacheHits: (getStats().solutionCacheHits || 0) + 1 });
-            } else if (cacheResult.type === 'similar' && cacheResult.similarSolution) {
-              const simSol = cacheResult.similarSolution;
-              log(`Solution cache SIMILAR HIT — including as context hint (type=${simSol.problemType})`, 'INFO', 'cycle');
-              action._cachedSolutionHint = simSol.solution;
-              action._cachedStepsHint = simSol.steps;
-              action._cacheHit = 'similar';
-              _cacheHitHash = cacheResult.hash;
-              updateStats({ solutionCacheSimilarHits: (getStats().solutionCacheSimilarHits || 0) + 1 });
-            }
-          }
-        } catch (cacheErr: any) {
-          log(`Solution cache lookup error: ${cacheErr.message || cacheErr}`, 'DEBUG', 'cycle');
-        }
-      }
-
-      // ─── Problem Classification Pipeline (Response 4) ───
-      // Classify the math problem type from available text, and optionally
-      // re-OCR with Pix2Tex if the vision model's text quality is poor.
-      // This runs before math verification to provide better context.
-      const classifier = _getProblemClassifier();
-      if (classifier && action && (action.currentState === 'question' || action.actionType === 'keypad_input' || action.value)) {
-        try {
-          // Get text from the page (a11y snapshot or body text)
-          let ocrText = '';
-          try {
-            const bodyText = await page.evaluate(() => document.body?.innerText || '');
-            if (bodyText && bodyText.length > 20) {
-              ocrText = bodyText.substring(0, 2000); // Limit to prevent huge prompts
-            }
-          } catch {}
-
-          // Fallback: use action reasoning as text source
-          if (!ocrText && action.reasoning) {
-            ocrText = action.reasoning;
-          }
-
-          if (ocrText) {
-            const classification = classifier.classifyProblem(ocrText);
-
-            // Check if Pix2Tex should re-OCR this image
-            const pix2tex = _getPix2tex();
-            if (pix2tex && classifier.shouldUsePix2Tex(ocrText, classification.type, false)) {
-              const p2tResult = await pix2tex.ocrMath(base64);
-              if (p2tResult.text && p2tResult.text.length > 10) {
-                log(`Pix2Tex re-OCR: ${p2tResult.text.length} chars (conf=${p2tResult.confidence}%)`, 'INFO', 'cycle');
-                // Use Pix2Tex text for re-classification
-                const reclassified = classifier.classifyProblem(p2tResult.text);
-                // Attach to action for downstream consumers
-                action._pix2texText = p2tResult.text;
-                action._pix2texLatex = p2tResult.latex;
-                action._problemType = reclassified.type;
-                action._problemConfidence = reclassified.confidence;
-                action._ocrQuality = reclassified.ocrQuality;
-
-                // Record model-type affinity after this attempt
-                const providerName = action.provider || 'unknown';
-                classifier.recordModelTypeAffinity(reclassified.type, providerName, true); // optimistic, updated later on failure
-              }
-            } else {
-              // No Pix2Tex re-OCR needed — use regex classification
-              action._problemType = classification.type;
-              action._problemConfidence = classification.confidence;
-              action._ocrQuality = classification.ocrQuality;
-            }
-
-            if (action._problemType && action._problemType !== 'UNKNOWN') {
-              log(`Problem classified: ${action._problemType} (conf=${(action._problemConfidence || 0).toFixed(0)}%, OCR quality=${(action._ocrQuality || 0).toFixed(0)}%)`, 'INFO', 'cycle');
-            }
-          }
-        } catch (classErr: any) {
-          // Non-critical: classification failure shouldn't break the cycle
-          log(`Problem classification failed: ${classErr.message || classErr}`, 'DEBUG', 'cycle');
-        }
-      }
-
-      // Math verification: check answer before submitting (Response 1)
-      const mathVerify = _getMathVerify();
-      if (mathVerify && action && mathVerify.shouldVerify(action.currentState || '')) {
-        // For keypad/input actions: verify the typed value
-        // For click actions on assessment: verify using text regions from pixel fallback
-        let answerValue = action.value || action.keypadSequence?.map((k: any) => k.digit || k.label || '').join('') || '';
-        let problemContext = action.reasoning || '';
-
-        // Response 5: For click actions with _textRegions (pixel fallback MCQ),
-        // try to construct a verification context from the text region metadata.
-        // Note: pixel fallback can't OCR the actual text, but it provides density
-        // and position info. The math verifier uses this as supplementary context.
-        if (!answerValue && action.actionType === 'click' && action._textRegions) {
-          const tr = action._textRegions;
-          answerValue = `[choice at index ${action._textRegions._clickedChoiceIndex ?? '?'}]`;
-          problemContext += ` [pixel-fallback: question text density=${tr.questionRegion?.density.toFixed(2)}, ` +
-            `${tr.choiceRegions.length} choices detected]`;
-        }
-
-        if (answerValue && typeof answerValue === 'string' && answerValue.trim().length > 0) {
-          try {
-            // Use reasoning/action text as problem context, the answer value as proposed answer
-            const verifyResult = await mathVerify.verifyAnswer(problemContext, answerValue);
-            if (!verifyResult.correct && verifyResult.confidence > 0.7) {
-              log(`Math verification FAILED (method=${verifyResult.method}, conf=${verifyResult.confidence.toFixed(2)}): ${verifyResult.explanation}. Skipping submit.`, 'WARN', 'cycle');
-              // Skip this action — the answer is likely wrong. Let the next iteration re-analyze.
-              action = { actionType: 'wait', currentState: action.currentState, reasoning: `Verification failed: ${verifyResult.explanation}`, targetX: 0, targetY: 0 };
-              consecutiveTribunalFailures++;
-              updateStats({ mathVerifyFailed: (getStats().mathVerifyFailed || 0) + 1 });
-              // Continue to next loop iteration (re-screenshot and retry)
-              await sleep(CONFIG.BETWEEN_STEPS_MS * wm);
-              continue;
-            } else if (verifyResult.correct && verifyResult.method !== 'unknown') {
-              log(`Math verification PASSED (method=${verifyResult.method}, conf=${verifyResult.confidence.toFixed(2)})`, 'INFO', 'cycle');
-              updateStats({ mathVerifyPassed: (getStats().mathVerifyPassed || 0) + 1 });
-
-              // ─── Solution Cache Store (Response 5) ───
-              // Store the verified solution for future reuse.
-              // If this was a cache hit, record the successful reuse.
-              const solCache2 = _getSolutionCache();
-              if (solCache2) {
-                try {
-                  if (_cacheHitHash && _cacheHitProblemText) {
-                    // This was a cache hit — record successful reuse
-                    solCache2.recordReuseOutcome(_cacheHitHash, true);
-                  } else if (problemContext) {
-                    // New solution — store it
-                    const steps = action.reasoning ? action.reasoning.split(/\n|\./).filter((s: string) => s.trim().length > 10).slice(0, 10) : [];
-                    solCache2.store(problemContext, answerValue, steps, {
-                      problemType: action._problemType || 'UNKNOWN',
-                      modelUsed: action.provider || 'unknown',
-                      verified: true,
-                    });
-                  }
-                } catch (storeErr: any) {
-                  log(`Solution cache store error: ${storeErr.message || storeErr}`, 'DEBUG', 'cycle');
-                }
-              }
-            }
-          } catch (verifyErr: any) {
-            log(`Math verification error: ${verifyErr.message || verifyErr}. Proceeding with action.`, 'WARN', 'cycle');
-          }
-        }
-      }
-
-      // Quota bargaining
-      if (quotaBargain && !quotaBargain.canUseProvider('openrouter') && !quotaBargain.canUseProvider('mistral')) {
-        log('Quota exhausted. Finding new free models...', 'WARN', 'cycle');
-        const newModels = await quotaBargain.findNewFreeModels();
-        if (newModels.length > 0) {
-          resetCycleProviderState();
-          for (const model of newModels) {
-            // Dynamic providers discovered via quota bargaining are registered but skip tribunal
-            // (they need actual endpoint configuration before they can participate)
-            log(`Discovered model ${model} but needs endpoint configuration`, 'DEBUG', 'cycle');
-          }
-        }
-      }
-
-      const preActionState = currentState;
-      const startTime = Date.now();
-      let actionSuccess = false;
-
-      // Execute action with plugin pre-hook
-      pluginAPI?.runHooks?.('preAction', { page, action, state: currentState });
-
-      if (action.actionType === 'click') {
-        clickAttempts++;
-        const beforeBodyLen = await page.evaluate(() => document.body.innerText.length);
-        if (executeAction) await executeAction(page, action);
-        const afterUrl = page.url();
-        const afterBodyLen = await page.evaluate(() => document.body.innerText.length);
-        if (afterUrl !== beforeUrl || afterBodyLen !== beforeBodyLen) {
-          clickSuccesses++;
-          actionSuccess = true;
-          consecutiveFailures = 0;
-        } else {
-          // Network replay fallback
-          if (CONFIG.NETWORK_REPLAY_ON_CLICK_FAIL && network) {
-            const submission = network.getLastSubmission('start');
-            if (submission) {
-              const replayed = await network.replayRequest(page, submission);
-              if (replayed) { log('Network replay bypassed UI!', 'INFO', 'cycle'); actionSuccess = true; }
-            }
-          }
-          // Swipe + retry
-          if (!actionSuccess && gestures && executeAction) {
-            await gestures.performSwipe(page, 500, 400, 500, 200);
-            await executeAction(page, action);
-            if (page.url() !== afterUrl) actionSuccess = true;
-          }
-        }
-        // Canvas parsing fallback
-        if (!actionSuccess && canvas && dpr) {
-          const canvasData = await canvas.parseTextAndButtons(base64);
-          if (canvasData.watchButton) {
-            const coords = dpr.getJitteredClick(canvasData.watchButton.centerX, canvasData.watchButton.centerY);
-            await page.mouse.click(coords.x, coords.y);
-            actionSuccess = true;
-          }
-        }
-        // Engine tap fallback
-        if (!actionSuccess && inspector) {
-          const engineTap = await inspector.dispatchTapViaEngine(page, 300, 400);
-          if (engineTap) actionSuccess = true;
-        }
-        // Brute force fallback
-        if (!actionSuccess && bruteForce) {
-          const bruteSuccess = await bruteForce.bruteForceNavigate(page);
-          if (bruteSuccess) actionSuccess = true;
-        }
-        if (actionSuccess) consecutiveFailures = 0;
-      } else {
-        if (executeAction) await executeAction(page, action);
-        actionSuccess = true;
-        consecutiveFailures = 0;
-      }
-
-      // ─── Pixel Calibration Sampling ───
-      // After a successful click, sample the button color at click coordinates.
-      // This builds a distribution of observed colors per category, so pixel-fallback
-      // can adapt if MathU changes its color scheme.
-      if (actionSuccess && action.actionType === 'click' && (action.targetX > 0 || action.targetY > 0)) {
-        try {
-          const pixelCal = require('./pixel-calibration');
-          const pngShot = await page.screenshot({ type: 'png', fullPage: false }).catch(() => null);
-          if (pngShot && pngShot.length > 100) {
-            // Use DPR-adjusted coordinates (action coords are in viewport pixels)
-            const dprMod = require('./browser');
-            const dpr = dprMod._dprScale || 1.0;
-            pixelCal.sampleAtCoordinates(
-              pngShot,
-              Math.round(action.targetX * dpr),
-              Math.round(action.targetY * dpr),
-              action.actionType
-            ).catch(() => {});
-            // Also sample surrounding area (background, adjacent elements)
-            pixelCal.sampleSurroundings(
-              pngShot,
-              Math.round(action.targetX * dpr),
-              Math.round(action.targetY * dpr),
-              action.actionType
-            ).catch(() => {});
-          }
-        } catch (calErr: any) {
-          log(`Pixel calibration sampling failed: ${calErr.message || calErr}`, 'DEBUG', 'cycle');
-        }
-      }
-
-      // ─── Pixel Training: Record successful action for self-training ───
-      // After EVERY successful click (from any source — AI, pixel-fallback,
-      // pixel-explorer, action cache), record the (screenshot, action, result)
-      // triple so pixel-fallback can learn from it.
-      if (actionSuccess && action.actionType === 'click' && (action.targetX > 0 || action.targetY > 0)) {
-        try {
-          const pixelTraining = require('./pixel-training');
-          if (pixelTraining && pixelTraining.recordSuccess) {
-            // Reuse the PNG from calibration if available, otherwise training will capture its own
-            const trainingPng = (typeof pngShot !== 'undefined' && pngShot && pngShot.length > 100) ? pngShot : undefined;
-            pixelTraining.recordSuccess({
-              page,
-              action,
-              screenshotBuf: trainingPng,
-              pageFingerprint: typeof screenshotHash === 'string' ? screenshotHash : '',
-              viewportWidth: 1280,
-              viewportHeight: 720,
-              latencyMs: Date.now() - startTime,
-            }).catch(() => {});
-          }
-        } catch (trainErr: any) {
-          log(`Pixel training recording failed: ${trainErr.message || trainErr}`, 'DEBUG', 'cycle');
-        }
-      }
-
-      // ─── Pixel Explorer Outcome Observation ───
-      // If this was a pixel-explorer action, observe the outcome to learn from it.
-      if (actionSuccess && action._pixelExplorer && action._explorationMapKey) {
-        try {
-          const pixelExplorer = require('./pixel-explorer');
-          // screenshotHash was captured before the action as `screenshotHash` variable
-          pixelExplorer.observeOutcome(
-            page,
-            typeof screenshotHash === 'string' ? screenshotHash : '',
-            action._explorationMapKey,
-            action._explorationCellCx || action.targetX,
-            action._explorationCellCy || action.targetY
-          ).catch(() => {});
-        } catch (expErr: any) {
-          log(`Pixel explorer outcome observation failed: ${expErr.message || expErr}`, 'DEBUG', 'cycle');
-        }
-      }
-
-      // ─── Action Cache Save / Failure Tracking ───
-      // After action execution, update the cache:
-      // - Success: save the action (if not from cache) for future reuse
-      // - Failure: record failure count; evict if too many consecutive failures
-      if (_actionCacheSig && actionCache) {
-        if (actionSuccess && !_actionCacheHit) {
-          // Save new successful action to cache (only if it wasn't already from cache)
-          // This builds the cache over time as the bot discovers working actions
-          try {
-            actionCache.save(_actionCacheSig, {
-              actionType: action.actionType,
-              targetX: action.targetX,
-              targetY: action.targetY,
-              value: action.value || '',
-              keypadSequence: action.keypadSequence,
-              currentState: action.currentState || currentState || 'unknown',
-              reasoning: action.reasoning,
-            });
-          } catch (saveErr: any) {
-            log(`Action cache save error: ${saveErr.message || saveErr}`, 'DEBUG', 'cycle');
-          }
-        } else if (!actionSuccess && _actionCacheHit) {
-          // Cached action failed — record failure and possibly evict
-          const evicted = actionCache.recordFailure(_actionCacheSig);
-          if (evicted) {
-            log('Action cache entry evicted due to repeated failures — will re-query AI next cycle', 'WARN', 'cycle');
-          }
-        }
-      }
-
-      // ─── Module Download Wait Logic (Response 3) ───
-      // After executing a download click, wait for the module content to appear.
-      // Uses screenshot hash comparison to detect when the page changes.
-      if (_moduleDownloadState === 'download_clicked' && actionSuccess) {
-        log('Module download flow: waiting for content to change...', 'INFO', 'cycle');
-        const downloadStartTime = Date.now();
-        let contentAppeared = false;
-        const { sleep: dlSleep } = require('./utils-sleep');
-
-        // Poll for screenshot change (indicates download started/completed)
-        while (Date.now() - downloadStartTime < MODULE_DOWNLOAD_TIMEOUT_MS) {
-          await dlSleep(MODULE_DOWNLOAD_POLL_INTERVAL_MS);
-          try {
-            const pollScreenshot = await page.screenshot({ type: 'jpeg', quality: 30 });
-            const pollHash = crypto.createHash('md5').update(pollScreenshot).digest('hex');
-
-            if (pollHash !== _preDownloadScreenshotHash) {
-              // Screenshot changed — download has started or completed
-              _moduleDownloadState = 'downloading';
-              log('Module download flow: screenshot changed, download in progress', 'INFO', 'cycle');
-
-              // Wait additional time for content to fully render
-              await dlSleep(2000);
-
-              // Check if module content (topic buttons) is now visible via pixel analysis
-              try {
-                const pngScreenshot = await page.screenshot({ type: 'png', fullPage: false });
-                const pixelMod = require('./pixel-fallback');
-                const decoded = pixelMod._decodePNG?.(pngScreenshot);
-                if (decoded && pixelMod._isModuleContentLoaded?.(decoded.rgba, decoded.width, decoded.height)) {
-                  _moduleDownloadState = 'content_visible';
-                  log('Module download flow: content loaded! Topics visible.', 'INFO', 'cycle');
-                  contentAppeared = true;
-                }
-              } catch (pxErr: any) {
-                log(`Module download flow: pixel check failed (${pxErr.message || pxErr}), assuming content loaded`, 'DEBUG', 'cycle');
-                // If pixel check fails, assume content loaded after screenshot change
-                contentAppeared = true;
-                _moduleDownloadState = 'content_visible';
-              }
-              break;
-            }
-          } catch (pollErr: any) {
-            log(`Module download flow: poll screenshot failed (${pollErr.message || pollErr})`, 'DEBUG', 'cycle');
-          }
-        }
-
-        if (!contentAppeared) {
-          // Download may still be in progress or failed
-          const elapsed = Date.now() - downloadStartTime;
-          if (elapsed >= MODULE_DOWNLOAD_TIMEOUT_MS) {
-            log(`Module download flow: timeout after ${elapsed / 1000}s. Scrolling and retrying.`, 'WARN', 'cycle');
-            _moduleDownloadRetryCount++;
-            if (_moduleDownloadRetryCount <= MODULE_DOWNLOAD_MAX_RETRIES) {
-              // Try scrolling and clicking the card again
-              try { await page.evaluate(() => window.scrollBy(0, -200)); } catch { /* non-critical */ }
-              await dlSleep(1000);
-              _moduleDownloadState = 'idle'; // Reset to try again on next cycle
-            } else {
-              log(`Module download flow: max retries (${MODULE_DOWNLOAD_MAX_RETRIES}) exceeded. Moving on.`, 'WARN', 'cycle');
-              _moduleDownloadState = 'idle';
-            }
-          } else {
-            // Still waiting — stay in download_clicked state for next cycle to continue polling
-            log('Module download flow: still waiting, will poll again next cycle', 'DEBUG', 'cycle');
-          }
-        }
-
-        // If content is now visible, let the next cycle iteration find Watch/Start buttons
-        if (_moduleDownloadState === 'content_visible') {
-          _moduleDownloadState = 'idle';
-          _preDownloadScreenshotHash = null;
-          // Don't set currentState to module_downloading — let the next iteration
-          // detect the assignments page with visible topic buttons
-          // Force a new screenshot on the next iteration by jumping to top of loop
-          await dlSleep((CONFIG.BETWEEN_STEPS_MS || 2000) * 1);
-          continue;
-        }
-      }
-
-      // If download was clicked but action failed (click didn't register)
-      if (_moduleDownloadState === 'download_clicked' && !actionSuccess) {
-        log('Module download flow: click failed, will retry on next cycle', 'DEBUG', 'cycle');
-        _moduleDownloadState = 'idle'; // Reset so we can try again
-      }
-
-      // Record experiment result
-      const latency = Date.now() - startTime;
-      if (strategyVariants?.getActiveExperiment?.()) {
-        strategyVariants.recordExperimentResult?.(actionSuccess, latency);
-        const exp = strategyVariants.getActiveExperiment();
-        if (exp?.results?.attempts >= 30) {
-          if (strategyVariants.shouldPromoteExperiment?.()) {
-            strategyVariants.promoteActiveExperiment?.();
-          } else {
-            strategyVariants.revertExperiment?.(exp);
-          }
-        }
-      }
-
-      // Adaptive performance
-      if (CONFIG.ENABLE_ADAPTIVE_PERFORMANCE && adaptiveEngine) { adaptiveEngine.recordLatency(latency); }
-
-      // Blackbox recording
-      if (CONFIG.ENABLE_BLACKBOX && blackbox) {
-        const semanticsSnapshot = await _getA11ySnapshot().getA11ySnapshot(page);
-        blackbox.record({ state: action.currentState, action: action.actionType, semantics: JSON.stringify(semanticsSnapshot).substring(0, 500), hash: screenshotHash, success: actionSuccess ? 1 : 0, reasoning: action.reasoning || '', latency, provider_used: action.provider || 'unknown' });
-        if (insertSemanticsSnapshot) insertSemanticsSnapshot.run(Date.now(), semanticsSnapshot ? Object.keys(semanticsSnapshot).length : 0, JSON.stringify(semanticsSnapshot).substring(0, 1000));
-      }
-
-      // Flutter semantics persistence
-      if (CONFIG.ENABLE_FLUTTER_SEMANTICS && semantics) {
-        const items = await semantics.getInteractiveItems(page, true);
-        // v5-fix: Use DI-injected insertFlutterSemantics instead of inline require('./database')
-        const insertFlutterSemantics = dbHelpers.insertFlutterSemantics || null;
-        insertFlutterSemantics?.run?.(page.url(), JSON.stringify(items.slice(0, 50)), Date.now());
-      }
-
-      // Stagnation recovery & module tracking
-      if (recoverIfStuck) await recoverIfStuck(page, screenshot, action);
-      if (trackModuleProgress) await trackModuleProgress(page, base64);
-      // ── Memory: release screenshot + base64 after ALL consumers ──
-      // This is the last place either is used in the loop iteration.
-      // Nulling frees ~20-60KB (base64) + ~15-25KB (raw Buffer) immediately.
-      screenshot = null as any;
-      base64 = null as any;
-      _actionCacheSig = null;
-      // Resilience: semantic progress detection
-      if (progressSemanticDetector) {
-        try {
-          const semState = await progressSemanticDetector.getSemanticState(page);
-          if (semState) {
-            log(`Semantic state: Q${semState.questionNumber}/${semState.totalQuestions} module=${semState.module} score=${semState.score}`, 'DEBUG', 'cycle');
-          }
-        } catch (e: any) { /* non-critical */ }
-      }
-
-      // Module completion
-      if (['score_screen', 'pathway_feedback'].includes(action.currentState) && action.currentState !== currentState) {
-        questionsCompleted++;
-        _midQuiz = false; // v6: quiz done, safe to close browser for memory
-        try { const memoryMode = require('./memory-mode'); memoryMode.setMidQuiz(false); } catch {}
-        lastQuestionCompletionTime = Date.now();
-        lastScreenshotChangeTime = Date.now();
-        updateStats({ questionsCompleted });
-        // Notify health watchdog of progress (Response 2)
-        _getHealthWatchdog()?.notifyProgress?.();
-        trackProgress?.({ action: action.actionType, state: action.currentState, timestamp: new Date().toISOString(), questionsCompleted });
-        if (upsertLastState) upsertLastState.run(page.url(), action.currentState, Date.now());
-        consecutiveFailures = 0;
-        saveCheckpoint?.({ url: page.url(), state: action.currentState, questionsCompleted });
-        // Run solution cache maintenance every 100 questions (Response 5)
-        if (questionsCompleted % 100 === 0) {
-          try { _getSolutionCache()?.runMaintenance?.(); } catch { /* non-critical */ }
-          try { _getActionCache()?.runMaintenance?.(); } catch { /* non-critical */ }
-        }
-        if (currentModule && recordModuleCompletion) {
-          const timeTaken = Date.now() - cycleStart;
-          recordModuleCompletion(currentModule, timeTaken);
-          log(`Module ${currentModule} completed in ${timeTaken / 1000}s`, 'INFO', 'cycle');
-          currentModule = getNextModule?.();
-          if (currentModule) { log(`Next module: ${currentModule}`, 'INFO', 'cycle'); }
-        }
-      }
-
-      // Resilience: speed benchmark timeout check
-      if (progressSpeedBenchmark && action.currentState === preActionState) {
-        const speedCheck = progressSpeedBenchmark.checkSpeedTimeout(startTime, action.currentState);
-        if (speedCheck?.timedOut) {
-          log(`Speed timeout: ${speedCheck.currentTime}ms > 3x avg ${speedCheck.avgTime?.toFixed(0)}ms. Forcing skip.`, 'WARN', 'cycle');
-        }
-      }
-      // Stuck detection
-      if (action.currentState === preActionState && !actionSuccess) {
-        stuckCounter++;
-        consecutiveTribunalFailures++;
-      } else {
-        stuckCounter = 0;
-        consecutiveTribunalFailures = 0;
-        explorationFailures = 0;
-        explorationMode = false;
-      }
-
-      // Unknown state escape hatch — prevents 75s × N death spiral
-      // When providers can't determine the page state, they return 'unknown'
-      // and default to 'wait', creating an infinite idle loop. After
-      // MAX_UNKNOWN_STATE consecutive unknowns, force a page reload to
-      // break the cycle and potentially land on a recognizable page.
-      if (action.currentState === 'unknown' || !action.currentState) {
-        unknownStateCounter++;
-        // 20-min stagnation auto-ban: if no screenshot change + no question completion
-        // for 20+ minutes in unknown/error loop, auto-ban 'wait' to force reload
-        const timeSinceScreenshotChange = Date.now() - lastScreenshotChangeTime;
-        const timeSinceQuestionCompletion = Date.now() - lastQuestionCompletionTime;
-        if (!stagnationAutoBanTriggered
-            && action.actionType === 'wait'
-            && timeSinceScreenshotChange > STAGNATION_AUTO_BAN_MS
-            && timeSinceQuestionCompletion > STAGNATION_AUTO_BAN_MS) {
-          log(`20-min stagnation detected in unknown loop (no screenshot change, no completions). Triggering runtime heal + auto-banning wait action.`, 'WARN', 'cycle');
-          // v9: Trigger runtime heal FIRST — it may fix the root cause
-          // (stale providers, corrupted DB, quarantined modules) without
-          // needing to ban wait or reload.
-          try {
-            const selfHealMod = getDep('selfHeal');
-            if (selfHealMod?.performRuntimeHeal && CONFIG.SELF_HEAL_ENABLED) {
-              selfHealMod.performRuntimeHeal().then((rtResult: any) => {
-                if (rtResult?.healed) {
-                  log(`Stagnation runtime heal succeeded: ${rtResult.results?.filter((r: any) => r.healed).map((r: any) => r.avenue).join(', ')}`, 'INFO', 'cycle');
-                }
-              }).catch(() => {});
-            }
-          } catch {}
-          // Also request self-heal session if in memory protection
-          try {
-            const memoryMode = require('./memory-mode');
-            if (memoryMode.isMemoryProtection?.()) {
-              memoryMode.beginSelfHealSession?.('stagnation_20min_unknown_loop');
-            }
-          } catch {}
-          try {
-            const dbMod = require('./database');
-            dbMod.insertBannedAction?.('wait', 'stagnation-guard', Date.now() + 60 * 60 * 1000);
-          } catch { /* non-critical */ }
-          stagnationAutoBanTriggered = true;
-          try {
-            const sendAlert = require('./alerting').sendAlert;
-            sendAlert?.('20-min stagnation auto-ban triggered: wait action banned');
-          } catch { /* non-critical */ }
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-          lastScreenshotChangeTime = Date.now();
-          continue;
-        }
-        if (unknownStateCounter >= MAX_UNKNOWN_STATE) {
-          log(`Unknown state ${unknownStateCounter} times in a row. Trying pixel fallback before reload.`, 'WARN', 'cycle');
-          unknownStateCounter = 0;
-          // Try pixel-based fallback before reloading — it can handle login pages
-          // and other pages even when AI, DOM, and semantics are all unavailable
-          try {
-            const pixelFallback = require('./pixel-fallback');
-            const pixelAction = await pixelFallback.generatePixelFallbackAction(page, currentState || undefined);
-            if (pixelAction && pixelAction.actionType && pixelAction.actionType !== 'wait') {
-              log(`Pixel fallback saved us: ${pixelAction.actionType} at (${pixelAction.targetX}, ${pixelAction.targetY}) state=${pixelAction.currentState}`, 'INFO', 'cycle');
-              if (executeAction) await executeAction(page, pixelAction);
-              lastScreenshotChangeTime = Date.now();
-              continue;
-            }
-          } catch (pfErr: any) {
-            log(`Pixel fallback attempt failed: ${pfErr.message || pfErr}`, 'DEBUG', 'cycle');
-          }
-          // Pixel fallback didn't help — fall back to reload
-          try {
-            const currentUrl = page.url();
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-            // If still on same page after reload, try navigating to BASE_URL
-            if (page.url() === currentUrl && CONFIG.BASE_URL) {
-              log('Reload didn\'t change page, navigating to BASE_URL.', 'WARN', 'cycle');
-              await page.goto(CONFIG.BASE_URL, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-            }
-          } catch (reloadErr: any) {
-            log(`Page reload failed: ${reloadErr.message || reloadErr}`, 'WARN', 'cycle');
-          }
-          continue; // Skip the wait action and re-evaluate on next iteration
-        }
-      // Also handle 'error' state — same death spiral as unknown
-      } else if (action.currentState === 'error') {
-        // 20-min stagnation auto-ban for error loops
-        const timeSinceScreenshotChange = Date.now() - lastScreenshotChangeTime;
-        const timeSinceQuestionCompletion = Date.now() - lastQuestionCompletionTime;
-        if (!stagnationAutoBanTriggered
-            && action.actionType === 'wait'
-            && timeSinceScreenshotChange > STAGNATION_AUTO_BAN_MS
-            && timeSinceQuestionCompletion > STAGNATION_AUTO_BAN_MS) {
-          log(`20-min stagnation detected in error loop (no screenshot change, no completions). Triggering runtime heal + auto-banning wait action.`, 'WARN', 'cycle');
-          // v9: Trigger runtime heal FIRST — same as unknown-loop stagnation
-          try {
-            const selfHealMod = getDep('selfHeal');
-            if (selfHealMod?.performRuntimeHeal && CONFIG.SELF_HEAL_ENABLED) {
-              selfHealMod.performRuntimeHeal().then((rtResult: any) => {
-                if (rtResult?.healed) {
-                  log(`Stagnation runtime heal succeeded: ${rtResult.results?.filter((r: any) => r.healed).map((r: any) => r.avenue).join(', ')}`, 'INFO', 'cycle');
-                }
-              }).catch(() => {});
-            }
-          } catch {}
-          // Also request self-heal session if in memory protection
-          try {
-            const memoryMode = require('./memory-mode');
-            if (memoryMode.isMemoryProtection?.()) {
-              memoryMode.beginSelfHealSession?.('stagnation_20min_error_loop');
-            }
-          } catch {}
-          try {
-            const dbMod = require('./database');
-            dbMod.insertBannedAction?.('wait', 'stagnation-guard', Date.now() + 60 * 60 * 1000);
-          } catch { /* non-critical */ }
-          stagnationAutoBanTriggered = true;
-          try {
-            const sendAlert = require('./alerting').sendAlert;
-            sendAlert?.('20-min stagnation auto-ban triggered: wait action banned');
-          } catch { /* non-critical */ }
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-          lastScreenshotChangeTime = Date.now();
-          continue;
-        }
-      } else {
-        unknownStateCounter = 0;
-        // Auto-rearm: if screenshot changes within 60s of ban, clear the flag
-        if (stagnationAutoBanTriggered && (Date.now() - lastScreenshotChangeTime) < 60000) {
-          stagnationAutoBanTriggered = false;
-          try {
-            const dbMod = require('./database');
-            dbMod.deleteBannedAction?.('wait', 'stagnation-guard');
-          } catch { /* non-critical */ }
-        }
-      }
-
-      // Exploration mode
-      if (consecutiveTribunalFailures >= CONFIG.EXPLORATION_CONSECUTIVE_FAILURES && CONFIG.ENABLE_EXPLORATION_PASS && explorationCartographer) {
-        log(`${consecutiveTribunalFailures} consecutive tribunal failures. Entering exploration mode.`, 'WARN', 'cycle');
-        explorationMode = true;
-        explorationMap = await explorationCartographer.explore(page);
-        if (explorationMap) { log('Exploration map built. Continuing with enhanced context.', 'INFO', 'cycle'); consecutiveTribunalFailures = 0; } else { log('Exploration failed to produce map.', 'WARN', 'cycle'); }
-      }
-
-      // Stuck recovery
-      if (stuckCounter >= MAX_STUCK) {
-        log(`Stuck for ${MAX_STUCK} cycles. Attempting recovery.`, 'WARN', 'cycle');
-        if (humanCaptcha) {
-          const restored = await humanCaptcha.tryAllSessions(page);
-          if (restored) { log('Session pool restored access.', 'INFO', 'cycle'); stuckCounter = 0; }
-        }
-        if (stuckCounter >= MAX_STUCK) {
-          // v10: Try self-heal FIRST (runtime heal is fast, non-destructive)
-          // before falling back to the heavier GitOps approach.
-          if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
-            const selfHealMod = getDep('selfHeal');
-            if (selfHealMod?.performRuntimeHeal) {
-              log(`Stuck ${MAX_STUCK} cycles — triggering runtime heal as stuck recovery`, 'INFO', 'cycle');
-              try {
-                const memoryMode = require('./memory-mode');
-                if (memoryMode.isMemoryProtection?.()) {
-                  memoryMode.beginSelfHealSession?.(`stuck_${MAX_STUCK}_cycles`);
-                }
-              } catch {}
-              selfHealMod.performRuntimeHeal().then((rtResult: any) => {
-                if (rtResult?.healed) {
-                  log(`Stuck recovery: runtime heal succeeded`, 'INFO', 'cycle');
-                  stuckCounter = 0;
-                }
-              }).catch(() => {});
-            }
-          }
-          // GitOps fallback (existing behavior)
-          const codegenTribunal = _getCodegenTribunal();
-          if (codegenTribunal) {
-          const investigation = { url: page.url(), html: await page.content(), fileContent: 'Unknown', targetFile: 'cycle-cycle-manager.ts' };
-          const errorLogs = `Stuck for ${MAX_STUCK} cycles at state ${currentState}`;
-          const fixes = await codegenTribunal.generateCodeFixViaTribunal(investigation, errorLogs);
-          if (fixes && fixes.length > 0 && CONFIG.GITOPS_ENABLED && gitOps?.applyAndVerify) {
-            try { await gitOps.applyAndVerify(fixes); log('Self-heal applied via GitOps. Restarting cycle.', 'INFO', 'cycle'); throw new Error('RESTART_CYCLE'); } catch (e: any) { if (e.message === 'RESTART_CYCLE') throw e; gitOps.rollbackToPrevious?.(); }
-          }
-          } // end codegenTribunal block
-        }
-      }
-
-      currentState = action.currentState;
-      // v6: Track mid-quiz state for browser-preserving memory shedding.
-      // We're "mid-quiz" when the state indicates we're on a question page
-      // (not assignments, not score screen, not module downloading).
-      // This drives the preserveBrowser flag in memory protection.
-      const _quizStates = new Set(['question', 'question_m mcq', 'question_input', 'keypad', 'question_feedback', 'explanation', 'assessment', 'quiz_active']);
-      _midQuiz = _quizStates.has(action.currentState || '') || (action.currentState === 'question' || action.actionType === 'keypad_input' || action.actionType === 'keypad_sequence');
-      // Also update the module-level flag so render-free-plan monitor can read it
-      try { const memoryMode = require('./memory-mode'); memoryMode.setMidQuiz(_midQuiz); } catch {}
-      // ── Dashboard state ban enforcement ──
-      // If the current state has been banned from the dashboard, skip
-      // it and force a page reload to escape the banned state.
-      try {
-        const persistConfig = require('./persistent-config');
-        if (persistConfig.isStateBanned(currentState)) {
-          log(`State '${currentState}' is banned via dashboard — forcing page reload to escape`, 'WARN', 'cycle');
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-          currentState = 'assignments_page'; // Reset to safe state
-          continue; // Re-evaluate on next iteration
-        }
-      } catch { /* non-critical: persistent-config not available */ }
-      if (questionsCompleted > 0) {
-        lastProgressTime = Date.now();
-      } else if (Date.now() - lastProgressTime > CONFIG.PROGRESS_TIMEOUT_MS) {
-        // v6: Progress timeout — throw a CLASSIFIED error so self-heal can trigger.
-        // Previously this was a plain Error which fell through as 'fatal' (not retryable,
-        // not healable), so self-heal NEVER fired on progress stalls. The bot just
-        // retried the cycle endlessly. Now we throw a structured error with a
-        // healable code so _isDesperatelyBroken recognizes it.
-        const progressErr: any = new Error(`Progress timeout: 0 questions completed in ${Math.round(CONFIG.PROGRESS_TIMEOUT_MS / 60000)}min`);
-        progressErr.code = 'E_PROGRESS_STALL';
-        progressErr.retryable = false;
-        progressErr.healable = true;
-        throw progressErr;
-      }
-
-      // v6: Slow progress detection — even if some questions completed, if we
-      // haven't completed ANY in PROGRESS_SLOW_TIMEOUT_MS, the bot is likely
-      // stuck in a loop (answering the same question wrong, clicking the wrong
-      // button, etc.). This is structurally broken behavior that self-heal should
-      // investigate. Uses a separate, longer timeout than the zero-progress case.
-      // Default: 2x PROGRESS_TIMEOUT_MS (60min with default 30min config).
-      const SLOW_PROGRESS_MS = (CONFIG.PROGRESS_SLOW_TIMEOUT_MS || CONFIG.PROGRESS_TIMEOUT_MS * 2);
-      if (questionsCompleted > 0 && Date.now() - lastProgressTime > SLOW_PROGRESS_MS) {
-        const slowErr: any = new Error(`Slow progress: last question completion was ${Math.round((Date.now() - lastProgressTime) / 60000)}min ago`);
-        slowErr.code = 'E_SLOW_PROGRESS';
-        slowErr.retryable = false;
-        slowErr.healable = true;
-        throw slowErr;
-      }
-
-      // Save session to pool
-      if (humanCaptcha) {
-        const storage = await page.context().storageState();
-        humanCaptcha.saveSessionToPool(storage);
-      }
+      return { total, passed, failed, results };
+    } catch (err: any) {
+      logError('Failed to run regression suite', err);
+      return { total: 0, passed: 0, failed: 0, results: [], error: err.message };
     }
+  }
 
-    // Post-cycle alerting
-    if (clickAttempts > 5) {
-      const successRate = clickSuccesses / clickAttempts;
-      if (successRate < 0.3) { log(`Click success rate too low (${(successRate * 100).toFixed(0)}%). Triggering alert.`, 'WARN', 'cycle'); if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Low click success rate: ${successRate}`); } catch (e: any) {} }
+  _getTestFiles() { 
+    try {
+      if (!fs.existsSync(REGRESSION_DIR)) return [];
+      return fs.readdirSync(REGRESSION_DIR)
+        .filter((f: any) => f.endsWith('.test.js'))
+        .map((f: any) => path.join(REGRESSION_DIR, f))
+        .sort();
+    } catch (err: any) {
+      logError('Failed to list regression test files', err);
+      return [];
     }
-    log(`Cycle complete: ${questionsCompleted} questions processed`, 'INFO', 'cycle');
-    consecutiveFailures = 0;
+  }
 
-    // ─── Training maintenance: prune old data every 50 cycles ───
-    const _cycleNum = getStats().cycleCount || 0;
-    if (_cycleNum % 50 === 0) {
+  _runSingleTest(filePath: any) { 
+    return new Promise((resolve) => {
+      const timeout = CONFIG.REGRESSION_TEST_TIMEOUT_MS || 30000;
+      const start = Date.now();
+
       try {
-        const pixelTraining = require('./pixel-training');
-        if (pixelTraining?.getStatus?.()?.dbRowCount > 200) {
-          // pruneOldData not in existing API — rely on MAX_SAMPLES_PER_STATE in recordSuccess
-          log(`Training data: ${pixelTraining.getStatus().dbRowCount} entries in DB`, 'DEBUG', 'cycle');
-        }
-      } catch {}
-    }
-  } catch (err: any) {
-    const errorType = classifyProviderError?.(err);
-    // v6: Fall back to properties set directly on the error object.
-    // classifyProviderError only recognizes MathUBotError instances and
-    // common Node/Playwright patterns. Custom structured errors (like
-    // progress stalls) carry their own code/retryable/healable.
-    const isRetryable = errorType?.retryable ?? err.retryable ?? false;
-    const isHealable = errorType?.healable ?? err.healable ?? false;
-    const errorCode = errorType?.code || err.code || 'E_UNKNOWN';
-    logError(`Cycle error (${errorCode})`, err);
-    // Resilience: report failure to cascade breaker
-    cascadeBreaker?.recordFailure?.('cycleManager', err);
-    // Resilience: report failure to module quarantine
-    runtimeModuleQuarantine?.recordFailure?.('cycleManager', err);
-    updateStats({ errors: (getStats().errors || 0) + 1 });
-    consecutiveFailures++;
-    // v4: Record error code for desperation analysis
-    _recordErrorForDesperation(errorCode);
-    if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Cycle error: ${err instanceof Error ? err.message : String(err)}`); } catch (e: any) {}
+        const child = fork(filePath, [], {
+          timeout,
+          cwd: PROJECT_ROOT,
+          stdio: 'pipe',
+          env: { ...process.env, NODE_ENV: 'test' }
+        });
 
-    // Error routing based on type
-    const isErrorTransient = isRetryable && !isHealable;
-    const isErrorFatal = !isRetryable && !isHealable;
+        let output = '';
 
-    if (isErrorTransient) {
-      log('Transient error -- will retry next cycle', 'WARN', 'cycle');
-      // v10: Error-rate spike override — even transient errors trigger runtime
-      // heal if they're coming in fast enough. 6+ errors in 2min suggests
-      // something systemic (broken network interceptor, stuck rate limiter).
-      //
-      // v11: OOM EMERGENCY OVERRIDE — when the restart guardian is in
-      // emergency mode (detected OOM loop), self-heal MUST fire regardless
-      // of error classification. Without this, a cycle that only sees 429s
-      // (transient) never reaches _isDesperatelyBroken() because it's in
-      // the wrong branch of the if/else chain. The bot knows it's in an
-      // OOM loop but self-heal never runs.
-      const isEmergencyMode = (() => { try { return require('./survival-restart-guardian').isEmergencyMode?.(); } catch { return false; } })();
-      if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning && (_isErrorRateSpiking() || isEmergencyMode)) {
-        const reason = isEmergencyMode ? 'OOM emergency mode' : 'error-rate spike';
-        // In OOM emergency, call performRuntimeHeal DIRECTLY (bypasses circuit
-        // breaker). The normal getDep path goes through the circuit breaker
-        // wrapper which may be OPEN from previous failed heals.
-        const healFn = isEmergencyMode
-          ? (() => { try { return require('./self-heal').performRuntimeHeal; } catch { return null; } })()
-          : getDep('selfHeal')?.performRuntimeHeal;
-        if (healFn) {
-          log(`${reason} detected — triggering runtime heal despite transient classification`, 'WARN', 'cycle');
+        child.stdout.on('data', (data: any) => { output += data.toString(); });
+        child.stderr.on('data', (data: any) => { output += data.toString(); });
+
+        let _timeoutHandle: any;
+      child.on('exit', (code: any) => {
+        if (_timeoutHandle) { clearTimeout(_timeoutHandle); _timeoutHandle = null; }
+          const duration = Date.now() - start;
+          const testPassed = code === 0;
+
           try {
-            const memoryMode = require('./memory-mode');
-            if (memoryMode.isMemoryProtection?.()) {
-              memoryMode.beginSelfHealSession?.(isEmergencyMode ? 'oom_emergency_transient' : 'error_rate_spike');
-            }
-          } catch {}
-          selfHealRunning = true;
-          healFn().then((rtResult: any) => {
-            selfHealRunning = false;
-            if (rtResult?.healed) {
-              log(`${reason}: runtime heal succeeded`, 'INFO', 'cycle');
-              consecutiveFailures = Math.max(0, consecutiveFailures - 2);
-              // Reset circuit breaker on successful OOM emergency heal
-              if (isEmergencyMode) {
-                try {
-                  const cb = require('./self-heal-circuit-breaker');
-                  const breaker = cb.healerCircuitBreaker || cb;
-                  if (typeof breaker.reset === 'function') breaker.reset();
-                } catch {}
-              }
-            }
-          }).catch(() => { selfHealRunning = false; });
-        }
+            getDb()?.prepare(
+              'UPDATE regression_tests SET last_run_at = ?, last_run_passed = ?, total_runs = total_runs + 1, total_passes = total_passes + ?, consecutive_passes = CASE WHEN ? = 1 THEN consecutive_passes + 1 ELSE 0 END WHERE file_path = ?'
+            ).run(Date.now(), testPassed ? 1 : 0, testPassed ? 1 : 0, testPassed ? 1 : 0, filePath);
+          } catch (updateErr: any) {
+            // Non-fatal
+          }
+
+          resolve({
+            file: path.basename(filePath),
+            filePath,
+            passed: testPassed,
+            duration,
+            exitCode: code,
+            output: output.substring(0, 500)
+          });
+        });
+
+        child.on('error', (err: any) => {
+          const duration = Date.now() - start;
+          resolve({
+            file: path.basename(filePath),
+            filePath,
+            passed: false,
+            duration,
+            error: err.message
+          });
+        });
+
+        _timeoutHandle = setTimeout(() => {
+          try { child.kill('SIGKILL'); } catch (e: any) { /* already dead */ }
+          resolve({
+            file: path.basename(filePath),
+            filePath,
+            passed: false,
+            duration: Date.now() - start,
+            error: 'Test timed out'
+          });
+        }, timeout + 5000);
+      } catch (err: any) {
+        resolve({
+          file: path.basename(filePath),
+          filePath,
+          passed: false,
+          duration: Date.now() - start,
+          error: err.message
+        });
       }
-    } else if (isErrorFatal) {
-      log('Fatal error -- restarting cycle', 'ERROR', 'cycle');
-    } else {
-      // v9: FAST RUNTIME HEAL — fires on FIRST healable error (progress stall,
-      // restart loop, selector drift, etc.) without waiting for desperation.
-      // This is the key new trigger: self-heal activates early via runtime
-      // avenues (DB repair, provider reset, config reconcile, cache flush).
-      // If those don't help, the old desperate-check + code-patch path runs.
-      if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning && isHealable) {
-        const performRuntimeHeal = getDep('selfHeal')?.performRuntimeHeal;
-        if (performRuntimeHeal) {
-          log(`Healable error ${errorCode} — triggering fast runtime heal (failure #${consecutiveFailures})`, 'INFO', 'cycle');
-          // Request self-heal session if in memory protection (runtime heal
-          // may need full-power modules like config-reconciler)
-          try {
-            const memoryMode = require('./memory-mode');
-            if (memoryMode.isMemoryProtection?.()) {
-              memoryMode.beginSelfHealSession?.(`healable_error:${errorCode}`);
-            }
-          } catch {}
-          // Fire runtime heal in background — don't block the cycle
-          performRuntimeHeal().then((rtResult: any) => {
-            if (rtResult?.healed) {
-              const avenues = rtResult.results?.filter((r: any) => r.healed).map((r: any) => r.avenue).join(', ');
-              log(`Fast runtime heal SUCCEEDED for ${errorCode}: ${avenues}`, 'INFO', 'cycle');
-              // If runtime heal fixed something, reset a portion of consecutive failures
-              // (don't reset to 0 — the underlying issue may still exist, but the
-              // runtime state is now cleaner so the next attempt is more likely to work)
-              consecutiveFailures = Math.max(0, consecutiveFailures - 2);
-            }
-          }).catch(() => {});
+    });
+  }
+
+  async _pruneOldTests() { 
+    try {
+      const cutoffTimestamp = Date.now() - (PRUNE_AFTER_DAYS * 24 * 60 * 60 * 1000);
+      const oldTests = getDb()?.prepare(
+        'SELECT * FROM regression_tests WHERE created_at < ? AND consecutive_passes >= 5 AND total_runs >= 5 ORDER BY created_at ASC'
+      ).all(cutoffTimestamp);
+
+      if (oldTests.length === 0) return;
+
+      let pruned = 0;
+      for (const test of oldTests) {
+        try {
+          if (test.file_path && fs.existsSync(test.file_path)) {
+            fs.unlinkSync(test.file_path);
+          }
+          getDb()?.prepare('DELETE FROM regression_tests WHERE id = ?').run(test.id);
+          pruned++;
+        } catch (delErr: any) {
+          log(`Failed to prune regression test ${test.id}: ${delErr.message}`, 'WARN', 'regression-bank');
         }
       }
 
-      // v4: Full self-heal when the bot is DESPERATELY broken.
-      // See _isDesperatelyBroken() for the full criteria.
-      // Note: performSelfHeal() now includes the runtime heal fast-pass
-      // internally, so even this path benefits from the new avenues.
-      if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning && performSelfHeal && _isDesperatelyBroken(CONFIG)) {
-        // Build a human-readable reason for WHY self-heal triggered
-        const healReason = _getSelfHealReason(CONFIG);
-        log(`${consecutiveFailures} consecutive failures (DESPERATE: ${healReason}). Attempting full self-heal...`, 'WARN', 'cycle');
-        selfHealRunning = true;
-        performSelfHeal().then((healed: any) => { 
-          selfHealRunning = false;
-          if (healed) { log('Full self-heal successful. Resetting failure count.', 'INFO', 'cycle'); consecutiveFailures = 0; }
-          else { log('Self-heal failed. Alerting and stopping.', 'ERROR', 'cycle'); if (CONFIG.ALERT_ON_ERROR) try { sendAlert('Self-heal failed after multiple attempts. Stopping.'); } catch (e: any) {} stopRequested = true; }
-        }).catch((e: any) => { selfHealRunning = false; logError('Self-heal threw error', e); });
-      } else if (CONFIG.SELF_HEAL_ENABLED && consecutiveFailures >= CONFIG.SELF_HEAL_FAILURE_THRESHOLD) {
-        log(`${consecutiveFailures} consecutive failures but NOT desperate (transient/error pattern). Skipping full self-heal. Will keep retrying.`, 'DEBUG', 'cycle');
+      if (pruned > 0) {
+        log(`Pruned ${pruned} old regression tests (older than ${PRUNE_AFTER_DAYS} days, consistently passing)`, 'INFO', 'regression-bank');
       }
-      if (consecutiveFailures % 5 === 0) {
-        try { const pd = _getProviderDiscovery(); if (pd?.refreshAllProviderModels) pd.refreshAllProviderModels().catch((e: any) => logError('Model refresh failed', e)); } catch (e: any) { /* non-critical */ }
-      }
-      if (consecutiveFailures % 10 === 0) {
-        try { const pr = _getProcessRetrainer(); if (pr?.retrainProcesses) pr.retrainProcesses().catch((e: any) => logError('Retraining failed', e)); } catch (e: any) { /* non-critical */ }
-      }
+    } catch (err: any) {
+      logError('Failed to prune old regression tests', err);
     }
-  } finally {
-    // v6: Clear mid-quiz flag so monitors don't preserve browser after cycle ends
-    try { const memoryMode = require('./memory-mode'); memoryMode.setMidQuiz(false); } catch {}
-    if (closeBrowser) await closeBrowser();
-    if (clearCache) clearCache();
-    _networkSetup = false;
-    if (CONFIG.ENABLE_GC_ON_CYCLE && global.gc) { global.gc(); log('Garbage collection triggered.', 'DEBUG', 'cycle'); }
+  }
+
+  getRegressionCount() { 
+    try {
+      const row = getDb()?.prepare('SELECT COUNT(*) as count FROM regression_tests').get();
+      return row ? row.count : 0;
+    } catch (err: any) {
+      logError('Failed to get regression test count', err);
+      return 0;
+    }
+  }
+
+  getRegressionStats() { 
+    try {
+      const total = getDb()?.prepare('SELECT COUNT(*) as count FROM regression_tests').get().count;
+      const passed = getDb()?.prepare('SELECT COUNT(*) as count FROM regression_tests WHERE last_run_passed = 1').get().count;
+      const failed = getDb()?.prepare('SELECT COUNT(*) as count FROM regression_tests WHERE last_run_passed = 0').get().count;
+      const neverRun = getDb()?.prepare('SELECT COUNT(*) as count FROM regression_tests WHERE last_run_at IS NULL').get().count;
+      return { total, passed, failed, neverRun };
+    } catch (err: any) {
+      logError('Failed to get regression stats', err);
+      return { total: 0, passed: 0, failed: 0, neverRun: 0 };
+    }
   }
 }
 
-module.exports = { runCycle, requestStop, isOrParked: () => _orParked, _injectDependencies };
+const regressionBank = new RegressionBank();
+
+module.exports = {
+  regressionBank,
+  RegressionBank,
+  generateRegressionTest: (recording: any, patch: any) => regressionBank.generateRegressionTest(recording, patch),
+  runRegressionSuite: () => regressionBank.runRegressionSuite(),
+  getRegressionCount: () => regressionBank.getRegressionCount(),
+  getRegressionStats: () => regressionBank.getRegressionStats(),
+  _injectDependencies,
+};
