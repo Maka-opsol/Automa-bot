@@ -197,6 +197,21 @@ function _recordErrorForDesperation(code: string) {
 }
 
 /**
+ * v10: Error-rate spike detection.
+ * Triggers runtime heal when errors are coming in FAST even if individually
+ * they're transient. A burst of 6+ errors in 2 minutes usually means something
+ * systemic is wrong (broken network interceptor, stuck rate limiter, etc.)
+ * that runtime heal can fix without code patches.
+ */
+function _isErrorRateSpiking(): boolean {
+  if (_recentErrorCodes.length < 6) return false;
+  const now = Date.now();
+  const SPIKE_WINDOW_MS = 2 * 60 * 1000; // 2 min
+  const recentSpikes = _recentErrorCodes.filter(e => now - e.ts < SPIKE_WINDOW_MS);
+  return recentSpikes.length >= 6;
+}
+
+/**
  * v6: Return a human-readable reason for WHY self-heal is triggering.
  * Used in log messages so operators can quickly understand the cause.
  */
@@ -503,6 +518,38 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const info = cs.getColdStartInfo();
       log(`Cold start recovery: ${info?.reason || 'unknown'}. Using fast startup path.`, 'INFO', 'cycle');
       cs._recoveryLogged = true;
+
+      // v12: CHECKPOINT RESUME — if the previous instance was OOM-killed mid-heal,
+      // there's a checkpoint in the DB. Log it and schedule an immediate self-heal
+      // to resume from where we left off. This is the key to restart-proof healing:
+      // the bot doesn't start from scratch, it CONTINUES the interrupted pipeline.
+      try {
+        const ckptModule = require('./self-heal-checkpoint');
+        const ckptStatus = ckptModule.getStatus();
+        if (ckptStatus.hasCheckpoint) {
+          log(`HEAL CHECKPOINT FOUND: phase=${ckptStatus.phase}, age=${Math.round((ckptStatus.age || 0) / 60000)}min, mem_at_save=${Math.round((ckptStatus.memoryAtSave || 0) / 1024 / 1024)}MB — will resume on next self-heal trigger`, 'WARN', 'cycle');
+          // Trigger self-heal immediately (after a brief 10s delay for bot stabilization)
+          const performSelfHeal = getDep('selfHeal')?.performSelfHeal;
+          if (performSelfHeal && CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
+            log('Scheduling immediate self-heal to resume from checkpoint (10s delay)...', 'INFO', 'cycle');
+            setTimeout(() => {
+              if (selfHealRunning) return; // Already healing
+              selfHealRunning = true;
+              performSelfHeal().then((healed: any) => {
+                selfHealRunning = false;
+                if (healed) {
+                  log('Checkpoint resume self-heal SUCCEEDED. Clearing checkpoint.', 'INFO', 'cycle');
+                  consecutiveFailures = 0;
+                } else {
+                  log('Checkpoint resume self-heal paused (more phases remaining). Will retry next cycle.', 'WARN', 'cycle');
+                }
+              }).catch((e: any) => { selfHealRunning = false; logError('Checkpoint resume self-heal threw error', e); });
+            }, 10 * 1000).unref?.();
+          }
+        }
+      } catch (ckptErr: any) {
+        // Non-critical — checkpoint module may not exist
+      }
     }
   } catch { /* non-critical */ }
   try {
@@ -559,6 +606,26 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   try {
     const checkpoint = loadCheckpoint?.();
     if (checkpoint) { log(`Resuming from checkpoint at ${new Date(checkpoint.savedAt).toISOString()}`, 'INFO', 'cycle'); }
+
+    // v9: PROACTIVE RUNTIME HEAL on restart-loop detection.
+    // If the bot has restarted frequently, something is wrong in runtime state
+    // that self-heal's runtime avenues can fix without code patches.
+    // This runs ONCE at cycle start, before the main loop begins.
+    try {
+      const guardian = require('./survival-restart-guardian');
+      const rStatus = guardian.getStatus?.();
+      if (rStatus && rStatus.recentUnexpectedRestarts >= 2 && CONFIG.SELF_HEAL_ENABLED) {
+        const selfHealMod = getDep('selfHeal');
+        if (selfHealMod?.performRuntimeHeal) {
+          log(`Restart loop detected (${rStatus.recentUnexpectedRestarts} restarts) — proactive runtime heal at cycle start`, 'WARN', 'cycle');
+          const rtResult = await selfHealMod.performRuntimeHeal();
+          if (rtResult?.healed) {
+            const avenues = rtResult.results?.filter((r: any) => r.healed).map((r: any) => r.avenue).join(', ');
+            log(`Proactive runtime heal SUCCEEDED: ${avenues}`, 'INFO', 'cycle');
+          }
+        }
+      }
+    } catch {}
 
     // Resilience: use browser-phoenix multi-tier launch if available
     const launchFn = browserPhoenix?.phoenixBrowserRetry || withBrowserRetry;
@@ -623,6 +690,52 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     let unknownStateCounter = 0; // Counts consecutive 'unknown' currentState results
     const MAX_UNKNOWN_STATE = 3; // After this many unknowns, force recovery
 
+    // v10: Restart-count tracker — triggers self-heal if too many browser
+    // restarts happen in a short window (symptom of a deeper issue).
+    let recentRestartTimes: number[] = [];
+    const RESTART_WINDOW_MS = 10 * 60 * 1000; // 10 min window
+    const RESTART_COUNT_SELF_HEAL_THRESHOLD = 4; // 4 restarts in 10min → self-heal
+    let restartSelfHealTriggered = false;
+
+    // v10: Helper to track restarts and trigger self-heal if too many
+    function _trackBrowserRestart() {
+      recentRestartTimes.push(Date.now());
+      // Prune old entries outside the window
+      const windowStart = Date.now() - RESTART_WINDOW_MS;
+      recentRestartTimes = recentRestartTimes.filter(t => t >= windowStart);
+      // Check if we've hit the threshold
+      if (!restartSelfHealTriggered && recentRestartTimes.length >= RESTART_COUNT_SELF_HEAL_THRESHOLD) {
+        log(`Restart storm detected: ${recentRestartTimes.length} browser restarts in ${RESTART_WINDOW_MS / 60000}min — triggering self-heal`, 'WARN', 'cycle');
+        restartSelfHealTriggered = true;
+        if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
+          const selfHealMod = getDep('selfHeal');
+          if (selfHealMod?.performRuntimeHeal) {
+            try {
+              const memoryMode = require('./memory-mode');
+              if (memoryMode.isMemoryProtection?.()) {
+                memoryMode.beginSelfHealSession?.(`restart_storm_${recentRestartTimes.length}_in_${RESTART_WINDOW_MS / 60000}min`);
+              }
+            } catch {}
+            selfHealMod.performRuntimeHeal().then((rtResult: any) => {
+              if (rtResult?.healed) {
+                log(`Restart storm: runtime heal succeeded`, 'INFO', 'cycle');
+              }
+            }).catch(() => {});
+          }
+          // If runtime heal doesn't help, also trigger full self-heal
+          const performSelfHeal = getDep('selfHeal')?.performSelfHeal;
+          if (performSelfHeal && !selfHealRunning) {
+            selfHealRunning = true;
+            performSelfHeal().then((healed: any) => {
+              selfHealRunning = false;
+              if (healed) log('Restart storm: full self-heal succeeded', 'INFO', 'cycle');
+              else log('Restart storm: full self-heal failed', 'ERROR', 'cycle');
+            }).catch(() => { selfHealRunning = false; });
+          }
+        }
+      }
+    }
+
     // 20-min stagnation auto-ban: track screenshot hash changes + question completions
     // to detect death spirals (wait/error loops with no progress)
     let lastScreenshotChangeTime = Date.now();
@@ -678,6 +791,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             _networkSetup = false;
             page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
             browserLastRestart = Date.now();
+            _trackBrowserRestart();
             memoryMode.clearBrowserClosedFlag();
           } else {
             log('Memory shed preserved browser (mid-quiz) — continuing without restart', 'INFO', 'cycle');
@@ -687,6 +801,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           _networkSetup = false;
           page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
           browserLastRestart = Date.now();
+          _trackBrowserRestart();
         }
       }
       if (getBrowserDisconnected()) throw new Error('Browser disconnected');
@@ -696,6 +811,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         _networkSetup = false;
         page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
         browserLastRestart = Date.now();
+        _trackBrowserRestart();
         if (typeof resetBrowserLaunchCount === 'function') resetBrowserLaunchCount();
         else log('resetBrowserLaunchCount not available from browser module', 'WARN', 'cycle');
       }
@@ -1611,7 +1727,27 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             && action.actionType === 'wait'
             && timeSinceScreenshotChange > STAGNATION_AUTO_BAN_MS
             && timeSinceQuestionCompletion > STAGNATION_AUTO_BAN_MS) {
-          log(`20-min stagnation detected in unknown loop (no screenshot change, no completions). Auto-banning wait action.`, 'WARN', 'cycle');
+          log(`20-min stagnation detected in unknown loop (no screenshot change, no completions). Triggering runtime heal + auto-banning wait action.`, 'WARN', 'cycle');
+          // v9: Trigger runtime heal FIRST — it may fix the root cause
+          // (stale providers, corrupted DB, quarantined modules) without
+          // needing to ban wait or reload.
+          try {
+            const selfHealMod = getDep('selfHeal');
+            if (selfHealMod?.performRuntimeHeal && CONFIG.SELF_HEAL_ENABLED) {
+              selfHealMod.performRuntimeHeal().then((rtResult: any) => {
+                if (rtResult?.healed) {
+                  log(`Stagnation runtime heal succeeded: ${rtResult.results?.filter((r: any) => r.healed).map((r: any) => r.avenue).join(', ')}`, 'INFO', 'cycle');
+                }
+              }).catch(() => {});
+            }
+          } catch {}
+          // Also request self-heal session if in memory protection
+          try {
+            const memoryMode = require('./memory-mode');
+            if (memoryMode.isMemoryProtection?.()) {
+              memoryMode.beginSelfHealSession?.('stagnation_20min_unknown_loop');
+            }
+          } catch {}
           try {
             const dbMod = require('./database');
             dbMod.insertBannedAction?.('wait', 'stagnation-guard', Date.now() + 60 * 60 * 1000);
@@ -1665,7 +1801,25 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             && action.actionType === 'wait'
             && timeSinceScreenshotChange > STAGNATION_AUTO_BAN_MS
             && timeSinceQuestionCompletion > STAGNATION_AUTO_BAN_MS) {
-          log(`20-min stagnation detected in error loop (no screenshot change, no completions). Auto-banning wait action.`, 'WARN', 'cycle');
+          log(`20-min stagnation detected in error loop (no screenshot change, no completions). Triggering runtime heal + auto-banning wait action.`, 'WARN', 'cycle');
+          // v9: Trigger runtime heal FIRST — same as unknown-loop stagnation
+          try {
+            const selfHealMod = getDep('selfHeal');
+            if (selfHealMod?.performRuntimeHeal && CONFIG.SELF_HEAL_ENABLED) {
+              selfHealMod.performRuntimeHeal().then((rtResult: any) => {
+                if (rtResult?.healed) {
+                  log(`Stagnation runtime heal succeeded: ${rtResult.results?.filter((r: any) => r.healed).map((r: any) => r.avenue).join(', ')}`, 'INFO', 'cycle');
+                }
+              }).catch(() => {});
+            }
+          } catch {}
+          // Also request self-heal session if in memory protection
+          try {
+            const memoryMode = require('./memory-mode');
+            if (memoryMode.isMemoryProtection?.()) {
+              memoryMode.beginSelfHealSession?.('stagnation_20min_error_loop');
+            }
+          } catch {}
           try {
             const dbMod = require('./database');
             dbMod.insertBannedAction?.('wait', 'stagnation-guard', Date.now() + 60 * 60 * 1000);
@@ -1707,6 +1861,27 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           if (restored) { log('Session pool restored access.', 'INFO', 'cycle'); stuckCounter = 0; }
         }
         if (stuckCounter >= MAX_STUCK) {
+          // v10: Try self-heal FIRST (runtime heal is fast, non-destructive)
+          // before falling back to the heavier GitOps approach.
+          if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
+            const selfHealMod = getDep('selfHeal');
+            if (selfHealMod?.performRuntimeHeal) {
+              log(`Stuck ${MAX_STUCK} cycles — triggering runtime heal as stuck recovery`, 'INFO', 'cycle');
+              try {
+                const memoryMode = require('./memory-mode');
+                if (memoryMode.isMemoryProtection?.()) {
+                  memoryMode.beginSelfHealSession?.(`stuck_${MAX_STUCK}_cycles`);
+                }
+              } catch {}
+              selfHealMod.performRuntimeHeal().then((rtResult: any) => {
+                if (rtResult?.healed) {
+                  log(`Stuck recovery: runtime heal succeeded`, 'INFO', 'cycle');
+                  stuckCounter = 0;
+                }
+              }).catch(() => {});
+            }
+          }
+          // GitOps fallback (existing behavior)
           const codegenTribunal = _getCodegenTribunal();
           if (codegenTribunal) {
           const investigation = { url: page.url(), html: await page.content(), fileContent: 'Unknown', targetFile: 'cycle-cycle-manager.ts' };
@@ -1822,23 +1997,77 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
     if (isErrorTransient) {
       log('Transient error -- will retry next cycle', 'WARN', 'cycle');
+      // v10: Error-rate spike override — even transient errors trigger runtime
+      // heal if they're coming in fast enough. 6+ errors in 2min suggests
+      // something systemic (broken network interceptor, stuck rate limiter).
+      if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning && _isErrorRateSpiking()) {
+        const performRuntimeHeal = getDep('selfHeal')?.performRuntimeHeal;
+        if (performRuntimeHeal) {
+          log(`Error-rate spike detected (${_recentErrorCodes.filter(e => Date.now() - e.ts < 120000).length} errors in 2min) — triggering runtime heal despite transient classification`, 'WARN', 'cycle');
+          try {
+            const memoryMode = require('./memory-mode');
+            if (memoryMode.isMemoryProtection?.()) {
+              memoryMode.beginSelfHealSession?.('error_rate_spike');
+            }
+          } catch {}
+          performRuntimeHeal().then((rtResult: any) => {
+            if (rtResult?.healed) {
+              log(`Error-rate spike: runtime heal succeeded`, 'INFO', 'cycle');
+              consecutiveFailures = Math.max(0, consecutiveFailures - 1);
+            }
+          }).catch(() => {});
+        }
+      }
     } else if (isErrorFatal) {
       log('Fatal error -- restarting cycle', 'ERROR', 'cycle');
     } else {
-      // v4: Only attempt self-heal when the bot is DESPERATELY broken.
+      // v9: FAST RUNTIME HEAL — fires on FIRST healable error (progress stall,
+      // restart loop, selector drift, etc.) without waiting for desperation.
+      // This is the key new trigger: self-heal activates early via runtime
+      // avenues (DB repair, provider reset, config reconcile, cache flush).
+      // If those don't help, the old desperate-check + code-patch path runs.
+      if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning && isHealable) {
+        const performRuntimeHeal = getDep('selfHeal')?.performRuntimeHeal;
+        if (performRuntimeHeal) {
+          log(`Healable error ${errorCode} — triggering fast runtime heal (failure #${consecutiveFailures})`, 'INFO', 'cycle');
+          // Request self-heal session if in memory protection (runtime heal
+          // may need full-power modules like config-reconciler)
+          try {
+            const memoryMode = require('./memory-mode');
+            if (memoryMode.isMemoryProtection?.()) {
+              memoryMode.beginSelfHealSession?.(`healable_error:${errorCode}`);
+            }
+          } catch {}
+          // Fire runtime heal in background — don't block the cycle
+          performRuntimeHeal().then((rtResult: any) => {
+            if (rtResult?.healed) {
+              const avenues = rtResult.results?.filter((r: any) => r.healed).map((r: any) => r.avenue).join(', ');
+              log(`Fast runtime heal SUCCEEDED for ${errorCode}: ${avenues}`, 'INFO', 'cycle');
+              // If runtime heal fixed something, reset a portion of consecutive failures
+              // (don't reset to 0 — the underlying issue may still exist, but the
+              // runtime state is now cleaner so the next attempt is more likely to work)
+              consecutiveFailures = Math.max(0, consecutiveFailures - 2);
+            }
+          }).catch(() => {});
+        }
+      }
+
+      // v4: Full self-heal when the bot is DESPERATELY broken.
       // See _isDesperatelyBroken() for the full criteria.
+      // Note: performSelfHeal() now includes the runtime heal fast-pass
+      // internally, so even this path benefits from the new avenues.
       if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning && performSelfHeal && _isDesperatelyBroken(CONFIG)) {
         // Build a human-readable reason for WHY self-heal triggered
         const healReason = _getSelfHealReason(CONFIG);
-        log(`${consecutiveFailures} consecutive failures (DESPERATE: ${healReason}). Attempting self-heal...`, 'WARN', 'cycle');
+        log(`${consecutiveFailures} consecutive failures (DESPERATE: ${healReason}). Attempting full self-heal...`, 'WARN', 'cycle');
         selfHealRunning = true;
         performSelfHeal().then((healed: any) => { 
           selfHealRunning = false;
-          if (healed) { log('Self-heal successful. Resetting failure count.', 'INFO', 'cycle'); consecutiveFailures = 0; }
+          if (healed) { log('Full self-heal successful. Resetting failure count.', 'INFO', 'cycle'); consecutiveFailures = 0; }
           else { log('Self-heal failed. Alerting and stopping.', 'ERROR', 'cycle'); if (CONFIG.ALERT_ON_ERROR) try { sendAlert('Self-heal failed after multiple attempts. Stopping.'); } catch (e: any) {} stopRequested = true; }
         }).catch((e: any) => { selfHealRunning = false; logError('Self-heal threw error', e); });
       } else if (CONFIG.SELF_HEAL_ENABLED && consecutiveFailures >= CONFIG.SELF_HEAL_FAILURE_THRESHOLD) {
-        log(`${consecutiveFailures} consecutive failures but NOT desperate (transient/error pattern). Skipping self-heal. Will keep retrying.`, 'DEBUG', 'cycle');
+        log(`${consecutiveFailures} consecutive failures but NOT desperate (transient/error pattern). Skipping full self-heal. Will keep retrying.`, 'DEBUG', 'cycle');
       }
       if (consecutiveFailures % 5 === 0) {
         try { const pd = _getProviderDiscovery(); if (pd?.refreshAllProviderModels) pd.refreshAllProviderModels().catch((e: any) => logError('Model refresh failed', e)); } catch (e: any) { /* non-critical */ }
