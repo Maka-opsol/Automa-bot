@@ -150,7 +150,6 @@ async function attemptMemoryRecovery(options?: { preserveBrowser?: boolean }): P
   } catch { /* ignore */ }
 
   const afterMB = getHeapUsedMB();
-  const thresholds = _getThresholds();
   const freed = beforeMB - afterMB;
   log(`Memory recovery: ${beforeMB.toFixed(1)}MB → ${afterMB.toFixed(1)}MB (${freed >= 0 ? freed.toFixed(1) : '0'}MB freed, soft threshold=${thresholds.softMB}MB)`, 'INFO');
 
