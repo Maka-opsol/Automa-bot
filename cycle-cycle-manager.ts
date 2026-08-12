@@ -253,10 +253,24 @@ function _isDesperatelyBroken(CONFIG: any): boolean {
 
 function requestStop() {  stopRequested = true; }
 
-function checkMemoryAndRecover(CONFIG: any, log: any, clearCache: any) { 
+// v5 FIX: checkMemoryAndRecover now calls memoryMode.shedMemory (async) which
+// actually closes the browser and frees ~100-200MB. Previously it only did
+// clearCache + GC, which freed maybe 5-10MB — nowhere near enough on 512MB.
+// v6 FIX: Now accepts preserveBrowser to use graduated shedding mid-quiz.
+//   When preserveBrowser=true, uses L0-L2 (caches, page blank+restore, reload)
+//   instead of L3 (close browser) which would destroy quiz state.
+//   Returns true if memory was high AND recovery was attempted.
+async function checkMemoryAndRecover(CONFIG: any, log: any, clearCache: any, preserveBrowser: boolean = false): Promise<boolean> {
   const used = process.memoryUsage().heapUsed / 1024 / 1024;
   if (used > CONFIG.MEMORY_RESTART_THRESHOLD_MB) {
-    log(`Memory high (${used.toFixed(0)}MB) -- cleaning up`, 'WARN', 'cycle');
+    log(`Memory high (${used.toFixed(0)}MB) -- shedding memory (preserveBrowser=${preserveBrowser})`, 'WARN', 'cycle');
+    try {
+      const memoryMode = require('./memory-mode');
+      await memoryMode.shedMemory('cycle-check-memory', {
+        preserveBrowser,
+        targetMB: CONFIG.MEMORY_RESTART_THRESHOLD_MB - 30, // aim 30MB below threshold
+      });
+    } catch { /* memory-mode not available */ }
     if (clearCache) clearCache();
     if (global.gc) global.gc();
     return true;
@@ -502,6 +516,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     }
 
     let questionsCompleted = checkpoint?.questionsCompleted || 0;
+
+    // v6: Track whether we're mid-quiz (vs. between quizzes on assignments page).
+    // When mid-quiz, memory protection uses browser-safe shedding (L0-L2)
+    // instead of closing the browser (L3) which would destroy quiz state.
+    let _midQuiz = false;
     let lastProgressTime = Date.now();
     let browserLastRestart = Date.now();
     let currentState = checkpoint?.state || null;
@@ -548,12 +567,34 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
 
       // Resilience: heap guardian check (supplements built-in checkMemoryAndRecover)
-      runtimeHeapGuardian?.checkMemory?.();
-      if (checkMemoryAndRecover(CONFIG, log, clearCache)) {
-        await closeBrowser();
-        _networkSetup = false;
-        page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
-        browserLastRestart = Date.now();
+      // v5 FIX: checkMemory is now async
+      // v6 FIX: pass preserveBrowser when mid-quiz to avoid destroying quiz state
+      const guardianHit = await runtimeHeapGuardian?.checkMemory?.({ preserveBrowser: _midQuiz });
+      if (guardianHit) {
+        log('Heap guardian triggered hard threshold — breaking cycle', 'ERROR', 'cycle');
+        break;
+      }
+      if (await checkMemoryAndRecover(CONFIG, log, clearCache, _midQuiz)) {
+        // v6: Only close+restart browser if shedMemory actually closed it.
+        // When preserveBrowser=true (mid-quiz), shedMemory uses L0-L2 and
+        // the browser stays open — no need to re-launch.
+        try {
+          const memoryMode = require('./memory-mode');
+          if (memoryMode.wasBrowserClosedByProtection()) {
+            await closeBrowser();
+            _networkSetup = false;
+            page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+            browserLastRestart = Date.now();
+            memoryMode.clearBrowserClosedFlag();
+          } else {
+            log('Memory shed preserved browser (mid-quiz) — continuing without restart', 'INFO', 'cycle');
+          }
+        } catch { /* memory-mode not available, do full restart to be safe */
+          await closeBrowser();
+          _networkSetup = false;
+          page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+          browserLastRestart = Date.now();
+        }
       }
       if (getBrowserDisconnected()) throw new Error('Browser disconnected');
       if (getBrowserLaunchCount() > 10 || (Date.now() - browserLastRestart) > browserRestartInterval) {
@@ -1419,6 +1460,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // Module completion
       if (['score_screen', 'pathway_feedback'].includes(action.currentState) && action.currentState !== currentState) {
         questionsCompleted++;
+        _midQuiz = false; // v6: quiz done, safe to close browser for memory
+        try { const memoryMode = require('./memory-mode'); memoryMode.setMidQuiz(false); } catch {}
         lastQuestionCompletionTime = Date.now();
         lastScreenshotChangeTime = Date.now();
         updateStats({ questionsCompleted });
@@ -1584,6 +1627,14 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
 
       currentState = action.currentState;
+      // v6: Track mid-quiz state for browser-preserving memory shedding.
+      // We're "mid-quiz" when the state indicates we're on a question page
+      // (not assignments, not score screen, not module downloading).
+      // This drives the preserveBrowser flag in memory protection.
+      const _quizStates = new Set(['question', 'question_m mcq', 'question_input', 'keypad', 'question_feedback', 'explanation', 'assessment', 'quiz_active']);
+      _midQuiz = _quizStates.has(action.currentState || '') || (action.currentState === 'question' || action.actionType === 'keypad_input' || action.actionType === 'keypad_sequence');
+      // Also update the module-level flag so render-free-plan monitor can read it
+      try { const memoryMode = require('./memory-mode'); memoryMode.setMidQuiz(_midQuiz); } catch {}
       // ── Dashboard state ban enforcement ──
       // If the current state has been banned from the dashboard, skip
       // it and force a page reload to escape the banned state.
@@ -1671,6 +1722,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
     }
   } finally {
+    // v6: Clear mid-quiz flag so monitors don't preserve browser after cycle ends
+    try { const memoryMode = require('./memory-mode'); memoryMode.setMidQuiz(false); } catch {}
     if (closeBrowser) await closeBrowser();
     if (clearCache) clearCache();
     _networkSetup = false;
