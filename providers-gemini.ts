@@ -61,7 +61,7 @@ function normalizeGeminiError(err: any): Error {
     return new Error('HTTP_ERROR_403: ' + msg);
   }
 
-  if (msg.includes('NOT_FOUND') || status === 'NOT_FOUND') {
+  if (msg.includes('NOT_FOUND') || /not found/i.test(msg) || status === 'NOT_FOUND' || status === 404) {
     return new Error('HTTP_ERROR_404: ' + msg);
   }
 
@@ -195,9 +195,9 @@ function GeminiProvider() {
           // Continue to next model in chain
           continue;
         }
-        // 404 = model doesn't exist, skip to next in chain
-        if (err.message && err.message.includes('HTTP_ERROR_404')) {
-          log(`Gemini model ${modelId} not found (404), trying next fallback`, 'WARN', 'gemini');
+        // 404 = model doesn't exist or deprecated, skip to next in chain
+        if (err.message && (err.message.includes('HTTP_ERROR_404') || err.message.includes('no longer available'))) {
+          log(`Gemini model ${modelId} not found/deprecated (404), trying next fallback`, 'WARN', 'gemini');
           continue;
         }
         // Other non-429 error (400, 403, 503) — let the outer retry system handle it
