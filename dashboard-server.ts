@@ -576,6 +576,22 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
+  // Raw provider responses (auto-expire after 10s)
+  if (pathname === '/api/raw-responses') {
+    authWrap(() => {
+      try {
+        const { getRawResponses } = require('./providers-base');
+        const responses = getRawResponses();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(responses));
+      } catch (e: any) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return true;
+  }
+
   // Health (deep)
   if (pathname === '/api/health' || pathname === '/api/health/deep') {
     authWrap(() => {
@@ -1487,6 +1503,17 @@ function getDashboardHTML(): string {
     <div class="card-body" id="actionCacheStats"><div class="empty">Loading...</div></div>
   </div>
 
+  <!-- Raw Provider Responses -->
+  <div class="card full-width">
+    <div class="card-header">
+      <span>Raw Model Responses <small style="opacity:0.6">(auto-clear after 10s)</small></span>
+      <button class="btn sm" onclick="refreshRawResponses()">Refresh</button>
+    </div>
+    <div class="card-body" id="rawResponsesContainer" style="padding:0">
+      <div class="empty">Waiting for provider responses...</div>
+    </div>
+  </div>
+
   <!-- Logs -->
   <div class="card full-width">
     <div class="card-header">
@@ -1791,6 +1818,46 @@ async function toggleBoolConfig(key, newValue) {
   if (r?.success) loadConfigKeys();
 }
 
+// ── Raw Responses ──
+let _lastRawResponseCount = 0;
+async function refreshRawResponses() {
+  const el = document.getElementById('rawResponsesContainer');
+  try {
+    const responses = await api('/api/raw-responses');
+    if (!Array.isArray(responses) || responses.length === 0) {
+      if (_lastRawResponseCount > 0) { el.innerHTML = '<div class="empty">No active responses (cleared after 10s)</div>'; _lastRawResponseCount = 0; }
+      return;
+    }
+    _lastRawResponseCount = responses.length;
+    let html = '';
+    for (const r of responses) {
+      const age = Math.round((Date.now() - r.ts) / 1000);
+      const remaining = Math.max(0, 10 - age);
+      const ageClass = remaining <= 3 ? 'red' : remaining <= 6 ? 'yellow' : 'green';
+      html += '<div style="margin:8px 12px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
+      html += '<strong style="color:var(--accent)">' + r.provider + '</strong>';
+      html += '<span style="font-size:11px;opacity:0.7">' + (r.model || '') + '</span>';
+      html += '<span class="' + ageClass + '" style="font-size:11px;padding:1px 6px;border-radius:8px">' + remaining + 's</span>';
+      html += '</div>';
+      // Show content (the text the model returned)
+      const content = r.content || '';
+      const escaped = content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      html += '<pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;max-height:300px;overflow:auto;margin:0;background:var(--code-bg);padding:8px;border-radius:4px">' + escaped + '</pre>';
+      // Show full body toggle if available
+      if (r.fullBody) {
+        const bodyId = 'fb_' + r.ts + '_' + r.provider;
+        html += '<details style="margin-top:6px"><summary style="cursor:pointer;font-size:11px;opacity:0.7">Full API response body</summary>';
+        const bodyEscaped = r.fullBody.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        html += '<pre style="white-space:pre-wrap;word-break:break-word;font-size:11px;max-height:400px;overflow:auto;margin:4px 0 0;padding:8px;background:var(--code-bg);border-radius:4px">' + bodyEscaped + '</pre>';
+        html += '</details>';
+      }
+      html += '</div>';
+    }
+    el.innerHTML = html;
+  } catch(e) { el.innerHTML = '<div class="empty">Error loading responses</div>'; }
+}
+
 // ── Logs ──
 async function refreshLogs() {
   const text = await api('/api/logs');
@@ -1883,8 +1950,10 @@ async function refreshAll() {
   await refreshAll();
   await loadConfigKeys();
   refreshLogs();
+  refreshRawResponses();
   setInterval(() => { if (autoRefresh) refreshAll(); }, 5000);
   setInterval(refreshLogs, 10000);
+  setInterval(refreshRawResponses, 2000);
 })();
 </script>
 </body>
