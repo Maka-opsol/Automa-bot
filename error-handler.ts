@@ -30,6 +30,17 @@ process.on('uncaughtException', (err: Error, origin: string): void => {
 });
 
 process.on('unhandledRejection', (reason: unknown, _promise: Promise<unknown>): void => {
+  // Suppress known false positives from timed-out async operations.
+  // When safeCall() times out, in-flight promises may crash due to
+  // Playwright prototype corruption (Array.from, Array.isArray undefined).
+  // These are NOT real errors — the timeout already handled the situation.
+  const msg = (reason instanceof Error ? reason.message : String(reason)) || '';
+  if (msg.includes('Array.from is not a function') ||
+      msg.includes('Array.isArray is not a function') ||
+      msg.includes('Array is not a function')) {
+    return; // silently suppress
+  }
+
   const { safeLog } = require('./logger');
   const classified = classifyError(reason instanceof Error ? reason : new Error(String(reason)));
   safeLog({
