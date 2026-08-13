@@ -68,7 +68,9 @@ function CerebrasProvider() {
       if (!response?.choices?.[0]?.message?.content) {
         throw new Error('CEREBRAS_EMPTY_RESPONSE');
       }
-      return response.choices[0].message.content;
+      const content = response.choices[0].message.content;
+      try { require('./providers-base').storeRawResponse('Cerebras', content, JSON.stringify(response), config.model || 'gemma-4-31b'); } catch {}
+      return content;
     };
 
     // P7: Pass providerName for health-aware retries
