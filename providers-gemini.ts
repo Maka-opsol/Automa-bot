@@ -253,6 +253,8 @@ async function _callWithModel(
   const text = response.text();
   if (!text) throw new Error('EMPTY_RESPONSE');
 
+  try { require('./providers-base').storeRawResponse('Gemini', text, undefined, modelId); } catch {}
+
   if (options.validate === false) return text;
   return validateActionResponse(extractJSON(text, 'Gemini'), 'Gemini');
 }
