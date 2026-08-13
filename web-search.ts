@@ -7,16 +7,20 @@ function getCONFIG(): Record<string, any> { return _deps.config || require('./ge
 const { fetchJSON } = require('./utils-fetch');
 const { log, logError } = require('./logger');
 
-async function searchDuckDuckGo(query: any) { 
+async function searchDuckDuckGo(query: any) {
   const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
   try {
-    const data = await fetchJSON(url, {}, 10000);
+    const data = await fetchJSON(url, {}, 20000);
     let results = [];
     if (data.AbstractText) results.push(data.AbstractText);
     if (data.RelatedTopics) { for (const topic of data.RelatedTopics) { if (topic.Text) results.push(topic.Text); } }
     if (data.Infobox && data.Infobox.content) { for (const item of data.Infobox.content) { if (item.value) results.push(item.value); } }
     return results.join(' ');
-  } catch (err: any) { logError('DuckDuckGo search failed', err); return null; }
+  } catch (err: any) {
+    // DDG search is best-effort context — never an error condition
+    log(`DuckDuckGo search failed: ${err.message}`, 'DEBUG', 'web-search');
+    return null;
+  }
 }
 
 async function fetchOpenRouterModels() { 
