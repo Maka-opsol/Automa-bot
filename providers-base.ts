@@ -421,7 +421,7 @@ function classifyError(err: any): { category: string; retryable: boolean; retryA
   }
 
   // Auth errors
-  if (status === 401 || status === 403 || msg.includes('unauthorized') || msg.includes('forbidden') || msg.includes('invalid api')) {
+  if (status === 401 || status === 403 || msg.includes('unauthorized') || msg.includes('forbidden') || msg.includes('invalid api') || msg.includes('HTTP_ERROR_403') || msg.includes('HTTP_ERROR_401')) {
     return { category: 'auth', retryable: false, retryAfterMs: 0 };
   }
 
