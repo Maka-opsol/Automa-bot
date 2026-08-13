@@ -296,7 +296,7 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
       } catch (err: any) {
         const latency = Date.now() - start;
         recordProviderResult(provider.name, false, latency);
-        addProviderFailure(provider.name);
+        addProviderFailure(provider.name, err);
         const errMsg = err && err.message ? String(err.message) : String(err);
         log(`Tribunal: ${provider.name} failed: ${errMsg}`, 'WARN', 'tribunal');
         return null;
