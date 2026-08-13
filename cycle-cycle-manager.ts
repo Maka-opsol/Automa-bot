@@ -1073,7 +1073,17 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           }
         } else {
           try {
-            action = await safeCall((_sig: any) => determineNextAction(base64, page.url(), explorationMode ? explorationMap : null), 'Tribunal', { timeoutMs: CONFIG.TRIBUNAL_TIMEOUT_MS, url: 'tribunal' });
+            // Call determineNextAction directly — it has its own internal safeCall
+            // timeout (120s) wrapping runTribunal. Adding another safeCall here
+            // created a triple-nested timeout race where the outer one fired ~10ms
+            // before the inner, aborting the tribunal right as it computed consensus
+            // and orphaning a valid result in favor of pixel-fallback.
+            action = await determineNextAction(base64, page.url(), explorationMode ? explorationMap : null);
+            // If tribunal internally failed and returned a wait/error fallback, try pixel fallback
+            if (action?.actionType === 'wait' && action?.reasoning?.includes('tribunal failure')) {
+              logError('Tribunal returned fallback wait, trying pixel fallback', new Error(action.reasoning || ''));
+              action = await getFallbackAction(page, currentState || undefined);
+            }
           } catch (err: any) {
             const errMsg = err?.message || String(err);
             // Fast-path: if OR daily limit just got exhausted, enter park immediately
