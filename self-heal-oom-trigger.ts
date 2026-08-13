@@ -167,33 +167,37 @@ function getRecentOOMKillCount(windowMs: number = 30 * 60 * 1000): number {
  * recently scheduled one.
  */
 function shouldScheduleBootHeal(): boolean {
-  // Check 1: Is there an active OOM loop? (restart guardian knows)
-  // Also get the OOM kill count — if it's high enough, skip cooldown.
-  let oomKillCount = 0;
+  // Check 1: Is there an active OOM loop?
+  // Use BOTH the restart guardian AND our own process_lifecycle count.
+  // They can disagree: the guardian uses its own calibration-table counting
+  // ("Loaded 1 restart record") while process_lifecycle uses PID-based OOM
+  // detection ("lifecycle_ooms=2"). If EITHER says OOM loop, we proceed.
+  let oomKillCount = getRecentOOMKillCount();
   let isEmergencyMode = false;
+  let guardianAgrees = false;
+
   try {
     const guardian = require('./survival-restart-guardian');
     isEmergencyMode = !!guardian.isEmergencyMode?.();
-    if (!isEmergencyMode) {
-      // Not in emergency mode — but check moderate restart count
+    if (isEmergencyMode) {
+      guardianAgrees = true;
+    } else {
       const status = guardian.getStatus?.();
-      if (!status || status.recentUnexpectedRestarts < 2) {
-        return false;
+      if (status && status.recentUnexpectedRestarts >= 2) {
+        guardianAgrees = true;
       }
     }
-  } catch {
-    // Restart guardian not available — use our own DB check
-    oomKillCount = getRecentOOMKillCount();
-    if (oomKillCount < 2) return false;
-  }
+  } catch { /* guardian not available */ }
+
+  // If NEITHER the guardian NOR our own lifecycle count sees a loop, bail.
+  if (!guardianAgrees && oomKillCount < 2) return false;
 
   // Check 2: Cooldown — don't schedule if we recently tried
-  // EXCEPTION: If 2+ OOM kills in 30min, we're in an active death spiral.
-  // The cooldown marker persists across OOM restarts (it's in DB/Turso),
-  // so each new boot sees "cooldown active" and skips the heal forever.
-  // In a death spiral, the cooldown must be bypassed.
-  if (oomKillCount === 0) oomKillCount = getRecentOOMKillCount();
-  const isDeathSpiral = oomKillCount >= 3 || isEmergencyMode;
+  // EXCEPTION: If 2+ OOM kills in 30min or guardian emergency mode,
+  // we're in an active death spiral. The cooldown marker persists
+  // across OOM restarts (it's in DB/Turso), so each new boot sees
+  // "cooldown active" and skips the heal forever. Bypass in a spiral.
+  const isDeathSpiral = oomKillCount >= 2 || isEmergencyMode;
 
   if (!isDeathSpiral) {
     try {
@@ -210,7 +214,7 @@ function shouldScheduleBootHeal(): boolean {
       }
     } catch { /* non-critical */ }
   } else {
-    log(`Cooldown BYPASSED — OOM death spiral detected (${oomKillCount} kills, emergency=${isEmergencyMode})`, 'WARN');
+    log(`Cooldown BYPASSED — OOM death spiral (lifecycle_ooms=${oomKillCount}, guardian=${guardianAgrees}, emergency=${isEmergencyMode})`, 'WARN');
   }
 
   return true;
@@ -554,7 +558,31 @@ function recheckAfterTursoSync(): { healScheduled: boolean; oomKillCount: number
   if (guardianSeesLoop || oomKillCount >= 2) {
     log(`Post-Turso recheck: OOM loop CONFIRMED (guardian=${guardianSeesLoop}, lifecycle_ooms=${oomKillCount})`, 'ERROR');
 
-    if (shouldScheduleBootHeal()) {
+    // Directly check cooldown — don't go through shouldScheduleBootHeal()
+    // because that function re-queries the guardian which may disagree with
+    // the oomKillCount we already have. We KNOW there's a loop here.
+    // Bypass cooldown entirely when OOM count is high (death spiral).
+    const isDeathSpiral = oomKillCount >= 2 || guardianSeesLoop;
+    let cooldownBlocked = false;
+    if (!isDeathSpiral) {
+      try {
+        const db = getDb();
+        if (db) {
+          const row = db.prepare('SELECT value, updated_at FROM calibration WHERE key = ?').get(DB_KEY_LAST_BOOT_HEAL);
+          if (row) {
+            const lastHealTime = parseInt(row.value, 10);
+            if (Date.now() - lastHealTime < BOOT_HEAL_COOLDOWN_MS) {
+              cooldownBlocked = true;
+              log(`Post-Turso: boot heal in cooldown (last ${Math.round((Date.now() - lastHealTime) / 60000)}min ago)`, 'DEBUG');
+            }
+          }
+        }
+      } catch {}
+    } else {
+      log(`Cooldown BYPASSED — OOM death spiral (kills=${oomKillCount}, guardian=${guardianSeesLoop})`, 'WARN');
+    }
+
+    if (!cooldownBlocked) {
       log(`Post-Turso OOM self-heal TRIGGERED`, 'ERROR');
       const timer = setTimeout(() => {
         triggerBootHeal().catch(() => {});
