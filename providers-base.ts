@@ -17,6 +17,47 @@
  *   _getOrLimiter()              — Get OpenRouter rate limiter
  */
 
+// ─── Raw Response Buffer ─────────────────────────────────────────────
+// Stores full raw responses from all providers for dashboard inspection.
+// Entries auto-expire after 10 seconds.
+
+const _rawResponses: Array<{ provider: string; model: string; ts: number; content: string; fullBody?: string }> = [];
+const RAW_RESPONSE_TTL_MS = 10000;
+const RAW_RESPONSE_MAX = 20;
+
+/**
+ * Store a raw provider response for dashboard inspection.
+ * @param provider - Provider name (e.g. 'Groq', 'Agnes')
+ * @param content - The text content returned by the model
+ * @param fullBody - Optional full HTTP response JSON (for OpenAI-compatible providers)
+ * @param model - Model name used
+ */
+function storeRawResponse(provider: string, content: string, fullBody?: string, model?: string) {
+  try {
+    _rawResponses.push({
+      provider,
+      model: model || '',
+      ts: Date.now(),
+      content,
+      fullBody: fullBody || undefined,
+    });
+    // Cap buffer size
+    while (_rawResponses.length > RAW_RESPONSE_MAX) _rawResponses.shift();
+  } catch { /* non-critical */ }
+}
+
+/**
+ * Get all raw responses, pruning expired entries (>10s old).
+ */
+function getRawResponses(): Array<{ provider: string; model: string; ts: number; content: string; fullBody?: string }> {
+  const now = Date.now();
+  // Prune expired
+  while (_rawResponses.length > 0 && now - _rawResponses[0].ts > RAW_RESPONSE_TTL_MS) {
+    _rawResponses.shift();
+  }
+  return [..._rawResponses];
+}
+
 const _getLog = () => { try { return require('./logger'); } catch { return { log: console.log, logError: console.error }; } };
 
 /**
@@ -141,7 +182,9 @@ async function callChatCompletionWithRollback(
     });
     if (retryResponse.ok) {
       const data = await retryResponse.json();
-      return data.choices?.[0]?.message?.content || '';
+      const content = data.choices?.[0]?.message?.content || '';
+      storeRawResponse(providerName, content, JSON.stringify(data), model);
+      return content;
     }
     const errText = sanitizeErrorText(await retryResponse.text().catch(() => 'Unknown error'));
     throw new Error(`HTTP_ERROR_${retryResponse.status}: ${errText}`);
@@ -166,7 +209,9 @@ async function callChatCompletionWithRollback(
           });
           if (retryResponse.ok) {
             const data = await retryResponse.json();
-            return data.choices?.[0]?.message?.content || '';
+            const content = data.choices?.[0]?.message?.content || '';
+            storeRawResponse(providerName, content, JSON.stringify(data), payload.model);
+            return content;
           }
           const errText = sanitizeErrorText(await retryResponse.text().catch(() => 'Unknown error'));
           throw new Error(`HTTP_ERROR_${retryResponse.status}: ${errText}`);
@@ -184,7 +229,9 @@ async function callChatCompletionWithRollback(
   }
 
   const data = await response.json();
-  return data.choices?.[0]?.message?.content || '';
+  const content = data.choices?.[0]?.message?.content || '';
+  storeRawResponse(providerName, content, JSON.stringify(data), model);
+  return content;
 }
 
 // ─── getFallbackModels ──────────────────────────────────────────────────
@@ -654,4 +701,7 @@ module.exports = {
   // FIX: Export cooldown functions so providers can check before calling
   setProviderCooldown,
   getProviderCooldownRemainingMs,
+  // Raw response buffer for dashboard
+  storeRawResponse,
+  getRawResponses,
 };
