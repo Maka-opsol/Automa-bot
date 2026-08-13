@@ -437,7 +437,7 @@ async function getAvailableProviders(options?: { visionOnly?: boolean }) {
   // --- Phase 3: Sort by health score (highest first) ---
   candidates.sort((a, b) => b.healthScore - a.healthScore);
 
-  // --- Phase 4: Fail-fast on empty (P16) ---
+  // --- Phase 4: Fail-safe on empty (P16) ---
   if (candidates.length === 0) {
     const now = Date.now();
     // Rate-limit CRITICAL log to once per 10 minutes to avoid spam
@@ -483,6 +483,26 @@ async function getAvailableProviders(options?: { visionOnly?: boolean }) {
     } catch (e: any) { log(`Emergency discovery failed: ${e.message}`, 'ERROR', 'registry'); }
     } else {
       log('No providers available — skipping emergency discovery (cooldown active).', 'DEBUG', 'registry');
+    }
+  }
+
+  // --- Phase 4.5: Last-resort bypass ---
+  // When ALL providers are filtered out (including after emergency discovery),
+  // re-scan ignoring blacklist/health/circuit/cooldown but still requiring a
+  // working factory and not retired. Better to try a degraded provider than
+  // to have zero providers and idle.
+  if (candidates.length === 0) {
+    for (const entry of PROVIDER_TABLE) {
+      if (configLoader.isProviderDisabledByDefault(entry.name)) continue;
+      if (!entry.factory) continue;
+      let fn: any;
+      try { fn = entry.factory(); } catch { continue; }
+      if (!fn) continue;
+      if (isProviderRetired(entry.name)) continue;
+      // Skip Gemini 429 cooldown even in last-resort (cooldown is real)
+      if (entry.name === 'Gemini' && isGeminiOnCooldown()) continue;
+      log(`Last-resort: including ${entry.name} (bypassing blacklist/health)`, 'WARN', 'registry');
+      candidates.push({ name: entry.name, fn, healthScore: 0.1 });
     }
   }
 
@@ -579,6 +599,20 @@ function getAvailableProviderCount(options?: { visionOnly?: boolean }): number {
       } catch {}
     }
     count++;
+  }
+
+  // Last-resort: if count is 0, check if any factory can produce a provider
+  // (ignoring blacklist/health). Matches the async getAvailableProviders logic.
+  if (count === 0) {
+    for (const entry of PROVIDER_TABLE) {
+      if (configLoader.isProviderDisabledByDefault(entry.name)) continue;
+      if (!entry.factory) continue;
+      try { if (!entry.factory()) continue; } catch { continue; }
+      if (isProviderRetired(entry.name)) continue;
+      if (entry.name === 'Gemini' && isGeminiOnCooldown()) continue;
+      count++;
+      break; // Only need 1 to prevent false "no providers"
+    }
   }
 
   // FIX: Always log diagnostic info when count is 0 (or on first call)
