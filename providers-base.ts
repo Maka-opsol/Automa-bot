@@ -398,3 +398,260 @@ const _providerCooldowns = new Map<string, number>(); // provider -> cooldownEnd
 
 function setProviderCooldown(providerName: string, cooldownMs: number): void {
   _providerCooldowns.set(providerName, Date.now() + cooldownMs);
+}
+
+function getProviderCooldownRemainingMs(providerName: string): number {
+  const end = _providerCooldowns.get(providerName);
+  if (!end) return 0;
+  const remaining = end - Date.now();
+  if (remaining <= 0) { _providerCooldowns.delete(providerName); return 0; }
+  return remaining;
+}
+
+function classifyError(err: any): { category: string; retryable: boolean; retryAfterMs: number } {
+  const msg = err?.message || err?.toString?.() || '';
+  const status = err?.status || err?.statusCode || 0;
+
+  // Rate limited
+  if (status === 429 || msg.includes('rate_limit') || msg.includes('rate limit') || msg.includes('rate_limited')) {
+    // Extract retry-after from message or default to 120s (was 60s — too aggressive)
+    const match = msg.match(/retry after (\d+)ms/);
+    const retryAfterMs = match ? parseInt(match[1], 10) : 120000;
+    return { category: 'rate_limited', retryable: true, retryAfterMs };
+  }
+
+  // Auth errors
+  if (status === 401 || status === 403 || msg.includes('unauthorized') || msg.includes('forbidden') || msg.includes('invalid api')) {
+    return { category: 'auth', retryable: false, retryAfterMs: 0 };
+  }
+
+  // Model errors
+  if (status === 404 || msg.includes('model_not_found') || msg.includes('does not exist') || msg.includes('no longer available') || msg.includes('HTTP_ERROR_404')) {
+    return { category: 'model_not_found', retryable: false, retryAfterMs: 0 };
+  }
+
+  // Server errors
+  if (status >= 500 || msg.includes('timeout') || msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT')) {
+    return { category: 'server_error', retryable: true, retryAfterMs: 5000 };
+  }
+
+  // Empty response
+  if (msg.includes('empty_response') || msg.includes('EMPTY_RESPONSE') || msg.includes('No content')) {
+    return { category: 'empty_response', retryable: true, retryAfterMs: 2000 };
+  }
+
+  // Default
+  return { category: 'unknown', retryable: true, retryAfterMs: 3000 };
+}
+
+// ─── retryWithBackoff ─────────────────────────────────────────────────────
+
+/**
+ * Retry a function with exponential backoff.
+ * Respects circuit breaker via providerName.
+ */
+/**
+ * Retry a function with exponential backoff + jitter.
+ * FIX: Added per-provider 429 cooldown awareness and jitter to prevent
+ * thundering-herd effect where all providers retry simultaneously.
+ */
+async function retryWithBackoff(
+  fn: () => Promise<any>,
+  options: {
+    maxRetries?: number;
+    baseDelayMs?: number;
+    providerName?: string;
+    signal?: AbortSignal;
+  } = {}
+): Promise<any> {
+  const { signal } = options;
+  const { maxRetries = 3, baseDelayMs = 1000, providerName } = options;
+  const log = _getLog().log;
+
+  // FIX: Check if provider is already in cooldown from a previous 429
+  if (providerName) {
+    const cooldownRemaining = getProviderCooldownRemainingMs(providerName);
+    if (cooldownRemaining > 0) {
+      log(
+        `Provider ${providerName} in 429 cooldown (${Math.round(cooldownRemaining / 1000)}s remaining) — skipping retries`,
+        'WARN',
+        'base'
+      );
+      throw new Error(`PROVIDER_COOLDOWN: ${providerName} rate-limited, retry after ${Math.round(cooldownRemaining / 1000)}s`);
+    }
+  }
+
+  let lastError: any = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      const classified = classifyError(err);
+
+      // FIX: On 429, register provider-level cooldown so future calls
+      // (even from different code paths) won't hammer the same provider
+      if (classified.category === 'rate_limited' && providerName) {
+        setProviderCooldown(providerName, classified.retryAfterMs);
+      }
+
+      // FIX: Check if the caller (e.g. tribunal) has already aborted.
+      // Don't waste time retrying when the parent request is dead.
+      if (signal?.aborted) {
+        throw new DOMException('Aborted due to parent signal', 'AbortError');
+      }
+
+      if (!classified.retryable || attempt >= maxRetries) {
+        log(
+          `Retry exhausted for ${providerName || 'unknown'}: ${classified.category}: ${attempt >= maxRetries ? `max ${maxRetries} retries exceeded` : `not retryable`} (attempt ${attempt + 1}/${maxRetries})`,
+          'WARN',
+          'base'
+        );
+        throw err;
+      }
+
+      // FIX: Add jitter (±25%) to prevent synchronized retry storms
+      const baseDelay = classified.retryAfterMs || baseDelayMs * Math.pow(2, attempt);
+      const jitter = baseDelay * 0.25 * (Math.random() * 2 - 1);
+      const delay = Math.min(Math.round(baseDelay + jitter), 120000); // cap at 2min
+      log(
+        `Retry ${attempt + 1}/${maxRetries} for ${providerName || 'unknown'} after ${delay}ms: ${classified.category}`,
+        'WARN',
+        'base'
+      );
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw lastError;
+}
+
+// ─── safeCall ───────────────────────────────────────────────────────────
+
+/**
+ * Wrap a function call with a timeout. Used for tribunal, provider calls etc.
+ * Gracefully handles timeouts without crashing the cycle.
+ */
+async function safeCall(
+  fn: (signal: any) => Promise<any>,
+  label: string,
+  options: { timeoutMs?: number; url?: string; signal?: any; maxRetries?: number; baseDelay?: number } = {}
+): Promise<any> {
+  const { timeoutMs = 120000, url, signal: externalSignal } = options;
+  const log = _getLog().log;
+
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const abortController = new AbortController();
+  const { signal } = abortController;
+
+  // FIX: Link external signal (e.g. tribunal abort) to our controller
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      abortController.abort();
+    } else {
+      externalSignal.addEventListener('abort', () => abortController.abort(), { once: true });
+    }
+  }
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      abortController.abort();
+      reject(new Error(`${label} timed out after ${timeoutMs}ms${url ? ` (${url})` : ''}`));
+    }, timeoutMs);
+  });
+
+  // Start fn(signal) so we can attach a catch handler if timeout wins the race.
+  // Without this, when the timeout fires first, fn()'s promise keeps running
+  // in the background — if it later rejects (e.g. Array.from corruption),
+  // that rejection is unhandled and crashes the process.
+  const fnPromise = fn(signal);
+
+  try {
+    const result = await Promise.race([
+      fnPromise,
+      timeoutPromise,
+    ]);
+    return result;
+  } catch (err: any) {
+    log(`${label} failed: ${err.message || err}`, 'WARN', 'base');
+    // If we timed out, fnPromise is still in flight. Attach a silent catch
+    // to prevent UNHANDLED_REJECTION if it later rejects.
+    fnPromise.catch(() => {});
+    throw err;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
+// ─── coalescer ──────────────────────────────────────────────────────────
+
+/**
+ * Call coalescer — deduplicates concurrent async calls with the same key.
+ * If a call with the same key is already in-flight, returns the same promise
+ * instead of firing a duplicate request. Results are cached for ttlMs after
+ * the call resolves so that near-duplicate keys also hit the cache.
+ *
+ * Usage:  const result = await coalescer.execute('my-key', () => doExpensiveWork(), 5000);
+ */
+const coalescer = {
+  _inflight: new Map<string, Promise<any>>(),
+  _cached: new Map<string, { result: any; expiry: number }>(),
+
+  /**
+   * Execute fn(key) with coalescing.
+   * @param key   - Deduplication key (e.g. screenshot hash)
+   * @param fn    - The async function to call
+   * @param ttlMs - Cache TTL in ms after the call resolves (default 5000)
+   */
+  async execute(key: string, fn: () => Promise<any>, ttlMs: number = 5000): Promise<any> {
+    const now = Date.now();
+
+    // 1. Check cache
+    const cached = this._cached.get(key);
+    if (cached && cached.expiry > now) {
+      return cached.result;
+    }
+    if (cached) this._cached.delete(key); // expired
+
+    // 2. Check in-flight
+    const inflight = this._inflight.get(key);
+    if (inflight) return inflight;
+
+    // 3. Execute
+    const promise = fn().then((result: any) => {
+      this._inflight.delete(key);
+      this._cached.set(key, { result, expiry: Date.now() + ttlMs });
+      return result;
+    }).catch((err: any) => {
+      this._inflight.delete(key);
+      throw err;
+    });
+
+    this._inflight.set(key, promise);
+    return promise;
+  },
+
+  /** Clear all cached and in-flight state */
+  clear(): void {
+    this._inflight.clear();
+    this._cached.clear();
+  },
+};
+
+module.exports = {
+  extractJSON,
+  validateActionResponse,
+  getProviderConfig,
+  retryWithBackoff,
+  classifyError,
+  safeCall,
+  coalescer,
+  callChatCompletionWithRollback,
+  fetchWithTimeout,
+  sanitizeErrorText,
+  getFallbackModels,
+  _getOrLimiter,
+  _injectDependencies,
+  // FIX: Export cooldown functions so providers can check before calling
+  setProviderCooldown,
+  getProviderCooldownRemainingMs,
+};
