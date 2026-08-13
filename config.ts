@@ -301,7 +301,8 @@ function isValidRemoteOverride(key: string, value: unknown): boolean {
     EXPECTED_IP_COUNTRY: { type: 'string', maxLength: 100, regex: /^[a-zA-Z\s\-']+$/ },
     AUTO_INSTALL_DEPENDENCIES: { type: 'boolean' },
     // SANDBOX_MODE intentionally omitted from schema — it is in BLOCKED_KEYS
-    WEB_SEARCH_ENABLED: { type: 'boolean' }
+    WEB_SEARCH_ENABLED: { type: 'boolean' },
+    RAW_RESPONSE_TTL_MS: { type: 'number', min: 5000, max: 300000 },
   };
   const schemaItem: OverrideSchemaItem | undefined = schema[key];
   if (!schemaItem) return false;
@@ -428,6 +429,7 @@ const env = envalid.cleanEnv(process.env, {
   LAST_STATE_PATH: str({ default: path.join(PROJECT_ROOT, 'last-state.json') }),
   LOG_MAX_SIZE_MB: num({ default: 50 }),
   LOG_MAX_FILES: num({ default: 5 }),
+  RAW_RESPONSE_TTL_MS: num({ default: 30000 }),
   LOG_ROTATE_INTERVAL: str({ default: '1d' }),
   SLEEP_MIN_HOURS: num({ default: 10 }),
   SLEEP_MAX_HOURS: num({ default: 16 }),
@@ -681,6 +683,7 @@ const _configStore: Record<string, any> = {
   LAST_STATE_PATH: env.LAST_STATE_PATH,
   LOG_MAX_SIZE_MB: env.LOG_MAX_SIZE_MB,
   LOG_MAX_FILES: env.LOG_MAX_FILES,
+  RAW_RESPONSE_TTL_MS: env.RAW_RESPONSE_TTL_MS,
   LOG_ROTATE_INTERVAL: env.LOG_ROTATE_INTERVAL,
   SLEEP_MIN_HOURS: env.SLEEP_MIN_HOURS,
   SLEEP_MAX_HOURS: env.SLEEP_MAX_HOURS,
