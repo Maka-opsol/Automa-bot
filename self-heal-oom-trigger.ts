@@ -392,27 +392,35 @@ async function triggerBootHeal(): Promise<void> {
       log('performRuntimeHeal not available — self-heal module not loaded yet', 'WARN');
     }
 
-    // ── STEP 2: Full self-heal (with circuit breaker) for code-patch fix ──
-    // Only attempt if runtime heal didn't help AND we're not in an OOM
-    // death spiral (the full pipeline uses more memory — risky when OOMing).
-    // Request a self-heal session for full power if in memory_protection.
-    if (!anyHealed) {
+    // ── STEP 2: Full self-heal (code-patch pipeline) ──
+    // Runtime heal clears stuck state but doesn't fix memory leaks.
+    // If we're in a death spiral (3+ OOM kills), the full pipeline
+    // must run to investigate and patch the root cause.
+    // The full heal requests a self-heal session for full power.
+    const oomKills = getRecentOOMKillCount();
+    const deepHealNeeded = oomKills >= 3 || !anyHealed;
+    if (deepHealNeeded) {
       try {
         const memoryMode = require('./memory-mode');
         if (memoryMode.isMemoryProtection?.()) {
-          memoryMode.beginSelfHealSession?.('oom_boot_trigger');
+          memoryMode.beginSelfHealSession?.(anyHealed ? 'oom_deep_heal_after_runtime' : 'oom_boot_trigger');
         }
       } catch {}
 
       const performSelfHeal = selfHealMod.performSelfHeal;
       if (typeof performSelfHeal === 'function') {
-        log('Runtime heal didn\'t help — attempting full performSelfHeal()...', 'WARN');
-        const fullHealed = await performSelfHeal();
-        if (fullHealed) {
-          log('Boot-time OOM full self-heal SUCCEEDED', 'INFO');
-          anyHealed = true;
-        } else {
-          log('Boot-time OOM full self-heal found no fixable issues', 'WARN');
+        log(`OOM death spiral (${oomKills} kills, runtime_healed=${anyHealed}) — attempting full code-patch heal...`, 'ERROR');
+        try {
+          const fullHealed = await performSelfHeal();
+          if (fullHealed) {
+            log('Boot-time OOM full self-heal SUCCEEDED', 'INFO');
+            anyHealed = true;
+          } else {
+            log('Boot-time OOM full self-heal found no fixable issues', 'WARN');
+          }
+        } catch (fullErr: any) {
+          // Full heal can OOM itself on 512MB — log but don't crash
+          log(`Full self-heal threw (may OOM on 512MB): ${fullErr.message}`, 'WARN');
         }
       }
     }
