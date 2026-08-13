@@ -252,6 +252,7 @@ async function _callWithModel(
     if (!responseText) {
       throw new Error('CLOUDFLARE_EMPTY_RESPONSE');
     }
+    try { require('./providers-base').storeRawResponse('Cloudflare', responseText, JSON.stringify(data), body.model || currentModel); } catch {}
     return responseText;
   };
 
