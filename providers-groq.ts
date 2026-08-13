@@ -81,7 +81,9 @@ function GroqProvider() {
       if (!response?.choices?.[0]?.message?.content) {
         throw new Error('GROQ_EMPTY_RESPONSE');
       }
-      return response.choices[0].message.content;
+      const content = response.choices[0].message.content;
+      try { require('./providers-base').storeRawResponse('Groq', content, JSON.stringify(response), body.model); } catch {}
+      return content;
     };
 
     // P7: Pass providerName for health-aware retries
