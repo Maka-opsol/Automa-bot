@@ -55,6 +55,16 @@ class HealerCircuitBreaker {
           updated_at INTEGER
         )
       `);
+      // Migration: add sliding_window column if missing (table created
+      // before this column was added — CREATE IF NOT EXISTS won't add it)
+      try {
+        getDb()?.exec(`ALTER TABLE healer_circuit_state ADD COLUMN sliding_window TEXT DEFAULT '[]'`);
+      } catch (alterErr: any) {
+        // Column already exists — expected, ignore
+        if (!alterErr.message?.includes('duplicate column')) {
+          log(`Circuit breaker migration warning: ${alterErr.message}`, 'DEBUG', 'healer-cb');
+        }
+      }
     } catch (err: any) {
       logError('Failed to create healer_circuit_state table', err);
     }
