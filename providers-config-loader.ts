@@ -131,10 +131,6 @@ const DEFAULTS: Record<string, ProviderDefault> = {
     envKeys: ['GEMINI_API_KEY'],
     visionCapable: true,
     fallbackModels: [
-      // v3 series — next-gen, higher RPM limits on free tier
-      'gemini-3-flash',
-      'gemini-3.1-pro',
-      'gemini-3.1-flash-lite',
       // v2.5 stable fallback
       'gemini-2.5-pro',
       // Legacy fallbacks (still free, lower rate limits)
