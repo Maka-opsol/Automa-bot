@@ -54,7 +54,11 @@ async function determineNextAction(base64Image: string, pageUrl: string | null =
       } catch (e: any) { logError('Failed to save screenshot', e as Error); }
     }
     let action;
-    try { action = await safeCall((sig: any) => runTribunal(compressed, pageUrl, uiMap, sig), 'Tribunal', { timeoutMs: CONFIG.TRIBUNAL_TIMEOUT_MS, url: 'tribunal' }); } catch (err: any) { logError('Tribunal failed, using fallback', err as Error); action = { actionType: 'wait', currentState: 'error', reasoning: 'Fallback due to tribunal failure', targetX: 0, targetY: 0 }; }
+    // Call runTribunal directly — it has its own internal 120s AbortController
+    // timeout. Wrapping it in another safeCall here created a race where this
+    // layer's timeout fired ~5ms before the tribunal's own, aborting consensus
+    // computation and orphaning valid results.
+    try { action = await runTribunal(compressed, pageUrl, uiMap); } catch (err: any) { logError('Tribunal failed, using fallback', err as Error); action = { actionType: 'wait', currentState: 'error', reasoning: 'Fallback due to tribunal failure', targetX: 0, targetY: 0 }; }
     return action;
   }, 5000);
   setCachedAction(base64Image, action);
