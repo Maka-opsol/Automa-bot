@@ -1131,7 +1131,7 @@ async function runtimeHealProviders(): Promise<RuntimeHealResult> {
     // 5b: Clear rate-limiter state (stuck rate-limits block providers permanently)
     try {
       const rateLimiter = require('./openrouter-rate-limiter');
-      if (rateLimiter.resetAll?.) {
+      if (rateLimiter.resetAll) {
         rateLimiter.resetAll();
         fixes++;
         log('Rate limiter reset', 'INFO', 'self-heal');
@@ -1141,7 +1141,7 @@ async function runtimeHealProviders(): Promise<RuntimeHealResult> {
     // 5c: Reset provider fallback chain (sometimes it gets stuck on a dead provider)
     try {
       const fallback = require('./providers-fallback');
-      if (fallback.resetFallbackIndex?.) {
+      if (fallback.resetFallbackIndex) {
         fallback.resetFallbackIndex();
         fixes++;
         log('Provider fallback index reset', 'INFO', 'self-heal');
