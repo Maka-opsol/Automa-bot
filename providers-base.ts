@@ -19,10 +19,9 @@
 
 // ─── Raw Response Buffer ─────────────────────────────────────────────
 // Stores full raw responses from all providers for dashboard inspection.
-// Entries auto-expire after 10 seconds.
+// TTL is configurable via RAW_RESPONSE_TTL_MS (default 30s, changeable from dashboard).
 
 const _rawResponses: Array<{ provider: string; model: string; ts: number; content: string; fullBody?: string }> = [];
-const RAW_RESPONSE_TTL_MS = 10000;
 const RAW_RESPONSE_MAX = 20;
 
 /**
@@ -47,12 +46,14 @@ function storeRawResponse(provider: string, content: string, fullBody?: string, 
 }
 
 /**
- * Get all raw responses, pruning expired entries (>10s old).
+ * Get all raw responses, pruning expired entries. TTL read from RAW_RESPONSE_TTL_MS config.
  */
 function getRawResponses(): Array<{ provider: string; model: string; ts: number; content: string; fullBody?: string }> {
   const now = Date.now();
+  let ttl = 30000;
+  try { ttl = require('./get-config').RAW_RESPONSE_TTL_MS || 30000; } catch { /* use default */ }
   // Prune expired
-  while (_rawResponses.length > 0 && now - _rawResponses[0].ts > RAW_RESPONSE_TTL_MS) {
+  while (_rawResponses.length > 0 && now - _rawResponses[0].ts > ttl) {
     _rawResponses.shift();
   }
   return [..._rawResponses];
