@@ -265,13 +265,17 @@ function resetCycleProviderState() {
   log('Provider cycle state reset (blacklist cleared, health reset)', 'INFO', 'registry');
 }
 
-function addProviderFailure(name: string) { 
+function addProviderFailure(name: string, err?: any) { 
   const log = getLog();
   cycleFailCounts[name] = (cycleFailCounts[name] || 0) + 1;
 
-  // Gemini-specific: track 429s for escalating cooldown
+  // Gemini-specific: track 429s for escalating cooldown.
+  // Only count actual rate-limit errors, not 404s, auth errors, etc.
   if (name === 'Gemini') {
-    recordGemini429();
+    const msg = err?.message || '';
+    if (msg.includes('HTTP_ERROR_429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota') || msg.includes('429')) {
+      recordGemini429();
+    }
   }
 
   // Blacklist after 2 consecutive failures in this cycle
