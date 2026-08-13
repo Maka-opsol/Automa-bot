@@ -290,6 +290,8 @@ const SAFE_CONFIG_KEYS = new Set([
   'BROWSER_LAUNCH_EXTENDED_TIMEOUT_MS', 'BROWSER_CONTEXT_TIMEOUT_MS', 'BROWSER_CLOSE_TIMEOUT_MS',
   // Log ring buffer
   'LOG_RING_BUFFER_MAX',
+  // Raw response display
+  'RAW_RESPONSE_TTL_MS',
 ]);
 
 // Config key metadata for the dashboard editor (grouped, with descriptions + type hints)
@@ -381,6 +383,8 @@ const CONFIG_KEY_META: Record<string, { group: string; label: string; type: 'num
   BROWSER_LAUNCH_EXTENDED_TIMEOUT_MS: { group: 'Browser', label: 'Extended Launch Timeout', type: 'number', desc: 'Extended browser launch timeout' },
   BROWSER_CONTEXT_TIMEOUT_MS:   { group: 'Browser', label: 'Context Timeout (ms)', type: 'number', desc: 'Browser context creation timeout' },
   BROWSER_CLOSE_TIMEOUT_MS:    { group: 'Browser', label: 'Close Timeout (ms)', type: 'number', desc: 'Browser close timeout' },
+  // Raw responses
+  RAW_RESPONSE_TTL_MS:        { group: 'Logging', label: 'Response Display TTL (ms)', type: 'number', desc: 'How long raw model responses stay visible on dashboard (5s–300s)' },
 };
 
 // In-memory banned-states store (backed by persistent-config for same-instance restarts)
@@ -576,14 +580,16 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
-  // Raw provider responses (auto-expire after 10s)
+  // Raw provider responses (auto-expire after configurable TTL)
   if (pathname === '/api/raw-responses') {
     authWrap(() => {
       try {
         const { getRawResponses } = require('./providers-base');
         const responses = getRawResponses();
+        let ttlMs = 30000;
+        try { ttlMs = require('./get-config').RAW_RESPONSE_TTL_MS || 30000; } catch { /* default */ }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(responses));
+        res.end(JSON.stringify({ ttlMs, responses }));
       } catch (e: any) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: e.message }));
@@ -1823,17 +1829,21 @@ let _lastRawResponseCount = 0;
 async function refreshRawResponses() {
   const el = document.getElementById('rawResponsesContainer');
   try {
-    const responses = await api('/api/raw-responses');
-    if (!Array.isArray(responses) || responses.length === 0) {
-      if (_lastRawResponseCount > 0) { el.innerHTML = '<div class="empty">No active responses (cleared after 10s)</div>'; _lastRawResponseCount = 0; }
+    const data = await api('/api/raw-responses');
+    const arr = Array.isArray(data) ? data : (data && data.responses) || [];
+    const ttlSec = Math.round(((data && data.ttlMs) || 30000) / 1000);
+    if (arr.length === 0) {
+      if (_lastRawResponseCount > 0) { el.innerHTML = '<div class="empty">No active responses (cleared after ' + ttlSec + 's)</div>'; _lastRawResponseCount = 0; }
       return;
     }
-    _lastRawResponseCount = responses.length;
+    _lastRawResponseCount = arr.length;
     let html = '';
-    for (const r of responses) {
+    for (const r of arr) {
       const age = Math.round((Date.now() - r.ts) / 1000);
-      const remaining = Math.max(0, 10 - age);
-      const ageClass = remaining <= 3 ? 'red' : remaining <= 6 ? 'yellow' : 'green';
+      const remaining = Math.max(0, ttlSec - age);
+      const redThreshold = Math.max(1, Math.round(ttlSec * 0.1));
+      const yellowThreshold = Math.round(ttlSec * 0.5);
+      const ageClass = remaining <= redThreshold ? 'red' : remaining <= yellowThreshold ? 'yellow' : 'green';
       html += '<div style="margin:8px 12px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">';
       html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
       html += '<strong style="color:var(--accent)">' + r.provider + '</strong>';
