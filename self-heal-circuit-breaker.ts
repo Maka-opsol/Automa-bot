@@ -105,7 +105,7 @@ class HealerCircuitBreaker {
     }
   }
 
-  _persist() { 
+  _persist() {
     try {
       getDb()?.prepare(`
         UPDATE healer_circuit_state SET
@@ -127,7 +127,27 @@ class HealerCircuitBreaker {
         Date.now()
       );
     } catch (err: any) {
-      logError('Failed to persist circuit breaker state', err);
+      if (err.message?.includes('no such column')) {
+        // Column missing (old schema or Turso overwrite) — migrate and retry
+        try {
+          getDb()?.exec(`ALTER TABLE healer_circuit_state ADD COLUMN sliding_window TEXT DEFAULT '[]'`);
+          getDb()?.prepare(`
+            UPDATE healer_circuit_state SET
+              state = ?, failure_count = ?, success_count = ?,
+              last_failure_time = ?, consecutive_opens = ?,
+              sliding_window = ?, updated_at = ?
+            WHERE id = 1
+          `).run(
+            this._state, this._failureCount, this._successCount,
+            this._lastFailureTime, this._consecutiveOpens,
+            JSON.stringify(this._slidingWindow), Date.now()
+          );
+        } catch (retryErr: any) {
+          logError('Failed to persist circuit breaker state after migration', retryErr);
+        }
+      } else {
+        logError('Failed to persist circuit breaker state', err);
+      }
     }
   }
 
