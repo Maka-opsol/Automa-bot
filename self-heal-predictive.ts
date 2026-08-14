@@ -323,13 +323,42 @@ class SelfHealPredictor {
 
         log('Shadow investigation: page captured, requesting tribunal fix', 'INFO', 'predictive-heal');
 
-        const { generateCodeFixViaTribunal } = tribunal;
-        const fixes = await generateCodeFixViaTribunal(
-          { url: investigationResult.url, html: investigationResult.html, screenshotBase64: investigationResult.screenshotBase64 },
-          `Predictive anomaly detected at ${new Date().toISOString()}. Metrics indicate pre-failure conditions. Generate preventive fix.`
-        );
+        // Shadow investigation uses the FIX-generation path (not raw)
+        // because the cached result must be in fix format for later application.
+        // Import consultTribunalRaw for the actual call with proper timeout.
+        const { generateCodeFixViaTribunal, consultTribunalRaw } = tribunal;
 
-        if (fixes && fixes.length > 0) {
+        // Build a proper codegen prompt for shadow fix
+        const shadowPrompt = `Predictive anomaly detected at ${new Date().toISOString()}. Metrics indicate pre-failure conditions.\n` +
+          `Current URL: ${investigationResult.url}\n` +
+          `HTML snippet: ${(investigationResult.html || '').substring(0, 1500)}\n\n` +
+          `Generate a JSON ARRAY of code fixes. Each object must have:\n` +
+          `- "file": (string) relative path of the file to fix\n` +
+          `- "change": (string) human-readable description\n` +
+          `- "patch": (string) either a UNIFIED DIFF or the COMPLETE REPLACEMENT code.\n\n` +
+          `ONLY return valid JSON. No markdown, no explanations outside the JSON.`;
+
+        const shadowSignal = AbortSignal.timeout(120_000);
+        let rawResult: string | null = null;
+        try {
+          rawResult = await consultTribunalRaw(shadowPrompt, shadowSignal);
+        } catch (e: any) {
+          log('Shadow tribunal call failed or timed out', 'WARN', 'predictive-heal');
+        }
+
+        // Parse the raw result into fix objects
+        let fixes: any[] = [];
+        if (rawResult) {
+          try {
+            const parsed = JSON.parse(rawResult);
+            const arr = Array.isArray(parsed) ? parsed : [parsed];
+            fixes = arr.filter((f: any) => f && typeof f.file === 'string' && typeof f.patch === 'string' && f.patch.trim().length >= 5);
+          } catch (e: any) {
+            log('Shadow tribunal returned invalid JSON', 'WARN', 'predictive-heal');
+          }
+        }
+
+        if (fixes.length > 0) {
           const cacheKey = `shadow_${Date.now()}`;
           this.shadowFixCache.set(cacheKey, {
             fixes,
