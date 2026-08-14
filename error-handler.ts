@@ -9,44 +9,70 @@ const { classifyError } = require('./errors');
 const isHFSpaces = !!(process.env.PORT || process.env.SPACE_ID || process.env.SPACE_AUTHOR_NAME);
 
 process.on('uncaughtException', (err: Error, origin: string): void => {
-  const { safeLog } = require('./logger');
-  const classified = classifyError(err);
-  safeLog({
-    type: 'UNCAUGHT_EXCEPTION',
-    error: {
-      name: classified.name,
-      code: classified.code,
-      message: classified.message,
-      stack: classified.stack?.split('\n')?.slice(0, 10),
-    },
-    classified: classified.toJSON(),
-    origin,
-  }, 'FATAL', 'error-handler');
+  // MUST NOT throw — this is the last line of defense.
+  // Any exception here becomes a true unhandleable crash.
+  try {
+    const { safeLog } = require('./logger');
+    let classified;
+    try {
+      classified = classifyError(err);
+    } catch {
+      // classifyError itself crashed (corrupted prototypes under memory pressure)
+      classified = null;
+    }
+    if (classified) {
+      safeLog({
+        type: 'UNCAUGHT_EXCEPTION',
+        error: {
+          name: classified.name,
+          code: classified.code,
+          message: classified.message,
+          stack: classified.stack?.split?.('\n')?.slice?.(0, 10),
+        },
+        classified: typeof classified.toJSON === 'function' ? classified.toJSON() : { name: 'unknown', message: String(err), code: 'E_UNKNOWN' },
+        origin,
+      }, 'FATAL', 'error-handler');
+    } else {
+      safeLog({
+        type: 'UNCAUGHT_EXCEPTION',
+        error: { name: err?.name || 'Unknown', message: String(err?.message ?? err), code: 'E_UNKNOWN' },
+        origin,
+      }, 'FATAL', 'error-handler');
+    }
+  } catch {
+    // Last resort — logger itself is broken
+    console.error('uncaughtException (logger broken):', String(err));
+  }
   if (isHFSpaces) {
-    safeLog({ message: 'HF Spaces: uncaughtException intercepted — NOT shutting down (HTTP server must stay alive)' }, 'WARN', 'error-handler');
+    try {
+      const { safeLog } = require('./logger');
+      safeLog({ message: 'HF Spaces: uncaughtException intercepted — NOT shutting down (HTTP server must stay alive)' }, 'WARN', 'error-handler');
+    } catch { console.warn('HF Spaces: uncaughtException intercepted — NOT shutting down'); }
   } else {
     setTimeout(() => { gracefulShutdown('uncaughtException'); }, 1000);
   }
 });
 
 process.on('unhandledRejection', (reason: unknown, _promise: Promise<unknown>): void => {
-  // Suppress known false positives from timed-out async operations.
-  // When safeCall() times out, in-flight promises may crash due to
-  // Playwright prototype corruption (Array.from, Array.isArray undefined).
-  // These are NOT real errors — the timeout already handled the situation.
-  const msg = (reason instanceof Error ? reason.message : String(reason)) || '';
-  if (msg.includes('Array.from is not a function') ||
-      msg.includes('Array.isArray is not a function') ||
-      msg.includes('Array is not a function')) {
-    return; // silently suppress
+  try {
+    const { safeLog } = require('./logger');
+    let classified;
+    try {
+      classified = classifyError(reason instanceof Error ? reason : new Error(String(reason)));
+    } catch {
+      classified = null;
+    }
+    if (classified) {
+      safeLog({
+        type: 'UNHANDLED_REJECTION',
+        reason: typeof classified.toJSON === 'function' ? classified.toJSON() : { name: 'unknown', message: String(reason) },
+      }, 'ERROR', 'error-handler');
+    } else {
+      safeLog({ type: 'UNHANDLED_REJECTION', reason: { message: String(reason) } }, 'ERROR', 'error-handler');
+    }
+  } catch {
+    console.error('unhandledRejection (logger broken):', String(reason));
   }
-
-  const { safeLog } = require('./logger');
-  const classified = classifyError(reason instanceof Error ? reason : new Error(String(reason)));
-  safeLog({
-    type: 'UNHANDLED_REJECTION',
-    reason: classified.toJSON(),
-  }, 'ERROR', 'error-handler');
 });
 
 process.on('warning', (warning: Error): void => {
