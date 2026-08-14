@@ -85,7 +85,10 @@ class MathUBotError extends Error {
     this.context = opts.context || {};
     this.retryAfterMs = opts.retryAfterMs ?? null;
     this.timestamp = Date.now();
-    Error.captureStackTrace(this, this.constructor);
+    // Guard: captureStackTrace can fail under memory pressure on Render
+    // (corrupted V8 stack API). Non-critical — pino will still serialize
+    // the error name/message/code without a stack.
+    try { Error.captureStackTrace(this, this.constructor); } catch { /* no stack */ }
   }
 
   /** Serialize for structured logging / API responses. */
@@ -262,31 +265,44 @@ class ValidationError extends MathUBotError {
 function classifyError(err: unknown): MathUBotError {
   if (err instanceof MathUBotError) return err;
 
-  const message = (err as Error)?.message || String(err);
+  // Guard: err may be undefined, null, a string, number, etc.
+  // String() handles all primitives. For objects without .message,
+  // fall back to JSON.stringify then String.
+  let message: string;
+  try {
+    message = (err instanceof Error) ? err.message : String(err ?? 'unknown error');
+    if (!message || typeof message !== 'string') message = String(err ?? 'unknown error');
+  } catch {
+    message = 'unknown error';
+  }
 
-  // Auto-classify common Node / Playwright errors
-  const lowerMessage = message.toLowerCase();
-  if ((err as Error)?.name === 'TimeoutError' || lowerMessage.includes('timeout')) {
-    return new NetworkTimeoutError(message, { cause: err as Error });
-  }
-  if (message.includes('rate limit') || message.includes('429') || message.includes('too many requests')) {
-    return new RateLimitedError(message, { cause: err as Error });
-  }
-  if (lowerMessage.includes('browser') && (lowerMessage.includes('closed') || lowerMessage.includes('disconnected') || lowerMessage.includes('target closed'))) {
-    return new BrowserDisconnectedError(message, { cause: err as Error });
-  }
-  if (message.includes('ECONNREFUSED') || message.includes('ENOTFOUND')) {
-    return new TransientError(message, { cause: err as Error, code: 'E_CONNECTION_FAILED' });
-  }
-  if (message.includes('fetch failed')) {
-    return new NetworkTimeoutError(message, { cause: err as Error });
-  }
-  if (lowerMessage.includes('captcha')) {
-    return new CaptchaEncounteredError(message, { cause: err as Error });
+  try {
+    // Auto-classify common Node / Playwright errors
+    const lowerMessage = message.toLowerCase();
+    if ((err instanceof Error && err.name === 'TimeoutError') || lowerMessage.includes('timeout')) {
+      return new NetworkTimeoutError(message, { cause: err instanceof Error ? err : undefined });
+    }
+    if (message.includes('rate limit') || message.includes('429') || message.includes('too many requests')) {
+      return new RateLimitedError(message, { cause: err instanceof Error ? err : undefined });
+    }
+    if (lowerMessage.includes('browser') && (lowerMessage.includes('closed') || lowerMessage.includes('disconnected') || lowerMessage.includes('target closed'))) {
+      return new BrowserDisconnectedError(message, { cause: err instanceof Error ? err : undefined });
+    }
+    if (message.includes('ECONNREFUSED') || message.includes('ENOTFOUND')) {
+      return new TransientError(message, { cause: err instanceof Error ? err : undefined, code: 'E_CONNECTION_FAILED' });
+    }
+    if (message.includes('fetch failed')) {
+      return new NetworkTimeoutError(message, { cause: err instanceof Error ? err : undefined });
+    }
+    if (lowerMessage.includes('captcha')) {
+      return new CaptchaEncounteredError(message, { cause: err instanceof Error ? err : undefined });
+    }
+  } catch {
+    // Classification logic itself threw (e.g. corrupted prototypes under memory pressure)
   }
 
   // Default: wrap as unknown transient (safe default — retryable)
-  return new TransientError(message, { cause: err as Error, code: ERROR_CODES.UNKNOWN });
+  return new TransientError(message, { cause: err instanceof Error ? err : undefined, code: ERROR_CODES.UNKNOWN });
 }
 
 module.exports = { ERROR_CODES, MathUBotError, TransientError, NetworkTimeoutError, RateLimitedError, ProviderTemporaryError, BrowserDisconnectedError, CaptchaEncounteredError, FatalError, CredentialInvalidError, EncryptionFailureError, DatabaseCorruptError, SandboxEscapedError, OutOfMemoryError, HealableError, SelectorDriftError, UIChangedError, ProviderPermanentError, StateDeadlockError, PatchFailedError, ConfigError, AuthenticationError, ProviderError, StateError, SandboxError, ValidationError, classifyError };
