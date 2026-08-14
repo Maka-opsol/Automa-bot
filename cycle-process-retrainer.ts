@@ -66,21 +66,18 @@ async function generateNewStatesAndTransitions(failureScreenshots: any) {
 
   const knownStates = new Set(Object.values(STATES));
 
+  const prompt = `Analyze these ${failureScreenshots.length} failure screenshots and suggest new state definitions and transitions for the state machine.\n` +
+    `The bot got stuck in unknown states. Generate valid JSON with: {"states": [{"name": "STATE_NAME", "description": "what this state looks like"}, ...], "transitions": {"STATE_NAME": ["TARGET_STATE_1", "TARGET_STATE_2"], ...}}\n` +
+    `Rules: State names must be UPPER_SNAKE_CASE, max 50 chars. Only suggest transitions to these known states: ${Array.from(knownStates).join(', ')}\n` +
+    `Previous states: ${JSON.stringify(STATES || {})}\n`;
+
   try {
-    const { generateCodeFixViaTribunal } = require('./providers-codegen-tribunal');
-    const prompt = `Analyze these ${failureScreenshots.length} failure screenshots and suggest new state definitions and transitions for the state machine.\n` +
-      `The bot got stuck in unknown states. Generate valid JSON with: {"states": [{"name": "STATE_NAME", "description": "what this state looks like"}, ...], "transitions": {"STATE_NAME": ["TARGET_STATE_1", "TARGET_STATE_2"], ...}}\n` +
-      `Rules: State names must be UPPER_SNAKE_CASE, max 50 chars. Only suggest transitions to these known states: ${Array.from(knownStates).join(', ')}.\n` +
-      `Previous states: ${JSON.stringify(STATES || {})}\n`;
-
-    const fixes = await generateCodeFixViaTribunal(
-      { url: 'retraining', html: '', fileContent: prompt, targetFile: 'state-machine-states' },
-      prompt
-    );
-
-    if (fixes && fixes.length > 0 && fixes[0].patch) {
+    const { consultTribunalRaw } = require('./providers-codegen-tribunal');
+    const signal = AbortSignal.timeout(120_000);
+    const rawResult = await consultTribunalRaw(prompt, signal, { responseFormatJson: true });
+    if (rawResult) {
       try {
-        const parsed = JSON.parse(fixes[0].patch);
+        const parsed = JSON.parse(rawResult);
         const newStates = (parsed.states || []).filter((s: any) => s && validateStateName(s.name));
         const newTransitions = validateTransitions(parsed.transitions, knownStates);
 
