@@ -100,16 +100,27 @@ class RegressionBank {
 
       let testBody = '';
       try {
-        const { generateCodeFixViaTribunal } = require('./providers-codegen-tribunal');
-        const mockInvestigation = {
-          url: 'regression-generation',
-          html: '',
-          fileContent: prompt,
-          targetFile: `regression_${patchId}`
-        };
-        const result = await generateCodeFixViaTribunal(mockInvestigation, prompt);
-        if (result && result.length > 0 && result[0].patch) {
-          testBody = result[0].patch;
+        const { consultTribunalRaw } = require('./providers-codegen-tribunal');
+        const regressPrompt = [
+          'Write a Node.js test that fails on the old code and passes on the new code.',
+          `The bug was: ${reasoning}`,
+          `State was: ${state}`,
+          `Action was: ${action}`,
+          `Screenshot hash: ${screenshotHash}`,
+          `Target file: ${patch.file || 'unknown'}`,
+          'The test must:',
+          '1. Use const assert = require("assert");',
+          '2. Test the specific behavior that was fixed',
+          '3. Be self-contained and runnable with: node <test_file>',
+          '4. Export a run() function that returns { passed: boolean, error: string|null }',
+          '5. Handle errors gracefully - catch them and return { passed: false, error: ... }',
+          'Return ONLY the test code, no explanations.'
+        ].join('\n');
+
+        const signal = AbortSignal.timeout(120_000);
+        const result = await consultTribunalRaw(regressPrompt, signal, { responseFormatJson: false });
+        if (result && result.trim().length > 0) {
+          testBody = result.trim();
         }
       } catch (tribunalErr: any) {
         logError('Tribunal call failed for regression test generation, using template', tribunalErr);
