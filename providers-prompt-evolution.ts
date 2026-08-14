@@ -349,30 +349,17 @@ class PromptEvolver {
 
       let suggestion: string | null = null;
       try {
-        const { generateCodeFixViaTribunal } = require('./providers-codegen-tribunal');
-        const mockInvestigation = {
-          url: 'prompt-evolution',
-          html: '',
-          fileContent: metaPrompt,
-          targetFile: 'prompt-evolve'
-        };
-
-        // BUG FIX (Response 18): Race tribunal call against timeout.
-        // On Render, the tribunal can stall for minutes if the provider
-        // API is slow. This prevents the evolution cycle from hanging.
-        const tribunalPromise = generateCodeFixViaTribunal(mockInvestigation, metaPrompt);
-        const timeoutPromise = new Promise<null>(resolve =>
-          setTimeout(() => resolve(null), TRIBUNAL_TIMEOUT_MS)
-        );
-        const result = await Promise.race([tribunalPromise, timeoutPromise]);
+        const { consultTribunalRaw } = require('./providers-codegen-tribunal');
+        const signal = AbortSignal.timeout(TRIBUNAL_TIMEOUT_MS);
+        const result = await consultTribunalRaw(metaPrompt, signal, { responseFormatJson: false });
 
         if (result === null) {
           log(`Tribunal call timed out for state '${state}' (${TRIBUNAL_TIMEOUT_MS / 1000}s)`, 'WARN', 'prompt-evolution');
           return null;
         }
 
-        if (result && result.length > 0 && result[0].patch) {
-          suggestion = result[0].patch.trim();
+        if (result && result.trim().length >= 20) {
+          suggestion = result.trim();
         }
       } catch (tribunalErr: any) {
         logError('Tribunal call failed for prompt evolution', tribunalErr);
