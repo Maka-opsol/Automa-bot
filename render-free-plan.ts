@@ -1030,14 +1030,44 @@ try {
 } catch { /* best-effort */ }
 
 // ═══════════════════════════════════════════════════════════════════════
-// START THE DAEMON (non-blocking — runs in background)
+// WAIT FOR OOM BOOT HEAL BEFORE STARTING DAEMON
 // ═══════════════════════════════════════════════════════════════════════
+// If an OOM boot heal was scheduled (init or recheckAfterTursoSync),
+// we MUST wait for it to complete before starting the cycle daemon.
+// Without this wait, the daemon starts burning vision AI quota while
+// the code-generation tribunal is still investigating the root cause.
+//
+// The oom-trigger module handles the full flow:
+//   1. Runtime heal (clear stuck state)
+//   2. Code-patch pipeline via generateCodeFixViaTribunal()
+//   3. triggerImmediateRedeploy() → push to GitHub → Render deploy
+//   4. Wait for SIGTERM (Render replacing this instance)
+//
+// waitForBootHeal() returns when all of the above completes.
+// If the heal succeeded and triggered a redeploy, the SIGTERM will
+// kill this process before we reach startDaemon().
+(async () => {
+  try {
+    const oomTrigger = require('./self-heal-oom-trigger');
+    if (oomTrigger.isBootHealInProgress?.()) {
+      log('OOM boot heal in progress — WAITING before starting daemon (code-gen tribunal running)...', 'WARN', 'render-free-plan');
+      const healResult = await oomTrigger.waitForBootHeal();
+      log(`OOM boot heal completed: result=${healResult.result}, waited=${healResult.waited}ms`, healResult.result === 'success' ? 'INFO' : 'WARN', 'render-free-plan');
+    }
+  } catch (waitErr: any) {
+    log(`OOM heal wait failed (non-fatal, starting daemon): ${waitErr.message}`, 'WARN', 'render-free-plan');
+  }
 
-log('Starting daemon loop (background, all features)...', 'INFO', 'render-free-plan');
-startDaemon().catch(err => {
-  logError('Fatal daemon error', err);
-  if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Fatal daemon error: ${err.message}`); } catch { /* non-critical */ }
-  log('Daemon crashed — will restart on next cycle iteration', 'ERROR', 'render-free-plan');
-});
+  // ═══════════════════════════════════════════════════════════════════════
+  // START THE DAEMON (non-blocking — runs in background)
+  // ═══════════════════════════════════════════════════════════════════════
 
-log('MathU Bot v6 — Render Free Plan fully started (all features, no workers)', 'INFO', 'render-free-plan');
+  log('Starting daemon loop (background, all features)...', 'INFO', 'render-free-plan');
+  startDaemon().catch(err => {
+    logError('Fatal daemon error', err);
+    if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Fatal daemon error: ${err.message}`); } catch { /* non-critical */ }
+    log('Daemon crashed — will restart on next cycle iteration', 'ERROR', 'render-free-plan');
+  });
+
+  log('MathU Bot v6 — Render Free Plan fully started (all features, no workers)', 'INFO', 'render-free-plan');
+})();
