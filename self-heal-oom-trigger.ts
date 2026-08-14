@@ -493,12 +493,22 @@ function init(options: {
   }
 
   // Wire process stop recording into shutdown
+  // Also cancel the git-deploy SIGTERM watchdog so it doesn't
+  // log a false 'redeploy failed' after Render terminates us.
   try {
     const origShutdown = (process as any).__oomTriggerShutdownHook;
     if (!origShutdown) {
       (process as any).__oomTriggerShutdownHook = true;
       const shutdownHook = () => {
         recordProcessStop('graceful_shutdown');
+        // Cancel the full-heal SIGTERM watchdog — Render is killing us
+        // because the new deploy is ready, which means the redeploy succeeded.
+        try {
+          const gitDeploy = require('./self-heal-git-deploy');
+          if (typeof gitDeploy.cancelSigtermWatchdog === 'function') {
+            gitDeploy.cancelSigtermWatchdog();
+          }
+        } catch {}
       };
       process.on('SIGTERM', shutdownHook);
       process.on('SIGINT', shutdownHook);
