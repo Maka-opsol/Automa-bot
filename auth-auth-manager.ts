@@ -140,7 +140,14 @@ const { PROJECT_ROOT } = require('./project-root');
         continue;
       }
     }
-    throw new Error('No authentication strategy could handle this page');
+    // No strategy matched — don't throw. The strategies are weak selectors
+    // that only handle known login layouts. The vision AIs (tribunal) can see
+    // the page and handle it visually (click buttons, type credentials, etc.).
+    // Return false (not the page) so callers like refreshSession know auth
+    // didn't complete. The page is still usable — the cycle will proceed
+    // to the tribunal which can handle it visually.
+    log('No authentication strategy could handle this page — delegating to vision tribunal', 'WARN', 'auth');
+    return false;
   }
 
   /**
