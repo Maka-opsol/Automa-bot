@@ -21,13 +21,23 @@ process.on('uncaughtException', (err: Error, origin: string): void => {
       classified = null;
     }
     if (classified) {
+      let stackLines: string[] | null = null;
+      try {
+        const raw = classified.stack;
+        if (typeof raw === 'string' && raw.length > 0) {
+          stackLines = raw.split('\n');
+          if (Array.isArray(stackLines) && stackLines.length > 10) {
+            stackLines = stackLines.slice(0, 10);
+          }
+        }
+      } catch { /* corrupted stack under memory pressure */ }
       safeLog({
         type: 'UNCAUGHT_EXCEPTION',
         error: {
           name: classified.name,
           code: classified.code,
           message: classified.message,
-          stack: classified.stack?.split?.('\n')?.slice?.(0, 10),
+          stack: stackLines,
         },
         classified: typeof classified.toJSON === 'function' ? classified.toJSON() : { name: 'unknown', message: String(err), code: 'E_UNKNOWN' },
         origin,
