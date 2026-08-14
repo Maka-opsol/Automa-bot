@@ -132,9 +132,14 @@ class FailsafeCoordinator {
 const failsafeCoordinator = new FailsafeCoordinator();
 
 failsafeCoordinator.registerHealthCheck('database', async () => {
-  const { db } = require('./database');
-  db.prepare('SELECT 1').get();
-  const stats = require('./database').getDatabaseStats();
+  const database = require('./database');
+  // database.ts does NOT export `db` directly — it exports checkIntegrity and
+  // getDatabaseStats.  Use those instead of reaching for the raw connection.
+  if (typeof database.checkIntegrity === 'function') {
+    const ok = database.checkIntegrity();
+    if (!ok) throw new Error('Database integrity check failed');
+  }
+  const stats = database.getDatabaseStats ? database.getDatabaseStats() : null;
   if (stats && stats.totalSizeBytes > 200 * 1024 * 1024) { throw new Error(`Database size ${(stats.totalSizeBytes/1024/1024).toFixed(1)} MB exceeds critical threshold`); }
   const result = { sizeMB: stats ? (stats.totalSizeBytes/1024/1024).toFixed(1) : 0 };
 // @ts-expect-error
