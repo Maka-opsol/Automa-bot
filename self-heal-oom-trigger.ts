@@ -565,6 +565,21 @@ function recheckAfterTursoSync(): { healScheduled: boolean; oomKillCount: number
     }
   } catch { /* non-critical */ }
 
+  // ═══════════════════════════════════════════════════════════════════
+  // ALSO: Recover any pending SIGTERM watchdog from a previous
+  // instance that OOM'd. This is the REAL recovery point because
+  // on Render free tier, the local DB is empty at module load time
+  // (ephemeral disk wiped by OOM). After Turso sync, the
+  // calibration table with the watchdog deadline is now available.
+  // Uses Date.now() comparison — same timing method as cycle-watchdog.
+  // ═══════════════════════════════════════════════════════════════════
+  try {
+    const gitDeploy = require('./self-heal-git-deploy');
+    if (typeof gitDeploy.recoverWatchdogOnBoot === 'function') {
+      gitDeploy.recoverWatchdogOnBoot();
+    }
+  } catch {}
+
   // Now re-check OOM conditions with the restored DB data
   const oomKillCount = getRecentOOMKillCount();
 
