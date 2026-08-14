@@ -70,16 +70,11 @@ class DiffMinimizer {
 
       let minimizedDiff = null;
       try {
-        const { generateCodeFixViaTribunal } = require('./providers-codegen-tribunal');
-        const mockInvestigation = {
-          url: 'diff-minimization',
-          html: '',
-          fileContent: prompt,
-          targetFile: 'diff-minimize'
-        };
-        const result = await generateCodeFixViaTribunal(mockInvestigation, 'Minimize this patch to the smallest possible unified diff');
-        if (result && result.length > 0 && result[0].patch) {
-          minimizedDiff = result[0].patch;
+        const { consultTribunalRaw } = require('./providers-codegen-tribunal');
+        const signal = AbortSignal.timeout(120_000);
+        const result = await consultTribunalRaw(prompt, signal, { responseFormatJson: false });
+        if (result && result.trim().length > 0) {
+          minimizedDiff = result.trim();
         }
       } catch (tribunalErr: any) {
         logError('Tribunal call failed for diff minimization, keeping original', tribunalErr);
