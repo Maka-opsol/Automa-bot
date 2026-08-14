@@ -118,30 +118,18 @@ class StateRecovery {
         `Respond in this exact JSON format only (no markdown, no explanation outside JSON):\n` +
         `{"state_name": "descriptive_state_name", "transitions": ["target_state_1", "target_state_2"], "reasoning": "brief explanation of why this state exists"}`;
 
-      // Send to tribunal for analysis
+      // Send to tribunal for analysis (text-only — codegen models can't see images)
       let analysis = null;
       try {
-        const { generateCodeFixViaTribunal } = require('./providers-codegen-tribunal');
-        const investigation = {
-          screenshot,
-          html: '',
-          url: '',
-          fileContent: '',
-          targetFile: '',
-        };
-        const fixes = await generateCodeFixViaTribunal(investigation, prompt);
-        // The tribunal returns fixes array; for state discovery we parse the change description
-        if (fixes && fixes.length > 0) {
-          // Try to extract state info from the first fix's metadata or change description
-          const analysisText = fixes[0].change || fixes[0].description || JSON.stringify(fixes[0]);
-          // Attempt to parse as JSON
+        const { consultTribunalRaw } = require('./providers-codegen-tribunal');
+        const signal = AbortSignal.timeout(90_000);
+        const rawResult = await consultTribunalRaw(prompt, signal, { responseFormatJson: true });
+        if (rawResult) {
           try {
-            const jsonMatch = analysisText.match(/\{[\s\S]*"state_name"[\s\S]*\}/);
-            if (jsonMatch) {
-              analysis = JSON.parse(jsonMatch[0]);
-            }
+            const parsed = JSON.parse(rawResult);
+            if (parsed.state_name) analysis = parsed;
           } catch (e: any) {
-            // Not JSON - try VLM
+            // Not valid JSON — try VLM fallback
           }
         }
       } catch (tribunalErr: any) {
