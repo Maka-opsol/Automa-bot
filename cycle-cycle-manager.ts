@@ -58,6 +58,25 @@ let _orParked = false;
 let _orParkedDate = '';   // YYYY-MM-DD UTC of the day we parked
 const OR_PARK_CHECK_INTERVAL_MS = 60000; // Check for midnight every 60s
 
+/* ── 10-Minute Question Stuck Detector ──────────────────────────────────────
+ * If a single question takes longer than 10 minutes, the bot is stuck.
+ * This uses MULTIPLE time sources to avoid false positives from clock skew
+ * or timer drift:
+ *   Avenue 1: Wall clock — Date.now() minus question entry time
+ *   Avenue 2: DB progress log — check for any progress entries in last 10min
+ *   Avenue 3: Cycle count × estimated iteration time (cycles * ~30s avg)
+ *   Avenue 4: Heartbeat file mtime — last process heartbeat timestamp
+ * If ANY 2 of 4 avenues agree the question has been stuck for 10+ minutes,
+ * full self-heal is triggered. This is a hard requirement — no escape.
+ */
+let _questionEnteredAt: number | null = null;      // Wall clock when we entered a question state
+let _questionCycleCount: number = 0;                // Cycles spent on current question
+let _lastQuestionState: string | null = null;       // The state when we entered the question
+const QUESTION_STUCK_MS = 10 * 60 * 1000;           // 10 minutes
+const QUESTION_STUCK_MIN_CYCLES = 15;               // 15 cycles * ~40s avg = ~10min
+const QUESTION_STUCK_VOTES_NEEDED = 2;              // 2 of 4 avenues must agree
+let _questionStuckHealTriggered = false;             // Prevent re-triggering
+
 /**
  * Check if OpenRouter budget is exhausted AND no other providers available.
  * If so, enter park mode (returns true). If midnight has rolled over,
@@ -170,6 +189,7 @@ const TRANSIENT_ERROR_CODES = new Set([
 const PROGRESS_STALL_CODES = new Set([
   'E_PROGRESS_STALL',   // 0 questions in PROGRESS_TIMEOUT_MS
   'E_SLOW_PROGRESS',    // questions completed but then stalled for 2x timeout
+  'E_QUESTION_STUCK',   // single question stuck for 10+ minutes (4-avenue detector)
 ]);
 
 // v6: Healable codes — self-heal should fire for these even at lower thresholds.
@@ -178,6 +198,7 @@ const HEALABLE_ERROR_CODES = new Set([
   'E_SELECTOR_DRIFT', 'E_UI_CHANGED', 'E_PROVIDER_PERMANENT',
   'E_STATE_DEADLOCK', 'E_PATCH_FAILED',
   'E_PROGRESS_STALL', 'E_SLOW_PROGRESS', 'E_RESTART_LOOP',
+  'E_QUESTION_STUCK',
 ]);
 
 /**
@@ -1959,6 +1980,178 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         slowErr.retryable = false;
         slowErr.healable = true;
         throw slowErr;
+      }
+
+      // ── 10-Minute Question Stuck Detector (FULL self-heal trigger) ──
+      // Tracks time spent on a SINGLE question using 4 independent avenues.
+      // When 2+ avenues agree the question has been stuck for 10+ minutes,
+      // full self-heal is triggered directly — no error code juggling,
+      // no _isDesperatelyBroken gate, no consecutive failure threshold.
+      // This is a HARD trigger. It MUST fire.
+      try {
+        const _quizStates = new Set(['question', 'question_m mcq', 'question_input', 'keypad', 'question_feedback', 'explanation', 'assessment', 'quiz_active']);
+        const onQuestion = _quizStates.has(action.currentState || '') || action.actionType === 'keypad_input' || action.actionType === 'keypad_sequence';
+
+        if (onQuestion) {
+          // Track when we entered this question (first time seeing a question state,
+          // or re-entered after leaving to a non-question state like score_screen)
+          if (!_questionEnteredAt || _lastQuestionState !== action.currentState) {
+            // Only reset if we came from a non-question state
+            const wasOnQuestion = _quizStates.has(currentState || '');
+            if (!wasOnQuestion) {
+              _questionEnteredAt = Date.now();
+              _questionCycleCount = 0;
+              _questionStuckHealTriggered = false;
+              _lastQuestionState = action.currentState;
+              log(`Question entered: ${action.currentState} at ${new Date().toISOString()}`, 'DEBUG', 'cycle');
+            }
+          }
+          _questionCycleCount++;
+
+          // Don't check until at least 5 cycles (avoids false positive on first iteration)
+          if (_questionCycleCount >= 5 && !_questionStuckHealTriggered && !selfHealRunning) {
+            let stuckVotes = 0;
+            let avenues: string[] = [];
+
+            // Avenue 1: Wall clock — Date.now() minus question entry time
+            if (_questionEnteredAt) {
+              const wallElapsed = Date.now() - _questionEnteredAt;
+              if (wallElapsed >= QUESTION_STUCK_MS) {
+                stuckVotes++;
+                avenues.push(`wall=${Math.round(wallElapsed / 60000)}min`);
+              }
+            }
+
+            // Avenue 2: DB progress log — any progress entries in last 10 minutes?
+            try {
+              const dbMod = require('./database');
+              const db = dbMod.db;
+              if (db) {
+                const recentProgress = db.prepare(
+                  `SELECT COUNT(*) as cnt FROM progress_log WHERE timestamp > ?`
+                ).get(Date.now() - QUESTION_STUCK_MS);
+                // If no progress entries in 10min AND we've been on a question, vote stuck
+                if (recentProgress && recentProgress.cnt === 0) {
+                  stuckVotes++;
+                  avenues.push('db_progress=0');
+                }
+              }
+            } catch { /* progress_log table might not exist */ }
+
+            // Avenue 3: Cycle count × estimated iteration time
+            // Average cycle iteration is ~30-40s. 15 cycles × 40s = 10min.
+            if (_questionCycleCount >= QUESTION_STUCK_MIN_CYCLES) {
+              const estimatedMs = _questionCycleCount * 40000;
+              if (estimatedMs >= QUESTION_STUCK_MS) {
+                stuckVotes++;
+                avenues.push(`cycles=${_questionCycleCount}×40s`);
+              }
+            }
+
+            // Avenue 4: Heartbeat file mtime — when was the last heartbeat written?
+            // The heartbeat is written at the top of every cycle iteration.
+            // If the oldest heartbeat in our window is >10min old, we've been running
+            // that long. Combined with being on a question, this confirms stuckness.
+            try {
+              const fs = require('fs');
+              const stat = fs.statSync(CONFIG.HEARTBEAT_FILE);
+              const heartbeatAge = Date.now() - stat.mtimeMs;
+              // Heartbeat is updated every cycle, so it's always fresh (< 1min).
+              // Instead, compare heartbeat age against question entry time.
+              // If heartbeat is recent but question entry was 10+ min ago, confirms
+              // the process has been alive and cycling on this question the whole time.
+              if (_questionEnteredAt && heartbeatAge < 60000 && (Date.now() - _questionEnteredAt) >= QUESTION_STUCK_MS) {
+                stuckVotes++;
+                avenues.push('heartbeat_confirmed');
+              }
+            } catch { /* heartbeat file might not exist */ }
+
+            // TRIGGER: 2+ avenues agree → full self-heal, no gates
+            if (stuckVotes >= QUESTION_STUCK_VOTES_NEEDED) {
+              _questionStuckHealTriggered = true;
+              const errMsg = `QUESTION STUCK for 10+ minutes (${avenues.join(', ')}). Triggering full self-heal directly.`;
+              log(errMsg, 'ERROR', 'cycle');
+
+              // Record error code so _isDesperatelyBroken also recognizes it
+              _recordErrorForDesperation('E_QUESTION_STUCK');
+
+              try {
+                const sendAlert = require('./alerting').sendAlert;
+                sendAlert?.(`10-min question stuck: ${avenues.join(', ')}`);
+              } catch {}
+
+              // DIRECT full self-heal — bypass _isDesperatelyBroken, bypass
+              // consecutive failure count, bypass circuit breaker.
+              // This is structurally identical to how the OOM trigger works:
+              // call performRuntimeHeal first, then performSelfHeal.
+              if (CONFIG.SELF_HEAL_ENABLED) {
+                selfHealRunning = true;
+                const selfHealMod = require('./self-heal');
+
+                // Step 1: Runtime heal (clear stuck state)
+                const performRuntimeHeal = selfHealMod.performRuntimeHeal;
+                if (typeof performRuntimeHeal === 'function') {
+                  log('Question-stuck: calling performRuntimeHeal() directly...', 'WARN', 'cycle');
+                  try {
+                    const rtResult = await performRuntimeHeal();
+                    if (rtResult?.healed) {
+                      const av = rtResult.results?.filter((r: any) => r.healed).map((r: any) => r.avenue).join(', ');
+                      log(`Question-stuck runtime heal succeeded: ${av}`, 'INFO', 'cycle');
+                    }
+                  } catch (rtErr: any) {
+                    log(`Question-stuck runtime heal error: ${rtErr.message}`, 'WARN', 'cycle');
+                  }
+                }
+
+                // Step 2: Full self-heal (code-patch pipeline) — ALWAYS runs
+                // for question-stuck, unlike OOM trigger which has conditions.
+                const performSelfHeal = selfHealMod.performSelfHeal;
+                if (typeof performSelfHeal === 'function') {
+                  log('Question-stuck: attempting FULL self-heal (code-patch pipeline)...', 'ERROR', 'cycle');
+                  try {
+                    // Request self-heal session if in memory protection
+                    try {
+                      const memoryMode = require('./memory-mode');
+                      if (memoryMode.isMemoryProtection?.()) {
+                        memoryMode.beginSelfHealSession?.('question_stuck_10min');
+                      }
+                    } catch {}
+
+                    const fullHealed = await performSelfHeal();
+                    if (fullHealed) {
+                      log('Question-stuck FULL self-heal SUCCEEDED', 'INFO', 'cycle');
+                      consecutiveFailures = 0;
+                    } else {
+                      log('Question-stuck FULL self-heal found no fixable issues', 'WARN', 'cycle');
+                    }
+                  } catch (fullErr: any) {
+                    log(`Question-stuck full heal threw: ${fullErr.message}`, 'ERROR', 'cycle');
+                  }
+                }
+                selfHealRunning = false;
+              }
+
+              // Force a page reload after heal to break any visual loop
+              try {
+                await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+                lastScreenshotChangeTime = Date.now();
+                // Reset question tracking so the timer restarts fresh
+                _questionEnteredAt = Date.now();
+                _questionCycleCount = 0;
+                _questionStuckHealTriggered = false;
+              } catch {}
+            }
+          }
+        } else {
+          // Not on a question — reset tracking
+          _questionEnteredAt = null;
+          _questionCycleCount = 0;
+          _questionStuckHealTriggered = false;
+          _lastQuestionState = null;
+        }
+      } catch (qsErr: any) {
+        // Question-stuck detector must NEVER crash the cycle loop
+        logError('Question-stuck detector error (non-fatal)', qsErr);
       }
 
       // Save session to pool
