@@ -627,7 +627,18 @@ function applyFixesToStaging(fixes: any, stagingSource: any) {
 
 let _healInProgress = false;
 
-async function performSelfHeal() {
+interface SelfHealOptions {
+  /**
+   * Skip the runtime heal fast-pass and go directly to the code-patch pipeline.
+   * Use when the caller has already run performRuntimeHeal() separately
+   * (e.g., self-heal-oom-trigger.ts Step 1 → Step 2).
+   * Without this, performSelfHeal() would re-run runtime heal, succeed,
+   * and return true WITHOUT ever calling the code-generation tribunal.
+   */
+  skipRuntimeHeal?: boolean;
+}
+
+async function performSelfHeal(options?: SelfHealOptions) {
   if (_healInProgress) { log('Self-heal already in progress, skipping', 'DEBUG', 'self-heal'); return false; }
 
   // v9: FAST PASS — runtime healing avenues (no /tmp, no code patches, no AI).
@@ -635,19 +646,28 @@ async function performSelfHeal() {
   // we fall through to the heavy code-patch pipeline.
   // Importantly, runtime heals bypass the daily patch limit and cooldown —
   // they're safe, non-destructive, and can run every time if needed.
-  try {
-    log('Attempting runtime heal (fast pass)...', 'INFO', 'self-heal');
-    const runtimeResult = await performRuntimeHeal();
-    if (runtimeResult.healed) {
-      const successes = runtimeResult.results.filter(r => r.healed);
-      log(`Runtime heal SUCCEEDED via: ${successes.map(r => r.avenue).join(', ')}`, 'INFO', 'self-heal');
-      logAudit(`Runtime heal succeeded: ${successes.map(r => r.avenue).join(', ')}`, 'self-heal');
-      _lastFailureTime = 0; // Reset cooldown on any successful heal
-      return true;
+  //
+  // CRITICAL: When skipRuntimeHeal=true, we skip this entire block.
+  // The OOM trigger already ran performRuntimeHeal() in Step 1. If we
+  // ran it again here, it would succeed (clearing caches again), return
+  // true, and the code-patch pipeline (tribunal) would NEVER execute.
+  if (!options?.skipRuntimeHeal) {
+    try {
+      log('Attempting runtime heal (fast pass)...', 'INFO', 'self-heal');
+      const runtimeResult = await performRuntimeHeal();
+      if (runtimeResult.healed) {
+        const successes = runtimeResult.results.filter(r => r.healed);
+        log(`Runtime heal SUCCEEDED via: ${successes.map(r => r.avenue).join(', ')}`, 'INFO', 'self-heal');
+        logAudit(`Runtime heal succeeded: ${successes.map(r => r.avenue).join(', ')}`, 'self-heal');
+        _lastFailureTime = 0; // Reset cooldown on any successful heal
+        return true;
+      }
+      log('Runtime heal found no fixable issues — falling through to code-patch pipeline', 'INFO', 'self-heal');
+    } catch (rtErr: any) {
+      logError('Runtime heal fast pass threw error (falling through)', rtErr);
     }
-    log('Runtime heal found no fixable issues — falling through to code-patch pipeline', 'INFO', 'self-heal');
-  } catch (rtErr: any) {
-    logError('Runtime heal fast pass threw error (falling through)', rtErr);
+  } else {
+    log('Skipping runtime heal fast-pass (skipRuntimeHeal=true) — going directly to code-patch pipeline', 'INFO', 'self-heal');
   }
 
   // ── SLOW PATH: Code-patch pipeline (original behavior) ──
