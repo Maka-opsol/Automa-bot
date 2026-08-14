@@ -197,7 +197,7 @@ function shouldScheduleBootHeal(): boolean {
   // we're in an active death spiral. The cooldown marker persists
   // across OOM restarts (it's in DB/Turso), so each new boot sees
   // "cooldown active" and skips the heal forever. Bypass in a spiral.
-  const isDeathSpiral = oomKillCount >= 2 || isEmergencyMode;
+  const isDeathSpiral = oomKillCount >= 2 || isEmergencyMode || guardianAgrees;
 
   if (!isDeathSpiral) {
     try {
@@ -394,11 +394,16 @@ async function triggerBootHeal(): Promise<void> {
 
     // ── STEP 2: Full self-heal (code-patch pipeline) ──
     // Runtime heal clears stuck state but doesn't fix memory leaks.
-    // If we're in a death spiral (3+ OOM kills), the full pipeline
+    // If we're in a death spiral (2+ OOM kills), the full pipeline
     // must run to investigate and patch the root cause.
     // The full heal requests a self-heal session for full power.
+    // NOTE: Previously required 3+ kills, but on Render free tier the
+    // 30-min window often misses kills (e.g. 8:28, 8:34, 9:01 — the
+    // 8:28 kill falls outside the window at 9:01). Since this code
+    // only runs when we already confirmed a death spiral (guardian
+    // agrees or lifecycle count >= 2), 2 kills is sufficient.
     const oomKills = getRecentOOMKillCount();
-    const deepHealNeeded = oomKills >= 3 || !anyHealed;
+    const deepHealNeeded = oomKills >= 2 || !anyHealed;
     if (deepHealNeeded) {
       try {
         const memoryMode = require('./memory-mode');
