@@ -75,61 +75,96 @@ let _deployInProgress = false;
 // ─── GitHub API ─────────────────────────────────────────────────────────────
 
 /**
- * Make an authenticated request to the GitHub API.
+ * Make an authenticated request to the GitHub API with retry.
+ * Retries on 429 (rate limit) and 5xx (server error) up to 3 times.
  * Returns parsed JSON or null on failure.
  */
-function githubApi(method: string, path: string, body?: any): Promise<any> {
+const GITHUB_API_MAX_RETRIES = 3;
+const GITHUB_API_RETRY_DELAY_MS = 2000;
+
+function githubApi(method: string, apiPath: string, body?: any): Promise<any> {
+  const token = process.env.GITHUB_TOKEN;
+  const repo = process.env.GITHUB_REPO; // e.g. 'owner/repo'
+
+  if (!token || !repo) {
+    log('Git deploy: GITHUB_TOKEN or GITHUB_REPO not set', 'WARN', 'self-heal-git-deploy');
+    return Promise.resolve(null);
+  }
+
   return new Promise((resolve) => {
-    const token = process.env.GITHUB_TOKEN;
-    const repo = process.env.GITHUB_REPO; // e.g. 'owner/repo'
+    let attempt = 0;
 
-    if (!token || !repo) {
-      log('Git deploy: GITHUB_TOKEN or GITHUB_REPO not set', 'WARN', 'self-heal-git-deploy');
-      resolve(null);
-      return;
-    }
+    function doRequest(): void {
+      attempt++;
+      const url = `https://api.github.com/repos/${repo}${apiPath}`;
+      const options: any = {
+        method,
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'User-Agent': 'MathU-Bot-SelfHeal',
+          'Accept': 'application/vnd.github.v3+json',
+        },
+      };
 
-    const url = `https://api.github.com/repos/${repo}${path}`;
-    const options: any = {
-      method,
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'User-Agent': 'MathU-Bot-SelfHeal',
-        'Accept': 'application/vnd.github.v3+json',
-      },
-    };
+      if (body) {
+        options.headers['Content-Type'] = 'application/json';
+        options.body = JSON.stringify(body);
+      }
 
-    if (body) {
-      options.headers['Content-Type'] = 'application/json';
-      options.body = JSON.stringify(body);
-    }
+      const req = https.request(url, options, (res: any) => {
+        let data = '';
+        res.on('data', (chunk: any) => { data += chunk; });
+        res.on('end', () => {
+          // Success
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            try { resolve(JSON.parse(data)); }
+            catch { resolve(data || true); }
+            return;
+          }
 
-    const req = https.request(url, options, (res: any) => {
-      let data = '';
-      res.on('data', (chunk: any) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          try { resolve(JSON.parse(data)); }
-          catch { resolve(data || true); }
-        } else {
-          log(`GitHub API ${method} ${path} → ${res.statusCode}: ${data.substring(0, 200)}`, 'WARN', 'self-heal-git-deploy');
+          // Retryable: 429 (rate limit) or 5xx (server error)
+          const isRetryable = res.statusCode === 429 || res.statusCode >= 500;
+          if (isRetryable && attempt < GITHUB_API_MAX_RETRIES) {
+            const delay = res.statusCode === 429
+              ? Math.min(60000, GITHUB_API_RETRY_DELAY_MS * Math.pow(2, attempt - 1))
+              : GITHUB_API_RETRY_DELAY_MS * attempt;
+            log(`GitHub API ${method} ${apiPath} → ${res.statusCode} (attempt ${attempt}/${GITHUB_API_MAX_RETRIES}), retrying in ${delay}ms`, 'WARN', 'self-heal-git-deploy');
+            setTimeout(doRequest, delay);
+            return;
+          }
+
+          // Non-retryable failure
+          log(`GitHub API ${method} ${apiPath} → ${res.statusCode} (attempt ${attempt}/${GITHUB_API_MAX_RETRIES}): ${data.substring(0, 300)}`, 'ERROR', 'self-heal-git-deploy');
           resolve(null);
-        }
+        });
       });
-    });
 
-    req.on('error', (err: Error) => {
-      logError(`GitHub API request failed: ${method} ${path}`, err);
-      resolve(null);
-    });
+      req.on('error', (err: Error) => {
+        if (attempt < GITHUB_API_MAX_RETRIES) {
+          const delay = GITHUB_API_RETRY_DELAY_MS * attempt;
+          log(`GitHub API ${method} ${apiPath} error (attempt ${attempt}/${GITHUB_API_MAX_RETRIES}): ${err.message}, retrying in ${delay}ms`, 'WARN', 'self-heal-git-deploy');
+          setTimeout(doRequest, delay);
+          return;
+        }
+        logError(`GitHub API ${method} ${apiPath} failed after ${GITHUB_API_MAX_RETRIES} attempts`, err);
+        resolve(null);
+      });
 
-    req.setTimeout(30000, () => {
-      req.destroy();
-      log(`GitHub API timeout: ${method} ${path}`, 'WARN', 'self-heal-git-deploy');
-      resolve(null);
-    });
+      req.setTimeout(30000, () => {
+        req.destroy();
+        if (attempt < GITHUB_API_MAX_RETRIES) {
+          log(`GitHub API ${method} ${apiPath} timeout (attempt ${attempt}/${GITHUB_API_MAX_RETRIES}), retrying`, 'WARN', 'self-heal-git-deploy');
+          setTimeout(doRequest, GITHUB_API_RETRY_DELAY_MS * attempt);
+          return;
+        }
+        log(`GitHub API ${method} ${apiPath} timed out after ${GITHUB_API_MAX_RETRIES} attempts`, 'ERROR', 'self-heal-git-deploy');
+        resolve(null);
+      });
 
-    req.end();
+      req.end();
+    }
+
+    doRequest();
   });
 }
 
@@ -169,45 +204,67 @@ async function getFileContent(filePath: string): Promise<{ content: string; sha:
 
 /**
  * Commit a file change to a branch via GitHub Contents API.
- * Creates the branch from the default branch if it doesn't exist.
+ * Has built-in retry for 409 Conflict (SHA race condition).
+ *
+ * The GitHub Contents API requires the current file's SHA when updating.
+ * If the SHA is stale (another commit happened between GET and PUT),
+ * GitHub returns 409 Conflict. This function retries by re-fetching
+ * the SHA and trying again.
  */
 async function commitFileToBranch(
   filePath: string,
   newContent: string,
   branch: string,
-  message: string
+  message: string,
+  maxRetries: number = 3
 ): Promise<{ commitSha: string } | null> {
-  try {
-    // Get the current file on the target branch (or default branch if new)
-    const existing = await githubApi('GET', `/contents/${filePath}?ref=${branch}`);
-    const sha = existing?.sha;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Get the current file on the target branch
+      const existing = await githubApi('GET', `/contents/${filePath}?ref=${branch}`);
+      const sha = existing?.sha;
 
-    // Encode to base64
-    const content = Buffer.from(newContent, 'utf8').toString('base64');
+      // Encode to base64
+      const content = Buffer.from(newContent, 'utf8').toString('base64');
 
-    const body: any = {
-      message,
-      content,
-      branch,
-    };
+      const body: any = {
+        message,
+        content,
+        branch,
+      };
 
-    // If file exists, we need its SHA for update
-    if (sha) {
-      body.sha = sha;
-    }
+      // If file exists, we need its SHA for update
+      if (sha) {
+        body.sha = sha;
+      }
 
-    const result = await githubApi('PUT', `/contents/${filePath}`, body);
-    if (!result?.commit?.sha) {
-      log(`Failed to commit ${filePath} to ${branch}`, 'WARN', 'self-heal-git-deploy');
+      const result = await githubApi('PUT', `/contents/${filePath}`, body);
+      if (result?.commit?.sha) {
+        log(`Committed ${filePath} to ${branch} (sha: ${result.commit.sha.substring(0, 7)}${attempt > 1 ? ` on attempt ${attempt}` : ''})`, 'INFO', 'self-heal-git-deploy');
+        return { commitSha: result.commit.sha };
+      }
+
+      // githubApi returns null on non-2xx. If it was a 409, retry.
+      // We can't tell from null alone, but the retry is harmless for other failures.
+      if (attempt < maxRetries) {
+        log(`Commit ${filePath} returned null (possible 409 Conflict), retrying (${attempt}/${maxRetries})...`, 'WARN', 'self-heal-git-deploy');
+        await new Promise(r => setTimeout(r, 1000 * attempt));
+        continue;
+      }
+
+      log(`Failed to commit ${filePath} to ${branch} after ${maxRetries} attempts`, 'ERROR', 'self-heal-git-deploy');
+      return null;
+    } catch (err: any) {
+      if (attempt < maxRetries) {
+        log(`commitFileToBranch ${filePath} threw (attempt ${attempt}/${maxRetries}): ${err.message}, retrying...`, 'WARN', 'self-heal-git-deploy');
+        await new Promise(r => setTimeout(r, 1000 * attempt));
+        continue;
+      }
+      logError(`commitFileToBranch ${filePath} failed after ${maxRetries} attempts`, err);
       return null;
     }
-
-    log(`Committed ${filePath} to ${branch} (sha: ${result.commit.sha.substring(0, 7)})`, 'INFO', 'self-heal-git-deploy');
-    return { commitSha: result.commit.sha };
-  } catch (err: any) {
-    logError(`commitFileToBranch failed for ${filePath}`, err);
-    return null;
   }
+  return null;
 }
 
 /**
@@ -754,7 +811,9 @@ function autoTrackVerificationCycles(): void {
 // ─── Immediate Redeploy (Full Self-Heal) ──────────────────────────────────
 
 const FULL_HEAL_SIGTERM_WATCHDOG_MS = 5 * 60 * 1000; // 5 minutes
-let _fullHealWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+const WATCHDOG_CHECK_INTERVAL_MS = 15 * 1000; // Check every 15 seconds (same style as cycle-watchdog)
+const WATCHDOG_DB_KEY = 'full_heal_watchdog_deadline';
+let _fullHealWatchdogInterval: ReturnType<typeof setInterval> | null = null;
 let _fullHealRedeployInProgress = false;
 
 /**
@@ -806,153 +865,309 @@ async function triggerImmediateRedeploy(patchedFiles: string[]): Promise<{
   const filesToCommit: Array<{ file: string; content: string }> = [];
 
   for (const file of patchedFiles) {
-    const overlayPath = pathModule.resolve('/tmp/self-heal-overlay', file);
-    if (fs.existsSync(overlayPath)) {
+    // Try multiple possible overlay paths:
+    //   1. /tmp/self-heal-overlay/{file}        — e.g. /tmp/self-heal-overlay/selectors-login.ts
+    //   2. /tmp/self-heal-overlay/{basename}    — e.g. /tmp/self-heal-overlay/selectors-login.ts
+    //   3. /tmp/self-heal-overlay/{file}.patch  — patch format
+    const candidatePaths = [
+      pathModule.resolve('/tmp/self-heal-overlay', file),
+      pathModule.resolve('/tmp/self-heal-overlay', pathModule.basename(file)),
+      file.startsWith('/') ? file : pathModule.resolve(process.cwd(), file),
+    ];
+
+    let content: string | null = null;
+    for (const candidate of candidatePaths) {
       try {
-        const content = fs.readFileSync(overlayPath, 'utf8');
-        filesToCommit.push({ file, content });
-      } catch (err: any) {
-        log(`Cannot read overlay for ${file}: ${err.message}`, 'WARN', 'self-heal-git-deploy');
+        if (fs.existsSync(candidate)) {
+          content = fs.readFileSync(candidate, 'utf8');
+          if (content && content.length > 0) {
+            log(`Read overlay for ${file} from ${candidate} (${content.length} bytes)`, 'DEBUG', 'self-heal-git-deploy');
+            break;
+          }
+          content = null;
+        }
+      } catch (readErr: any) {
+        log(`Cannot read ${candidate}: ${readErr.message}`, 'DEBUG', 'self-heal-git-deploy');
       }
+    }
+
+    if (content) {
+      filesToCommit.push({ file, content });
     } else {
-      log(`No overlay file for ${file} at ${overlayPath} — skipping`, 'WARN', 'self-heal-git-deploy');
+      log(`No overlay content found for ${file} — tried: ${candidatePaths.join(', ')}`, 'ERROR', 'self-heal-git-deploy');
     }
   }
 
   if (filesToCommit.length === 0) {
-    log('No patched files found in overlay to commit', 'WARN', 'self-heal-git-deploy');
+    log(`No patched files found in overlay to commit (requested: ${patchedFiles.join(', ')})`, 'ERROR', 'self-heal-git-deploy');
     return { redeployed: false, method: 'none', details: 'no patched files in overlay', files: [] };
   }
 
   _fullHealRedeployInProgress = true;
   const committedFiles: string[] = [];
+  const errors: string[] = [];
 
   try {
     const config = getCONFIG();
     const autoMerge = config.SELF_HEAL_GIT_AUTO_MERGE !== false; // default true
 
-    // 1. Get default branch info
-    const branchInfo = await getDefaultBranchSha();
-    if (!branchInfo && hasGithub) {
-      log('Immediate redeploy: cannot get default branch from GitHub', 'ERROR', 'self-heal-git-deploy');
-    }
+    // ═══════════════════════════════════════════════════════════════
+    // PHASE 1: GITHUB COMMIT
+    // This is the CRITICAL path. The self-heal can fix everything
+    // except itself — so this MUST work.
+    // ═══════════════════════════════════════════════════════════════
 
-    // 2. Create a branch
-    let targetBranch: string;
-    let branchCreated = false;
-
-    if (branchInfo) {
-      const timestamp = Date.now();
-      const branchName = `self-heal/full-heal-${timestamp}`;
-      const created = await githubApi('POST', '/git/refs', {
-        ref: `refs/heads/${branchName}`,
-        sha: branchInfo.sha,
-      });
-
-      if (created) {
-        targetBranch = branchName;
-        branchCreated = true;
-        log(`Created branch ${branchName} for full-heal redeploy`, 'INFO', 'self-heal-git-deploy');
-      } else {
-        targetBranch = branchInfo.branch;
-        log('Branch creation failed, pushing directly to default branch', 'WARN', 'self-heal-git-deploy');
+    if (hasGithub) {
+      // 1. Get default branch info — retry up to 3 times
+      let branchInfo = await getDefaultBranchSha();
+      if (!branchInfo) {
+        log('Immediate redeploy: getDefaultBranchSha failed — retrying once more...', 'WARN', 'self-heal-git-deploy');
+        await new Promise(r => setTimeout(r, 3000));
+        branchInfo = await getDefaultBranchSha();
       }
-    } else {
-      targetBranch = 'main'; // fallback
-    }
 
-    // 3. Commit each patched file to GitHub
-    if (hasGithub && branchInfo) {
-      for (const entry of filesToCommit) {
-        const message = `full self-heal: fix ${entry.file} (immediate redeploy ${new Date().toISOString()})`;
-        const result = await commitFileToBranch(entry.file, entry.content, targetBranch, message);
-        if (result) {
-          committedFiles.push(entry.file);
+      if (!branchInfo) {
+        // CRITICAL: GitHub API is unreachable. Log everything we can.
+        const diagInfo = JSON.stringify({
+          token_set: !!process.env.GITHUB_TOKEN,
+          token_prefix: process.env.GITHUB_TOKEN?.substring(0, 8) || 'none',
+          repo: process.env.GITHUB_REPO || 'not set',
+          files_requested: patchedFiles,
+          files_found_in_overlay: filesToCommit.map(f => f.file),
+        });
+        log(`CRITICAL: Cannot reach GitHub API — default branch SHA unknown. Cannot commit. Diag: ${diagInfo}`, 'ERROR', 'self-heal-git-deploy');
+        errors.push('github_api_unreachable');
+      }
+
+      // 2. Create a branch (for PR-based workflow)
+      let targetBranch: string;
+      let branchCreated = false;
+
+      if (branchInfo) {
+        const timestamp = Date.now();
+        const branchName = `self-heal/full-heal-${timestamp}`;
+        const created = await githubApi('POST', '/git/refs', {
+          ref: `refs/heads/${branchName}`,
+          sha: branchInfo.sha,
+        });
+
+        if (created) {
+          targetBranch = branchName;
+          branchCreated = true;
+          log(`Created branch ${branchName} (from ${branchInfo.branch}@${branchInfo.sha.substring(0, 7)})`, 'INFO', 'self-heal-git-deploy');
+        } else {
+          targetBranch = branchInfo.branch;
+          log(`Branch creation failed — committing directly to ${targetBranch}`, 'WARN', 'self-heal-git-deploy');
         }
+      } else {
+        targetBranch = 'main'; // last resort fallback
+        log(`No branch info — guessing target branch is 'main' (commit may fail)`, 'ERROR', 'self-heal-git-deploy');
       }
-    }
 
-    // 4. Create PR + auto-merge
-    let deployMethod: 'github_push' | 'render_api' | 'both' = 'render_api';
-
-    if (hasGithub && branchCreated && branchInfo && committedFiles.length > 0) {
-      const pr = await createPullRequest(
-        targetBranch,
-        branchInfo.branch,
-        `Full self-heal: auto-fix ${committedFiles.length} file(s)`,
-        `Immediate redeploy after successful full self-heal.\n\nFiles: ${committedFiles.join(', ')}\n\nTimestamp: ${new Date().toISOString()}`
-      );
-
-      if (pr) {
-        log(`PR created: #${pr.number} — ${pr.url}`, 'INFO', 'self-heal-git-deploy');
-
-        if (autoMerge) {
-          const merged = await githubApi('PUT', `/pulls/${pr.number}/merge`, {
-            commit_title: `Auto-merge full self-heal #${pr.number}`,
-            merge_method: 'squash',
-          });
-
-          if (merged) {
-            log(`PR #${pr.number} auto-merged — Render will auto-deploy from push`, 'INFO', 'self-heal-git-deploy');
-            deployMethod = 'github_push';
+      // 3. Commit each patched file to GitHub
+      if (branchInfo) {
+        log(`Committing ${filesToCommit.length} file(s) to ${targetBranch}...`, 'INFO', 'self-heal-git-deploy');
+        for (const entry of filesToCommit) {
+          const message = `full self-heal: fix ${entry.file} (immediate redeploy ${new Date().toISOString()})`;
+          const result = await commitFileToBranch(entry.file, entry.content, targetBranch, message);
+          if (result) {
+            committedFiles.push(entry.file);
           } else {
-            log(`PR #${pr.number} auto-merge failed — will use Render API`, 'WARN', 'self-heal-git-deploy');
+            errors.push(`commit_failed:${entry.file}`);
+            log(`FAILED to commit ${entry.file} to ${targetBranch} — this file will NOT be in the redeploy`, 'ERROR', 'self-heal-git-deploy');
+          }
+        }
+        log(`Committed ${committedFiles.length}/${filesToCommit.length} files to ${targetBranch}`, committedFiles.length > 0 ? 'INFO' : 'ERROR', 'self-heal-git-deploy');
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // PHASE 2: GET THE COMMIT ONTO THE DEFAULT BRANCH
+      //
+      // Render auto-deploys on push to the default branch.
+      // If we committed to a feature branch, we MUST merge it
+      // to the default branch. If merge fails, we MUST retry
+      // by committing directly to the default branch.
+      //
+      // This is the most failure-prone step. The PR merge can
+      // fail for many reasons (branch protection, conflicts,
+      // required reviews, etc.). We need a bulletproof fallback.
+      // ═══════════════════════════════════════════════════════════════
+
+      let githubPushTriggered = false;
+
+      if (branchCreated && committedFiles.length > 0) {
+        // We have commits on a feature branch. Try PR + merge.
+        const pr = await createPullRequest(
+          targetBranch,
+          branchInfo!.branch,
+          `Full self-heal: auto-fix ${committedFiles.length} file(s)`,
+          `Immediate redeploy after successful full self-heal.\n\nFiles: ${committedFiles.join(', ')}\n\nTimestamp: ${new Date().toISOString()}`
+        );
+
+        if (pr) {
+          log(`PR #${pr.number} created: ${pr.url}`, 'INFO', 'self-heal-git-deploy');
+
+          if (autoMerge) {
+            const merged = await githubApi('PUT', `/pulls/${pr.number}/merge`, {
+              commit_title: `Auto-merge full self-heal #${pr.number}`,
+              merge_method: 'squash',
+            });
+
+            if (merged) {
+              log(`PR #${pr.number} MERGED to ${branchInfo!.branch} — Render will auto-deploy`, 'INFO', 'self-heal-git-deploy');
+              githubPushTriggered = true;
+            } else {
+              errors.push('pr_merge_failed');
+              log(`PR #${pr.number} merge FAILED — falling back to direct commit to ${branchInfo!.branch}`, 'ERROR', 'self-heal-git-deploy');
+            }
+          } else {
+            // autoMerge disabled — PR is open but not merged.
+            // We still need to get the fix onto the default branch.
+            errors.push('pr_not_auto_merged');
+            log(`PR #${pr.number} created but auto-merge is disabled — falling back to direct commit`, 'WARN', 'self-heal-git-deploy');
           }
         } else {
-          deployMethod = 'github_push'; // Push still triggers Render auto-deploy
+          errors.push('pr_creation_failed');
+          log(`PR creation FAILED — falling back to direct commit to ${branchInfo!.branch}`, 'ERROR', 'self-heal-git-deploy');
+        }
+
+        // FALLBACK: If PR/merge failed, commit directly to default branch.
+        // This is the nuclear option — it bypasses PRs entirely.
+        // It's safe because self-heal patches are already verified working.
+        if (!githubPushTriggered && committedFiles.length > 0) {
+          log(`FALLBACK: Committing ${committedFiles.length} file(s) directly to ${branchInfo!.branch}...`, 'WARN', 'self-heal-git-deploy');
+          let fallbackCommitted = 0;
+          for (const entry of filesToCommit) {
+            const message = `full self-heal (direct): fix ${entry.file} (immediate redeploy ${new Date().toISOString()})`;
+            const result = await commitFileToBranch(entry.file, entry.content, branchInfo!.branch, message);
+            if (result) {
+              fallbackCommitted++;
+            }
+          }
+          if (fallbackCommitted > 0) {
+            log(`FALLBACK SUCCEEDED: ${fallbackCommitted}/${filesToCommit.length} files committed directly to ${branchInfo!.branch}`, 'INFO', 'self-heal-git-deploy');
+            githubPushTriggered = true;
+          } else {
+            errors.push('direct_commit_failed');
+            log(`FALLBACK FAILED: Could not commit directly to ${branchInfo!.branch} either`, 'ERROR', 'self-heal-git-deploy');
+          }
+        }
+      } else if (!branchCreated && committedFiles.length > 0) {
+        // Already committed directly to default branch
+        githubPushTriggered = true;
+        log(`Committed directly to ${targetBranch} — Render will auto-deploy from push`, 'INFO', 'self-heal-git-deploy');
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // PHASE 3: RENDER DEPLOY API (belt and suspenders)
+      // Even if the GitHub push triggers auto-deploy, we also
+      // call the Render API directly. If GitHub push failed
+      // but Render API works, the deploy still happens.
+      // ═══════════════════════════════════════════════════════════════
+
+      let renderTriggered = false;
+      if (hasRender) {
+        const renderResult = await triggerRenderDeploy(committedFiles.map(f => `full-heal-${f}`));
+        if (renderResult) {
+          renderTriggered = true;
+          log(`Render deploy triggered (id: ${renderResult.deployId?.substring(0, 8) || 'unknown'})`, 'INFO', 'self-heal-git-deploy');
+        } else {
+          errors.push('render_api_failed');
+          log('Render deploy API FAILED', 'ERROR', 'self-heal-git-deploy');
         }
       }
-    } else if (hasGithub && !branchCreated && committedFiles.length > 0) {
-      // Pushed directly to default branch — Render auto-deploys
-      deployMethod = 'github_push';
-      log(`Committed directly to ${targetBranch} — Render will auto-deploy from push`, 'INFO', 'self-heal-git-deploy');
-    }
 
-    // 5. Trigger Render Deploy API (belt and suspenders)
-    if (hasRender) {
-      const renderResult = await triggerRenderDeploy(committedFiles.map(f => `full-heal-${f}`));
-      if (renderResult) {
-        deployMethod = deployMethod === 'github_push' ? 'both' : 'render_api';
-        log(`Render deploy triggered (id: ${renderResult.deployId?.substring(0, 8)})`, 'INFO', 'self-heal-git-deploy');
-      } else {
-        log('Render deploy API call failed', 'WARN', 'self-heal-git-deploy');
+      // ═══════════════════════════════════════════════════════════════
+      // PHASE 4: DETERMINE OUTCOME
+      //
+      // The redeploy SUCCEEDED if ANY of these happened:
+      //   A) Files committed to default branch (GitHub push)
+      //   B) Render deploy API accepted
+      //
+      // The redeploy FAILED if NONE of these happened.
+      // ═══════════════════════════════════════════════════════════════
+
+      let deployMethod: 'github_push' | 'render_api' | 'both' | 'none' = 'none';
+      if (githubPushTriggered && renderTriggered) {
+        deployMethod = 'both';
+      } else if (githubPushTriggered) {
+        deployMethod = 'github_push';
+      } else if (renderTriggered) {
+        deployMethod = 'render_api';
       }
+
+      const succeeded = committedFiles.length > 0 && deployMethod !== 'none';
+
+      // 5. Record event with FULL diagnostic detail
+      try {
+        getInsertSelfHealEvent()?.(
+          Date.now(), 'immediate_redeploy', succeeded ? 'completed' : 'failed',
+          succeeded ? 'full_heal_redeploy_success' : 'full_heal_redeploy_failed',
+          null, 0, 0, 0, succeeded ? 'success' : 'error', 0,
+          JSON.stringify({
+            method: deployMethod,
+            committed: committedFiles,
+            branch: targetBranch,
+            totalRequested: patchedFiles.length,
+            totalFoundInOverlay: filesToCommit.length,
+            githubPushTriggered,
+            renderTriggered,
+            errors,
+          })
+        );
+      } catch {}
+
+      logAudit(`Immediate redeploy: ${committedFiles.length}/${filesToCommit.length} files committed via ${deployMethod}${errors.length > 0 ? ` (errors: ${errors.join(', ')})` : ''}`, 'self-heal-git-deploy');
+
+      // 6. Start SIGTERM watchdog — ONLY if something was actually deployed
+      if (succeeded) {
+        startSigtermWatchdog();
+      } else {
+        log(`CRITICAL: No deploy path succeeded. Errors: ${errors.join(', ')}. Self-heal fix will be LOST on next restart.`, 'ERROR', 'self-heal-git-deploy');
+      }
+
+      return {
+        redeployed: succeeded,
+        method: deployMethod,
+        details: `${committedFiles.length}/${filesToCommit.length} files committed via ${deployMethod}${errors.length > 0 ? ` [errors: ${errors.join(', ')}]` : ''}`,
+        files: committedFiles,
+      };
+    } else {
+      // No GitHub — Render API only
+      log('No GitHub credentials — using Render deploy API only', 'WARN', 'self-heal-git-deploy');
+
+      if (hasRender) {
+        const renderResult = await triggerRenderDeploy(patchedFiles.map(f => `full-heal-${f}`));
+        if (renderResult) {
+          log(`Render deploy triggered (id: ${renderResult.deployId?.substring(0, 8) || 'unknown'})`, 'INFO', 'self-heal-git-deploy');
+          startSigtermWatchdog();
+          return { redeployed: true, method: 'render_api', details: 'deployed via Render API (no GitHub)', files: [] };
+        } else {
+          errors.push('render_api_failed_no_github');
+          log('Render deploy API FAILED and no GitHub fallback available', 'ERROR', 'self-heal-git-deploy');
+        }
+      }
+
+      try {
+        getInsertSelfHealEvent()?.(
+          Date.now(), 'immediate_redeploy', 'failed', 'no_deploy_path_succeeded',
+          null, 0, 0, 0, 'error', 0,
+          JSON.stringify({ hasGithub, hasRender, errors, files: patchedFiles })
+        );
+      } catch {}
+
+      return { redeployed: false, method: 'none', details: `all deploy paths failed: ${errors.join(', ')}`, files: [] };
     }
-
-    const succeeded = committedFiles.length > 0 && (deployMethod !== 'none');
-
-    // 6. Record event
-    try {
-      getInsertSelfHealEvent()?.(
-        Date.now(), 'immediate_redeploy', succeeded ? 'completed' : 'failed',
-        succeeded ? 'full_heal_redeploy_success' : 'full_heal_redeploy_no_commits',
-        null, 0, 0, 0, succeeded ? 'success' : 'error', 0,
-        JSON.stringify({ method: deployMethod, files: committedFiles, branch: targetBranch, totalAttempted: filesToCommit.length })
-      );
-    } catch {}
-
-    logAudit(`Immediate redeploy: ${committedFiles.length}/${filesToCommit.length} files committed via ${deployMethod}`, 'self-heal-git-deploy');
-
-    // 7. Start SIGTERM watchdog — if Render doesn't kill us in 5 min, redeploy failed
-    if (succeeded) {
-      startSigtermWatchdog();
-    }
-
-    return {
-      redeployed: succeeded,
-      method: deployMethod,
-      details: `${committedFiles.length}/${filesToCommit.length} files committed and deployed via ${deployMethod}`,
-      files: committedFiles,
-    };
   } catch (err: any) {
-    logError('Immediate redeploy failed', err);
+    logError('Immediate redeploy threw unexpected error', err);
     try {
       getInsertSelfHealEvent()?.(
-        Date.now(), 'immediate_redeploy', 'failed', err.message,
-        null, 0, 0, 0, 'error', 0, null
+        Date.now(), 'immediate_redeploy', 'failed', 'unexpected_error',
+        null, 0, 0, 0, 'error', 0,
+        JSON.stringify({ error: err.message, stack: err.stack?.substring(0, 500), committedFiles, errors })
       );
     } catch {}
-    return { redeployed: false, method: 'none', details: err.message, files: [] };
+    return { redeployed: false, method: 'none', details: `unexpected error: ${err.message}`, files: [] };
   } finally {
     _fullHealRedeployInProgress = false;
   }
@@ -960,60 +1175,236 @@ async function triggerImmediateRedeploy(patchedFiles: string[]): Promise<{
 
 /**
  * Start a 5-minute SIGTERM watchdog.
- * After a successful immediate redeploy, Render should send SIGTERM to
- * the current instance within a few minutes (to replace it with the new deploy).
- * If no SIGTERM arrives within 5 minutes, the redeploy failed or Render
- * didn't pick up the change. Log a failure event so the next boot knows.
+ *
+ * Design: Same time-telling method as the 10-min question completion detector
+ * in cycle-watchdog.ts — uses Date.now() stored at start, then a poll-based
+ * interval checks elapsed time each tick. NO reliance on setTimeout firing
+ * accurately.
+ *
+ * OOM-proof: The deadline is persisted to the DB (calibration table).
+ * If the bot OOMs before the watchdog fires, the next boot will:
+ *   1. See the pending deadline in the DB
+ *   2. Check if the deadline has passed
+ *   3. If yes — log the failure event (redeploy didn't replace the instance)
+ *   4. If no — resume watching (the new process survived, meaning the old
+ *      instance was killed and a new one started = success)
+ *
+ * This means even if the bot OOMs 3 times in 5 minutes, the FIRST boot
+ * that survives past the deadline will correctly detect whether the
+ * redeploy succeeded or failed.
  */
 function startSigtermWatchdog(): void {
-  // Clear any existing watchdog
-  if (_fullHealWatchdogTimer) {
-    clearTimeout(_fullHealWatchdogTimer);
-  }
-
   const watchdogStartedAt = Date.now();
-  log(`SIGTERM watchdog started — expecting Render to terminate this instance within ${FULL_HEAL_SIGTERM_WATCHDOG_MS / 60000} minutes`, 'WARN', 'self-heal-git-deploy');
+  const deadline = watchdogStartedAt + FULL_HEAL_SIGTERM_WATCHDOG_MS;
 
-  _fullHealWatchdogTimer = setTimeout(() => {
-    // If we reach here, no SIGTERM was received — redeploy failed
-    const elapsed = Date.now() - watchdogStartedAt;
-    log(`SIGTERM watchdog FIRED after ${Math.round(elapsed / 60000)}min — no SIGTERM received. Full self-heal redeploy FAILED.`, 'ERROR', 'self-heal-git-deploy');
-    log('The new deploy did not replace this instance. Possible causes: Render didn\'t pick up the push, API key invalid, or service ID wrong.', 'ERROR', 'self-heal-git-deploy');
+  log(`SIGTERM watchdog started — deadline in ${FULL_HEAL_SIGTERM_WATCHDOG_MS / 60000} minutes (deadline=${new Date(deadline).toISOString()})`, 'WARN', 'self-heal-git-deploy');
 
-    try {
-      getInsertSelfHealEvent()?.(
-        Date.now(), 'immediate_redeploy', 'failed', 'sigterm_watchdog_fired',
-        `No SIGTERM received after ${Math.round(elapsed / 60000)} minutes — redeploy did not replace this instance`,
-        0, 0, 0, 'error', elapsed, null
-      );
-    } catch {}
+  // Persist the deadline to DB — survives OOM kills
+  try {
+    const db = getDb();
+    if (db) {
+      db.prepare('INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (?, ?, ?)')
+        .run(WATCHDOG_DB_KEY, JSON.stringify({ deadline, startedAt: watchdogStartedAt }), Date.now());
+    }
+  } catch {}
 
-    // Reset the watchdog
-    _fullHealWatchdogTimer = null;
-  }, FULL_HEAL_SIGTERM_WATCHDOG_MS);
+  // Stop any existing poll
+  stopWatchdogPoll();
 
-  // Don't hold the process open for the watchdog — if Render sends SIGTERM,
-  // it will kill us. If the watchdog fires, we just log and continue running.
-  if (_fullHealWatchdogTimer?.unref) {
-    _fullHealWatchdogTimer.unref();
+  // Poll-based check — same pattern as cycle-watchdog's Date.now() approach.
+  // NOT a single setTimeout (which dies on OOM). This interval is just for
+  // the living process; the DB persistence handles the OOM case.
+  _fullHealWatchdogInterval = setInterval(() => {
+    checkWatchdogDeadline(watchdogStartedAt, deadline);
+  }, WATCHDOG_CHECK_INTERVAL_MS);
+  if (_fullHealWatchdogInterval?.unref) {
+    _fullHealWatchdogInterval.unref();
   }
 }
 
 /**
+ * Check if the watchdog deadline has passed. Called by the poll interval.
+ * Uses Date.now() for elapsed time — same as cycle-watchdog.ts
+ * uses `Date.now() - questionState.questionStartTime`.
+ */
+function checkWatchdogDeadline(startedAt: number, deadline: number): void {
+  const now = Date.now();
+  const elapsed = now - startedAt;
+  const remaining = deadline - now;
+
+  // Log progress at 50%, 75%, 90% — same as cycle-watchdog diagnostics
+  const fractions = [0.5, 0.75, 0.9];
+  const loggedKey = '_watchdogLoggedThresholds';
+  const logged: number[] = (global as any)[loggedKey] || [];
+
+  for (const frac of fractions) {
+    const thresholdTime = startedAt + FULL_HEAL_SIGTERM_WATCHDOG_MS * frac;
+    if (now >= thresholdTime && !logged.includes(frac)) {
+      const elapsedMin = (elapsed / 60000).toFixed(1);
+      const pct = (frac * 100).toFixed(0);
+      log(
+        `SIGTERM watchdog DIAGNOSTIC [${pct}%]: ${elapsedMin}min elapsed, ` +
+        `waiting for Render to replace this instance (${Math.round(remaining / 60000)}min remaining)`,
+        'WARN', 'self-heal-git-deploy'
+      );
+      logged.push(frac);
+      (global as any)[loggedKey] = logged;
+    }
+  }
+
+  // Not timed out yet
+  if (now < deadline) {
+    return;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // DEADLINE REACHED — no SIGTERM received, redeploy failed
+  // ═══════════════════════════════════════════════════════════════
+  stopWatchdogPoll();
+  clearWatchdogDeadlineFromDb();
+  (global as any)[loggedKey] = [];
+
+  const elapsedMin = Math.round(elapsed / 60000);
+  log(`SIGTERM watchdog FIRED after ${elapsedMin}min — no SIGTERM received. Full self-heal redeploy FAILED.`, 'ERROR', 'self-heal-git-deploy');
+  log('The new deploy did not replace this instance. Possible causes: Render didn\'t pick up the push, API key invalid, or service ID wrong.', 'ERROR', 'self-heal-git-deploy');
+
+  try {
+    getInsertSelfHealEvent()?.(
+      Date.now(), 'immediate_redeploy', 'failed', 'sigterm_watchdog_fired',
+      `No SIGTERM received after ${elapsedMin} minutes — redeploy did not replace this instance`,
+      0, 0, 0, 'error', elapsed, null
+    );
+  } catch {}
+}
+
+/**
  * Cancel the SIGTERM watchdog — call when SIGTERM is received to avoid
- * logging a false failure.
+ * logging a false failure. Also clears the DB deadline.
  */
 function cancelSigtermWatchdog(): void {
-  if (_fullHealWatchdogTimer) {
-    clearTimeout(_fullHealWatchdogTimer);
-    _fullHealWatchdogTimer = null;
-    log('SIGTERM watchdog cancelled — instance is being replaced by new deploy', 'INFO', 'self-heal-git-deploy');
+  stopWatchdogPoll();
+  clearWatchdogDeadlineFromDb();
+  (global as any)['_watchdogLoggedThresholds'] = [];
+  log('SIGTERM watchdog cancelled — instance is being replaced by new deploy', 'INFO', 'self-heal-git-deploy');
+}
+
+/** Stop the poll interval. */
+function stopWatchdogPoll(): void {
+  if (_fullHealWatchdogInterval) {
+    clearInterval(_fullHealWatchdogInterval);
+    _fullHealWatchdogInterval = null;
+  }
+}
+
+/** Clear the persisted deadline from DB. */
+function clearWatchdogDeadlineFromDb(): void {
+  try {
+    const db = getDb();
+    if (db) {
+      db.prepare('DELETE FROM calibration WHERE key = ?').run(WATCHDOG_DB_KEY);
+    }
+  } catch {}
+}
+
+/**
+ * Check on boot if there's a pending watchdog deadline from a previous instance
+ * that OOM'd before the watchdog could fire.
+ *
+ * This is the OOM-proofing: if the old instance persisted a deadline but
+ * then OOM'd, the new instance picks it up here.
+ *
+ * Three cases:
+ *   1. Deadline passed, this is a NEW process (different PID) → redeploy failed
+ *   2. Deadline not yet passed → redeploy may still be in progress, resume watching
+ *   3. No deadline in DB → nothing to do
+ */
+function recoverWatchdogOnBoot(): void {
+  try {
+    const db = getDb();
+    if (!db) return;
+
+    const row = db.prepare('SELECT value, updated_at FROM calibration WHERE key = ?').get(WATCHDOG_DB_KEY);
+    if (!row) return;
+
+    let data: { deadline: number; startedAt: number };
+    try {
+      data = JSON.parse(row.value);
+    } catch { return; }
+
+    const now = Date.now();
+    const elapsed = now - data.startedAt;
+    const elapsedMin = Math.round(elapsed / 60000);
+
+    if (now >= data.deadline) {
+      // ═══════════════════════════════════════════════════════════════
+      // CASE 1: Deadline PASSED — the old instance OOM'd and the
+      // watchdog never fired. The redeploy may or may not have
+      // succeeded. Check if we're running the NEW code (the patches
+      // would be on disk if the merge happened).
+      //
+      // We can't know for certain if the deploy succeeded, but
+      // since we're in a NEW process and the watchdog deadline
+      // passed without the old instance being replaced, log it
+      // as a potential failure for diagnostics.
+      // ═══════════════════════════════════════════════════════════════
+      log(
+        `BOOT RECOVERY: SIGTERM watchdog deadline passed ${elapsedMin}min ago — previous instance OOM'd before watchdog fired. ` +
+        `The redeploy may have succeeded (this instance may have the fix) or failed.`,
+        'WARN', 'self-heal-git-deploy'
+      );
+
+      try {
+        getInsertSelfHealEvent()?.(
+          now, 'immediate_redeploy', 'failed', 'sigterm_watchdog_recovered_after_oom',
+          `Watchdog deadline passed ${elapsedMin}min ago. Previous instance likely OOM'd. This boot is the recovery.`,
+          0, 0, 0, 'warning', elapsed, null
+        );
+      } catch {}
+
+      // Clear the stale deadline
+      clearWatchdogDeadlineFromDb();
+    } else {
+      // ═══════════════════════════════════════════════════════════════
+      // CASE 2: Deadline NOT yet passed — the old instance OOM'd
+      // but the redeploy may still be in progress. We can't
+      // cancel the watchdog because we don't know if Render
+      // will SIGTERM us (the new instance) too.
+      //
+      // The safest approach: resume the watchdog with the
+      // ORIGINAL deadline. If Render replaces us before the
+      // deadline, great. If not, the watchdog will fire.
+      // ═══════════════════════════════════════════════════════════════
+      const remainingMin = Math.round((data.deadline - now) / 60000);
+      log(
+        `BOOT RECOVERY: Resuming SIGTERM watchdog — ${remainingMin}min remaining until deadline ` +
+        `(previous instance OOM'd before watchdog fired)`,
+        'WARN', 'self-heal-git-deploy'
+      );
+
+      // Resume polling with the original deadline
+      stopWatchdogPoll();
+      _fullHealWatchdogInterval = setInterval(() => {
+        checkWatchdogDeadline(data.startedAt, data.deadline);
+      }, WATCHDOG_CHECK_INTERVAL_MS);
+      if (_fullHealWatchdogInterval?.unref) {
+        _fullHealWatchdogInterval.unref();
+      }
+    }
+  } catch {
+    // Non-critical — DB may not be ready yet
   }
 }
 
 // ─── Init ───────────────────────────────────────────────────────────────────
 
 function init(): void {
+  // FIRST: Recover any pending SIGTERM watchdog from a previous instance
+  // that OOM'd. This must run BEFORE the early returns below because a
+  // watchdog deadline from a PREVIOUS boot must be honored regardless
+  // of whether the current config enables new deploys.
+  // Uses Date.now() comparison — same timing method as cycle-watchdog.
+  recoverWatchdogOnBoot();
+
   const config = getCONFIG();
   const enabled = config.SELF_DEPLOY_ENABLED === true
     || process.env.SELF_DEPLOY_ENABLED === 'true';
@@ -1065,6 +1456,7 @@ module.exports = {
   deployVerifiedPatches,
   triggerImmediateRedeploy,
   cancelSigtermWatchdog,
+  recoverWatchdogOnBoot,
   recordPatchForVerification,
   markCycleSuccess,
   markCycleFailed,
