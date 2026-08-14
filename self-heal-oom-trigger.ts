@@ -38,6 +38,40 @@ let _deps: Record<string, any> = {};
 let _initialized = false;
 let _bootHealScheduled = false;
 
+// ─── Heal completion signaling ────────────────────────────────────────────
+// The boot sequence (render-free-plan.ts) must WAIT for the OOM heal to
+// complete before starting the cycle daemon. Without this, the daemon
+// starts burning vision AI quota while the code-generation tribunal is
+// still investigating.
+//
+// _bootHealPromise resolves when the heal finishes (success or failure).
+// _bootHealDone is true once resolved. The cycle orchestrator checks
+// isBootHealInProgress() before starting cycles.
+let _bootHealPromise: Promise<void> | null = null;
+let _bootHealDone = true; // true = no heal pending
+let _bootHealResult: 'pending' | 'success' | 'failure' | 'none' = 'none';
+
+/**
+ * Check if a boot-time OOM heal is in progress.
+ * The cycle orchestrator should NOT start cycles while this is true.
+ */
+function isBootHealInProgress(): boolean {
+  return !_bootHealDone;
+}
+
+/**
+ * Wait for the boot heal to complete. Returns the result.
+ * If no heal was scheduled, returns immediately with 'none'.
+ * Used by the boot sequence to delay daemon start.
+ */
+async function waitForBootHeal(): Promise<{ result: string; waited: boolean }> {
+  if (_bootHealPromise) {
+    await _bootHealPromise;
+    return { result: _bootHealResult, waited: true };
+  }
+  return { result: 'none', waited: false };
+}
+
 function _injectDependencies(deps: Record<string, any>) {
   _deps = deps;
 }
@@ -323,6 +357,8 @@ async function triggerBootHeal(): Promise<void> {
     return;
   }
   _bootHealScheduled = true;
+  _bootHealDone = false;
+  _bootHealResult = 'pending';
 
   const diagnostics = gatherOOMDiagnostics();
   log(`Boot-time OOM self-heal triggered. Diagnostics:\n${diagnostics}`, 'WARN');
@@ -416,12 +452,56 @@ async function triggerBootHeal(): Promise<void> {
       if (typeof performSelfHeal === 'function') {
         log(`OOM death spiral (${oomKills} kills, runtime_healed=${anyHealed}) — attempting full code-patch heal...`, 'ERROR');
         try {
-          const fullHealed = await performSelfHeal();
+          // CRITICAL: pass { skipRuntimeHeal: true } because we already ran
+          // performRuntimeHeal() in Step 1 above. Without this flag,
+          // performSelfHeal() would re-run runtime heal, succeed, and
+          // return true WITHOUT ever calling the code-generation tribunal.
+          const fullHealed = await performSelfHeal({ skipRuntimeHeal: true });
           if (fullHealed) {
-            log('Boot-time OOM full self-heal SUCCEEDED', 'INFO');
+            log('Boot-time OOM full self-heal SUCCEEDED (code patches applied via tribunal)', 'INFO');
             anyHealed = true;
+            _bootHealResult = 'success';
+
+            // ═══════════════════════════════════════════════════════════════
+            // WAIT FOR SIGTERM — do NOT let the cycle daemon start.
+            // ═══════════════════════════════════════════════════════════════
+            // performSelfHeal() already called triggerImmediateRedeploy()
+            // which pushes to GitHub and triggers Render deploy.
+            // Render will SIGTERM this instance when the new deploy is ready.
+            // We wait here (with a 5-minute timeout) instead of returning
+            // control to the boot sequence which would start the cycle.
+            log('Self-heal patches applied — waiting for Render SIGTERM (new deploy incoming)...', 'WARN');
+            log('Cycle daemon is BLOCKED until SIGTERM arrives or 5-minute timeout.', 'WARN');
+            try {
+              await new Promise<void>((resolve, reject) => {
+                const SIGTERM_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+                let sigtermReceived = false;
+                const onSigterm = () => {
+                  sigtermReceived = true;
+                  log('SIGTERM received — Render is deploying the patched version. Exiting cleanly.', 'INFO');
+                  resolve();
+                };
+                process.once('SIGTERM', onSigterm);
+                const timeout = setTimeout(() => {
+                  process.removeListener('SIGTERM', onSigterm);
+                  if (!sigtermReceived) {
+                    log('SIGTERM timeout (5 min) — Render did NOT restart us. Patches are in overlay/GitHub but this instance continues.', 'ERROR');
+                    // Try to alert
+                    try {
+                      const alerting = require('./alerting');
+                      alerting.sendAlert?.('Self-heal patches applied but Render did not SIGTERM within 5 minutes');
+                    } catch {}
+                  }
+                  resolve();
+                }, SIGTERM_TIMEOUT_MS);
+                // DO NOT unref this timer — we need it to fire
+              });
+            } catch (waitErr: any) {
+              log(`SIGTERM wait error: ${waitErr.message}`, 'WARN');
+            }
           } else {
-            log('Boot-time OOM full self-heal found no fixable issues', 'WARN');
+            log('Boot-time OOM full self-heal found no fixable issues (tribunal ran but no consensus)', 'WARN');
+            _bootHealResult = 'failure';
           }
         } catch (fullErr: any) {
           // Full heal can OOM itself on 512MB — log but don't crash
@@ -454,6 +534,10 @@ async function triggerBootHeal(): Promise<void> {
     } catch {}
   } finally {
     _bootHealScheduled = false;
+    if (_bootHealResult === 'pending') {
+      _bootHealResult = anyHealed ? 'success' : 'failure';
+    }
+    _bootHealDone = true;
   }
 }
 
@@ -523,12 +607,17 @@ function init(options: {
     // - Finish initializing all subsystems
     // - Start the heap guardian (which prevents OOM during heal)
     // - Establish DB connection for Turso sync
-    const timer = setTimeout(() => {
-      triggerBootHeal().catch(() => {});
-    }, BOOT_HEAL_DELAY_MS);
+    // Create the promise BEFORE the timer so waitForBootHeal() can await it
+    _bootHealPromise = new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        triggerBootHeal().then(() => resolve()).catch(() => resolve());
+      }, BOOT_HEAL_DELAY_MS);
 
-    // Don't hold the process open for this timer
-    if (timer?.unref) timer.unref();
+      // DO NOT unref this timer — we need it to fire so the boot
+      // sequence can await the heal completion before starting the daemon.
+      // The old unref() meant the daemon started immediately while the
+      // heal ran in the background, burning vision AI for nothing.
+    });
 
     return { healScheduled: true, oomKillCount };
   }
@@ -620,13 +709,22 @@ function recheckAfterTursoSync(): { healScheduled: boolean; oomKillCount: number
       log(`Cooldown BYPASSED — OOM death spiral (kills=${oomKillCount}, guardian=${guardianSeesLoop})`, 'WARN');
     }
 
-    if (!cooldownBlocked) {
+    if (!cooldownBlocked && !_bootHealPromise) {
+      // Only schedule if init() didn't already schedule one.
+      // If init() already set _bootHealPromise, the daemon wait
+      // block will await that one — don't overwrite it.
       log(`Post-Turso OOM self-heal TRIGGERED`, 'ERROR');
-      const timer = setTimeout(() => {
-        triggerBootHeal().catch(() => {});
-      }, 5000); // Shorter delay — subsystems already running
-      if (timer?.unref) timer.unref();
+      _bootHealPromise = new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          triggerBootHeal().then(() => resolve()).catch(() => resolve());
+        }, 5000); // Shorter delay — subsystems already running
+        // DO NOT unref — daemon must wait for this
+      });
+      _bootHealDone = false;
+      _bootHealResult = 'pending';
       return { healScheduled: true, oomKillCount };
+    } else if (_bootHealPromise) {
+      log(`Post-Turso: OOM loop confirmed but init() already scheduled a heal — not double-scheduling`, 'DEBUG');
     } else {
       log(`Post-Turso: OOM loop confirmed but boot heal in cooldown`, 'WARN');
     }
@@ -641,5 +739,7 @@ module.exports = {
   getRecentOOMKillCount,
   gatherOOMDiagnostics,
   recheckAfterTursoSync,
+  isBootHealInProgress,
+  waitForBootHeal,
   _injectDependencies,
 };
