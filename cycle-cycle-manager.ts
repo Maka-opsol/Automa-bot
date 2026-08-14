@@ -626,8 +626,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     }
     if (CONFIG.FLUTTER_DPR_AUTO_CALIBRATE && dpr) { await dpr.calibrate(page); }
 
-    // Navigate to app if browser landed on about:blank (fresh start, no checkpoint)
-    if (!checkpoint && page.url() === 'about:blank') {
+    // Navigate to app if browser landed on about:blank (fresh start OR post-self-heal)
+    // Even with a checkpoint, self-heal may have killed the browser and re-launched
+    // to about:blank. If we're on about:blank, we MUST navigate — the checkpoint
+    // URL is stale (the browser was killed).
+    if (page.url() === 'about:blank') {
       const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
       if (targetUrl) {
         log(`Fresh start: navigating to ${targetUrl}`, 'INFO', 'cycle');
@@ -1051,10 +1054,14 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // Before calling the tribunal (expensive AI call), check if we have
       // a cached action for this exact visual context. If hit, skip the AI
       // call entirely and use the saved action.
+      // EXCLUSION: Never use cached actions for blank_page state — the page
+      // is not rendered yet, so any cached action is meaningless. Caching a
+      // blank page creates an infinite wait loop (blank → cached wait → blank).
       let _actionCacheSig: string | null = null;
       let _actionCacheHit = false;
       const actionCache = _getActionCache();
-      if (!action && actionCache && currentState) {
+      const _isBlankPageState = currentState === 'blank_page';
+      if (!action && actionCache && currentState && !_isBlankPageState) {
         try {
           // Compute context signature from current state + screenshot
           // Use previous cycle's state as the context key (currentState is set from last cycle)
@@ -1403,6 +1410,27 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const startTime = Date.now();
       let actionSuccess = false;
 
+      // ── EARLY EXIT: blank_page wait → navigate immediately ──
+      // Don't waste 75s executing a 'wait' on a blank page. Navigate to
+      // APP_URL right now and skip to the next loop iteration.
+      if (action.actionType === 'wait' && action.currentState === 'blank_page') {
+        const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
+        if (targetUrl) {
+          log(`blank_page early exit: skipping 75s wait, navigating to ${targetUrl}`, 'INFO', 'cycle');
+          try {
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
+              log(`blank_page early exit: navigation failed: ${e.message || e}`, 'WARN', 'cycle');
+            });
+            await new Promise(r => setTimeout(r, 8000));
+            if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+          } catch (navErr: any) {
+            log(`blank_page early exit failed: ${navErr.message || navErr}`, 'WARN', 'cycle');
+          }
+        }
+        lastScreenshotChangeTime = Date.now();
+        continue;
+      }
+
       // Execute action with plugin pre-hook
       pluginAPI?.runHooks?.('preAction', { page, action, state: currentState });
 
@@ -1536,7 +1564,9 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // After action execution, update the cache:
       // - Success: save the action (if not from cache) for future reuse
       // - Failure: record failure count; evict if too many consecutive failures
-      if (_actionCacheSig && actionCache) {
+      // GUARD: Never save blank_page actions — they're meaningless (page not
+      // rendered) and caching them creates an infinite wait loop.
+      if (_actionCacheSig && actionCache && !_isBlankPageState) {
         if (actionSuccess && !_actionCacheHit) {
           // Save new successful action to cache (only if it wasn't already from cache)
           // This builds the cache over time as the bot discovers working actions
@@ -1825,7 +1855,34 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           }
           continue; // Skip the wait action and re-evaluate on next iteration
         }
-      // Also handle 'error' state — same death spiral as unknown
+      // blank_page escape hatch — same logic as unknown/error
+      // The tribunal returns currentState='blank_page' when the screenshot is
+      // blank/white (no content rendered). If we keep waiting, the page stays
+      // blank forever. Force a navigate to APP_URL to break the loop.
+      } else if (action.currentState === 'blank_page') {
+        unknownStateCounter++;
+        log(`blank_page state detected (${unknownStateCounter} consecutive). Navigating to APP_URL to break blank-page loop.`, 'WARN', 'cycle');
+        unknownStateCounter = 0;
+        const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
+        if (targetUrl) {
+          try {
+            log(`blank_page escape: navigating to ${targetUrl}`, 'INFO', 'cycle');
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
+              log(`blank_page escape: navigation failed: ${e.message || e}`, 'WARN', 'cycle');
+            });
+            // Wait for Flutter to paint after navigation
+            await new Promise(r => setTimeout(r, 8000));
+            if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+          } catch (navErr: any) {
+            log(`blank_page escape failed: ${navErr.message || navErr}`, 'WARN', 'cycle');
+          }
+        }
+        // Clear any cached blank_page action so it doesn't get hit next cycle
+        if (_actionCacheSig && actionCache?.evictEntry) {
+          try { actionCache.evictEntry(_actionCacheSig); } catch {}
+        }
+        lastScreenshotChangeTime = Date.now();
+        continue;
       } else if (action.currentState === 'error') {
         // 20-min stagnation auto-ban for error loops
         const timeSinceScreenshotChange = Date.now() - lastScreenshotChangeTime;
@@ -2078,8 +2135,22 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
                   const fullHealed = await performSelfHeal();
                   if (fullHealed) {
-                    log('Zero-progress FULL self-heal SUCCEEDED', 'INFO', 'cycle');
+                    log('Zero-progress FULL self-heal SUCCEEDED — restarting process to apply changes cleanly', 'INFO', 'cycle');
                     consecutiveFailures = 0;
+                    // After a successful zero-progress self-heal, the process must
+                    // RESTART (not just reload the page). The heal may have cleared
+                    // caches, reset providers, and patched code via overlay — but
+                    // the running cycle has stale state (blank page, dead browser
+                    // context, exhausted action cache). A clean restart lets the
+                    // new instance boot fresh, navigate to APP_URL, and start
+                    // completing questions immediately.
+                    // On Render: exit(1) triggers auto-restart.
+                    try {
+                      const sendAlert = require('./alerting').sendAlert;
+                      sendAlert?.('Zero-progress self-heal succeeded — restarting process');
+                    } catch {}
+                    try { await (getDep('shutdown')?.gracefulShutdown || (() => Promise.resolve()))('zero-progress-heal-restart'); } catch {}
+                    process.exit(1);
                   } else {
                     log('Zero-progress FULL self-heal found no fixable issues', 'WARN', 'cycle');
                   }
