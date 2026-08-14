@@ -858,12 +858,20 @@ async function performSelfHeal() {
       }
     }
 
-    // v11: GIT DEPLOY — Queue patches for permanent GitHub commit + Render deploy.
-    // The overlay + hot-swap heal the RUNNING instance, but are lost on OOM/crash.
-    // Git deploy bakes the fix into the repo so new instances boot with it.
-    // After VERIFICATION_CYCLES (5) error-free cycles, the git-deploy module
-    // auto-commits to GitHub, creates a PR, auto-merges, and triggers a
-    // Render deploy via API — fully instance-independent healing.
+    // v11: IMMEDIATE REDEPLOY — Commit patches to GitHub + trigger Render deploy.
+    //
+    // This is the ONLY correct way to complete a full self-heal on Render.
+    // The overlay + hot-swap heal the RUNNING instance, but a fresh deploy
+    // from GitHub is the only way to guarantee the fix persists across
+    // OOM kills and instance replacements.
+    //
+    // After pushing to GitHub and triggering the Render deploy API,
+    // a 5-minute SIGTERM watchdog starts. If Render doesn't send SIGTERM
+    // within 5 minutes (to replace this instance with the new deploy),
+    // the redeploy is logged as failed.
+    //
+    // The old deferred path (recordPatchForVerification → 5 cycles → deploy)
+    // is kept as a fallback for files that don't have overlay copies yet.
     if (isReadOnlyFs) {
       try {
         const gitDeploy = require('./self-heal-git-deploy');
@@ -871,15 +879,47 @@ async function performSelfHeal() {
         if (_deps.logger || _deps.database) {
           try { gitDeploy._injectDependencies({ logger: _deps.logger, database: _deps.database, config: _deps.config }); } catch {}
         }
-        let queuedCount = 0;
-        for (const fix of safeFixes) {
-          if (gitDeploy.isDeployAllowed(fix.file)) {
-            gitDeploy.recordPatchForVerification(fix.id || String(Date.now()), fix.file);
-            queuedCount++;
+
+        // Collect all patched file names
+        const patchedFileNames = safeFixes.map((f: any) => f.file);
+
+        // Attempt immediate redeploy with ALL patched files
+        const hasGithub = !!(process.env.GITHUB_TOKEN && process.env.GITHUB_REPO);
+        const hasRender = !!(process.env.RENDER_API_KEY && process.env.RENDER_SERVICE_ID);
+
+        if (hasGithub || hasRender) {
+          log(`Full self-heal succeeded — triggering IMMEDIATE redeploy of ${patchedFileNames.length} file(s) to GitHub + Render`, 'INFO', 'self-heal');
+          const redeployResult = await gitDeploy.triggerImmediateRedeploy(patchedFileNames);
+          if (redeployResult.redeployed) {
+            log(`IMMEDIATE REDEPLOY TRIGGERED via ${redeployResult.method}: ${redeployResult.details}`, 'INFO', 'self-heal');
+            log('Waiting for Render to SIGTERM this instance (5-minute watchdog active)...', 'INFO', 'self-heal');
+          } else {
+            log(`Immediate redeploy failed: ${redeployResult.details} — patches are active via overlay/hot-swap but NOT persisted to GitHub`, 'WARN', 'self-heal');
+            // Fallback: queue for deferred deploy as before
+            let queuedCount = 0;
+            for (const fix of safeFixes) {
+              if (gitDeploy.isDeployAllowed(fix.file)) {
+                gitDeploy.recordPatchForVerification(fix.id || String(Date.now()), fix.file);
+                queuedCount++;
+              }
+            }
+            if (queuedCount > 0) {
+              log(`${queuedCount}/${safeFixes.length} patch(es) queued for deferred git deploy (fallback)`, 'INFO', 'self-heal');
+            }
           }
-        }
-        if (queuedCount > 0) {
-          log(`${queuedCount}/${safeFixes.length} patch(es) queued for git deploy verification (instance-independent healing)`, 'INFO', 'self-heal');
+        } else {
+          // No GitHub/Render creds — queue for deferred deploy (old behavior)
+          log('No GITHUB_TOKEN+REPO or RENDER_API_KEY+SERVICE_ID — cannot redeploy. Patches active via overlay only.', 'WARN', 'self-heal');
+          let queuedCount = 0;
+          for (const fix of safeFixes) {
+            if (gitDeploy.isDeployAllowed(fix.file)) {
+              gitDeploy.recordPatchForVerification(fix.id || String(Date.now()), fix.file);
+              queuedCount++;
+            }
+          }
+          if (queuedCount > 0) {
+            log(`${queuedCount}/${safeFixes.length} patch(es) queued for deferred git deploy verification`, 'INFO', 'self-heal');
+          }
         }
       } catch (gdErr: any) {
         log(`Git deploy recording failed (non-fatal): ${gdErr.message}`, 'WARN', 'self-heal');
