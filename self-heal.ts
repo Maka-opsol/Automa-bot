@@ -365,6 +365,77 @@ function getRecentErrors() {
   }
 }
 
+/**
+ * Error-pattern → likely target file mapping.
+ * When no specific file is known, the tribunal prompt defaults to
+ * "Target file to fix: Unknown" and shows no code. This map gives
+ * the tribunal a fighting chance by pointing it at the right file.
+ *
+ * Entries are ordered by specificity — first match wins.
+ */
+const ERROR_TO_FILE_HINTS: Array<{ pattern: RegExp; files: string[] }> = [
+  { pattern: /selector|click|wait_for|visible|locator/i, files: ['selectors.ts', 'browser.ts', 'cycle-action-executor.ts'] },
+  { pattern: /auth|login|signin|token|jwt|session/i, files: ['auth-strategies-microsoft-v2.ts', 'auth-auth-manager.ts', 'auth.ts', 'jwt.ts'] },
+  { pattern: /state.?machine|stuck|deadlock|transition/i, files: ['state-machine.ts', 'cycle-orchestrator.ts'] },
+  { pattern: /timeout|timed.?out|30[0-9]{3}/i, files: ['browser.ts', 'cycle-watchdog.ts', 'config.ts'] },
+  { pattern: /provider|model|openrouter|groq|mistral|api.?key/i, files: ['providers.ts', 'providers-registry.ts', 'providers-fallback.ts', 'providers-base.ts'] },
+  { pattern: /memory|oom|heap|gc|allocation/i, files: ['memory-mode.ts', 'runtime-heap-guardian.ts', 'resource-manager.ts'] },
+  { pattern: /screenshot|page|navigate|goto/i, files: ['browser.ts', 'cycle-action-executor.ts'] },
+  { pattern: /captcha/i, files: ['captcha-solver-external.ts', 'providers-detection-captcha-solver.ts'] },
+  { pattern: /stagnat|repeat|loop|circular/i, files: ['cycle-stagnation.ts', 'cycle-cycle-manager.ts', 'progress-tracker.ts'] },
+];
+
+/**
+ * Enrich the raw investigation from investigatePage() with a likely
+ * target file and its content, so the tribunal prompt isn't blind.
+ *
+ * Strategy:
+ * 1. Try to read recent patch_memory entries for the most-commonly-fixed file
+ * 2. Match error patterns against known file hints
+ * 3. Fall back to 'Unknown' (the tribunal can still guess from HTML)
+ */
+function enrichInvestigationWithTargetFile(investigation: any, errorLogs: string) {
+  const enriched = { ...investigation };
+
+  // Try patch memory first — it knows which files were fixed before
+  try {
+    const patchMem = getPatchMemory();
+    if (patchMem && typeof patchMem.getMostFrequentTarget === 'function') {
+      const frequentTarget = patchMem.getMostFrequentTarget();
+      if (frequentTarget) {
+        const filePath = path.join(SOURCE_DIR, frequentTarget);
+        if (fs.existsSync(filePath)) {
+          enriched.targetFile = frequentTarget;
+          enriched.fileContent = fs.readFileSync(filePath, 'utf8');
+          log(`Investigation enriched with patch-memory target: ${frequentTarget}`, 'DEBUG', 'self-heal');
+          return enriched;
+        }
+      }
+    }
+  } catch (e: any) { /* non-critical */ }
+
+  // Fall back to error-pattern matching
+  for (const entry of ERROR_TO_FILE_HINTS) {
+    if (entry.pattern.test(errorLogs)) {
+      for (const candidate of entry.files) {
+        const filePath = path.join(SOURCE_DIR, candidate);
+        if (fs.existsSync(filePath)) {
+          try {
+            enriched.targetFile = candidate;
+            enriched.fileContent = fs.readFileSync(filePath, 'utf8');
+            log(`Investigation enriched with error-pattern target: ${candidate}`, 'DEBUG', 'self-heal');
+            return enriched;
+          } catch (e: any) { /* read failed, try next */ }
+        }
+      }
+    }
+  }
+
+  // No match found — tribunal will see 'Unknown' but can still work from HTML
+  log('Investigation: no specific target file identified, tribunal will infer from HTML', 'DEBUG', 'self-heal');
+  return enriched;
+}
+
 // ═══════════════════════════════════════════════════════════
 //  TWO-LAYER AUDIT COORDINATION
 //
@@ -655,14 +726,27 @@ async function performSelfHeal() {
       }
     } catch (e: any) { /* non-critical */ }
 
-    // 4. Generate fixes via AI tribunal
+    // 3b. Enrich investigation with likely target file + its content.
+    //     investigatePage() only returns {screenshot, html, url} —
+    //     the tribunal needs to know WHICH file to fix and WHAT it contains.
+    //     We infer the target from the most recent error pattern.
+    const enrichedInvestigation = enrichInvestigationWithTargetFile(investigation, errorLogs);
+
+    // 4. Generate fixes via AI tribunal (with abort signal for timeout)
     let fixes: any[] | null;
+    const tribunalSignal = AbortSignal.timeout(getCONFIG().SELF_HEAL_TRIBUNAL_TIMEOUT_MS || 120_000);
     try {
       fixes = await getGenerateCodeFixViaTribunal()(
-        investigation,
-        errorLogs + (patchContext ? '\n\n' + patchContext : '')
+        enrichedInvestigation,
+        errorLogs + (patchContext ? '\n\n' + patchContext : ''),
+        tribunalSignal
       );
     } catch (err: any) {
+      if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+        log('Tribunal timed out — retrying', 'WARN', 'self-heal');
+        memoryMode.appendSelfHealProgress?.('tribunal_timeout', { attempt: attempts });
+        continue;
+      }
       logError('Tribunal failed to generate fixes', err);
       continue;
     }
