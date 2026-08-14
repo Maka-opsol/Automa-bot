@@ -1974,9 +1974,19 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           // GitOps fallback (existing behavior)
           const codegenTribunal = _getCodegenTribunal();
           if (codegenTribunal) {
-          const investigation = { url: page.url(), html: await page.content(), fileContent: 'Unknown', targetFile: 'cycle-cycle-manager.ts' };
+          // Build investigation with actual file content for the tribunal
+          let cmFileContent = '';
+          let cmTargetFile = 'cycle-cycle-manager.ts';
+          try {
+            const cmPath = require('path').join(require('./project-root').PROJECT_ROOT, cmTargetFile);
+            if (require('fs').existsSync(cmPath)) {
+              cmFileContent = require('fs').readFileSync(cmPath, 'utf8').substring(0, 8000);
+            }
+          } catch (e: any) { /* non-critical */ }
+          const investigation = { url: page.url(), html: await page.content(), fileContent: cmFileContent, targetFile: cmTargetFile };
           const errorLogs = `Stuck for ${MAX_STUCK} cycles at state ${currentState}`;
-          const fixes = await codegenTribunal.generateCodeFixViaTribunal(investigation, errorLogs);
+          const signal = AbortSignal.timeout(120_000);
+          const fixes = await codegenTribunal.generateCodeFixViaTribunal(investigation, errorLogs, signal);
           if (fixes && fixes.length > 0 && CONFIG.GITOPS_ENABLED && gitOps?.applyAndVerify) {
             try { await gitOps.applyAndVerify(fixes); log('Self-heal applied via GitOps. Restarting cycle.', 'INFO', 'cycle'); throw new Error('RESTART_CYCLE'); } catch (e: any) { if (e.message === 'RESTART_CYCLE') throw e; gitOps.rollbackToPrevious?.(); }
           }
