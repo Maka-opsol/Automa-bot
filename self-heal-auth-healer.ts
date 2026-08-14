@@ -96,10 +96,10 @@ class AuthHealer {
         await closeBrowser();
         page = null;
         log(`MFA detected during auth heal: ${mfaCheck.detail}. Alerting and entering DORMANT.`, 'ERROR', 'auth-healer');
-        try { (_deps.alerting?.sendAlert || (() => {}))('MFA detected during auth heal: ' + mfaCheck.detail + '. Human intervention needed.', 1); } catch {}
+        try { (_deps.alerting?.sendAlert || (() => {}))(\`MFA detected during auth heal: ${mfaCheck.detail}. Human intervention needed.\`, 1); } catch {}
         try {
           const { degradationLadder } = require('./self-heal-degradation-ladder');
-          degradationLadder.setLevel(4, 'MFA_DETECTED: ' + mfaCheck.detail);
+          degradationLadder.setLevel(4, \`MFA_DETECTED: ${mfaCheck.detail}\`);
         } catch {}
         logAudit(`MFA detected, entering DORMANT: ${mfaCheck.detail}`, 'auth-healer');
         return false;
@@ -131,14 +131,28 @@ class AuthHealer {
         targetFile: 'auth-strategies-microsoft-v2.ts',
       };
 
-      const prompt = 'The Microsoft login flow appears to have changed. Analyze the current login page and identify what has changed from the expected flow. ' +
-        'Current URL: ' + currentUrl + '\n\n' +
-        'Generate a patch for auth-strategies-microsoft-v2.ts to adapt to the new login page structure.';
+      // Load actual file content for the tribunal
+      try {
+        const { PROJECT_ROOT } = require('./project-root');
+        const authFs = require('fs');
+        const authPath = require('path').join(PROJECT_ROOT, investigation.targetFile);
+        if (authFs.existsSync(authPath)) {
+          investigation.fileContent = authFs.readFileSync(authPath, 'utf8');
+        }
+      } catch (e: any) { /* non-critical */ }
+
+      const authPrompt = \`The Microsoft login flow appears to have changed. Analyze the current login page and identify what has changed from the expected flow. \` +
+        \`Current URL: ${currentUrl}\n\n\` +
+        \`Generate a patch for auth-strategies-microsoft-v2.ts to adapt to the new login page structure.\`;
 
       let fixes: any[] = [];
       try {
         const { generateCodeFixViaTribunal } = require('./providers-codegen-tribunal');
-        fixes = await generateCodeFixViaTribunal(investigation, prompt);
+        const signal = AbortSignal.timeout(120_000);
+        const result = await generateCodeFixViaTribunal(investigation, authPrompt, signal);
+        if (result && result.length > 0) {
+          fixes = result;
+        }
       } catch (tribunalErr: any) {
         logError('Codegen tribunal failed for auth analysis', tribunalErr);
         log('Tribunal failed — falling back to lightweight heal', 'WARN', 'auth-healer');
