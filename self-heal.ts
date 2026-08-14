@@ -334,11 +334,24 @@ function verifyPromotedFiles(fixes: any, overlay?: any) {
 //  INVESTIGATION
 // ═══════════════════════════════════════════════════════════
 
-async function investigatePage() { 
+async function investigatePage() {  
   log('Investigating page for self-healing...', 'INFO', 'self-heal');
   let page;
   try {
-    page = await (_deps.browser?.launchBrowser || (() => {}))();
+    // Boot-time OOM heals run BEFORE the browser is initialised, so
+    // _deps.browser is absent.  In that case return a log-only
+    // investigation — the tribunal can still work from error patterns
+    // and target-file hints (enrichInvestigationWithTargetFile).
+    const launcher = _deps.browser?.launchBrowser;
+    if (!launcher) {
+      log('No browser available for investigation (boot-time heal) — using log-based context', 'WARN', 'self-heal');
+      return { screenshot: null, html: null, url: null, bootTime: true };
+    }
+    page = await launcher();
+    if (!page) {
+      log('Browser launch returned no page — using log-based context', 'WARN', 'self-heal');
+      return { screenshot: null, html: null, url: null, bootTime: true };
+    }
     await (_deps.auth?.authenticate || (() => {}))(page);
     await page.goto(getCONFIG().APP_URL + '/assignments', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(5000);
@@ -724,11 +737,16 @@ async function performSelfHeal(options?: SelfHealOptions) {
     log(`Self-heal attempt ${attempts}/${getCONFIG().SELF_HEAL_MAX_ATTEMPTS}`, 'INFO', 'self-heal');
 
     // 1. Investigate the current page state
+    //    bootTime sentinel means no browser — proceed with log-based context
+    //    rather than wasting all 3 retry attempts on a missing browser.
     const investigation = await investigatePage();
     if (!investigation) {
-      log('Investigation failed, retrying', 'ERROR', 'self-heal');
+      log('Investigation failed (unexpected error), retrying', 'ERROR', 'self-heal');
       memoryMode.appendSelfHealProgress?.('investigation_failed', { attempt: attempts });
       continue;
+    }
+    if (investigation.bootTime) {
+      log('Boot-time heal: proceeding with log-based investigation (no browser)', 'INFO', 'self-heal');
     }
     // v4: Save investigation to DB (survives OOM)
     memoryMode.appendSelfHealProgress?.('investigation', { summary: investigation?.summary?.substring(0, 200), attempt: attempts });
