@@ -66,9 +66,14 @@ async function callBazaarLinkCodeGenWithModel(prompt: any, signal: any, modelSlu
     }, { signal });
     content = response.choices[0].message.content ?? '';
   } catch (err: any) {
-    // On 429, sync the rate limiter to reality
+    // On 429, record 1 usage (same as success) to keep the counter accurate.
+    // The isExhausted() pre-check in the tribunal will naturally stop
+    // calling when the budget is truly exhausted. Using recordUsage()
+    // instead of forceExhaust() avoids over-counting: previously forceExhaust
+    // added 5 per 429, and with 3 concurrent models all getting 429 that
+    // burned 15 per tribunal round (50 budget in ~4 rounds with only ~12 actual requests).
     if (err?.status === 429 || String(err?.message || '').includes('429')) {
-      _getLimiter().forceExhaust('BazaarLink 429');
+      _getLimiter().recordUsage();
     }
     throw new Error(`BazaarLink ${modelSlug}: ${err.message || err}`);
   }
@@ -129,4 +134,3 @@ module.exports = {
   callBazaarLinkCodeGenWithModel,
   getBazaarLinkModels,
   _injectDependencies,
-};
