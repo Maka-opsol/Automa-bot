@@ -290,6 +290,7 @@ function isValidRemoteOverride(key: string, value: unknown): boolean {
     'AUDITOR_ENABLED', 'SELF_HEAL_ENABLED', 'SELF_HEAL_ALLOW_ALL', 'SANDBOX_MODE',
     'ADMIN_SECRET', 'POLICY_ENFORCED', 'SELF_DEPLOY_ENABLED',
     'HEALER_SELF_TEST_ENABLED', 'ADVERSARIAL_TESTER_ENABLED', 'CRITICAL_SHADOW_MODE_ENABLED',
+    'EXECUTIVE_KEY',
   ]);
   if (BLOCKED_KEYS.has(key)) return false;
   const schema: Record<string, OverrideSchemaItem> = {
@@ -588,6 +589,8 @@ const env = envalid.cleanEnv(process.env, {
   CLEAN_ROOM_TEST_INTERVAL_HOURS: num({ default: 168 }),
   DEGRADATION_LADDER_ENABLED: bool({ default: true }),
   SELF_DEPLOY_ENABLED: bool({ default: false }),
+  EXECUTIVE_KEY: str({ default: '' }),
+  SELF_HEAL_ACCEPT_ANY_FIX: bool({ default: false }),
   // Critical patch consensus safety timeouts
   CRITICAL_CONSENSUS_COOLING_OFF_MS: num({ default: 5 * 60 * 1000 }),
   CRITICAL_CONSENSUS_VERIFY_WINDOW_MS: num({ default: 10 * 60 * 1000 }),
@@ -848,6 +851,8 @@ const _configStore: Record<string, any> = {
   CLEAN_ROOM_TEST_INTERVAL_HOURS: env.CLEAN_ROOM_TEST_INTERVAL_HOURS,
   DEGRADATION_LADDER_ENABLED: env.DEGRADATION_LADDER_ENABLED,
   SELF_DEPLOY_ENABLED: env.SELF_DEPLOY_ENABLED,
+  EXECUTIVE_KEY: env.EXECUTIVE_KEY || '',
+  SELF_HEAL_ACCEPT_ANY_FIX: env.SELF_HEAL_ACCEPT_ANY_FIX,
   CRITICAL_CONSENSUS_COOLING_OFF_MS: env.CRITICAL_CONSENSUS_COOLING_OFF_MS,
   CRITICAL_CONSENSUS_VERIFY_WINDOW_MS: env.CRITICAL_CONSENSUS_VERIFY_WINDOW_MS,
   // Cloudinary screenshot storage
