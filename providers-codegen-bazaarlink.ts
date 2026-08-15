@@ -88,12 +88,19 @@ async function callBazaarLinkCodeGen(prompt: any, signal: any) {
 
 /**
  * Get the list of BazaarLink models to try in the codegen tribunal.
- * Returns specific free models; caller can also use 'auto:free'.
+ * Always puts auto:free first (best free model auto-selected), then
+ * specific free models as fallbacks.
  */
 function getBazaarLinkModels(): string[] {
   const configModel = getCONFIG().CODE_GEN_MODEL_BAZAARLINK;
-  if (configModel) return [configModel];
-  return DEFAULT_MODELS;
+  if (configModel) {
+    // If the user set a specific model, still try auto:free first
+    if (configModel !== 'auto:free') {
+      return ['auto:free', configModel];
+    }
+    return ['auto:free'];
+  }
+  return ['auto:free', ...DEFAULT_MODELS];
 }
 
 module.exports = {
