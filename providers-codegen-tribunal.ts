@@ -5,8 +5,7 @@ function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function getCONFIG(): Record<string, any> { return _deps.config || require('./get-config'); }
 
 const { callMistralCodeGen } = require('./providers-codegen-mistral');
-const { callQwenCodeGen } = require('./providers-codegen-qwen');
-const { callDeepSeekCodeGen } = require('./providers-codegen-deepseek');
+const { callBazaarLinkCodeGenWithModel, getBazaarLinkModels } = require('./providers-codegen-bazaarlink');
 const { callOpenRouterCodeGenWithModel } = require('./providers-codegen-openrouter');
 const { log, logError } = require('./logger');
 const { safeArrayFrom } = require('./providers-base');
@@ -58,15 +57,22 @@ function withTimeout(signal: any, timeoutMs: number): AbortController {
 }
 
 /**
- * Discover available models and return the list of OpenRouter model slugs
- * plus which dedicated providers are available.
- * Returns { orModels, hasMistral, hasQwen, hasDeepSeek }.
+ * Discover available codegen models.
+ * Returns { orModels, blModels, hasMistral, hasBazaarLink }.
+ *
+ * BazaarLink replaces Qwen + DeepSeek for codegen.
+ * OpenRouter is kept for vision tribunal (not codegen).
  */
 async function discoverModels() {
   let modelDiscovery;
   try { modelDiscovery = require('./services-model-discovery-advanced'); } catch (e: any) { modelDiscovery = null; }
   if (!modelDiscovery) return null;
 
+  // BazaarLink models (codegen primary — 50 free req/day)
+  const blModels = getBazaarLinkModels();
+  const hasBazaarLink = !!getCONFIG().BAZAARLINK_API_KEY;
+
+  // OpenRouter models (kept as codegen fallback, primary for vision)
   const provider = getCONFIG().CODE_GEN_PROVIDERS?.find?.((p: any) => p.name === 'openrouter');
   let orModels: string[] = [];
   if (provider && getCONFIG().OPENROUTER_API_KEY) {
@@ -76,11 +82,12 @@ async function discoverModels() {
     } catch (e: any) { /* model discovery can fail under memory pressure */ }
   }
   if (orModels.length === 0) orModels = ['openrouter/free'];
+
   return {
     orModels,
+    blModels,
     hasMistral: !!getCONFIG().MISTRAL_CODE_API_KEY,
-    hasQwen: !!getCONFIG().QWEN_CODE_API_KEY,
-    hasDeepSeek: !!getCONFIG().DEEPSEEK_CODE_API_KEY,
+    hasBazaarLink,
   };
 }
 
@@ -94,11 +101,10 @@ async function generateCodeFixViaTribunal(investigationData: any, errorLogs: any
   if (!models) { log('model-discovery-advanced not available', 'WARN', 'codegen'); return null; }
 
   const totalModels = models.orModels.length
-    + (models.hasMistral ? 1 : 0)
-    + (models.hasQwen ? 1 : 0)
-    + (models.hasDeepSeek ? 1 : 0);
+    + models.blModels.length
+    + (models.hasMistral ? 1 : 0);
 
-  log(`\u{1f9e0} SUPER TRIBUNAL: Consulting ${totalModels} models (${models.orModels.length} via OpenRouter + Mistral + Qwen + DeepSeek)...`, 'INFO', 'codegen');
+  log(`\u{1f9e0} SUPER TRIBUNAL: Consulting ${totalModels} models (${models.blModels.length} via BazaarLink + ${models.orModels.length} via OpenRouter + Mistral)...`, 'INFO', 'codegen');
 
   const prompt = buildCodeGenPrompt(investigationData, errorLogs);
   const ctl = withTimeout(signal, DEFAULT_TRIBUNAL_TIMEOUT_MS);
@@ -117,6 +123,25 @@ async function generateCodeFixViaTribunal(investigationData: any, errorLogs: any
 async function _runFixConsensus(prompt: string, models: any, totalModels: number, signal: any) {
   const allPromises: Promise<any>[] = [];
 
+  // BazaarLink models (primary codegen provider)
+  if (models.hasBazaarLink) {
+    for (const modelSlug of models.blModels) {
+      allPromises.push(
+        callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug)
+          .then((result: any) => ({ provider: `BL/${modelSlug}`, fixes: validateFixArray(result) }))
+          .catch((err: any) => ({ provider: `BL/${modelSlug}`, fixes: [], error: String(err.message || err).substring(0, 200) }))
+      );
+    }
+  }
+  // Mistral (dedicated codegen)
+  if (models.hasMistral) {
+    allPromises.push(
+      callMistralCodeGen(prompt, signal)
+        .then((result: any) => ({ provider: 'Mistral', fixes: validateFixArray(result) }))
+        .catch((err: any) => ({ provider: 'Mistral', fixes: [], error: String(err.message || err).substring(0, 200) }))
+    );
+  }
+  // OpenRouter (fallback codegen)
   for (const modelSlug of models.orModels) {
     if (getCONFIG().OPENROUTER_API_KEY) {
       allPromises.push(
@@ -125,27 +150,6 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
           .catch((err: any) => ({ provider: `OR/${modelSlug}`, fixes: [], error: String(err.message || err).substring(0, 200) }))
       );
     }
-  }
-  if (models.hasMistral) {
-    allPromises.push(
-      callMistralCodeGen(prompt, signal)
-        .then((result: any) => ({ provider: 'Mistral', fixes: validateFixArray(result) }))
-        .catch((err: any) => ({ provider: 'Mistral', fixes: [], error: String(err.message || err).substring(0, 200) }))
-    );
-  }
-  if (models.hasQwen) {
-    allPromises.push(
-      callQwenCodeGen(prompt, signal)
-        .then((result: any) => ({ provider: 'Qwen', fixes: validateFixArray(result) }))
-        .catch((err: any) => ({ provider: 'Qwen', fixes: [], error: String(err.message || err).substring(0, 200) }))
-    );
-  }
-  if (models.hasDeepSeek) {
-    allPromises.push(
-      callDeepSeekCodeGen(prompt, signal)
-        .then((result: any) => ({ provider: 'DeepSeek', fixes: validateFixArray(result) }))
-        .catch((err: any) => ({ provider: 'DeepSeek', fixes: [], error: String(err.message || err).substring(0, 200) }))
-    );
   }
 
   if (allPromises.length === 0) {
@@ -225,9 +229,8 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
   if (!models) { log('model-discovery-advanced not available for raw consultation', 'WARN', 'codegen'); return null; }
 
   const totalModels = models.orModels.length
-    + (models.hasMistral ? 1 : 0)
-    + (models.hasQwen ? 1 : 0)
-    + (models.hasDeepSeek ? 1 : 0);
+    + models.blModels.length
+    + (models.hasMistral ? 1 : 0);
 
   log(`\u{1f9e0} TRIBUNAL RAW: Consulting ${totalModels} models for generic task...`, 'INFO', 'codegen');
 
@@ -251,15 +254,13 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
         _callRawProvider('Mistral', () => callMistralCodeGen(prompt, ctl.signal), ctl.signal)
       );
     }
-    if (models.hasQwen) {
-      allPromises.push(
-        _callRawProvider('Qwen', () => callQwenCodeGen(prompt, ctl.signal), ctl.signal)
-      );
-    }
-    if (models.hasDeepSeek) {
-      allPromises.push(
-        _callRawProvider('DeepSeek', () => callDeepSeekCodeGen(prompt, ctl.signal), ctl.signal)
-      );
+    // BazaarLink for raw consultation
+    if (models.hasBazaarLink) {
+      for (const modelSlug of models.blModels) {
+        allPromises.push(
+          _callRawBazaarLink(prompt, ctl.signal, modelSlug)
+        );
+      }
     }
 
     if (allPromises.length === 0) {
@@ -365,7 +366,24 @@ async function _callRawOr(prompt: string, signal: any, modelSlug: string, respon
 }
 
 /**
- * Call a dedicated provider (Mistral/Qwen/DeepSeek) for raw text.
+ * Call a BazaarLink model for raw text (not fix-validated).
+ */
+async function _callRawBazaarLink(prompt: string, signal: any, modelSlug: string) {
+  try {
+    const { callBazaarLinkCodeGenWithModel } = require('./providers-codegen-bazaarlink');
+    const result = await callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug);
+    if (!result) return null;
+    const raw = typeof result === 'string' ? result : JSON.stringify(result);
+    if (!raw || raw.trim().length === 0) return null;
+    return { provider: `BL/${modelSlug}`, raw };
+  } catch (err: any) {
+    log(`Tribunal raw BL/${modelSlug} failed: ${String(err.message || err).substring(0, 200)}`, 'DEBUG', 'codegen');
+    return null;
+  }
+}
+
+/**
+ * Call a dedicated provider (Mistral) for raw text.
  */
 async function _callRawProvider(name: string, callFn: () => Promise<any>, signal: any) {
   try {
