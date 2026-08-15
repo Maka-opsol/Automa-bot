@@ -73,6 +73,7 @@ function createDatabaseConnectionAt(dbPath: string) {
 function checkIntegrity() { 
   const log = getLog();
   const logError = getLogError();
+  if (!db) { log('Database integrity check skipped — database not initialized yet', 'WARN', 'database'); return false; }
   try {
     const result = db.pragma('integrity_check');
     if (result[0]?.integrity_check !== 'ok') throw new Error(`Integrity check failed: ${JSON.stringify(result)}`);
@@ -367,7 +368,8 @@ function vacuumIfNeeded() {
   try { const pageCount = db.pragma('page_count')[0]?.page_count || 0; const freelistCount = db.pragma('freelist_count')[0]?.freelist_count || 0; if (pageCount > 0 && (freelistCount / pageCount) > 0.1) { getLog()(`Running VACUUM (freelist: ${freelistCount}/${pageCount} pages)`, 'INFO', 'database'); db.prepare('VACUUM').run(); } } catch (err: any) { getLogError()('VACUUM check failed', err); }
 }
 
-function getDatabaseStats() { 
+function getDatabaseStats() {
+  if (!db) return null;
   try { const pageCount = db.pragma('page_count')[0]?.page_count || 0; const pageSize = db.pragma('page_size')[0]?.page_size || 4096; const freelistCount = db.pragma('freelist_count')[0]?.freelist_count || 0; return { totalSizeBytes: pageCount * pageSize, freePages: freelistCount, totalPages: pageCount, utilizationPercent: pageCount > 0 ? ((pageCount - freelistCount) / pageCount * 100).toFixed(1) : 0 }; } catch (err: any) { getLogError()('Failed to get database stats', err); return null; }
 }
 
