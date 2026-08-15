@@ -53,8 +53,8 @@ function logError(msg: string, err: Error) {
 }
 
 // ─── Fallback thresholds (used only if memory-mode unavailable) ───
-const FALLBACK_SOFT_THRESHOLD_MB = 350;
-const FALLBACK_HARD_THRESHOLD_MB = 400;
+const FALLBACK_SOFT_THRESHOLD_MB = 200;
+const FALLBACK_HARD_THRESHOLD_MB = 220;
 const CHECK_INTERVAL_MS = 10000;
 
 // ─── State ───
