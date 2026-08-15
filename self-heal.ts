@@ -18,6 +18,12 @@ const crypto = require('crypto');
 // Lazy accessors — DI-injected dep preferred; fallback require is safe here
 // because self-heal only runs mid-cycle (long after container init).
 function getCONFIG(): Record<string, any> { return _deps.config || require('./get-config'); }
+
+// Executive privileges: activated by inputting the EXECUTIVE_KEY on the dashboard.
+// Not just "set" — must be actively provided to activate.
+function isExecutiveMode(): boolean {
+  try { return !!require('./dashboard-server').isExecutivePrivilegesActive?.(); } catch { return false; }
+}
 function getMemoryMode(): any { return require('./memory-mode'); }
 function getGenerateCodeFixViaTribunal() { return _deps.codegenTribunal?.generateCodeFixViaTribunal || require('./providers-codegen-tribunal').generateCodeFixViaTribunal; }
 function getExecutePatchInSandbox() { return _deps.sandboxExecutor?.executePatchInSandbox || require('./sandbox-executor').executePatchInSandbox; }
@@ -757,18 +763,16 @@ async function performSelfHeal(options?: SelfHealOptions) {
     } catch {}
 
     // ─── EXECUTIVE MODE & ACCEPT_ANY_FIX ─────────────────────────────
-    // EXECUTIVE_KEY (env): Nuclear option — skips ALL safety gates (audit,
-    // canary, adversarial, validation, diff-min) and pushes directly to GitHub.
-    // Only goal: get the fix onto GitHub as fast as possible.
+    // EXECUTIVE_KEY: Nuclear option — must be INPUT on dashboard to activate.
+    // Skips ALL safety gates (audit, canary, adversarial, validation, diff-min)
+    // and pushes directly to GitHub. Only goal: get the fix onto GitHub ASAP.
     //
-    // SELF_HEAL_ACCEPT_ANY_FIX (env): Softer option — skips audit/consensus
-    // but keeps other safety nets (canary, validation, adversarial testing).
-    //
-    // Both are set via dashboard env vars (Render dashboard, .env, etc.)
-    const executiveMode = !!process.env.EXECUTIVE_KEY;
-    const acceptAnyFix = executiveMode || process.env.SELF_HEAL_ACCEPT_ANY_FIX === 'true';
+    // SELF_HEAL_ACCEPT_ANY_FIX (dashboard toggle): Softer option — skips
+    // audit/consensus but keeps other safety nets (canary, validation, adversarial).
+    const executiveMode = isExecutiveMode();
+    const acceptAnyFix = executiveMode || getCONFIG().SELF_HEAL_ACCEPT_ANY_FIX === true;
     if (executiveMode) {
-      log('EXECUTIVE_MODE ACTIVE — all safety gates bypassed, targeting fastest GitHub push', 'WARN', 'self-heal');
+      log('EXECUTIVE PRIVILEGES ACTIVE — all safety gates bypassed, targeting fastest GitHub push', 'WARN', 'self-heal');
     } else if (acceptAnyFix) {
       log('ACCEPT_ANY_FIX active — audit/consensus skipped, other safety nets retained', 'INFO', 'self-heal');
     }
@@ -1515,8 +1519,8 @@ let _lastPatchDay = new Date().toDateString();
 let _lastFailureTime = 0;
 
 function checkSelfHealSafety() { 
-  // EXECUTIVE_MODE: bypass all safety limits — the operator has taken responsibility.
-  if (process.env.EXECUTIVE_KEY) return true;
+  // EXECUTIVE PRIVILEGES: bypass all safety limits — the operator has taken responsibility.
+  if (isExecutiveMode()) return true;
   const today = new Date().toDateString();
   if (today !== _lastPatchDay) {
     _patchesAppliedToday = 0;
