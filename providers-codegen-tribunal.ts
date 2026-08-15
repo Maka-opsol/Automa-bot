@@ -8,7 +8,6 @@ const { callMistralCodeGen, parseCodegenResponse } = require('./providers-codege
 const { callBazaarLinkCodeGenWithModel, getBazaarLinkModels } = require('./providers-codegen-bazaarlink');
 const blLimiter = require('./bazaarlink-rate-limiter');
 const { log, logError } = require('./logger');
-const { safeArrayFrom } = require('./providers-base');
 
 // ─── IMPORTANT: Provider Scope ─────────────────────────────────────────
 // This tribunal is for CODE GENERATION ONLY.
@@ -97,7 +96,8 @@ async function generateCodeFixViaTribunal(investigationData: any, errorLogs: any
   const totalModels = models.blModels.length
     + (models.hasMistral ? 1 : 0);
 
-  log(`\u{1f9e0} CODEGEN TRIBUNAL: Consulting ${totalModels} models (${models.blModels.length} via BazaarLink${models.hasMistral ? ' + Mistral' : ''})...`, 'INFO', 'codegen');
+  const blModelList = models.blModels.join(', ');
+  log(`\u{1f9e0} CODEGEN TRIBUNAL: Consulting ${totalModels} models — BazaarLink [${blModelList}]${models.hasMistral ? ' + Mistral' : ''}...`, 'INFO', 'codegen');
 
   const prompt = buildCodeGenPrompt(investigationData, errorLogs);
   const ctl = withTimeout(signal, DEFAULT_TRIBUNAL_TIMEOUT_MS);
@@ -126,6 +126,7 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
       blSkipped = true;
     } else {
       for (const modelSlug of models.blModels) {
+        log(`Tribunal: spawning BL/${modelSlug}`, 'DEBUG', 'codegen');
         allPromises.push(
           callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug)
             .then((result: any) => {
@@ -210,7 +211,7 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
       entry.providers.push(resp.provider);
     }
   }
-  const sortedVotes = safeArrayFrom(fixVotes.values()).sort((a, b) => b.count - a.count);
+  const sortedVotes = [...fixVotes.values()].sort((a, b) => b.count - a.count);
   const best = sortedVotes[0];
 
   if (best && best.count > 1) {
@@ -264,6 +265,7 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
     // Check budget BEFORE spawning — skip if exhausted.
     if (models.hasBazaarLink && !blLimiter.isExhausted()) {
       for (const modelSlug of models.blModels) {
+        log(`Tribunal raw: spawning BL/${modelSlug}`, 'DEBUG', 'codegen');
         allPromises.push(
           _callRawBazaarLink(prompt, ctl.signal, modelSlug)
         );
