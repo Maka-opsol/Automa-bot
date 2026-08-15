@@ -107,8 +107,15 @@ function deriveKey(passphrase: string, salt: Buffer): Buffer {
   }
   const key: Buffer = crypto.pbkdf2Sync(passphrase, salt, PBKDF2_ITERATIONS, KEY_LENGTH, PBKDF2_DIGEST);
   if (keyDerivationCache.size >= KEY_CACHE_MAX) {
-    const oldest: [string, KeyDerivationCacheEntry] = [...keyDerivationCache.entries()].sort((a: [string, KeyDerivationCacheEntry], b: [string, KeyDerivationCacheEntry]) => a[1].timestamp - b[1].timestamp)[0];
-    keyDerivationCache.delete(oldest[0]);
+    // OOM-safe: avoid spread on Map iterator (can fail under memory pressure)
+    let oldestKey: string | null = null;
+    let oldestTs = Infinity;
+    try {
+      for (const [k, v] of keyDerivationCache) {
+        if (v.timestamp < oldestTs) { oldestTs = v.timestamp; oldestKey = k; }
+      }
+    } catch { /* corrupted iterator — evict first key */ }
+    if (oldestKey) keyDerivationCache.delete(oldestKey);
   }
   keyDerivationCache.set(cacheKey, { key, timestamp: Date.now() });
   return key;
@@ -274,6 +281,7 @@ function isValidRemoteOverride(key: string, value: unknown): boolean {
     'DB_PATH', 'AUTH_STATE_PATH', 'USER_DATA_DIR', 'LOG_DIR',
     'SLACK_WEBHOOK_URL', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID',
     'MISTRAL_CODE_API_KEY', 'QWEN_CODE_API_KEY', 'DEEPSEEK_CODE_API_KEY',
+    'BAZAARLINK_API_KEY',
     'OPENROUTER_API_KEY', 'GITHUB_API_KEY', 'GROQ_API_KEY', 'GEMINI_API_KEY',
     'CF_API_KEY', 'CF_ACCOUNT_ID', 'NVIDIA_API_KEY', 'CEREBRAS_API_KEY',
     'CAPTCHA_API_KEY', 'BRAIN_API_KEY', 'REMOTE_BRAIN_URL',
@@ -463,13 +471,15 @@ const env = envalid.cleanEnv(process.env, {
   MISTRAL_CODE_API_KEY: str({ default: '' }),
   QWEN_CODE_API_KEY: str({ default: '' }),
   DEEPSEEK_CODE_API_KEY: str({ default: '' }),
+  BAZAARLINK_API_KEY: str({ default: '' }),
   OPENROUTER_API_KEY: str({ default: '' }),
   CODE_GEN_MODEL_MISTRAL: str({ default: 'codestral-latest' }),
   CODE_GEN_MODEL_QWEN: str({ default: 'qwen-coder-plus' }),
   CODE_GEN_MODEL_DEEPSEEK: str({ default: 'deepseek-coder' }),
   CODE_GEN_MODEL_OPENROUTER: str({ default: 'openrouter/free' }),
-  CODE_GEN_PROVIDERS: json({ default: [{ name: 'mistral', envKey: 'MISTRAL_CODE_API_KEY', endpoint: 'https://api.mistral.ai/v1' }, { name: 'qwen', envKey: 'QWEN_CODE_API_KEY', endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1' }, { name: 'deepseek', envKey: 'DEEPSEEK_CODE_API_KEY', endpoint: 'https://api.deepseek.com/v1' }, { name: 'openrouter', envKey: 'OPENROUTER_API_KEY', endpoint: 'https://openrouter.ai/api/v1' }] }),
-  CODE_GEN_FALLBACK_MODELS: json({ default: { mistral: 'codestral-latest', qwen: 'qwen-coder-plus', deepseek: 'deepseek-coder', openrouter: 'openrouter/free' } }),
+  CODE_GEN_MODEL_BAZAARLINK: str({ default: 'auto:free' }),
+  CODE_GEN_PROVIDERS: json({ default: [{ name: 'mistral', envKey: 'MISTRAL_CODE_API_KEY', endpoint: 'https://api.mistral.ai/v1' }, { name: 'bazaarlink', envKey: 'BAZAARLINK_API_KEY', endpoint: 'https://api.bazaarlink.ai/v1' }, { name: 'openrouter', envKey: 'OPENROUTER_API_KEY', endpoint: 'https://openrouter.ai/api/v1' }] }),
+  CODE_GEN_FALLBACK_MODELS: json({ default: { mistral: 'codestral-latest', bazaarlink: 'auto:free', openrouter: 'openrouter/free' } }),
   CODE_GEN_CONSENSUS_THRESHOLD: num({ default: 5 }),
   AUTO_INSTALL_DEPENDENCIES: bool({ default: false }),
   SANDBOX_MODE: bool({ default: false }),
@@ -717,11 +727,13 @@ const _configStore: Record<string, any> = {
   MISTRAL_CODE_API_KEY: env.MISTRAL_CODE_API_KEY || null,
   QWEN_CODE_API_KEY: env.QWEN_CODE_API_KEY || null,
   DEEPSEEK_CODE_API_KEY: env.DEEPSEEK_CODE_API_KEY || null,
+  BAZAARLINK_API_KEY: env.BAZAARLINK_API_KEY || null,
   OPENROUTER_API_KEY: env.OPENROUTER_API_KEY || null,
   CODE_GEN_MODEL_MISTRAL: env.CODE_GEN_MODEL_MISTRAL,
   CODE_GEN_MODEL_QWEN: env.CODE_GEN_MODEL_QWEN,
   CODE_GEN_MODEL_DEEPSEEK: env.CODE_GEN_MODEL_DEEPSEEK,
   CODE_GEN_MODEL_OPENROUTER: env.CODE_GEN_MODEL_OPENROUTER,
+  CODE_GEN_MODEL_BAZAARLINK: env.CODE_GEN_MODEL_BAZAARLINK,
   CODE_GEN_PROVIDERS: env.CODE_GEN_PROVIDERS,
   CODE_GEN_FALLBACK_MODELS: env.CODE_GEN_FALLBACK_MODELS,
   CODE_GEN_CONSENSUS_THRESHOLD: env.CODE_GEN_CONSENSUS_THRESHOLD,
@@ -885,7 +897,7 @@ function validateConfig(): void {
       console.warn('\u26A0\uFE0F DEGRADED: No vision API keys found. Vision-dependent features disabled.');
       credsOk = false;
     }
-    const codeKeys: string[] = ['MISTRAL_CODE_API_KEY', 'QWEN_CODE_API_KEY', 'DEEPSEEK_CODE_API_KEY', 'OPENROUTER_API_KEY'];
+    const codeKeys: string[] = ['MISTRAL_CODE_API_KEY', 'QWEN_CODE_API_KEY', 'DEEPSEEK_CODE_API_KEY', 'BAZAARLINK_API_KEY', 'OPENROUTER_API_KEY'];
     const hasCodeKey: boolean = codeKeys.some(k => process.env[k] && process.env[k].length > 10);
     if (!hasCodeKey) {
       console.warn('\u26A0\uFE0F No code-generation API keys found. Self-heal will be limited.');
