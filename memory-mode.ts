@@ -8,12 +8,12 @@
 //   FULL POWER:         All subsystems enabled, normal GC, full features.
 //                       Memory thresholds: warn=350MB, restart=400MB
 //
-//   MEMORY PROTECTION:  Heavy subsystems disabled, aggressive GC (30s),
+//   MEMORY PROTECTION:  Heavy subsystems disabled, aggressive GC (15s),
 //                       browser closed, caches purged, tighter thresholds.
-//                       Memory thresholds: warn=250MB, restart=280MB
+//                       Memory thresholds: warn=200MB, restart=220MB
 //
 // Auto-switching rules:
-//   → Memory Protection: when heap > 320MB or RSS > 440MB or wasRecentlyOOMKilled()
+//   → Memory Protection: when heap > 250MB or RSS > 380MB or wasRecentlyOOMKilled()
 //   → Full Power:       ONLY after a verified self-heal fix is promoted
 //                       (via promoteAfterSelfHealFix). NEVER auto-promotes.
 //                       Manual dashboard switch is still available for testing.
@@ -51,18 +51,18 @@ const MODE_THRESHOLDS = {
     warningStreak: 2,
   },
   memory_protection: {
-    warnHeapMB: 250,
-    restartHeapMB: 280,
-    rssHardLimitMB: 430,
-    gcIntervalMs: 30 * 1000,     // v3: was 60s — now 30s for more aggressive GC
-    monitorIntervalMs: 10 * 1000,  // v3: was 15s — now 10s for faster detection
+    warnHeapMB: 200,
+    restartHeapMB: 220,
+    rssHardLimitMB: 380,
+    gcIntervalMs: 15 * 1000,     // v7: was 30s — now 15s for more aggressive GC
+    monitorIntervalMs: 8 * 1000,   // v7: was 10s — now 8s for faster detection
     warningStreak: 1,              // v3: was 2 — now react on FIRST warning
   },
 };
 
 // Auto-downgrade triggers (switch to memory_protection)
-const AUTO_DOWNGRADE_HEAP_MB = 320;
-const AUTO_DOWNGRADE_RSS_MB = 440;
+const AUTO_DOWNGRADE_HEAP_MB = 250;
+const AUTO_DOWNGRADE_RSS_MB = 380;
 
 // v4: Auto-promote REMOVED. Full power is only granted after a verified
 // self-heal fix is promoted. This prevents the bot from eagerly switching
@@ -80,7 +80,7 @@ const AUTO_DOWNGRADE_RSS_MB = 440;
 //   'self_heal_granted_ts'  — when full power was granted for this session
 const CALIBRATION_KEY_SELF_HEAL_SESSION = 'self_heal_session';
 const CALIBRATION_KEY_SELF_HEAL_GRANTED_TS = 'self_heal_granted_ts';
-const SELF_HEAL_SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 min max per session
+const SELF_HEAL_SESSION_TIMEOUT_MS = 15 * 60 * 1000; // 15 min max per session (v7: was 30min)
 let _selfHealSessionTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Modules to disable in memory_protection mode
@@ -88,10 +88,13 @@ const HEAVY_SELF_HEAL_KEYS = [
   'BLACKBOX_FULL_ENABLED', 'ENABLE_EXPLORATION_PASS', 'ENABLE_ADAPTIVE_PERFORMANCE',
   'PROMPT_EVOLUTION_ENABLED', 'REGRESSION_BANK_ENABLED', 'PATCH_MEMORY_ENABLED',
   'HEAL_REWARD_TRACKER_ENABLED', 'SELF_HEAL_TIMELINE_ENABLED', 'EXTENDED_CHECKPOINT_ENABLED',
-  'CANARY_ROLLOUT_ENABLED', 'DIFF_MINIMIZER_ENABLED',
+  'CANARY_ROLLOUT_ENABLED', 'DIFF_MINIMIZER_ENABLED', 'ADVERSARIAL_TESTER_ENABLED',
+  'CLEAN_ROOM_TEST_ENABLED', 'SUBSYSTEM_CB_MESH_ENABLED', 'CONFIG_RECONCILER_ENABLED',
+  'DEPENDENCY_HEALER_ENABLED', 'DB_HEALER_ENABLED', 'STATE_RECOVERY_ENABLED',
+  'ENABLE_BLACKBOX',
 ];
 const HEAVY_RESILIENCE_KEYS = [
-  'ENABLE_BLACKBOX', 'POLICY_ACTION_VALIDATOR_ENABLED',
+  'POLICY_ACTION_VALIDATOR_ENABLED',
 ];
 
 let _currentMode: 'full_power' | 'memory_protection' = 'full_power';
