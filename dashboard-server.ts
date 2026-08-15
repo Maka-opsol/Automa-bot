@@ -125,6 +125,31 @@ function _timingSafeEqual(a: any, b: any) {
 const DASHBOARD_DIR = path.join(PROJECT_ROOT, 'public');
 const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
 
+// ── Executive Privileges ──────────────────────────────────────────
+// Runtime flag: activated by providing the correct EXECUTIVE_KEY.
+// More executive privileges can be added to this object later.
+// The EXECUTIVE_KEY env var stores the secret; it must be INPUT to activate.
+let _executivePrivilegesActive = false;
+let _executiveActivatedAt: number | null = null;
+
+function isExecutivePrivilegesActive(): boolean {
+  return _executivePrivilegesActive;
+}
+
+function activateExecutivePrivileges(providedKey: string): boolean {
+  const storedKey = process.env.EXECUTIVE_KEY || '';
+  if (!storedKey) return false;
+  if (!_timingSafeEqual(providedKey, storedKey)) return false;
+  _executivePrivilegesActive = true;
+  _executiveActivatedAt = Date.now();
+  return true;
+}
+
+function deactivateExecutivePrivileges(): void {
+  _executivePrivilegesActive = false;
+  _executiveActivatedAt = null;
+}
+
 // ── Auto-capture throttle (max once per 30s) ──
 let _lastAutoCaptureTs = 0;
 const AUTO_CAPTURE_INTERVAL_MS = 30 * 1000;
@@ -284,6 +309,8 @@ const SAFE_CONFIG_KEYS = new Set([
   'HEADLESS', 'AUTO_INSTALL_DEPENDENCIES',
   // Mode & feature flags (safe to toggle from dashboard)
   'DEGRADED_MODE', 'SELF_HEAL_ENABLED', 'ENABLE_STATUS_SERVER',
+  'SELF_HEAL_ACCEPT_ANY_FIX',
+
   // Human emulation
   'HUMAN_MOUSE_JITTER_PX', 'HUMAN_MOUSE_STEPS',
   // Browser contexts
@@ -359,6 +386,7 @@ const CONFIG_KEY_META: Record<string, { group: string; label: string; type: 'num
   ENABLE_BLACKBOX:              { group: 'Self-Heal', label: 'Blackbox', type: 'boolean', desc: 'Enable blackbox testing' },
   ENABLE_EXPLORATION_PASS:      { group: 'Self-Heal', label: 'Exploration Pass', type: 'boolean', desc: 'Periodic UI exploration' },
   ENABLE_ADAPTIVE_PERFORMANCE:  { group: 'Self-Heal', label: 'Adaptive Performance', type: 'boolean', desc: 'Adjust timing dynamically' },
+  SELF_HEAL_ACCEPT_ANY_FIX: { group: 'Self-Heal', label: 'Accept Any Fix', type: 'boolean', desc: 'Skip audit/consensus — apply any fix the tribunal returns' },
   // Logging
   LOG_LEVEL:                    { group: 'Logging', label: 'Log Level', type: 'string', desc: 'debug, info, warn, error' },
   LOG_MAX_SIZE_MB:             { group: 'Logging', label: 'Max Log Size (MB)', type: 'number', desc: 'Max size per log file' },
@@ -796,6 +824,24 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           timestamp: Date.now(),
           actionCache: (() => { try { return require('./services-action-cache').getStats(); } catch { return null; } })(),
           workShifts: (() => { try { const ws = require('./services-work-shifts'); const s = ws.getShift(); return { current: s.current, reason: s.reason, fullCycle: ws.shouldRunFullCycle() }; } catch { return null; } })(),
+          // Self-heal control status
+          selfHealControl: (() => {
+            try {
+              const blLimiter = require('./bazaarlink-rate-limiter');
+              const blStatus = blLimiter.getStatus ? blLimiter.getStatus() : null;
+              const memoryMode = require('./memory-mode');
+              return {
+                executiveMode: isExecutivePrivilegesActive(),
+                executiveConfigured: !!process.env.EXECUTIVE_KEY,
+                executiveActivatedAt: _executiveActivatedAt,
+                acceptAnyFix: (() => { try { return require('./get-config').SELF_HEAL_ACCEPT_ANY_FIX === true; } catch { return false; } })(),
+                selfHealEnabled: (() => { try { return require('./get-config').SELF_HEAL_ENABLED; } catch { return true; } })(),
+                sessionActive: memoryMode.isSelfHealSessionActive?.() ?? false,
+                currentMode: memoryMode.getMode?.() ?? 'unknown',
+                bazaarlinkBudget: blStatus ? { used: blStatus.used, remaining: blStatus.remaining, dailyLimit: blStatus.dailyLimit, date: blStatus.date } : null,
+              };
+            } catch { return { executiveMode: false, executiveConfigured: false, executiveActivatedAt: null, acceptAnyFix: false, selfHealEnabled: true, sessionActive: false, currentMode: 'unknown', bazaarlinkBudget: null }; }
+          })(),
         });
       } catch (e: any) {
         jsonRes(res, { error: e.message, timestamp: Date.now() }, 500);
@@ -1129,6 +1175,49 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
+  // ── Executive Privileges: activate / deactivate / status ──
+  if (pathname === '/api/executive/activate' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          const key = data.key;
+          if (!key || typeof key !== 'string') {
+            jsonRes(res, { error: 'Missing or invalid "key" field' }, 400); return;
+          }
+          if (activateExecutivePrivileges(key)) {
+            log('EXECUTIVE PRIVILEGES ACTIVATED via dashboard', 'WARN', 'dashboard');
+            jsonRes(res, { success: true, active: true, activatedAt: _executiveActivatedAt });
+          } else {
+            log('Failed executive activation attempt (wrong key or no EXECUTIVE_KEY set)', 'WARN', 'dashboard');
+            jsonRes(res, { error: 'Invalid key or EXECUTIVE_KEY not configured' }, 403);
+          }
+        } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
+      });
+    });
+    return true;
+  }
+
+  if (pathname === '/api/executive/deactivate' && req.method === 'POST') {
+    authWrap(() => {
+      deactivateExecutivePrivileges();
+      log('Executive privileges deactivated via dashboard', 'INFO', 'dashboard');
+      jsonRes(res, { success: true, active: false });
+    });
+    return true;
+  }
+
+  if (pathname === '/api/executive/status' && req.method === 'GET') {
+    authWrap(() => {
+      jsonRes(res, {
+        active: _executivePrivilegesActive,
+        configured: !!process.env.EXECUTIVE_KEY,
+        activatedAt: _executiveActivatedAt,
+      });
+    });
+    return true;
+  }
+
   // ── Generic command endpoint (legacy compat) ──
   if (pathname === '/api/command' && req.method === 'POST') {
     authWrap(() => {
@@ -1445,6 +1534,27 @@ function getDashboardHTML(): string {
     </div>
   </div>
 
+  <!-- Self-Heal Control -->
+  <div class="card">
+    <div class="card-header">Self-Heal Control</div>
+    <div class="card-body">
+      <div class="stat-row"><span class="stat-label">Executive Privileges</span><span id="shExecutive" class="stat-value">-</span></div>
+      <div id="execControls" style="margin:6px 0;display:flex;gap:6px;align-items:center;">
+        <input type="password" id="execKeyInput" placeholder="Enter EXECUTIVE_KEY..." style="flex:1;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg2);color:var(--text);font-size:12px;">
+        <button class="btn danger" id="execActivateBtn" onclick="execActivate()">Activate</button>
+        <button class="btn" id="execDeactivateBtn" onclick="execDeactivate()" style="display:none">Deactivate</button>
+      </div>
+      <div class="stat-row"><span class="stat-label">Accept Any Fix</span><span id="shAcceptAny" class="stat-value">-</span></div>
+      <div class="stat-row"><span class="stat-label">Self-Heal Session</span><span id="shSession" class="stat-value">-</span></div>
+      <div class="stat-row"><span class="stat-label">Memory Mode</span><span id="shMemoryMode" class="stat-value">-</span></div>
+      <div class="stat-row"><span class="stat-label">BazaarLink Budget</span><span id="shBLBudget" class="stat-value">-</span></div>
+      <div style="margin-top:8px;font-size:11px;color:var(--text2);line-height:1.4">
+        <b>Executive Privileges</b>: input the EXECUTIVE_KEY to bypass ALL safety gates (audit, canary, validation, limits) and push fixes directly to GitHub. More privileges will be added later.<br>
+        <b>Accept Any Fix</b> (toggle in Configuration): skip audit/consensus only, keep other safety nets.
+      </div>
+    </div>
+  </div>
+
   <!-- State Control -->
   <div class="card">
     <div class="card-header">State Control</div>
@@ -1656,6 +1766,29 @@ async function rollback() {
   if (!confirm('Rollback to previous version?')) return;
   const r = await api('/api/gitops/rollback', { method: 'POST' });
   toast(r?.success ? 'Rollback initiated' : 'Rollback failed', r?.success ? 'success' : 'error');
+}
+
+// ── Executive Privileges ──
+async function execActivate() {
+  const input = document.getElementById('execKeyInput');
+  const key = input?.value?.trim();
+  if (!key) { toast('Enter the EXECUTIVE_KEY', 'error'); return; }
+  if (!confirm('ACTIVATE EXECUTIVE PRIVILEGES?\nThis will bypass ALL safety gates and push fixes directly to GitHub.')) return;
+  const r = await api('/api/executive/activate', { method: 'POST', body: JSON.stringify({ key }) });
+  if (r?.success) {
+    toast('EXECUTIVE PRIVILEGES ACTIVATED', 'warn');
+    input.value = '';
+    refreshAll();
+  } else {
+    toast(r?.error || 'Activation failed', 'error');
+  }
+}
+async function execDeactivate() {
+  const r = await api('/api/executive/deactivate', { method: 'POST' });
+  if (r?.success) {
+    toast('Executive privileges deactivated', 'success');
+    refreshAll();
+  }
 }
 
 // ── State ──
@@ -1923,6 +2056,46 @@ async function refreshAll() {
         return '<div class="provider-row"><span class="provider-dot ' + cls + '"></span><span style="flex:1">' + p.name + '</span><span class="stat-value">' + (p.healthScore||0) + '%</span></div>';
       }).join('');
     } else { pList.innerHTML = '<div class="empty">No providers</div>'; }
+
+    // Self-Heal Control
+    const shc = full.selfHealControl;
+    if (shc) {
+      const exEl = document.getElementById('shExecutive');
+      const exDeactBtn = document.getElementById('execDeactivateBtn');
+      const exActBtn = document.getElementById('execActivateBtn');
+      const exInput = document.getElementById('execKeyInput');
+      if (shc.executiveMode) {
+        exEl.textContent = 'ACTIVE'; exEl.className = 'stat-value red';
+        exDeactBtn.style.display = '';
+        exActBtn.style.display = 'none';
+        exInput.style.display = 'none';
+      } else if (shc.executiveConfigured) {
+        exEl.textContent = 'configured (inactive)'; exEl.className = 'stat-value';
+        exDeactBtn.style.display = 'none';
+        exActBtn.style.display = '';
+        exInput.style.display = '';
+      } else {
+        exEl.textContent = 'not configured'; exEl.className = 'stat-value';
+        exDeactBtn.style.display = 'none';
+        exActBtn.style.display = 'none';
+        exInput.style.display = 'none';
+      }
+      const aaEl = document.getElementById('shAcceptAny');
+      if (shc.acceptAnyFix) { aaEl.textContent = 'ON'; aaEl.className = 'stat-value orange'; }
+      else { aaEl.textContent = 'off'; aaEl.className = 'stat-value'; }
+      const ssEl = document.getElementById('shSession');
+      if (shc.sessionActive) { ssEl.textContent = 'ACTIVE'; ssEl.className = 'stat-value yellow'; }
+      else { ssEl.textContent = 'idle'; ssEl.className = 'stat-value green'; }
+      const mmEl = document.getElementById('shMemoryMode');
+      mmEl.textContent = shc.currentMode || '-';
+      const blEl = document.getElementById('shBLBudget');
+      if (shc.bazaarlinkBudget) {
+        const bl = shc.bazaarlinkBudget;
+        const pct = bl.dailyLimit > 0 ? Math.round((bl.used / bl.dailyLimit) * 100) : 0;
+        const blCls = bl.remaining <= 5 ? 'red' : bl.remaining <= 15 ? 'orange' : 'green';
+        blEl.innerHTML = '<span class="' + blCls + '">' + bl.used + '/' + bl.dailyLimit + '</span> (' + bl.remaining + ' remaining, ' + pct + '% used)';
+      } else { blEl.textContent = 'unavailable'; }
+    }
   }
 
   // State
@@ -1978,4 +2151,7 @@ module.exports = {
   setLatestScreenshot,
   _getDashboardHTML: getDashboardHTML,
   _injectDependencies,
+  isExecutivePrivilegesActive,
+  activateExecutivePrivileges,
+  deactivateExecutivePrivileges,
 };
