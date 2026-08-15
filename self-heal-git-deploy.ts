@@ -41,6 +41,11 @@ function getInsertSelfHealEvent() { return _deps.database?.insertSelfHealEvent; 
 
 function getCONFIG(): Record<string, any> { return _deps.config || require('./get-config'); }
 
+// Executive privileges: activated by inputting the EXECUTIVE_KEY on the dashboard.
+function isExecutiveMode(): boolean {
+  try { return !!require('./dashboard-server').isExecutivePrivilegesActive?.(); } catch { return false; }
+}
+
 // ─── Configuration ─────────────────────────────────────────────────────────
 
 const SELF_DEPLOY_DAILY_MAX = 3;
@@ -410,8 +415,8 @@ async function rollbackBranch(branch: string, reason: string): Promise<boolean> 
  * Check if a file is allowed to be deployed to GitHub.
  */
 function isDeployAllowed(filePath: string): boolean {
-  // EXECUTIVE_MODE: allow ALL files to be deployed.
-  if (process.env.EXECUTIVE_KEY) return true;
+  // EXECUTIVE PRIVILEGES: allow ALL files to be deployed.
+  if (isExecutiveMode()) return true;
   return ALLOWED_DEPLOY_PREFIXES.some(prefix => filePath.startsWith(prefix));
 }
 
@@ -419,8 +424,8 @@ function isDeployAllowed(filePath: string): boolean {
  * Check deploy safety (rate limits, cooldowns).
  */
 function checkDeploySafety(): boolean {
-  // EXECUTIVE_MODE: bypass daily limits and cooldowns entirely.
-  if (process.env.EXECUTIVE_KEY) return true;
+  // EXECUTIVE PRIVILEGES: bypass daily limits and cooldowns entirely.
+  if (isExecutiveMode()) return true;
   const today = new Date().toDateString();
   if (today !== _lastDeployDay) {
     _deploysToday = 0;
@@ -1411,18 +1416,18 @@ function init(): void {
   recoverWatchdogOnBoot();
 
   const config = getCONFIG();
-  const executiveMode = !!process.env.EXECUTIVE_KEY;
+  const executiveMode = isExecutiveMode();
   const enabled = executiveMode
     || config.SELF_DEPLOY_ENABLED === true
     || process.env.SELF_DEPLOY_ENABLED === 'true';
 
   if (!enabled) {
-    log('Git deploy module DISABLED (SELF_DEPLOY_ENABLED not set, no EXECUTIVE_KEY)', 'INFO', 'self-heal-git-deploy');
+    log('Git deploy module DISABLED (SELF_DEPLOY_ENABLED not set, executive privileges not active)', 'INFO', 'self-heal-git-deploy');
     return;
   }
 
   if (executiveMode) {
-    log('EXECUTIVE_MODE: git deploy module enabled — bypassing daily limits and cooldowns', 'WARN', 'self-heal-git-deploy');
+    log('EXECUTIVE PRIVILEGES: git deploy module enabled — bypassing daily limits and cooldowns', 'WARN', 'self-heal-git-deploy');
   }
 
   const hasGithub = !!(process.env.GITHUB_TOKEN && process.env.GITHUB_REPO);
