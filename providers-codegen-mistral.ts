@@ -5,6 +5,7 @@ function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function getCONFIG(): Record<string, any> { return _deps.config || require('./get-config'); }
 
 const { fetchWithTimeout, sanitizeErrorText } = require('./providers-base');
+const _mistralLog = () => { try { return require('./logger').log; } catch { return console.log; } };
 
 /**
  * Parse a codegen response from Mistral.
@@ -103,7 +104,21 @@ async function callMistralCodeGen(prompt: any, signal: any) {
   const data = await response.json();
   const raw = data.choices?.[0]?.message?.content;
   if (!raw) throw new Error('Mistral empty response');
-  return parseCodegenResponse(raw);
+
+  // Debug: log raw response before parsing (same pattern as BazaarLink provider)
+  try {
+    _mistralLog()(`Mistral raw response (${raw.length} chars): ${raw.substring(0, 200).replace(/\n/g, ' ')}`, 'DEBUG', 'mistral-raw');
+  } catch {}
+
+  const parsed = parseCodegenResponse(raw);
+  if (!parsed) {
+    try { _mistralLog()('Mistral: parseCodegenResponse returned null', 'WARN', 'codegen'); } catch {}
+  } else if (Array.isArray(parsed)) {
+    try { _mistralLog()(`Mistral: parseCodegenResponse returned array with ${parsed.length} item(s)`, 'DEBUG', 'codegen'); } catch {}
+  } else {
+    try { _mistralLog()(`Mistral: parseCodegenResponse returned non-array: ${typeof parsed}`, 'DEBUG', 'codegen'); } catch {}
+  }
+  return parsed;
 }
 
 module.exports = { callMistralCodeGen, parseCodegenResponse, _injectDependencies };
