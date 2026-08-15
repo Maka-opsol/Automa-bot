@@ -19,8 +19,10 @@ function _getLimiter() {
   return _limiter;
 }
 
-// Default free models (provider-qualified format required by BazaarLink)
+// ⚠️ DO NOT ALTER THESE MODEL NAMES WITHOUT EXPLICIT USER PERMISSION ⚠️
+// 'auto:free' is a valid BazaarLink model that auto-selects the best free model.
 const DEFAULT_MODELS = [
+  'auto:free',
   'qwen/qwen3.7-flash',
   'deepseek/deepseek-v4-flash',
 ];
@@ -70,6 +72,12 @@ async function callBazaarLinkCodeGenWithModel(prompt: any, signal: any, modelSlu
   const raw = data.choices?.[0]?.message?.content;
   if (!raw) throw new Error(`BazaarLink ${modelSlug} empty response`);
 
+  // Debug log: first 200 chars of raw response (helps diagnose parse failures)
+  try {
+    const { log } = require('./logger');
+    log(`BL/${modelSlug} raw response (${raw.length} chars): ${raw.substring(0, 200).replace(/\n/g, ' ')}`, 'DEBUG', 'bl-raw');
+  } catch {}
+
   // Record usage after successful call
   _getLimiter().recordUsage();
 
@@ -88,8 +96,7 @@ async function callBazaarLinkCodeGen(prompt: any, signal: any) {
 
 /**
  * Get the list of BazaarLink models to try in the codegen tribunal.
- * Always puts auto:free first (best free model auto-selected), then
- * specific free models as fallbacks.
+ * ⚠️ DO NOT ALTER MODEL NAMES WITHOUT EXPLICIT USER PERMISSION ⚠️
  */
 function getBazaarLinkModels(): string[] {
   const configModel = getCONFIG().CODE_GEN_MODEL_BAZAARLINK;
