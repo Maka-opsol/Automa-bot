@@ -6,6 +6,7 @@ function getCONFIG(): Record<string, any> { return _deps.config || require('./ge
 
 const { callMistralCodeGen, parseCodegenResponse } = require('./providers-codegen-mistral');
 const { callBazaarLinkCodeGenWithModel, getBazaarLinkModels } = require('./providers-codegen-bazaarlink');
+const blLimiter = require('./bazaarlink-rate-limiter');
 const { log, logError } = require('./logger');
 const { safeArrayFrom } = require('./providers-base');
 
@@ -114,32 +115,50 @@ async function generateCodeFixViaTribunal(investigationData: any, errorLogs: any
  */
 async function _runFixConsensus(prompt: string, models: any, totalModels: number, signal: any) {
   const allPromises: Promise<any>[] = [];
+  let blSkipped = false;
 
   // BazaarLink models (PRIMARY codegen provider)
+  // CHECK BUDGET BEFORE spawning API calls — if exhausted, skip entirely
+  // to avoid burning retry attempts on guaranteed failures.
   if (models.hasBazaarLink) {
-    for (const modelSlug of models.blModels) {
-      allPromises.push(
-        callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug)
-          .then((result: any) => {
-            // Debug: log what BazaarLink actually returned
-            if (!result) {
-              log(`BL/${modelSlug}: parseCodegenResponse returned null`, 'WARN', 'codegen');
-            } else if (Array.isArray(result)) {
-              log(`BL/${modelSlug}: got ${result.length} raw fix(es) from parser`, 'DEBUG', 'codegen');
-            } else {
-              log(`BL/${modelSlug}: got non-array result: ${typeof result}`, 'DEBUG', 'codegen');
-            }
-            return { provider: `BL/${modelSlug}`, fixes: validateFixArray(result) };
-          })
-          .catch((err: any) => ({ provider: `BL/${modelSlug}`, fixes: [], error: String(err.message || err).substring(0, 200) }))
-      );
+    if (blLimiter.isExhausted()) {
+      log('BazaarLink budget exhausted — skipping BazaarLink calls this round', 'WARN', 'codegen');
+      blSkipped = true;
+    } else {
+      for (const modelSlug of models.blModels) {
+        allPromises.push(
+          callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug)
+            .then((result: any) => {
+              // Debug: log what BazaarLink actually returned
+              if (!result) {
+                log(`BL/${modelSlug}: parseCodegenResponse returned null`, 'WARN', 'codegen');
+              } else if (Array.isArray(result)) {
+                log(`BL/${modelSlug}: got ${result.length} raw fix(es) from parser`, 'DEBUG', 'codegen');
+              } else {
+                log(`BL/${modelSlug}: got non-array result: ${typeof result}`, 'DEBUG', 'codegen');
+              }
+              return { provider: `BL/${modelSlug}`, fixes: validateFixArray(result) };
+            })
+            .catch((err: any) => ({ provider: `BL/${modelSlug}`, fixes: [], error: String(err.message || err).substring(0, 200) }))
+        );
+      }
     }
   }
   // Mistral (dedicated codegen)
   if (models.hasMistral) {
     allPromises.push(
       callMistralCodeGen(prompt, signal)
-        .then((result: any) => ({ provider: 'Mistral', fixes: validateFixArray(result) }))
+        .then((result: any) => {
+          // Debug: log what Mistral's parser actually returned
+          if (!result) {
+            log('Mistral: parseCodegenResponse returned null', 'WARN', 'codegen');
+          } else if (Array.isArray(result)) {
+            log(`Mistral: got ${result.length} raw fix(es) from parser`, 'DEBUG', 'codegen');
+          } else {
+            log(`Mistral: got non-array result: ${typeof result}`, 'DEBUG', 'codegen');
+          }
+          return { provider: 'Mistral', fixes: validateFixArray(result) };
+        })
         .catch((err: any) => ({ provider: 'Mistral', fixes: [], error: String(err.message || err).substring(0, 200) }))
     );
   }
@@ -164,11 +183,14 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
     const nulls = results
       .filter(r => r.status === 'fulfilled' && !r.value.error && r.value.fixes.length === 0)
       .map((r: any) => r.value.provider);
-    log(`\u274c No valid fixes from ANY of the ${totalModels} codegen models. ` +
-      `Errors: ${errors.join('; ').substring(0, 400)}` +
-      (nulls.length > 0 ? ` | Empty responses: ${nulls.join(', ')}` : ''),
-      'ERROR', 'codegen');
-    return null;
+    const parts: string[] = [];
+    if (errors.length) parts.push(`Errors: ${errors.join('; ').substring(0, 400)}`);
+    if (nulls.length) parts.push(`Empty responses: ${nulls.join(', ')}`);
+    if (blSkipped) parts.push('BazaarLink skipped (budget exhausted)');
+    log(`\u274c No valid fixes from ${allPromises.length} model(s). ${parts.join(' | ')}`, 'ERROR', 'codegen');
+    // Signal to caller that this failure is NOT retriable if BazaarLink is
+    // exhausted and Mistral also failed/returned empty.
+    return blSkipped ? null : null;
   }
 
   log(`\u{1f4ca} ${validResponses.length}/${totalModels} codegen models returned valid fixes.`, 'INFO', 'codegen');
@@ -239,12 +261,15 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
     const allPromises: Promise<{ provider: string; raw: string } | null>[] = [];
 
     // BazaarLink for raw consultation (primary)
-    if (models.hasBazaarLink) {
+    // Check budget BEFORE spawning — skip if exhausted.
+    if (models.hasBazaarLink && !blLimiter.isExhausted()) {
       for (const modelSlug of models.blModels) {
         allPromises.push(
           _callRawBazaarLink(prompt, ctl.signal, modelSlug)
         );
       }
+    } else if (models.hasBazaarLink) {
+      log('Tribunal raw: BazaarLink budget exhausted — skipping', 'WARN', 'codegen');
     }
     if (models.hasMistral) {
       allPromises.push(
@@ -323,47 +348,46 @@ async function _callRawProvider(name: string, callFn: () => Promise<any>, signal
   }
 }
 
-function buildCodeGenPrompt(investigationData: any, errorLogs: any) { 
-  // Safely extract all fields with fallbacks - callers often omit some
+function buildCodeGenPrompt(investigationData: any, errorLogs: any) {
   const url = investigationData?.url || null;
   const html = investigationData?.html ? String(investigationData.html).substring(0, 1500) : null;
   const targetFile = investigationData?.targetFile || null;
   const fileContent = investigationData?.fileContent ? String(investigationData.fileContent).substring(0, 8000) : null;
   const isBootTime = !!investigationData?.bootTime;
 
-  // Build context sections conditionally - omit empty sections to reduce noise
   let contextLines: string[] = [];
   contextLines.push(`- Error/reason: ${errorLogs || 'Unknown recurring failure'}`);
   if (url) contextLines.push(`- Current URL: ${url}`);
   if (html) contextLines.push(`- HTML snippet: ${html}`);
   if (isBootTime) contextLines.push(`- NOTE: This is a boot-time heal (no browser available). Diagnose from error patterns only.`);
 
-  let prompt = `You are a senior Node.js/TypeScript developer diagnosing and fixing an automation bot.
-`;
+  let prompt = `You are a senior Node.js/TypeScript developer diagnosing and fixing an automation bot.\n`;
   prompt += `CONTEXT:\n${contextLines.join('\n')}\n`;
 
   if (targetFile && fileContent) {
-    prompt += `
-Target file to fix: ${targetFile}
-`;
+    prompt += `\nTarget file to fix: ${targetFile}\n`;
     prompt += `--- BEGIN FILE: ${targetFile} ---\n${fileContent}\n--- END FILE ---\n`;
     prompt += `INSTRUCTIONS:\n`;
     prompt += `1. Identify the exact bug in the file above.\n`;
     prompt += `2. Propose a fix.\n`;
+    prompt += `3. Return a JSON ARRAY of objects. Each object must have:\n`;
+    prompt += `- "file": (string) relative path from project root\n`;
+    prompt += `- "change": (string) human-readable description of the fix\n`;
+    prompt += `- "patch": (string) a UNIFIED DIFF patch (lines starting with + or -)\n`;
+    prompt += `If no fix is possible, return exactly: []\n`;
+    prompt += `Return ONLY the JSON array. No markdown fences, no explanation.\n`;
   } else {
     prompt += `\nNo specific target file identified. You must infer which file(s) to fix from the error context above.\n`;
     prompt += `INSTRUCTIONS:\n`;
     prompt += `1. Analyze the error and identify the likely source file.\n`;
-    prompt += `2. If you cannot determine a specific fix, return an empty array [].\n`;
-    prompt += `3. Do NOT invent fixes for files you cannot identify.\n`;
+    prompt += `2. Propose a fix with a unified diff patch.\n`;
+    prompt += `3. Return a JSON ARRAY of objects. Each object must have:\n`;
+    prompt += `- "file": (string) relative path from project root\n`;
+    prompt += `- "change": (string) human-readable description of the fix\n`;
+    prompt += `- "patch": (string) a UNIFIED DIFF patch (lines starting with + or -)\n`;
+    prompt += `Only return [] if you truly cannot identify any file to fix.\n`;
+    prompt += `Return ONLY the JSON array. No markdown fences, no explanation.\n`;
   }
-
-  prompt += `3. Return a JSON ARRAY of objects. Each object must have:\n`;
-  prompt += `- "file": (string) relative path from project root\n`;
-  prompt += `- "change": (string) human-readable description of the fix\n`;
-  prompt += `- "patch": (string) a UNIFIED DIFF patch (lines starting with + or -)\n`;
-  prompt += `If no fix is possible, return exactly: []\n`;
-  prompt += `Return ONLY the JSON array. No markdown fences, no explanation.\n`;
 
   return prompt;
 }
