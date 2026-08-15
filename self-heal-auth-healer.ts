@@ -141,9 +141,9 @@ class AuthHealer {
         }
       } catch (e: any) { /* non-critical */ }
 
-      const authPrompt = \`The Microsoft login flow appears to have changed. Analyze the current login page and identify what has changed from the expected flow. \` +
-        \`Current URL: ${currentUrl}\n\n\` +
-        \`Generate a patch for auth-strategies-microsoft-v2.ts to adapt to the new login page structure.\`;
+      const authPrompt = `The Microsoft login flow appears to have changed. Analyze the current login page and identify what has changed from the expected flow. Current URL: ${currentUrl}
+
+Generate a patch for auth-strategies-microsoft-v2.ts to adapt to the new login page structure.`;
 
       let fixes: any[] = [];
       try {
