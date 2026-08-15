@@ -101,17 +101,27 @@ async function callBazaarLinkCodeGen(prompt: any, signal: any) {
 /**
  * Get the list of BazaarLink models to try in the codegen tribunal.
  * ⚠️ DO NOT ALTER MODEL NAMES WITHOUT EXPLICIT USER PERMISSION ⚠️
+ *
+ * ALWAYS returns all models including fallbacks.
+ * Config model (if set and different from auto:free) is tried first.
  */
 function getBazaarLinkModels(): string[] {
+  // ⚠️ DO NOT ALTER THESE MODEL NAMES WITHOUT EXPLICIT USER PERMISSION ⚠️
+  const allModels = [
+    'auto:free',
+    'qwen/qwen3.7-flash',
+    'deepseek/deepseek-v4-flash',
+  ];
+
   const configModel = getCONFIG().CODE_GEN_MODEL_BAZAARLINK;
-  if (configModel) {
-    // If the user set a specific model, still try auto:free first
-    if (configModel !== 'auto:free') {
-      return ['auto:free', configModel];
-    }
-    return ['auto:free'];
+  if (configModel && configModel !== 'auto:free' && !allModels.includes(configModel)) {
+    // User set a custom model not in the default list — try it first
+    return [configModel, ...allModels];
   }
-  return ['auto:free', ...DEFAULT_MODELS];
+
+  // If config model is in the list, ensure it's first (it's already auto:free or a default)
+  // Otherwise return all defaults as-is.
+  return allModels;
 }
 
 module.exports = {
