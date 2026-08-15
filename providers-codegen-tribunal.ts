@@ -4,11 +4,17 @@ let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function getCONFIG(): Record<string, any> { return _deps.config || require('./get-config'); }
 
-const { callMistralCodeGen } = require('./providers-codegen-mistral');
+const { callMistralCodeGen, parseCodegenResponse } = require('./providers-codegen-mistral');
 const { callBazaarLinkCodeGenWithModel, getBazaarLinkModels } = require('./providers-codegen-bazaarlink');
-const { callOpenRouterCodeGenWithModel } = require('./providers-codegen-openrouter');
 const { log, logError } = require('./logger');
 const { safeArrayFrom } = require('./providers-base');
+
+// ─── IMPORTANT: Provider Scope ─────────────────────────────────────────
+// This tribunal is for CODE GENERATION ONLY.
+//   - BazaarLink: primary codegen provider (50 free req/day)
+//   - Mistral: dedicated codegen provider
+//   - OpenRouter is NOT used here — it's for the vision/general tribunal only.
+//   - Cloudflare, Gemini, etc. are NOT codegen providers — never call them here.
 
 // ─── Default timeout for tribunal calls when no external signal is provided ───
 const DEFAULT_TRIBUNAL_TIMEOUT_MS = 120_000; // 2 minutes
@@ -58,33 +64,21 @@ function withTimeout(signal: any, timeoutMs: number): AbortController {
 
 /**
  * Discover available codegen models.
- * Returns { orModels, blModels, hasMistral, hasBazaarLink }.
+ * Returns { blModels, hasMistral, hasBazaarLink }.
  *
- * BazaarLink replaces Qwen + DeepSeek for codegen.
- * OpenRouter is kept for vision tribunal (not codegen).
+ * CODEGEN PROVIDERS ONLY:
+ *   - BazaarLink: primary codegen provider (50 free req/day)
+ *   - Mistral: dedicated codegen provider
+ *
+ * OpenRouter, Cloudflare, Gemini, etc. are NOT codegen providers.
+ * They must NOT be called here — they belong to the vision/general tribunal.
  */
-async function discoverModels() {
-  let modelDiscovery;
-  try { modelDiscovery = require('./services-model-discovery-advanced'); } catch (e: any) { modelDiscovery = null; }
-  if (!modelDiscovery) return null;
-
+function discoverModels() {
   // BazaarLink models (codegen primary — 50 free req/day)
   const blModels = getBazaarLinkModels();
   const hasBazaarLink = !!getCONFIG().BAZAARLINK_API_KEY;
 
-  // OpenRouter models (kept as codegen fallback, primary for vision)
-  const provider = getCONFIG().CODE_GEN_PROVIDERS?.find?.((p: any) => p.name === 'openrouter');
-  let orModels: string[] = [];
-  if (provider && getCONFIG().OPENROUTER_API_KEY) {
-    try {
-      const freeModels = await modelDiscovery.getFreeModels(provider.name);
-      orModels = (freeModels || []).map((m: any) => m.id).filter((id: string) => id.includes(':free'));
-    } catch (e: any) { /* model discovery can fail under memory pressure */ }
-  }
-  if (orModels.length === 0) orModels = ['openrouter/free'];
-
   return {
-    orModels,
     blModels,
     hasMistral: !!getCONFIG().MISTRAL_CODE_API_KEY,
     hasBazaarLink,
@@ -97,14 +91,12 @@ async function discoverModels() {
 // ═══════════════════════════════════════════════════════════
 
 async function generateCodeFixViaTribunal(investigationData: any, errorLogs: any, signal?: any) { 
-  const models = await discoverModels();
-  if (!models) { log('model-discovery-advanced not available', 'WARN', 'codegen'); return null; }
+  const models = discoverModels();
 
-  const totalModels = models.orModels.length
-    + models.blModels.length
+  const totalModels = models.blModels.length
     + (models.hasMistral ? 1 : 0);
 
-  log(`\u{1f9e0} SUPER TRIBUNAL: Consulting ${totalModels} models (${models.blModels.length} via BazaarLink + ${models.orModels.length} via OpenRouter + Mistral)...`, 'INFO', 'codegen');
+  log(`\u{1f9e0} CODEGEN TRIBUNAL: Consulting ${totalModels} models (${models.blModels.length} via BazaarLink${models.hasMistral ? ' + Mistral' : ''})...`, 'INFO', 'codegen');
 
   const prompt = buildCodeGenPrompt(investigationData, errorLogs);
   const ctl = withTimeout(signal, DEFAULT_TRIBUNAL_TIMEOUT_MS);
@@ -123,12 +115,22 @@ async function generateCodeFixViaTribunal(investigationData: any, errorLogs: any
 async function _runFixConsensus(prompt: string, models: any, totalModels: number, signal: any) {
   const allPromises: Promise<any>[] = [];
 
-  // BazaarLink models (primary codegen provider)
+  // BazaarLink models (PRIMARY codegen provider)
   if (models.hasBazaarLink) {
     for (const modelSlug of models.blModels) {
       allPromises.push(
         callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug)
-          .then((result: any) => ({ provider: `BL/${modelSlug}`, fixes: validateFixArray(result) }))
+          .then((result: any) => {
+            // Debug: log what BazaarLink actually returned
+            if (!result) {
+              log(`BL/${modelSlug}: parseCodegenResponse returned null`, 'WARN', 'codegen');
+            } else if (Array.isArray(result)) {
+              log(`BL/${modelSlug}: got ${result.length} raw fix(es) from parser`, 'DEBUG', 'codegen');
+            } else {
+              log(`BL/${modelSlug}: got non-array result: ${typeof result}`, 'DEBUG', 'codegen');
+            }
+            return { provider: `BL/${modelSlug}`, fixes: validateFixArray(result) };
+          })
           .catch((err: any) => ({ provider: `BL/${modelSlug}`, fixes: [], error: String(err.message || err).substring(0, 200) }))
       );
     }
@@ -141,19 +143,12 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
         .catch((err: any) => ({ provider: 'Mistral', fixes: [], error: String(err.message || err).substring(0, 200) }))
     );
   }
-  // OpenRouter (fallback codegen)
-  for (const modelSlug of models.orModels) {
-    if (getCONFIG().OPENROUTER_API_KEY) {
-      allPromises.push(
-        callOpenRouterCodeGenWithModel(prompt, signal, modelSlug)
-          .then((result: any) => ({ provider: `OR/${modelSlug}`, fixes: validateFixArray(result) }))
-          .catch((err: any) => ({ provider: `OR/${modelSlug}`, fixes: [], error: String(err.message || err).substring(0, 200) }))
-      );
-    }
-  }
+
+  // NO OpenRouter here — it's for vision/general tribunal only.
+  // NO Cloudflare, Gemini, or any other non-codegen provider.
 
   if (allPromises.length === 0) {
-    log('No codegen providers available (no API keys configured)', 'ERROR', 'codegen');
+    log('No codegen providers available. Need BAZAARLINK_API_KEY or MISTRAL_CODE_API_KEY.', 'ERROR', 'codegen');
     return null;
   }
 
@@ -166,13 +161,23 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
     const errors = results
       .filter(r => r.status === 'fulfilled' && r.value.error)
       .map((r: any) => `${r.value.provider}: ${(r as any).value.error}`);
-    log(`\u274c No valid fixes from ANY of the ${totalModels} models. Errors: ${errors.join('; ').substring(0, 500)}`, 'ERROR', 'codegen');
+    const nulls = results
+      .filter(r => r.status === 'fulfilled' && !r.value.error && r.value.fixes.length === 0)
+      .map((r: any) => r.value.provider);
+    log(`\u274c No valid fixes from ANY of the ${totalModels} codegen models. ` +
+      `Errors: ${errors.join('; ').substring(0, 400)}` +
+      (nulls.length > 0 ? ` | Empty responses: ${nulls.join(', ')}` : ''),
+      'ERROR', 'codegen');
     return null;
   }
 
-  log(`\u{1f4ca} ${validResponses.length}/${totalModels} models returned valid fixes.`, 'INFO', 'codegen');
+  log(`\u{1f4ca} ${validResponses.length}/${totalModels} codegen models returned valid fixes.`, 'INFO', 'codegen');
 
   // ── Patch voting consensus ──
+  // With only BazaarLink + Mistral (2-3 models max), we can't reach
+  // a high consensus threshold. Use a pragmatic approach:
+  //   - If ANY model returned fixes, use the best one.
+  //   - If multiple models agree, prefer the agreed fix.
   const fixVotes = new Map();
   for (const resp of validResponses) {
     for (const fix of resp.fixes) {
@@ -185,18 +190,15 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
   }
   const sortedVotes = safeArrayFrom(fixVotes.values()).sort((a, b) => b.count - a.count);
   const best = sortedVotes[0];
-  const required = getCONFIG().CODE_GEN_CONSENSUS_THRESHOLD ?? 5;
 
-  if (best && best.count >= required) {
-    log(`\u2705 SUPER CONSENSUS: ${best.count}/${validResponses.length} models (${best.providers.join(', ')}) agree on ${best.fix.file}.`, 'INFO', 'codegen');
+  if (best && best.count > 1) {
+    // Multiple models agree — high confidence
+    log(`\u2705 CONSENSUS: ${best.count}/${validResponses.length} models (${best.providers.join(', ')}) agree on ${best.fix.file}.`, 'INFO', 'codegen');
     return [best.fix];
   }
-  if (validResponses.length >= 6) {
-    log(`\u274c No super-majority (best: ${best?.count || 0}/${validResponses.length}). Aborting to avoid corruption.`, 'ERROR', 'codegen');
-    return null;
-  }
   if (best) {
-    log(`\u26a0\ufe0f Limited responses (${validResponses.length}/${totalModels}). Using fallback fix from ${best.providers[0]}.`, 'WARN', 'codegen');
+    // Single model returned fixes — use it (better than nothing during OOM)
+    log(`\u26a0\ufe0f Single-model fix from ${best.providers[0]} for ${best.fix.file}.`, 'WARN', 'codegen');
     return [best.fix];
   }
   return null;
@@ -223,29 +225,24 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
  */
 async function consultTribunalRaw(prompt: string, signal?: any, options?: { timeoutMs?: number; responseFormatJson?: boolean }) {
   const timeoutMs = options?.timeoutMs || DEFAULT_TRIBUNAL_TIMEOUT_MS;
-  const responseFormatJson = options?.responseFormatJson !== false; // default true
 
-  const models = await discoverModels();
-  if (!models) { log('model-discovery-advanced not available for raw consultation', 'WARN', 'codegen'); return null; }
+  const models = discoverModels();
 
-  const totalModels = models.orModels.length
-    + models.blModels.length
+  const totalModels = models.blModels.length
     + (models.hasMistral ? 1 : 0);
 
-  log(`\u{1f9e0} TRIBUNAL RAW: Consulting ${totalModels} models for generic task...`, 'INFO', 'codegen');
+  log(`\u{1f9e0} TRIBUNAL RAW: Consulting ${totalModels} codegen models for generic task...`, 'INFO', 'codegen');
 
   const ctl = withTimeout(signal, timeoutMs);
 
   try {
-    // For raw consultation, we use a simpler approach: race all models
-    // and return the first successful response. This is much faster than
-    // waiting for all (no need for consensus on non-fix tasks).
     const allPromises: Promise<{ provider: string; raw: string } | null>[] = [];
 
-    for (const modelSlug of models.orModels) {
-      if (getCONFIG().OPENROUTER_API_KEY) {
+    // BazaarLink for raw consultation (primary)
+    if (models.hasBazaarLink) {
+      for (const modelSlug of models.blModels) {
         allPromises.push(
-          _callRawOr(prompt, ctl.signal, modelSlug, responseFormatJson)
+          _callRawBazaarLink(prompt, ctl.signal, modelSlug)
         );
       }
     }
@@ -253,14 +250,6 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
       allPromises.push(
         _callRawProvider('Mistral', () => callMistralCodeGen(prompt, ctl.signal), ctl.signal)
       );
-    }
-    // BazaarLink for raw consultation
-    if (models.hasBazaarLink) {
-      for (const modelSlug of models.blModels) {
-        allPromises.push(
-          _callRawBazaarLink(prompt, ctl.signal, modelSlug)
-        );
-      }
     }
 
     if (allPromises.length === 0) {
@@ -297,71 +286,6 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
     return best.raw;
   } finally {
     (ctl as any)._cleanup?.();
-  }
-}
-
-/**
- * Call an OpenRouter model for raw text (not fix-validated).
- */
-async function _callRawOr(prompt: string, signal: any, modelSlug: string, responseFormatJson: boolean) {
-  try {
-    const apiKey = getCONFIG().OPENROUTER_API_KEY;
-    if (!apiKey) return null;
-
-    const { fetchWithTimeout, extractJSON, sanitizeErrorText } = require('./providers-base');
-
-    // Import rate limiter
-    let orLimiter: any;
-    try { orLimiter = require('./openrouter-rate-limiter'); } catch { orLimiter = null; }
-    orLimiter?.checkBudget?.('critical');
-
-    const payload: any = {
-      model: modelSlug,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1,
-      max_tokens: 4096,
-    };
-    if (responseFormatJson) {
-      payload.response_format = { type: 'json_object' };
-    }
-
-    const response = await fetchWithTimeout('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': getCONFIG().APP_URL || 'https://mathu-bot.local',
-        'X-Title': 'MathU Bot Tribunal Raw',
-      },
-      body: JSON.stringify(payload),
-      signal
-    });
-
-    if (!response.ok) {
-      const errorText = sanitizeErrorText(await response.text());
-      throw new Error(`HTTP ${response.status}: ${errorText}`);
-    }
-
-    const data = await response.json();
-    const raw = data.choices?.[0]?.message?.content;
-    if (!raw) throw new Error('Empty response');
-
-    orLimiter?.recordUsage?.('critical');
-
-    // If JSON format was requested, extract and return the raw JSON string
-    if (responseFormatJson) {
-      try {
-        const parsed = JSON.parse(raw);
-        return { provider: `OR/${modelSlug}`, raw: JSON.stringify(parsed) };
-      } catch {
-        // Not valid JSON despite requesting it — return as-is
-        return { provider: `OR/${modelSlug}`, raw };
-      }
-    }
-    return { provider: `OR/${modelSlug}`, raw };
-  } catch (err: any) {
-    log(`Tribunal raw OR/${modelSlug} failed: ${String(err.message || err).substring(0, 200)}`, 'DEBUG', 'codegen');
-    return null;
   }
 }
 
