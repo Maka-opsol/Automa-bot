@@ -142,6 +142,17 @@ function recordUsage(): void {
   }
 }
 
+// ─── Query: Is Exhausted? (non-throwing) ──────────────────────────
+// Returns true if the daily budget is fully consumed.
+// Use this to SKIP spawning API calls entirely (avoids pointless retries).
+
+function isExhausted(): boolean {
+  if (DAILY_LIMIT <= 0) return false;
+  _ensureInitialized();
+  if (_state.date !== _todayUTC()) _resetForNewDay();
+  return _state.used >= DAILY_LIMIT;
+}
+
 // ─── Query API ────────────────────────────────────────────────────────
 
 function getRemaining(): number {
@@ -162,16 +173,21 @@ function getStatus() {
 }
 
 // ─── Force Exhaust ───────────────────────────────────────────────────
-// Sync internal counter to reality when BazaarLink returns 429.
+// Called when BazaarLink returns 429.
+// Instead of jumping straight to DAILY_LIMIT (which destroys accurate counting),
+// advance by a reasonable buffer so we track real usage correctly.
 
 function forceExhaust(reason: string): void {
   const log = _getLog();
   _ensureInitialized();
   if (_state.date !== _todayUTC()) _resetForNewDay();
   const wasUsed = _state.used;
-  _state.used = DAILY_LIMIT;
+  // Advance by 10% of daily limit (min 5) instead of jumping to max.
+  // This preserves accurate counting while still preventing rapid retry loops.
+  const buffer = Math.max(5, Math.ceil(DAILY_LIMIT * 0.1));
+  _state.used = Math.min(DAILY_LIMIT, _state.used + buffer);
   _persist();
-  log(`BazaarLink rate limit FORCE EXHAUSTED. Was ${wasUsed}/${DAILY_LIMIT}, now ${DAILY_LIMIT}/${DAILY_LIMIT}. Reason: ${reason}`, 'WARN', 'bl-limiter');
+  log(`BazaarLink 429 received. Advanced counter from ${wasUsed} to ${_state.used}/${DAILY_LIMIT}. Reason: ${reason}`, 'WARN', 'bl-limiter');
 }
 
-module.exports = { checkBudget, recordUsage, getRemaining, getStatus, forceExhaust, _injectDependencies, DAILY_LIMIT };
+module.exports = { checkBudget, recordUsage, getRemaining, getStatus, forceExhaust, isExhausted, _injectDependencies, DAILY_LIMIT };
