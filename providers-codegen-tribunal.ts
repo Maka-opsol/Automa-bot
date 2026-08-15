@@ -9,6 +9,7 @@ const { callQwenCodeGen } = require('./providers-codegen-qwen');
 const { callDeepSeekCodeGen } = require('./providers-codegen-deepseek');
 const { callOpenRouterCodeGenWithModel } = require('./providers-codegen-openrouter');
 const { log, logError } = require('./logger');
+const { safeArrayFrom } = require('./providers-base');
 
 // ─── Default timeout for tribunal calls when no external signal is provided ───
 const DEFAULT_TRIBUNAL_TIMEOUT_MS = 120_000; // 2 minutes
@@ -178,7 +179,7 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
       entry.providers.push(resp.provider);
     }
   }
-  const sortedVotes = Array.from(fixVotes.values()).sort((a, b) => b.count - a.count);
+  const sortedVotes = safeArrayFrom(fixVotes.values()).sort((a, b) => b.count - a.count);
   const best = sortedVotes[0];
   const required = getCONFIG().CODE_GEN_CONSENSUS_THRESHOLD ?? 5;
 
@@ -381,34 +382,48 @@ async function _callRawProvider(name: string, callFn: () => Promise<any>, signal
 }
 
 function buildCodeGenPrompt(investigationData: any, errorLogs: any) { 
-  // Safely extract all fields with fallbacks — callers often omit some
-  const url = (investigationData?.url || 'Unknown');
-  const html = String(investigationData?.html || '').substring(0, 1500);
-  const targetFile = (investigationData?.targetFile || 'Unknown');
-  const fileContent = String(investigationData?.fileContent || '').substring(0, 8000);
+  // Safely extract all fields with fallbacks - callers often omit some
+  const url = investigationData?.url || null;
+  const html = investigationData?.html ? String(investigationData.html).substring(0, 1500) : null;
+  const targetFile = investigationData?.targetFile || null;
+  const fileContent = investigationData?.fileContent ? String(investigationData.fileContent).substring(0, 8000) : null;
+  const isBootTime = !!investigationData?.bootTime;
 
-  return `
-You are a senior Node.js developer fixing an automation bot.
-CONTEXT:
-- Error/Stagnation reason: ${errorLogs || 'Unknown recurring failure'}
-- Current URL: ${url}
-- HTML Snippet: ${html}
-- Target file to fix: ${targetFile}
-The bot is failing due to UI changes or logic errors.
-Here is the current content of the file that likely needs fixing:
---- BEGIN FILE: ${targetFile} ---
-${fileContent}
---- END FILE ---
-INSTRUCTIONS:
-1. Identify the exact bug or missing selector/logic.
-2. Propose a fix.
-3. Return a JSON ARRAY of objects. Each object must have:
-- "file": (string) relative path
-- "change": (string) human-readable description
-- "patch": (string) either a UNIFIED DIFF (starting with --) or the COMPLETE REPLACEMENT code.
-If no fix is needed, return an empty array.
-ONLY return valid JSON. No markdown, no explanations outside the JSON.
+  // Build context sections conditionally - omit empty sections to reduce noise
+  let contextLines: string[] = [];
+  contextLines.push(`- Error/reason: ${errorLogs || 'Unknown recurring failure'}`);
+  if (url) contextLines.push(`- Current URL: ${url}`);
+  if (html) contextLines.push(`- HTML snippet: ${html}`);
+  if (isBootTime) contextLines.push(`- NOTE: This is a boot-time heal (no browser available). Diagnose from error patterns only.`);
+
+  let prompt = `You are a senior Node.js/TypeScript developer diagnosing and fixing an automation bot.
 `;
+  prompt += `CONTEXT:\n${contextLines.join('\n')}\n`;
+
+  if (targetFile && fileContent) {
+    prompt += `
+Target file to fix: ${targetFile}
+`;
+    prompt += `--- BEGIN FILE: ${targetFile} ---\n${fileContent}\n--- END FILE ---\n`;
+    prompt += `INSTRUCTIONS:\n`;
+    prompt += `1. Identify the exact bug in the file above.\n`;
+    prompt += `2. Propose a fix.\n`;
+  } else {
+    prompt += `\nNo specific target file identified. You must infer which file(s) to fix from the error context above.\n`;
+    prompt += `INSTRUCTIONS:\n`;
+    prompt += `1. Analyze the error and identify the likely source file.\n`;
+    prompt += `2. If you cannot determine a specific fix, return an empty array [].\n`;
+    prompt += `3. Do NOT invent fixes for files you cannot identify.\n`;
+  }
+
+  prompt += `3. Return a JSON ARRAY of objects. Each object must have:\n`;
+  prompt += `- "file": (string) relative path from project root\n`;
+  prompt += `- "change": (string) human-readable description of the fix\n`;
+  prompt += `- "patch": (string) a UNIFIED DIFF patch (lines starting with + or -)\n`;
+  prompt += `If no fix is possible, return exactly: []\n`;
+  prompt += `Return ONLY the JSON array. No markdown fences, no explanation.\n`;
+
+  return prompt;
 }
 
 module.exports = { generateCodeFixViaTribunal, consultTribunalRaw, _injectDependencies };
