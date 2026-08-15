@@ -81,8 +81,10 @@ function parseCodegenResponse(raw: string): any {
 async function callMistralCodeGen(prompt: any, signal: any) { 
   const apiKey = getCONFIG().MISTRAL_CODE_API_KEY;
   if (!apiKey) throw new Error('Mistral API key missing');
+  const model = getCONFIG().CODE_GEN_MODEL_MISTRAL;
+  if (!model) throw new Error('Mistral model not configured (CODE_GEN_MODEL_MISTRAL is empty)');
   const payload: any = {
-    model: getCONFIG().CODE_GEN_MODEL_MISTRAL,
+    model,
     messages: [{ role: 'user', content: prompt }],
     temperature: 0.1,
     max_tokens: 2048,
