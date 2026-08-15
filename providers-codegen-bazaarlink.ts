@@ -134,3 +134,4 @@ module.exports = {
   callBazaarLinkCodeGenWithModel,
   getBazaarLinkModels,
   _injectDependencies,
+};
