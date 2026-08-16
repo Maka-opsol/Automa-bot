@@ -678,13 +678,19 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     let unknownStateCounter = 0; // Counts consecutive 'unknown' currentState results
     const MAX_UNKNOWN_STATE = 3; // After this many unknowns, force recovery
 
-    // v11: Blank-page escalation ladder — prevents infinite blank/wait loops
+    // v12: Blank-page escalation ladder — prevents infinite blank/wait loops
     // Track consecutive blank-page detections separately from unknown states.
     // Step 1 (count >= 2): reload MathU
     // Step 2 (count >= 3): restart browser context entirely
+    // Step 3 (count >= 5): trigger full self-heal (let AI figure it out)
+    // v12 FIX: Counter is NO LONGER reset on browser restart. It only resets
+    // when the page is confirmed NON-blank. This prevents the loop:
+    //   blank → restart → blank → restart → blank → restart (forever)
+    // Instead: blank → restart → blank → restart → SELF-HEAL (3 restarts = done)
     let blankPageCounter = 0;
     const BLANK_RELOAD_THRESHOLD = 2;  // After 2 blank checks → reload
     const BLANK_RESTART_THRESHOLD = 3; // After 3 blank checks → restart browser context
+    const BLANK_SELF_HEAL_THRESHOLD = 5; // After 5 blank checks → full self-heal
 
     // v10: Restart-count tracker — triggers self-heal if too many browser
     // restarts happen in a short window (symptom of a deeper issue).
@@ -867,17 +873,74 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           }
           if (CONFIG.FLUTTER_DPR_AUTO_CALIBRATE && dpr) { await dpr.calibrate(page); }
         }
-        // v11: Check if auth guard detected a blank page.
-        // If so, skip the normal cycle and go straight to the escalation
-        // ladder — the tribunal will just return unknown/wait on a blank page.
-        const authGuardMod = getDep('authGuard');
-        if (authGuardMod?.consumeBlankPageFlag?.(page)) {
-          blankPageCounter++;
+      }
+
+      // v12: Blank-page counter management via auth guard flags.
+      // peekBlankPageFlag checks without consuming. consumeBlankPageFlag checks AND clears.
+      const authGuardMod = getDep('authGuard');
+      const isBlank = authGuardMod?.peekBlankPageFlag?.(page);
+      if (!isBlank) {
+        // No blank flag — page is valid, reset counter
+        blankPageCounter = 0;
+      } else {
+        // Blank flag IS set — consume it and enter the escalation ladder
+        authGuardMod?.consumeBlankPageFlag?.(page);
+        blankPageCounter++;
           log(`Auth guard flagged blank page (escalation step ${blankPageCounter})`, 'WARN', 'cycle');
-          if (blankPageCounter >= BLANK_RESTART_THRESHOLD) {
+          if (blankPageCounter >= BLANK_SELF_HEAL_THRESHOLD) {
+            // Step 3: Trigger full self-heal — something is fundamentally broken
+            // v12: If the page is blank this many times, the AIs can figure it out.
+            log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — triggering full self-heal (AI investigation)`, 'ERROR', 'cycle');
+            blankPageCounter = 0;
+            try {
+              const selfHealMod = getDep('selfHeal');
+              if (selfHealMod?.performSelfHeal && CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
+                selfHealRunning = true;
+                const healResult = await selfHealMod.performSelfHeal({ skipRuntimeHeal: true });
+                selfHealRunning = false;
+                log(`Blank-page self-heal result: ${JSON.stringify(healResult?.summary || healResult)?.substring(0, 200)}`, 'INFO', 'cycle');
+              } else {
+                log('Blank-page self-heal: not available or already running', 'WARN', 'cycle');
+              }
+            } catch (healErr: any) {
+              selfHealRunning = false;
+              log(`Blank-page self-heal failed: ${healErr.message || healErr}`, 'ERROR', 'cycle');
+            }
+            // Also restart browser as immediate recovery
+            try {
+              _trackBrowserRestart();
+              await closeBrowser?.();
+              _networkSetup = false;
+              page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+              if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
+                await network.setupInterception(page);
+                _networkSetup = true;
+              }
+              await page.goto(CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za', { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await new Promise(r => setTimeout(r, 8000));
+              if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+            } catch (restartErr: any) {
+              log(`Blank-page self-heal restart failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
+              try {
+                _networkSetup = false;
+                page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+                if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
+                  await network.setupInterception(page);
+                  _networkSetup = true;
+                }
+              } catch (recoveryErr: any) {
+                log(`Blank-page self-heal recovery also failed: ${recoveryErr.message || recoveryErr} — will break cycle`, 'ERROR', 'cycle');
+                break;
+              }
+            }
+            lastScreenshotChangeTime = Date.now();
+            continue;
+          } else if (blankPageCounter >= BLANK_RESTART_THRESHOLD) {
             // Step 2: Restart browser context entirely
             log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — RESTARTING browser context`, 'ERROR', 'cycle');
-            blankPageCounter = 0;
+            // v12 FIX: Do NOT reset blankPageCounter here.
+            // The counter only resets when the page is confirmed non-blank.
+            // This ensures repeated restarts eventually escalate to self-heal.
             try {
               _trackBrowserRestart();
               await closeBrowser?.();
@@ -1500,9 +1563,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const startTime = Date.now();
       let actionSuccess = false;
 
-      // ── EARLY EXIT: blank_page wait → navigate immediately ──
-      // Don't waste 75s executing a 'wait' on a blank page. Navigate to
-      // APP_URL right now and skip to the next loop iteration.
+      // ── EARLY EXIT: blank_page wait → escalate via ladder ──
+      // Don't waste 75s executing a 'wait' on a blank page.
+      // v12: Instead of always navigating, use the same escalation ladder
+      // as the auth-guard blank path. This ensures self-heal triggers after
+      // enough consecutive blanks instead of navigating forever.
       // v11: Set currentState = 'blank_page' before continue so the next
       // cycle's action cache exclusion knows the page is blank. Without this,
       // the cache would serve a stale 'unknown/wait' from a previous cycle.
@@ -1510,16 +1575,78 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         currentState = 'blank_page';
         blankPageCounter++;
         const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
-        if (targetUrl) {
-          log(`blank_page early exit: skipping 75s wait, navigating to ${targetUrl}`, 'INFO', 'cycle');
+
+        if (blankPageCounter >= BLANK_SELF_HEAL_THRESHOLD) {
+          // Step 3: Full self-heal
+          log(`blank_page early exit: ${blankPageCounter} consecutive blanks — triggering full self-heal (AI investigation)`, 'ERROR', 'cycle');
+          blankPageCounter = 0;
           try {
-            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
-              log(`blank_page early exit: navigation failed: ${e.message || e}`, 'WARN', 'cycle');
-            });
+            const selfHealMod = getDep('selfHeal');
+            if (selfHealMod?.performSelfHeal && CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
+              selfHealRunning = true;
+              const healResult = await selfHealMod.performSelfHeal({ skipRuntimeHeal: true });
+              selfHealRunning = false;
+              log(`Blank-page self-heal result: ${JSON.stringify(healResult?.summary || healResult)?.substring(0, 200)}`, 'INFO', 'cycle');
+            }
+          } catch (healErr: any) {
+            selfHealRunning = false;
+            log(`Blank-page self-heal failed: ${healErr.message || healErr}`, 'ERROR', 'cycle');
+          }
+          // Navigate after self-heal
+          if (targetUrl) {
+            try {
+              await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+              await new Promise(r => setTimeout(r, 8000));
+              if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+            } catch {}
+          }
+        } else if (blankPageCounter >= BLANK_RESTART_THRESHOLD) {
+          // Step 2: Restart browser
+          log(`blank_page early exit: ${blankPageCounter} consecutive blanks — RESTARTING browser context`, 'ERROR', 'cycle');
+          // v12: Do NOT reset blankPageCounter
+          try {
+            _trackBrowserRestart();
+            await closeBrowser?.();
+            _networkSetup = false;
+            page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+            if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
+              await network.setupInterception(page);
+              _networkSetup = true;
+            }
+            await page.goto(targetUrl || 'https://app.mathu.co.za', { waitUntil: 'domcontentloaded', timeout: 30000 });
             await new Promise(r => setTimeout(r, 8000));
             if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
-          } catch (navErr: any) {
-            log(`blank_page early exit failed: ${navErr.message || navErr}`, 'WARN', 'cycle');
+          } catch (restartErr: any) {
+            log(`blank_page browser restart failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
+            try {
+              _networkSetup = false;
+              page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+              if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) { await network.setupInterception(page); _networkSetup = true; }
+            } catch { break; }
+          }
+        } else if (blankPageCounter >= BLANK_RELOAD_THRESHOLD) {
+          // Step 1: Reload MathU
+          log(`blank_page early exit: ${blankPageCounter} consecutive blanks — reloading MathU`, 'WARN', 'cycle');
+          if (targetUrl) {
+            try {
+              await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+              await new Promise(r => setTimeout(r, 8000));
+              if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+            } catch {}
+          }
+        } else {
+          // First blank: just navigate
+          log(`blank_page early exit: skipping 75s wait, navigating to ${targetUrl}`, 'INFO', 'cycle');
+          if (targetUrl) {
+            try {
+              await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
+                log(`blank_page early exit: navigation failed: ${e.message || e}`, 'WARN', 'cycle');
+              });
+              await new Promise(r => setTimeout(r, 8000));
+              if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+            } catch (navErr: any) {
+              log(`blank_page early exit failed: ${navErr.message || navErr}`, 'WARN', 'cycle');
+            }
           }
         }
         lastScreenshotChangeTime = Date.now();
@@ -1950,32 +2077,36 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           }
           continue; // Skip the wait action and re-evaluate on next iteration
         }
-      // v11: blank_page ESCALATION LADDER
+      // v12: blank_page ESCALATION LADDER
       // The tribunal returns currentState='blank_page' when the screenshot is
       // blank/white (no content rendered). Instead of always navigating to
       // APP_URL (which often produces another blank page), escalate:
       //   Step 1 (count >= 2): reload MathU
       //   Step 2 (count >= 3): restart browser context entirely
-      //   Step 3 (count >= 5): trigger full self-heal (code-patch pipeline)
+      //   Step 3 (count >= 5): trigger full self-heal (let AI figure it out)
+      // v12 FIX: Counter NOT reset on browser restart — only on non-blank page.
       } else if (action.currentState === 'blank_page') {
         blankPageCounter++;
         unknownStateCounter = 0;
         log(`blank_page state detected (${blankPageCounter} consecutive). Escalating...`, 'WARN', 'cycle');
 
-        if (blankPageCounter >= 5) {
+        if (blankPageCounter >= BLANK_SELF_HEAL_THRESHOLD) {
           // Step 3: Trigger full self-heal — something is fundamentally broken
-          log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — triggering full self-heal`, 'ERROR', 'cycle');
+          // v12: If the page is blank this many times, the AIs can figure it out.
+          log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — triggering full self-heal (AI investigation)`, 'ERROR', 'cycle');
           blankPageCounter = 0;
           try {
             const selfHealMod = getDep('selfHeal');
             if (selfHealMod?.performSelfHeal && CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
-              selfHealMod.performSelfHeal({ skipRuntimeHeal: true }).then((result: any) => {
-                log(`Blank-page self-heal result: ${JSON.stringify(result?.summary || result)?.substring(0, 200)}`, 'INFO', 'cycle');
-              }).catch((err: any) => {
-                log(`Blank-page self-heal failed: ${err.message || err}`, 'ERROR', 'cycle');
-              });
+              selfHealRunning = true;
+              const healResult = await selfHealMod.performSelfHeal({ skipRuntimeHeal: true });
+              selfHealRunning = false;
+              log(`Blank-page self-heal result: ${JSON.stringify(healResult?.summary || healResult)?.substring(0, 200)}`, 'INFO', 'cycle');
             }
-          } catch {}
+          } catch (healErr: any) {
+            selfHealRunning = false;
+            log(`Blank-page self-heal failed: ${healErr.message || healErr}`, 'ERROR', 'cycle');
+          }
           // Also try browser restart as immediate recovery
           try {
             _trackBrowserRestart();
@@ -1991,15 +2122,10 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
           } catch (restartErr: any) {
             log(`Blank-page browser restart (step 3) failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
-            // Browser is dead — attempt recovery before next cycle
             try {
               _networkSetup = false;
               page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
-              if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
-                await network.setupInterception(page);
-                _networkSetup = true;
-              }
-              log('Blank-page step-3 restart: recovery via withBrowserRetry succeeded', 'INFO', 'cycle');
+              if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) { await network.setupInterception(page); _networkSetup = true; }
             } catch (recoveryErr: any) {
               log(`Blank-page step-3 restart: recovery also failed: ${recoveryErr.message || recoveryErr} — will break cycle`, 'ERROR', 'cycle');
               break;
@@ -2010,6 +2136,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         } else if (blankPageCounter >= BLANK_RESTART_THRESHOLD) {
           // Step 2: Restart browser context entirely
           log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — RESTARTING browser context`, 'ERROR', 'cycle');
+          // v12 FIX: Do NOT reset blankPageCounter here.
           try {
             _trackBrowserRestart();
             await closeBrowser?.();
@@ -2024,15 +2151,10 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
           } catch (restartErr: any) {
             log(`Blank-page browser restart failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
-            // Browser is dead — attempt recovery before next cycle
             try {
               _networkSetup = false;
               page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
-              if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
-                await network.setupInterception(page);
-                _networkSetup = true;
-              }
-              log('Blank-page tribunal restart: recovery via withBrowserRetry succeeded', 'INFO', 'cycle');
+              if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) { await network.setupInterception(page); _networkSetup = true; }
             } catch (recoveryErr: any) {
               log(`Blank-page tribunal restart: recovery also failed: ${recoveryErr.message || recoveryErr} — will break cycle`, 'ERROR', 'cycle');
               break;
