@@ -714,7 +714,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           const performSelfHeal = getDep('selfHeal')?.performSelfHeal;
           if (performSelfHeal && !selfHealRunning) {
             selfHealRunning = true;
-            performSelfHeal().then((healed: any) => {
+            performSelfHeal({ skipRuntimeHeal: true }).then((healed: any) => {
               selfHealRunning = false;
               if (healed) log('Restart storm: full self-heal succeeded', 'INFO', 'cycle');
               else log('Restart storm: full self-heal failed', 'ERROR', 'cycle');
@@ -2129,7 +2129,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                     }
                   } catch {}
 
-                  const fullHealed = await performSelfHeal();
+                  const fullHealed = await performSelfHeal({ skipRuntimeHeal: true });
                   if (fullHealed) {
                     log('Zero-progress FULL self-heal SUCCEEDED — restarting process to apply changes cleanly', 'INFO', 'cycle');
                     consecutiveFailures = 0;
