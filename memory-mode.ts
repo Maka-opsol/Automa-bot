@@ -1,34 +1,49 @@
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════════════
-// Memory Mode Manager — Full Power / Memory Protection
+// Memory Mode Manager — Full Power / Memory Protection / Minimum
 // ═══════════════════════════════════════════════════════════════════════
-// Two operational modes:
+// Three operational modes:
 //
 //   FULL POWER:         All subsystems enabled, normal GC, full features.
 //                       Memory thresholds: warn=350MB, restart=400MB
 //
-//   MEMORY PROTECTION:  Heavy subsystems disabled, aggressive GC (15s),
-//                       browser closed, caches purged, tighter thresholds.
+//   MEMORY PROTECTION:  Heavy self-heal subsystems disabled, aggressive
+//                       GC (15s), caches purged, tighter thresholds.
 //                       Memory thresholds: warn=200MB, restart=220MB
+//
+//   MINIMUM:            Everything not needed to solve questions is
+//                       disabled. Only the core cycle (screenshot →
+//                       tribunal → action) remains. No exploration, no
+//                       diary workers, no telemetry, no survival pings,
+//                       no module tracking, no work shifts, no alerting,
+//                       no pix2tex, no VLM, no GAN telemetry, no progress
+//                       detection, no health checks, no circuit breakers.
+//                       Memory thresholds: warn=150MB, restart=170MB
+//                       GC every 8s. Monitor every 5s.
 //
 // Auto-switching rules:
 //   → Memory Protection: when heap > 250MB or RSS > 380MB or wasRecentlyOOMKilled()
+//   → Minimum:          when OOM death spiral detected AND self-heal
+//                       fails, OR when restored from database.
 //   → Full Power:       ONLY after a verified self-heal fix is promoted
 //                       (via promoteAfterSelfHealFix). NEVER auto-promotes.
 //                       Manual dashboard switch is still available for testing.
 //
+// Minimum mode escape hatches:
+//   → Self-heal session can promote minimum → memory_protection (not
+//     directly to full_power). After a verified fix, minimum can
+//     eventually return to memory_protection.
+//   → Manual dashboard switch can override to any mode.
+//
 // v3 FIX: _applyMode('memory_protection') now performs IMMEDIATE memory
 //   recovery (close browser, clear caches, force GC) instead of just
-//   setting env vars. This was the root cause of the bot dying without
-//   ever activating protection — it switched mode but never freed memory.
+//   setting env vars.
 //
 // v3 FIX: recordOOMExit now blocks briefly for the Turso write to ensure
-//   the OOM marker survives the restart. Previously the fire-and-forget
-//   Turso write never completed before process.exit().
+//   the OOM marker survives the restart.
 //
-// v3 FIX: Added shedMemory() as a standalone emergency function that can
-//   be called by the heap guardian or cycle manager at any time.
+// v3 FIX: Added shedMemory() as a standalone emergency function.
 // ═══════════════════════════════════════════════════════════════════════
 
 const persistConfig = require('./persistent-config');
@@ -37,10 +52,14 @@ const persistConfig = require('./persistent-config');
 const CALIBRATION_KEY_MODE = 'memory_mode_current';
 const CALIBRATION_KEY_OOM_EXIT = 'oom_last_exit_ts';
 const CALIBRATION_KEY_MEMORY_HEARTBEAT = 'last_memory_heartbeat';
+const CALIBRATION_KEY_MINIMUM_MODE = 'minimum_mode_active'; // persists minimum mode to DB
 const OOM_RECOVERY_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const HEARTBEAT_RECOVERY_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const MINIMUM_MODE_OOM_KILL_THRESHOLD = 3; // 3+ OOM kills in window = auto minimum
 
 // ── Mode thresholds ──
+type MemoryMode = 'full_power' | 'memory_protection' | 'minimum';
+
 const MODE_THRESHOLDS = {
   full_power: {
     warnHeapMB: 350,
@@ -57,6 +76,14 @@ const MODE_THRESHOLDS = {
     gcIntervalMs: 15 * 1000,     // v7: was 30s — now 15s for more aggressive GC
     monitorIntervalMs: 8 * 1000,   // v7: was 10s — now 8s for faster detection
     warningStreak: 1,              // v3: was 2 — now react on FIRST warning
+  },
+  minimum: {
+    warnHeapMB: 150,
+    restartHeapMB: 170,
+    rssHardLimitMB: 300,
+    gcIntervalMs: 8 * 1000,       // very aggressive GC
+    monitorIntervalMs: 5 * 1000,   // very fast detection
+    warningStreak: 1,
   },
 };
 
@@ -97,7 +124,35 @@ const HEAVY_RESILIENCE_KEYS = [
   'POLICY_ACTION_VALIDATOR_ENABLED',
 ];
 
-let _currentMode: 'full_power' | 'memory_protection' = 'full_power';
+// ── Additional keys disabled ONLY in minimum mode ──
+// Everything that isn't needed to solve questions.
+const MINIMUM_ONLY_KEYS = [
+  // Workers & background tasks
+  'DIARY_WORKER_ENABLED',        // diary logging worker thread
+  'WORKER_MANAGER_ENABLED',      // worker thread manager
+  // Telemetry & monitoring
+  'ENABLE_GAN_TELEMETRY',        // GAN telemetry collection
+  'ENABLE_LOCAL_VLM',            // local VLM model loading (~50-100MB)
+  // Services
+  'NTFY_ENABLED',                // push notification alerts
+  'PIX2TEX_ENABLED',             // OCR math extraction service
+  // Survival & longevity
+  'SURVIVAL_ENABLED',            // survival subsystem (ephemeral shield, tombstone, etc.)
+  'LONGEVITY_ENABLED',           // longevity subsystem (self-ping, UI recovery, etc.)
+  // Progress & tracking
+  'PROGRESS_DETECTOR_ENABLED',   // progress/semantic detection
+  'MODULE_TRACKING_ENABLED',     // module completion tracking
+  // Monitoring
+  'HEALTH_CHECK_ENABLED',        // periodic health checks
+  'CIRCUIT_BREAKER_ENABLED',     // subsystem circuit breakers
+  // Work shifts
+  'WORK_SHIFTS_ENABLED',         // work shift scheduling
+  // Exploration
+  'ENABLE_EXPLORATION_PASS',     // already in HEAVY but duplicate for clarity
+  'ENABLE_ADAPTIVE_PERFORMANCE', // already in HEAVY but duplicate for clarity
+];
+
+let _currentMode: MemoryMode = 'full_power';
 let _gcTimer: ReturnType<typeof setInterval> | null = null;
 let _monitorTimer: ReturnType<typeof setInterval> | null = null;
 let _modeChangeCallbacks: Array<(mode: string, reason: string) => void> = [];
@@ -117,7 +172,7 @@ function _log(msg: string, level: string = 'INFO') {
 }
 
 // ── Get current mode ──
-function getMode(): 'full_power' | 'memory_protection' {
+function getMode(): MemoryMode {
   return _currentMode;
 }
 
@@ -126,7 +181,11 @@ function getThresholds() {
 }
 
 function isMemoryProtection(): boolean {
-  return _currentMode === 'memory_protection';
+  return _currentMode === 'memory_protection' || _currentMode === 'minimum';
+}
+
+function isMinimumMode(): boolean {
+  return _currentMode === 'minimum';
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -363,16 +422,53 @@ function clearBrowserClosedFlag(): void {
 }
 
 // ── Apply mode: set env vars, persist, AND shed memory ──
-async function _applyMode(mode: 'full_power' | 'memory_protection', reason: string): Promise<void> {
+async function _applyMode(mode: MemoryMode, reason: string): Promise<void> {
   const prev = _currentMode;
   _currentMode = mode;
   const thresholds = MODE_THRESHOLDS[mode];
 
-  if (mode === 'memory_protection') {
+  if (mode === 'minimum') {
+    // MINIMUM: disable everything. Includes all memory_protection keys PLUS
+    // additional minimum-only keys.
+    const allKeys = [...HEAVY_SELF_HEAL_KEYS, ...HEAVY_RESILIENCE_KEYS, ...MINIMUM_ONLY_KEYS];
+    for (const key of allKeys) {
+      process.env[key] = 'false';
+    }
+    // Also disable screenshots and log rotation to reduce disk I/O
+    process.env.SAVE_SCREENSHOTS = 'false';
+    process.env.ENABLE_GAN_TELEMETRY = 'false';
+    process.env.ENABLE_LOCAL_VLM = 'false';
+    _log(`MINIMUM mode activated: ${reason}. Disabled ${allKeys.length} modules. Only core question-solving pipeline active. Thresholds: warn=${thresholds.warnHeapMB}MB restart=${thresholds.restartHeapMB}MB GC=${thresholds.gcIntervalMs / 1000}s`, 'ERROR');
+
+    // Persist minimum mode to DB so it survives restarts
+    try {
+      const dbMod = require('./database');
+      if (dbMod?.db && dbMod.upsertCalibration) {
+        dbMod.upsertCalibration.run(CALIBRATION_KEY_MINIMUM_MODE, JSON.stringify({ active: true, reason, ts: Date.now() }), Date.now());
+      }
+    } catch { /* DB not ready */ }
+
+    // Aggressive memory shed
+    if (prev !== mode) {
+      const afterMB = await shedMemory(`minimum_activate:${reason}`, { maxLevel: 3, preserveBrowser: false });
+      _log(`Minimum mode memory shed: ${afterMB.toFixed(1)}MB`, 'ERROR');
+    }
+  } else if (mode === 'memory_protection') {
     // Disable heavy modules via env vars
     for (const key of [...HEAVY_SELF_HEAL_KEYS, ...HEAVY_RESILIENCE_KEYS]) {
       process.env[key] = 'false';
     }
+    // Re-enable minimum-only keys (they're only disabled in minimum mode)
+    for (const key of MINIMUM_ONLY_KEYS) {
+      delete process.env[key];
+    }
+    // Clear minimum mode DB marker
+    try {
+      const dbMod = require('./database');
+      if (dbMod?.db?.prepare) {
+        dbMod.db.prepare('DELETE FROM calibration WHERE key = ?').run(CALIBRATION_KEY_MINIMUM_MODE);
+      }
+    } catch { /* DB not ready */ }
     _log(`MEMORY PROTECTION mode activated: ${reason}. Disabled ${HEAVY_SELF_HEAL_KEYS.length + HEAVY_RESILIENCE_KEYS.length} heavy modules. Thresholds: warn=${thresholds.warnHeapMB}MB restart=${thresholds.restartHeapMB}MB GC=${thresholds.gcIntervalMs / 1000}s`, 'WARN');
 
     // v3 FIX: Actually shed memory instead of just logging about it
@@ -384,9 +480,16 @@ async function _applyMode(mode: 'full_power' | 'memory_protection', reason: stri
     }
   } else {
     // Re-enable heavy modules (only env — they won't start until restart)
-    for (const key of [...HEAVY_SELF_HEAL_KEYS, ...HEAVY_RESILIENCE_KEYS]) {
+    for (const key of [...HEAVY_SELF_HEAL_KEYS, ...HEAVY_RESILIENCE_KEYS, ...MINIMUM_ONLY_KEYS]) {
       delete process.env[key];
     }
+    // Clear minimum mode DB marker
+    try {
+      const dbMod = require('./database');
+      if (dbMod?.db?.prepare) {
+        dbMod.db.prepare('DELETE FROM calibration WHERE key = ?').run(CALIBRATION_KEY_MINIMUM_MODE);
+      }
+    } catch { /* DB not ready */ }
     _browserClosedByProtection = false;
     _log(`FULL POWER mode activated: ${reason}. Heavy modules will re-enable on restart. Thresholds: warn=${thresholds.warnHeapMB}MB restart=${thresholds.restartHeapMB}MB GC=${thresholds.gcIntervalMs / 1000}s`, 'INFO');
   }
@@ -410,8 +513,29 @@ async function _applyMode(mode: 'full_power' | 'memory_protection', reason: stri
   }
 }
 
+/**
+ * Activate minimum mode. Called when OOM death spiral + self-heal failure
+ * is detected, or when restored from DB.
+ */
+async function activateMinimumMode(reason: string): Promise<void> {
+  if (_currentMode === 'minimum') return; // already in minimum
+  await _applyMode('minimum', reason);
+  _restartTimers();
+}
+
+/**
+ * Deactivate minimum mode, returning to memory_protection.
+ * Called after a successful self-heal fix from minimum mode,
+ * or manually from the dashboard.
+ */
+async function deactivateMinimumMode(reason: string): Promise<void> {
+  if (_currentMode !== 'minimum') return;
+  await _applyMode('memory_protection', `minimum_exit:${reason}`);
+  _restartTimers();
+}
+
 // ── Manual mode switch (from dashboard) ──
-async function switchMode(mode: 'full_power' | 'memory_protection', reason: string): Promise<void> {
+async function switchMode(mode: MemoryMode, reason: string): Promise<void> {
   await _applyMode(mode, `manual:${reason}`);
   _restartTimers();
 }
@@ -419,7 +543,7 @@ async function switchMode(mode: 'full_power' | 'memory_protection', reason: stri
 // ── Auto-downgrade check ──
 // v5 FIX: Now async because _applyMode is async (awaits browser cleanup)
 async function checkAutoDowngrade(heapMB: number, rssMB: number): Promise<boolean> {
-  if (_currentMode === 'memory_protection') return false;
+  if (_currentMode === 'memory_protection' || _currentMode === 'minimum') return false;
 
   let shouldDowngrade = false;
   let reason = '';
@@ -437,6 +561,8 @@ async function checkAutoDowngrade(heapMB: number, rssMB: number): Promise<boolea
   // Mid-run OOM detection is handled by checkAfterTursoSync() via the DB.
 
   if (shouldDowngrade) {
+    // If already in minimum, don't downgrade further
+    if (_currentMode === 'minimum') return false;
     await _applyMode('memory_protection', `auto:${reason}`);
     _restartTimers();
   }
@@ -542,10 +668,15 @@ async function beginSelfHealSession(reason: string): Promise<boolean> {
     _log(`Self-heal session already active — ignoring beginSelfHealSession('${reason}')`, 'WARN');
     return false;
   }
-  if (_currentMode !== 'memory_protection') {
-    _log(`Not in memory_protection mode (current: ${_currentMode}) — self-heal session not needed`, 'DEBUG');
+  // Allow self-heal from both memory_protection AND minimum mode.
+  // From minimum: promote to memory_protection (NOT full_power — too dangerous).
+  // From memory_protection: promote to full_power (existing behavior).
+  if (_currentMode !== 'memory_protection' && _currentMode !== 'minimum') {
+    _log(`Not in memory_protection or minimum mode (current: ${_currentMode}) — self-heal session not needed`, 'DEBUG');
     return false;
   }
+
+  const wasMinimum = _currentMode === 'minimum';
 
   _selfHealSessionActive = true;
   const grantedTs = Date.now();
@@ -565,10 +696,14 @@ async function beginSelfHealSession(reason: string): Promise<boolean> {
     }
   } catch { /* non-critical */ }
 
-  // Switch to full power
+  // Switch to appropriate mode for healing
+  // From minimum: go to memory_protection (safer, still disables heavy self-heal
+  //   but re-enables the minimum-only keys like workers, telemetry, etc.)
+  // From memory_protection: go to full_power (existing behavior)
+  const healMode: MemoryMode = wasMinimum ? 'memory_protection' : 'full_power';
   // v5 FIX: await the mode switch (it's async now)
-  await _applyMode('full_power', `self_heal_begin:${reason}`);
-  _log(`SELF-HEAL SESSION STARTED: ${reason}. Full power granted for up to ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min. SAVE ALL PROGRESS TO DB.`, 'WARN');
+  await _applyMode(healMode, `self_heal_begin:${reason}`);
+  _log(`SELF-HEAL SESSION STARTED: ${reason}. Promoted from ${wasMinimum ? 'MINIMUM' : 'MEMORY PROTECTION'} to ${healMode} for up to ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min. SAVE ALL PROGRESS TO DB.`, 'WARN');
 
   // Start timeout
   _startSelfHealSessionTimeout(SELF_HEAL_SESSION_TIMEOUT_MS);
@@ -654,14 +789,15 @@ async function finalizeSelfHealSession(): Promise<void> {
     }
   } catch { /* non-critical */ }
 
-  // Return to memory protection
+  // Return to memory protection (or minimum if we were in minimum before)
   // v5 FIX: await so browser is actually closed before returning
-  if (_currentMode !== 'memory_protection') {
-    await _applyMode('memory_protection', 'self_heal_finalize:fix_verified');
+  const targetMode: MemoryMode = 'memory_protection'; // always return to at least memory_protection
+  if (_currentMode !== targetMode) {
+    await _applyMode(targetMode, 'self_heal_finalize:fix_verified');
     _restartTimers();
   }
 
-  _log('Self-heal session FINALIZED. Returning to MEMORY PROTECTION. Patch drafts deleted.', 'INFO');
+  _log(`Self-heal session FINALIZED. Returning to ${targetMode}. Patch drafts deleted.`, 'INFO');
 }
 
 /**
@@ -683,14 +819,28 @@ async function abortSelfHealSession(reason: string): Promise<void> {
     abortedAt: Date.now(),
   });
 
-  // Return to memory protection immediately
+  // Return to memory protection immediately (or stay in minimum if DB says so)
   // v5 FIX: await so browser is actually closed
-  if (_currentMode !== 'memory_protection') {
-    await _applyMode('memory_protection', `self_heal_abort:${reason}`);
+  // Check if minimum mode was active before this session
+  let targetMode: MemoryMode = 'memory_protection';
+  try {
+    const dbMod = require('./database');
+    if (dbMod?.selectCalibration) {
+      const minRow = dbMod.selectCalibration.get(CALIBRATION_KEY_MINIMUM_MODE);
+      if (minRow) {
+        try {
+          const parsed = JSON.parse(minRow.value);
+          if (parsed.active) targetMode = 'minimum';
+        } catch {}
+      }
+    }
+  } catch {}
+  if (_currentMode !== targetMode) {
+    await _applyMode(targetMode, `self_heal_abort:${reason}`);
     _restartTimers();
   }
 
-  _log(`Self-heal session ABORTED: ${reason}. Returned to MEMORY PROTECTION.`, 'WARN');
+  _log(`Self-heal session ABORTED: ${reason}. Returned to ${targetMode}.`, 'WARN');
 }
 
 /**
@@ -738,11 +888,31 @@ async function checkAfterTursoSync(selectCalibration: any, upsertCalibration: an
   if (!selectCalibration || !upsertCalibration) return;
 
   try {
+    // Check 0: Is MINIMUM mode persisted in the DB? (highest priority)
+    const minRow = selectCalibration.get(CALIBRATION_KEY_MINIMUM_MODE);
+    if (minRow) {
+      try {
+        const parsed = JSON.parse(minRow.value);
+        if (parsed.active && _currentMode !== 'minimum') {
+          await _applyMode('minimum', `db_restored_minimum:${parsed.reason || 'unknown'}`);
+          _restartTimers();
+          _log('Restored MINIMUM mode from database (Turso recovery)', 'ERROR');
+          return;
+        }
+      } catch { /* parse error */ }
+    }
+
     // Check 1: Was the mode persisted as memory_protection in the DB (via Turso)?
     const modeRow = selectCalibration.get(CALIBRATION_KEY_MODE);
     if (modeRow) {
       try {
         const parsed = JSON.parse(modeRow.value);
+        if (parsed.mode === 'minimum' && _currentMode !== 'minimum') {
+          await _applyMode('minimum', `db_restored_mode:${parsed.reason || 'unknown'}`);
+          _restartTimers();
+          _log('Restored MINIMUM mode from database (mode field)', 'ERROR');
+          return;
+        }
         if (parsed.mode === 'memory_protection' && _currentMode !== 'memory_protection') {
           await _applyMode('memory_protection', `db_restored:${parsed.reason || 'unknown'}`);
           _restartTimers();
@@ -835,20 +1005,66 @@ function recordOOMExit(heapMB: number, rssMB: number): void {
   _log(`OOM exit recorded: heap=${heapMB.toFixed(0)}MB rss=${rssMB.toFixed(0)}MB`, 'WARN');
 }
 
-// ── Initialize: restore persisted mode + check for OOM history ──// v5 FIX: init() is intentionally sync (called at module load time).
+/**
+ * Get the stored OOM kill count from the lifecycle OOM tracking.
+ * Used at init to decide between memory_protection and minimum.
+ */
+function _getStoredOOMCount(): number {
+  try {
+    const dbMod = require('./database');
+    if (!dbMod?.selectCalibration) return 0;
+    const row = dbMod.selectCalibration.get('lifecycle_oom_count');
+    if (!row) return 0;
+    const count = parseInt(row.value, 10);
+    return isNaN(count) ? 0 : count;
+  } catch { return 0; }
+}
+
+// ── Initialize: restore persisted mode + check for OOM history ──
+// v5 FIX: init() is intentionally sync (called at module load time).
 // At init, no browser exists yet, so _applyMode's shedMemory is a no-op for
 // the browser step — only sets env vars and persists. The real memory shed
 // happens later when checkAfterTursoSync() or the monitor triggers it.
 // We fire-and-forget the _applyMode promise to avoid changing the init API.
 function init(): void {
   try {
+    // Check for persisted minimum mode in DB first (survives /tmp wipes)
+    try {
+      const dbMod = require('./database');
+      if (dbMod?.selectCalibration) {
+        const minRow = dbMod.selectCalibration.get(CALIBRATION_KEY_MINIMUM_MODE);
+        if (minRow) {
+          try {
+            const parsed = JSON.parse(minRow.value);
+            if (parsed.active) {
+              _applyMode('minimum', `db_boot_minimum:${parsed.reason || 'unknown'}`).catch(() => {});
+              _log('Starting in MINIMUM mode (restored from database)', 'ERROR');
+              _checkForActiveSelfHealSession();
+              _restartTimers();
+              return;
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+
     const persisted = persistConfig.getMode();
-    if (persisted.current === 'memory_protection') {
+    if (persisted.current === 'minimum') {
+      _applyMode('minimum', `restored:${persisted.reason}`).catch(() => {});
+      _log('Starting in MINIMUM mode (restored from persistent storage)', 'ERROR');
+    } else if (persisted.current === 'memory_protection') {
       _applyMode('memory_protection', `restored:${persisted.reason}`).catch(() => {});
       _log('Restored MEMORY PROTECTION mode from persistent storage', 'INFO');
     } else if (persistConfig.wasRecentlyOOMKilled()) {
-      _applyMode('memory_protection', 'auto:OOM_kill_recovery').catch(() => {});
-      _log('Detected recent OOM kill — starting in MEMORY PROTECTION mode', 'WARN');
+      // Check OOM kill count — if very high, go straight to minimum
+      const oomCount = _getStoredOOMCount();
+      if (oomCount >= MINIMUM_MODE_OOM_KILL_THRESHOLD) {
+        _applyMode('minimum', `boot_oom_count:${oomCount}`).catch(() => {});
+        _log(`Detected ${oomCount} recent OOM kills — starting in MINIMUM mode`, 'ERROR');
+      } else {
+        _applyMode('memory_protection', 'auto:OOM_kill_recovery').catch(() => {});
+        _log('Detected recent OOM kill — starting in MEMORY PROTECTION mode', 'WARN');
+      }
     } else {
       // v4: Default to memory_protection. Full power requires self-heal session
       // or manual dashboard switch. This is the safe default on 512MB.
@@ -907,7 +1123,10 @@ module.exports = {
   getMode,
   getThresholds,
   isMemoryProtection,
+  isMinimumMode,
   switchMode,
+  activateMinimumMode,
+  deactivateMinimumMode,
   checkAutoDowngrade,
   checkAfterTursoSync,
   recordOOMExit,
@@ -927,7 +1146,10 @@ module.exports = {
   // Constants
   HEAVY_SELF_HEAL_KEYS,
   HEAVY_RESILIENCE_KEYS,
+  MINIMUM_ONLY_KEYS,
   AUTO_DOWNGRADE_HEAP_MB,
   AUTO_DOWNGRADE_RSS_MB,
+  MINIMUM_MODE_OOM_KILL_THRESHOLD,
   SELF_HEAL_SESSION_TIMEOUT_MS,
+  CALIBRATION_KEY_MINIMUM_MODE,
 };
