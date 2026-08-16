@@ -16,9 +16,12 @@ let authAttempts = 0;
 // ─── Pixel-based blank page detection ───────────────────────────────────
 // Flutter Web renders everything to <canvas>, so innerText is always empty.
 // Text-length heuristics are fundamentally broken for Flutter SPAs.
-// Instead, sample 5 pixels from a screenshot. If all 5 are the same colour,
-// the page is visually blank (white, black, or any solid colour).
-// If even 1 pixel differs, real content has been rendered.
+// Instead, sample 12 pixels in a 4x3 grid from a PNG screenshot.
+// A page is blank only if ALL 12 pixels have near-zero variance
+// (max standard deviation < 3 across R/G/B channels).
+// Real content (text, buttons, images) always produces enough variance
+// to exceed this threshold, even on pages with large solid-color areas.
+// Uses PNG pixel sampling for accuracy, with JPEG fallback.
 
 /**
  * Undo PNG row filters to get actual pixel values.
@@ -61,7 +64,7 @@ function _defilterPng(raw: Buffer, width: number, height: number, bpp: number): 
 }
 
 /**
- * Sample 12 pixels from a PNG screenshot buffer in a 4×3 grid.
+ * Sample 12 pixels from a PNG screenshot buffer in a 4x3 grid.
  * Returns array of [r, g, b] tuples, or null on failure.
  */
 function _samplePixelsFromPng(pngBuffer: Buffer): Array<[number, number, number]> | null {
@@ -121,17 +124,43 @@ function _samplePixelsFromPng(pngBuffer: Buffer): Array<[number, number, number]
 }
 
 /**
- * Take a screenshot and check if all sampled pixels are the same colour.
- * If yes → page is visually blank. If no → content has been rendered.
+ * Take a screenshot and check if the page is visually blank.
+ * Uses PNG pixel sampling (12 pixels, 4x3 grid) with variance-based detection.
+ * Falls back to JPEG buffer size heuristic if PNG parsing fails.
+ *
+ * A page is blank only if ALL 12 sampled pixels have near-zero variance
+ * (standard deviation < 3 per RGB channel). This correctly handles:
+ *   - White pages (all 255)
+ *   - Black pages (all 0)
+ *   - Solid colour pages (uniform)
+ *   - Pages with ANY content (text, buttons, images) → variance > 3
  */
 async function _isPageVisuallyBlank(page: any): Promise<boolean> {
   try {
     const buf = await page.screenshot({ type: 'png', fullPage: false });
     const samples = _samplePixelsFromPng(buf);
-    if (!samples) return false; // can't determine — assume not blank
-    const [r0, g0, b0] = samples[0];
-    const allSame = samples.every(([r, g, b]) => r === r0 && g === g0 && b === b0);
-    return allSame;
+    if (samples && samples.length >= 8) {
+      // Compute per-channel standard deviation
+      const rMean = samples.reduce((s, p) => s + p[0], 0) / samples.length;
+      const gMean = samples.reduce((s, p) => s + p[1], 0) / samples.length;
+      const bMean = samples.reduce((s, p) => s + p[2], 0) / samples.length;
+      const rStd = Math.sqrt(samples.reduce((s, p) => s + (p[0] - rMean) ** 2, 0) / samples.length);
+      const gStd = Math.sqrt(samples.reduce((s, p) => s + (p[1] - gMean) ** 2, 0) / samples.length);
+      const bStd = Math.sqrt(samples.reduce((s, p) => s + (p[2] - bMean) ** 2, 0) / samples.length);
+      const maxStd = Math.max(rStd, gStd, bStd);
+      const isBlank = maxStd < 3;
+      log(`Pixel blank check: ${samples.length} samples, std(R=${rStd.toFixed(1)}, G=${gStd.toFixed(1)}, B=${bStd.toFixed(1)}), maxStd=${maxStd.toFixed(1)} → ${isBlank ? 'BLANK' : 'NOT blank'}`, 'DEBUG', 'auth-guard');
+      return isBlank;
+    }
+    // PNG parsing failed — fall back to buffer size heuristic
+    // A real rendered page at quality 20 produces >3KB even if mostly blank.
+    // A genuinely blank page (solid white/black rectangle) compresses to <2KB.
+    const jpegBuf = await page.screenshot({ type: 'jpeg', quality: 20 }).catch(() => null);
+    if (jpegBuf && jpegBuf.length < 2000) {
+      log(`Pixel sampling unavailable, JPEG size=${jpegBuf.length}bytes < 2000 → assuming blank`, 'DEBUG', 'auth-guard');
+      return true;
+    }
+    return false; // can't determine — assume not blank
   } catch {
     return false; // screenshot failed — assume not blank
   }
@@ -198,11 +227,12 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
     // ── BLANK PAGE DETECTION (pixel-based, must run BEFORE canvas check) ──
     // Flutter Web paints everything to <canvas>, so innerText is always empty.
     // Text-length heuristics are fundamentally broken for Flutter SPAs.
-    // Instead, sample 5 pixels from a screenshot. If all 5 are the same colour,
-    // the page is visually blank. If even 1 differs, real content is rendered.
+    // Instead, sample 12 pixels from a screenshot. If pixel variance is
+    // near-zero (std < 3), the page is visually blank.
+    // If even 1 pixel differs significantly, real content is rendered.
     const visuallyBlank = await _isPageVisuallyBlank(page);
     if (visuallyBlank) {
-      log('SPA check: Screenshot is visually blank (all 5 sampled pixels identical) — session NOT valid', 'WARN', 'auth-guard');
+      log('SPA check: Screenshot is visually blank (low pixel variance) — session NOT valid', 'WARN', 'auth-guard');
       return false;
     }
 
@@ -223,11 +253,20 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
  * decide whether to delegate to the tribunal (has content) or escalate
  * via reload/restart (blank canvas).
  *
- * Uses pixel-based detection: samples 5 pixels from a screenshot.
- * If all 5 are the same colour, the page is visually blank.
+ * Uses pixel-based detection: samples 12 pixels from a screenshot.
+ * If pixel variance is near-zero (std < 3), the page is visually blank.
  */
 async function _isPageBlank(page: any): Promise<boolean> {
   return _isPageVisuallyBlank(page);
+}
+
+/**
+ * Check if the blank-page flag is set WITHOUT consuming it.
+ * Used by cycle-manager to decide whether to reset blankPageCounter
+ * before the actual consumeBlankPageFlag call.
+ */
+function peekBlankPageFlag(page: any): boolean {
+  return !!(page as any)?._authBlankPage;
 }
 
 /**
@@ -401,4 +440,3 @@ function getCaptchaFailureCount(): number {
   return _consecutiveCaptchaFailures;
 }
 
-module.exports = { ensureAuthenticated, handleCaptcha, resetCaptchaFailureCount, getCaptchaFailureCount, consumeBlankPageFlag, _isPageBlank, _injectDependencies };
