@@ -1,4 +1,4 @@
-'use strict';
+ strict';
 
 let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
@@ -12,26 +12,20 @@ function getAuditPatchContent() { return _deps.sandboxExecutor?.auditPatchConten
 /**
  * Self-heal auditor — Layer 2 of the two-layer audit system.
  *
- * Layer 1 (sandbox-executor.js) handles deterministic checks:
- *   - File-level policy (immutable/restricted/allowed)
- *   - Content pattern blocking (30+ dangerous patterns)
- *   - Path traversal, syntax validation, size limits
+ * v2: Enhanced for non-codegen provider patches.
+ * When a patch comes from a non-codegen provider (Gemini, Groq, Cloudflare,
+ * etc.), additional safety layers are activated:
  *
- * This module handles probabilistic checks:
- *   - Fast keyword pre-filter (isObviouslyMalicious)
- *   - AI tribunal vote (multiple independent models)
- *
- * The two layers are coordinated by self-heal.js:
- *   1. Sandbox runs first — if it blocks, AI auditor is never called
- *   2. AI auditor runs second — catches semantic maliciousness
- *      that pattern matching can't detect (e.g. data exfiltration
- *      via allowed API calls, logic bombs, etc.)
+ *   - Extended keyword scanning (more patterns)
+ *   - Higher auditor count (more independent models vote)
+ *   - Stricter supermajority threshold (3/4 instead of 2/3)
+ *   - Output structure validation (full file content vs unified diff)
+ *   - Single-veto enforcement (any single auditor can block)
+ *   - Size and entropy checks
  */
 
 // ─── Keyword Pre-Filter ───
 // These are patterns that are obviously malicious regardless of context.
-// NOTE: The sandbox already blocks most of these at the content level.
-// This pre-filter exists as a FAST first pass before spending API calls.
 const FORBIDDEN_KEYWORDS = [
   'child_process', 'exec(', 'spawn(', 'eval(', 'Function(',
   'require("fs")', "require('fs')", 'fs.readFile', 'fs.writeFile', 'fs.unlink',
@@ -39,9 +33,162 @@ const FORBIDDEN_KEYWORDS = [
   'atob(', 'btoa(',
 ];
 
-function isObviouslyMalicious(patchText: any) { 
+// v2: Extended keyword list for non-codegen patches (more dangerous models)
+const EXTENDED_FORBIDDEN_KEYWORDS = [
+  ...FORBIDDEN_KEYWORDS,
+  // Data exfiltration vectors
+  'fetch(', 'http.get', 'http.request', 'https://',
+  'XMLHttpRequest', 'WebSocket',
+  'net.connect', 'dns.lookup',
+  // File system access (beyond what's needed)
+  'fs.mkdir', 'fs.rmdir', 'fs.rmSync', 'fs.unlinkSync',
+  'fs.copyFile', 'fs.renameSync',
+  // Code execution vectors
+  'new Function', 'vm.runInNewContext', 'vm.runInThisContext',
+  'require("child_process")', "require('child_process')",
+  // Network exfiltration patterns
+  'encodeURIComponent', 'JSON.stringify(process',
+  // Process manipulation
+  'process.exit(', 'process.kill(', 'process.disconnect(',
+  // Module cache poisoning
+  'delete require.cache',
+  // Timer bombs
+  'setInterval(', 'setTimeout(.*\d{6,}',
+  // Environment access
+  'process.env.HOME', 'process.env.USER', 'process.env.PATH',
+];
+
+function isObviouslyMalicious(patchText: any): boolean {
   const lower = patchText.toLowerCase();
   return FORBIDDEN_KEYWORDS.some(keyword => lower.includes(keyword.toLowerCase()));
+}
+
+/**
+ * v2: Extended keyword check for non-codegen patches.
+ * Checks a broader set of dangerous patterns AND also validates
+ * the structural integrity of the patch.
+ */
+function isObviouslyMaliciousExtended(patchText: any): { malicious: boolean; reasons: string[] } {
+  const lower = patchText.toLowerCase();
+  const reasons: string[] = [];
+
+  for (const keyword of EXTENDED_FORBIDDEN_KEYWORDS) {
+    if (lower.includes(keyword.toLowerCase())) {
+      reasons.push(`Extended keyword: ${keyword}`);
+    }
+  }
+
+  // Structural checks
+  if (!patchText || typeof patchText !== 'string') {
+    reasons.push('Patch is not a string');
+  } else {
+    // Check for unified diff format (self-heal only supports full file replacement)
+    if (patchText.trimStart().startsWith('---')) {
+      reasons.push('Patch is a unified diff (not full file replacement)');
+    }
+    // Check for suspiciously short patches
+    if (patchText.trim().length < 50) {
+      reasons.push('Patch is suspiciously short (< 50 chars)');
+    }
+    // Check for suspiciously large patches
+    if (patchText.length > 200 * 1024) {
+      reasons.push('Patch is suspiciously large (> 200KB)');
+    }
+    // Check for binary-like content
+    const nullByteCount = (patchText.match(/\0/g) || []).length;
+    if (nullByteCount > 0) {
+      reasons.push(`Patch contains ${nullByteCount} null byte(s)`);
+    }
+    // Check for high entropy (possible encrypted/obfuscated content)
+    if (_hasHighEntropy(patchText)) {
+      reasons.push('Patch has unusually high entropy (possible obfuscation)');
+    }
+    // Check that patch starts with a valid module pattern
+    const trimmedStart = patchText.trimStart().substring(0, 20);
+    const validStarts = ["'use strict'", '"use strict"', 'import ', 'export ', '//', '/*', '/**'];
+    if (!validStarts.some(s => trimmedStart.startsWith(s))) {
+      reasons.push(`Patch doesn't start with a recognized module pattern (starts with: "${trimmedStart.substring(0, 30)}")`);
+    }
+    // Check for unbalanced braces (basic syntax sanity)
+    if (!_hasBalancedBraces(patchText)) {
+      reasons.push('Patch has unbalanced braces/brackets/parens');
+    }
+  }
+
+  return { malicious: reasons.length > 0, reasons };
+}
+
+/**
+ * Calculate Shannon entropy of a string.
+ * High entropy (> 4.5) suggests encrypted or compressed content.
+ */
+function _shannonEntropy(str: string): number {
+  const freq: Record<string, number> = {};
+  for (const ch of str) {
+    freq[ch] = (freq[ch] || 0) + 1;
+  }
+  let entropy = 0;
+  const len = str.length;
+  for (const ch in freq) {
+    const p = freq[ch] / len;
+    if (p > 0) entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+function _hasHighEntropy(str: string): boolean {
+  // Only check if patch is reasonably long
+  if (str.length < 200) return false;
+  // Sample entropy on first 1000 chars for speed
+  const sample = str.substring(0, 1000);
+  return _shannonEntropy(sample) > 4.5;
+}
+
+/**
+ * Check if braces, brackets, and parentheses are balanced.
+ * Ignores those inside strings and comments (basic check).
+ */
+function _hasBalancedBraces(str: string): boolean {
+  let depth = 0;
+  let bracketDepth = 0;
+  let parenDepth = 0;
+  let inString: string | null = null;
+  let inLineComment = false;
+  let inBlockComment = false;
+
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    const next = str[i + 1];
+
+    if (inLineComment) {
+      if (ch === '\n') inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === '*' && next === '/') { inBlockComment = false; i++; }
+      continue;
+    }
+    if (inString) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === inString) inString = null;
+      continue;
+    }
+
+    if (ch === '/' && next === '/') { inLineComment = true; i++; continue; }
+    if (ch === '/' && next === '*') { inBlockComment = true; i++; continue; }
+    if (ch === '"' || ch === "'" || ch === '`') { inString = ch; continue; }
+
+    if (ch === '{') depth++;
+    else if (ch === '}') depth--;
+    else if (ch === '[') bracketDepth++;
+    else if (ch === ']') bracketDepth--;
+    else if (ch === '(') parenDepth++;
+    else if (ch === ')') parenDepth--;
+
+    if (depth < 0 || bracketDepth < 0 || parenDepth < 0) return false;
+  }
+
+  return depth === 0 && bracketDepth === 0 && parenDepth === 0;
 }
 
 // ─── AI Auditor Configuration ───
@@ -61,7 +208,35 @@ Respond ONLY in this exact JSON format:
 { "is_safe": true/false, "reason": "One sentence explaining why." }
 `;
 
-function getAuditorConfig() { 
+/**
+ * v2: Stricter auditor prompt for non-codegen patches.
+ * Adds more specific checks for common non-codegen failure modes.
+ */
+const NON_CODEGEN_AUDITOR_PROMPT = `
+You are an EXTREMELY strict cybersecurity auditor for an autonomous bot.
+A NON-CODE-GENERATION AI model (like Gemini, Groq, or Cloudflare) has generated
+a JavaScript code patch. These models are NOT designed for code generation and
+frequently produce dangerous, malformed, or subtly broken code.
+
+You must REJECT the patch if it contains ANY of the following:
+1. Network requests to ANY domain (the bot should never make outbound HTTP requests from patched code).
+2. ANY file system operations (fs.read, fs.write, etc.).
+3. ANY usage of 'child_process', 'exec', 'spawn', 'eval()', 'Function('.
+4. ANY access to environment variables.
+5. Infinite loops, unbounded recursion, or memory bombs.
+6. Obfuscated code (base64, hex sequences, encoded strings).
+7. Code that modifies process-level state (process.env, process.exit, etc.).
+8. Code that seems like placeholder/dummy content (e.g., just 'use strict' with nothing else, or a file that just exports an empty object).
+9. Code that imports or requires modules not related to the fix.
+10. The patch looks like a DESCRIPTION of a fix rather than actual code.
+11. The patch contains markdown, HTML, or non-JavaScript content.
+12. The patch is a unified diff (lines starting with + or -) rather than a complete file.
+
+RESPOND ONLY in this exact JSON format:
+{ "is_safe": true/false, "reason": "One sentence explaining why." }
+`;
+
+function getAuditorConfig() {
   if (process.env.AUDITOR_USE_ACTIVE === 'false' && process.env.AUDITOR_MODEL) {
     const provider = process.env.AUDITOR_PROVIDER || 'openrouter';
     const endpointMap = { openrouter: 'https://openrouter.ai/api/v1/chat/completions', mistral: 'https://api.mistral.ai/v1/chat/completions' };
@@ -83,18 +258,71 @@ function getAuditorConfig() {
   return { provider: 'openrouter', model: 'openrouter/free', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: getCONFIG().OPENROUTER_API_KEY };
 }
 
+/**
+ * v2: Get auditor configs for non-codegen patches.
+ * Returns MORE auditor configs for higher confidence.
+ * Includes additional provider endpoints.
+ */
+function getNonCodegenAuditorConfigs(): Array<{ provider: string; model: string; endpoint: string; apiKey: string | null }> {
+  const configs: Array<{ provider: string; model: string; endpoint: string; apiKey: string | null }> = [];
+
+  // OpenRouter (free tier)
+  if (getCONFIG().OPENROUTER_API_KEY) {
+    configs.push({
+      provider: 'openrouter', model: 'openrouter/free',
+      endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+      apiKey: getCONFIG().OPENROUTER_API_KEY,
+    });
+  }
+
+  // Mistral Codestral (dedicated code model — best auditor)
+  if (getCONFIG().MISTRAL_CODE_API_KEY) {
+    configs.push({
+      provider: 'mistral', model: 'codestral-latest',
+      endpoint: 'https://api.mistral.ai/v1/chat/completions',
+      apiKey: getCONFIG().MISTRAL_CODE_API_KEY,
+    });
+  }
+
+  // Gemini (if available — excellent for security analysis)
+  if (getCONFIG().GEMINI_API_KEY) {
+    try {
+      const gemini = require('./providers-gemini');
+      if (gemini) {
+        configs.push({
+          provider: 'gemini', model: 'gemini-2.0-flash',
+          endpoint: 'gemini-native',
+          apiKey: getCONFIG().GEMINI_API_KEY,
+        });
+      }
+    } catch {}
+  }
+
+  // Groq (fast, good for pattern matching)
+  if (getCONFIG().GROQ_API_KEY) {
+    configs.push({
+      provider: 'groq', model: 'qwen/qwen3.6-27b',
+      endpoint: 'https://api.groq.com/openai/v1/chat/completions',
+      apiKey: getCONFIG().GROQ_API_KEY,
+    });
+  }
+
+  return configs;
+}
+
 // ─── Single AI Auditor Call ───
 
-async function auditPatchWithAI(patchText: any, signal: any, configOverride = null) { 
+async function auditPatchWithAI(patchText: any, signal: any, configOverride = null, isNonCodegen = false) {
   let config = configOverride || getAuditorConfig();
   if (!config.apiKey) {
     log('Auditor API key missing. Blocking patch by default.', 'WARN', 'auditor');
     return { is_safe: false, reason: 'Auditor API key not configured', provider: config.provider, model: config.model };
   }
   try {
+    const prompt = isNonCodegen ? NON_CODEGEN_AUDITOR_PROMPT : AUDITOR_PROMPT;
     const response = await getCallChatCompletion()(
       config.endpoint, config.apiKey, config.model, null,
-      AUDITOR_PROMPT + '\n\nPATCH TO AUDIT:\n' + patchText,
+      prompt + '\n\nPATCH TO AUDIT:\n' + patchText,
       { responseFormat: { type: 'json_object' }, signal }
     );
     const content = response.choices?.[0]?.message?.content;
@@ -110,11 +338,22 @@ async function auditPatchWithAI(patchText: any, signal: any, configOverride = nu
 
 // ─── Tribunal Audit (multiple independent models) ───
 
-async function auditPatchWithTribunal(patchText: any, signal: any) { 
-  const auditorConfigs = [
-    { provider: 'openrouter', model: 'openrouter/free' },
-    { provider: 'mistral', model: 'codestral-latest' },
-  ];
+async function auditPatchWithTribunal(patchText: any, signal: any, options?: { isNonCodegen?: boolean }) {
+  const isNonCodegen = options?.isNonCodegen || false;
+
+  // v2: Use more auditors and stricter thresholds for non-codegen patches
+  let auditorConfigs: Array<{ provider: string; model: string }>;
+  if (isNonCodegen) {
+    // Get all available auditors for non-codegen patches
+    const fullConfigs = getNonCodegenAuditorConfigs();
+    auditorConfigs = fullConfigs.map(c => ({ provider: c.provider, model: c.model }));
+    log(`Non-codegen audit: using ${auditorConfigs.length} auditors with strict mode`, 'INFO', 'auditor');
+  } else {
+    auditorConfigs = [
+      { provider: 'openrouter', model: 'openrouter/free' },
+      { provider: 'mistral', model: 'codestral-latest' },
+    ];
+  }
 
   const results: PromiseSettledResult<any>[] = await Promise.allSettled(auditorConfigs.map(async ({ provider, model }) => {
     let config = null;
@@ -122,9 +361,13 @@ async function auditPatchWithTribunal(patchText: any, signal: any) {
       config = { provider, model, endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: getCONFIG().OPENROUTER_API_KEY };
     } else if (provider === 'mistral' && getCONFIG().MISTRAL_CODE_API_KEY) {
       config = { provider, model, endpoint: 'https://api.mistral.ai/v1/chat/completions', apiKey: getCONFIG().MISTRAL_CODE_API_KEY };
+    } else if (provider === 'gemini' && getCONFIG().GEMINI_API_KEY) {
+      config = { provider, model, endpoint: 'gemini-native', apiKey: getCONFIG().GEMINI_API_KEY };
+    } else if (provider === 'groq' && getCONFIG().GROQ_API_KEY) {
+      config = { provider, model, endpoint: 'https://api.groq.com/openai/v1/chat/completions', apiKey: getCONFIG().GROQ_API_KEY };
     }
     if (!config) return null;
-    return auditPatchWithAI(patchText as any, signal as any, config as any);
+    return auditPatchWithAI(patchText as any, signal as any, config as any, isNonCodegen);
   }));
 
   const votes = results
@@ -136,18 +379,42 @@ async function auditPatchWithTribunal(patchText: any, signal: any) {
   const total = votes.length;
 
   if (total === 0) {
-    // No auditors available — fall back to single call
-    return auditPatchWithAI(patchText, signal);
+    return auditPatchWithAI(patchText, signal, null, isNonCodegen);
   }
 
-  const threshold = Math.ceil(total * 2 / 3);
+  // v2: Stricter threshold for non-codegen patches
+  // Normal: 2/3 supermajority
+  // Non-codegen: 3/4 supermajority OR single-veto
+  let threshold: number;
+  let singleVeto = false;
+  if (isNonCodegen) {
+    threshold = Math.ceil(total * 3 / 4); // 75% supermajority
+    singleVeto = true; // Any single auditor can block
+  } else {
+    threshold = Math.ceil(total * 2 / 3); // 67% supermajority
+  }
+
+  // v2: Single-veto check for non-codegen patches
+  if (singleVeto) {
+    const unsafeVotes = votes.filter(v => v.is_safe === false);
+ for (const veto of unsafeVotes) {
+      log(`NON-CODEGEN SINGLE VETO: ${veto.provider}/${veto.model} vetoed patch: ${veto.reason}`, 'WARN', 'auditor');
+      return {
+        safe: false,
+        is_safe: false,
+        reason: `Non-codegen single-veto by ${veto.provider}/${veto.model}: ${veto.reason}`,
+        votes,
+      };
+    }
+  }
+
   const approved = safeVotes.length >= threshold;
 
   return {
     safe: approved,
     is_safe: approved,
     reason: approved
-      ? `Approved by ${safeVotes.length}/${total} auditors`
+      ? `Approved by ${safeVotes.length}/${total} auditors${isNonCodegen ? ' (non-codegen strict mode)' : ''}`
       : `Rejected by majority (${safeVotes.length}/${total})`,
     votes,
   };
@@ -159,27 +426,35 @@ async function auditPatchWithTribunal(patchText: any, signal: any) {
  * Standard audit — keyword check + AI tribunal.
  * Used for ALLOWED files (non-restricted). Returns simple safe/unsafe.
  *
- * @param {string} patchText
- * @param {AbortSignal} [signal]
- * @returns {Promise<{ safe: boolean, reason?: string }>}
+ * v2: Accepts options.isNonCodegen for stricter validation.
  */
-async function auditPatch(patchText: any, signal: any) { 
+async function auditPatch(patchText: any, signal: any, options?: { isNonCodegen?: boolean }) {
+  const isNonCodegen = options?.isNonCodegen || false;
+
   // Fast keyword pre-filter
   if (isObviouslyMalicious(patchText)) {
     log('Patch blocked by keyword pre-filter.', 'WARN', 'auditor');
     return { safe: false, reason: 'Blocked by keyword scanner' };
   }
 
+  // v2: Extended keyword check for non-codegen patches
+  if (isNonCodegen) {
+    const extendedResult = isObviouslyMaliciousExtended(patchText);
+    if (extendedResult.malicious) {
+      log(`Patch blocked by EXTENDED keyword scanner (${extendedResult.reasons.length} issues): ${extendedResult.reasons.slice(0, 3).join('; ')}`, 'WARN', 'auditor');
+      return { safe: false, reason: `Extended keyword scan: ${extendedResult.reasons.slice(0, 3).join('; ')}` };
+    }
+  }
+
   // Optional: use sandbox content audit as additional pre-filter
-  // This catches patterns that the keyword scanner might miss
   const sandboxAudit = getAuditPatchContent()(patchText);
   if (!sandboxAudit.safe) {
     log(`Patch blocked by sandbox content audit: ${sandboxAudit.violations.length} violations`, 'WARN', 'auditor');
     return { safe: false, reason: `Sandbox content audit: ${sandboxAudit.violations.join('; ')}` };
   }
 
-  // AI tribunal (ALWAYS runs for security — cannot be disabled for restricted-file audits)
-  const aiResult = await auditPatchWithTribunal(patchText, signal);
+  // AI tribunal
+  const aiResult = await auditPatchWithTribunal(patchText, signal, { isNonCodegen });
   if (!aiResult.safe && !aiResult.is_safe) {
     log(`Patch blocked by AI auditor: ${aiResult.reason}`, 'WARN', 'auditor');
     return { safe: false, reason: aiResult.reason };
@@ -190,14 +465,11 @@ async function auditPatch(patchText: any, signal: any) {
 
 /**
  * Vote-collecting audit — used for RESTRICTED files.
- * Returns individual auditor votes so the approval workflow can
- * make its own supermajority decision.
- *
- * @param {string} patchText
- * @param {AbortSignal} [signal]
- * @returns {Promise<{ safe: boolean, is_safe: boolean, reason: string, votes: Array }>}
+ * v2: Accepts options.isNonCodegen for stricter validation.
  */
-async function auditPatchWithVotes(patchText: any, signal: any) { 
+async function auditPatchWithVotes(patchText: any, signal: any, options?: { isNonCodegen?: boolean }) {
+  const isNonCodegen = options?.isNonCodegen || false;
+
   // Keyword pre-filter
   if (isObviouslyMalicious(patchText)) {
     return {
@@ -207,7 +479,21 @@ async function auditPatchWithVotes(patchText: any, signal: any) {
     };
   }
 
-  // Sandbox content audit (via DI accessor for consistency)
+  // v2: Extended keyword check for non-codegen patches
+  if (isNonCodegen) {
+    const extendedResult = isObviouslyMaliciousExtended(patchText);
+    if (extendedResult.malicious) {
+      return {
+        safe: false, is_safe: false,
+        reason: `Extended keyword scan: ${extendedResult.reasons.slice(0, 3).join('; ')}`,
+        votes: extendedResult.reasons.map(r => ({
+          auditor: 'extended-keyword-filter', safe: false, reason: r,
+        })),
+      };
+    }
+  }
+
+  // Sandbox content audit
   const sandboxAudit = getAuditPatchContent()(patchText);
   if (!sandboxAudit.safe) {
     return {
@@ -220,7 +506,7 @@ async function auditPatchWithVotes(patchText: any, signal: any) {
   }
 
   // AI tribunal with vote collection
-  const result = await auditPatchWithTribunal(patchText, signal);
+  const result = await auditPatchWithTribunal(patchText, signal, { isNonCodegen });
   return {
     safe: result.safe,
     is_safe: result.is_safe,
@@ -229,4 +515,4 @@ async function auditPatchWithVotes(patchText: any, signal: any) {
   };
 }
 
-module.exports = { auditPatch, auditPatchWithVotes, isObviouslyMalicious, _injectDependencies };
+module.exports = { auditPatch, auditPatchWithVotes, isObviouslyMalicious, isObviouslyMaliciousExtended, _injectDependencies };
