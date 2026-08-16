@@ -1308,8 +1308,8 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
         readBody(req, res, (body) => {
           try {
             const data = JSON.parse(body);
-            if (!data.mode || !['full_power', 'memory_protection'].includes(data.mode)) {
-              jsonRes(res, { error: 'mode must be "full_power" or "memory_protection"' }, 400); return;
+            if (!data.mode || !['full_power', 'memory_protection', 'minimum'].includes(data.mode)) {
+              jsonRes(res, { error: 'mode must be "full_power", "memory_protection", or "minimum"' }, 400); return;
             }
             const memoryModeMod = require('./memory-mode');
             const prev = memoryModeMod.getMode();
@@ -1320,7 +1320,7 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
               previousMode: prev,
               currentMode: data.mode,
               thresholds: memoryModeMod.getThresholds(),
-              note: data.mode === 'full_power' ? 'Full power mode active. Heavy modules will re-enable on restart.' : 'Memory protection active. Heavy modules disabled.',
+              note: data.mode === 'full_power' ? 'Full power mode active. Heavy modules will re-enable on restart.' : data.mode === 'minimum' ? 'MINIMUM mode active. Only question-solving pipeline running. All non-essential modules disabled.' : 'Memory protection active. Heavy modules disabled.',
             });
           } catch (e: any) { jsonRes(res, { error: e.message }, 400); }
         });
@@ -1509,7 +1509,8 @@ function getDashboardHTML(): string {
       <div id="modeInfo" style="font-size:12px;color:var(--text2);margin-bottom:10px">Loading mode info...</div>
       <div class="btn-group">
         <button class="btn primary" id="btnFullPower" onclick="switchMode('full_power')">Full Power</button>
-        <button class="btn warn" id="btnMemProtect" onclick="switchMode('memory_protection')">Memory Protection</button>
+        <button class="btn warn" id="btnMemProtect" onclick="switchMode('memory_protection')">Mem Protection</button>
+        <button class="btn danger" id="btnMinimum" onclick="switchMode('minimum')" title="Disables everything except question-solving pipeline">Minimum</button>
       </div>
       <div style="margin-top:10px;font-size:11px;color:var(--text2)" id="modeThresholds"></div>
     </div>
@@ -1848,12 +1849,14 @@ async function refreshMode() {
   const btnFP = document.getElementById('btnFullPower');
   const btnMP = document.getElementById('btnMemProtect');
 
-  const isMP = r.currentMode === 'memory_protection';
-  const label = isMP ? 'MEMORY PROTECTION' : 'FULL POWER';
+  const isMin = r.currentMode === 'minimum';
+  const isMP = r.currentMode === 'memory_protection' || isMin;
+  const label = isMin ? 'MINIMUM' : isMP ? 'MEMORY PROTECTION' : 'FULL POWER';
   if (badge) {
     badge.textContent = label;
-    badge.style.background = isMP ? '#92400e' : '#065f46';
-    badge.style.color = isMP ? '#fcd34d' : '#6ee7b7';
+    if (isMin) { badge.style.background = '#7f1d1d'; badge.style.color = '#fca5a5'; }
+    else if (isMP) { badge.style.background = '#92400e'; badge.style.color = '#fcd34d'; }
+    else { badge.style.background = '#065f46'; badge.style.color = '#6ee7b7'; }
   }
   if (info) {
     const heap = r.currentMemory?.heapMB || '?';
@@ -1864,12 +1867,15 @@ async function refreshMode() {
   if (thresholds && r.thresholds) {
     thresholds.textContent = \`Warn: \${r.thresholds.warnHeapMB}MB | Restart: \${r.thresholds.restartHeapMB}MB | RSS hard: \${r.thresholds.rssHardLimitMB}MB | GC: \${r.thresholds.gcIntervalMs / 1000}s\`;
   }
-  if (btnFP) btnFP.style.opacity = isMP ? '0.5' : '1';
-  if (btnMP) btnMP.style.opacity = isMP ? '1' : '0.5';
+  const btnMin = document.getElementById('btnMinimum');
+  if (btnFP) btnFP.style.opacity = isMin ? '0.3' : isMP ? '0.5' : '1';
+  if (btnMP) btnMP.style.opacity = isMin ? '0.5' : isMP ? '1' : '0.5';
+  if (btnMin) btnMin.style.opacity = isMin ? '1' : '0.5';
 }
 async function switchMode(mode) {
-  const action = mode === 'memory_protection' ? 'switch to Memory Protection' : 'switch to Full Power';
-  if (!confirm(\`\${action}? \${mode === 'full_power' ? 'Heavy modules will re-enable on restart.' : 'Heavy modules will be disabled immediately.'}\`)) return;
+  const msgs = { full_power: 'Heavy modules will re-enable on restart.', memory_protection: 'Heavy self-heal modules disabled.', minimum: 'ALL non-essential modules disabled. Only question-solving pipeline remains.' };
+  const action = 'switch to ' + (mode === 'minimum' ? 'MINIMUM' : mode === 'memory_protection' ? 'Memory Protection' : 'Full Power');
+  if (!confirm(`${action}? ${msgs[mode] || ''}`)) return;
   const r = await api('/api/mode', { method: 'POST', body: JSON.stringify({ mode, reason: 'dashboard_manual' }) });
   if (r?.success) {
     toast(\`Mode: \${r.previousMode} → \${r.currentMode}\`, 'success');
