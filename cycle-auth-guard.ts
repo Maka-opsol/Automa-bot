@@ -8,8 +8,16 @@ function getCONFIG(): any { return _deps.config || {}; }
 function log(msg: string, level?: string, mod?: string) { _deps.logger?.log?.(msg, level, mod) ?? console.log(msg); }
 function logError(msg: string, err: Error, ctx?: any) { _deps.logger?.logError?.(msg, err, ctx) ?? console.error(msg, err); }
 
-const { retryWithBackoff } = require('./providers-base');
 const zlib = require('zlib');
+
+// Lazy import — providers-base is heavy and may not be available during
+// early DI initialization. Only needed in the non-SPA auth fallback path.
+let _retryWithBackoff: ((fn: any, opts: any) => Promise<any>) | null = null;
+function _getRetryWithBackoff() {
+  if (_retryWithBackoff) return _retryWithBackoff;
+  try { _retryWithBackoff = require('./providers-base').retryWithBackoff; } catch {}
+  return _retryWithBackoff;
+}
 
 let authAttempts = 0;
 
@@ -341,7 +349,8 @@ async function ensureAuthenticated(page: any) {
 
     // Genuinely unauthenticated (redirected to Microsoft login or unknown domain)
     await browser.closeBrowser?.();
-    const newPage = await retryWithBackoff(browser.launchBrowser, { maxRetries: 2 });
+    const retryFn = _getRetryWithBackoff();
+    const newPage = retryFn ? await retryFn(browser.launchBrowser, { maxRetries: 2 }) : await browser.launchBrowser?.();
     try {
       await auth.authenticate?.(newPage);
       authAttempts = 0;
@@ -440,3 +449,4 @@ function getCaptchaFailureCount(): number {
   return _consecutiveCaptchaFailures;
 }
 
+module.exports = { ensureAuthenticated, handleCaptcha, resetCaptchaFailureCount, getCaptchaFailureCount, consumeBlankPageFlag, peekBlankPageFlag, _isPageBlank, _injectDependencies };
