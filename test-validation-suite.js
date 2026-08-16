@@ -8,6 +8,7 @@ function getDb() { return _deps.database?.db; }
 
 const { log, logError } = require('./logger');
 const CONFIG = require('./config');
+const fs = require('fs');
 
 const TESTS = [
   {
