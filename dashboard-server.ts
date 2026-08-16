@@ -1747,10 +1747,10 @@ async function enableSelfHeal() {
   toast('Enabling self-heal (all layers)...', 'info');
   const r = await api('/api/self-heal/enable', { method: 'POST' });
   if (r?.success) {
-    toast(\`Self-heal enabled: \${r.totalReEnabled} sub-modules restored\${r.modeSwitched ? (r.sessionBased ? ', self-heal session active (30min timeout)' : ', switched to full_power') : ''}\`, 'success');
+    toast(`Self-heal enabled: ${r.totalReEnabled} sub-modules restored${r.modeSwitched ? (r.sessionBased ? ', self-heal session active (30min timeout)' : ', switched to full_power') : ''}`, 'success');
     refreshAll();
   } else {
-    toast(\`Failed: \${r?.error || 'unknown'}\`, 'error');
+    toast(`Failed: ${r?.error || 'unknown'}`, 'error');
   }
 }
 async function gc() {
@@ -1862,10 +1862,10 @@ async function refreshMode() {
     const heap = r.currentMemory?.heapMB || '?';
     const rss = r.currentMemory?.rssMB || '?';
     const peak = r.recentPeak;
-    info.innerHTML = \`Heap: \${heap}MB | RSS: \${rss}MB | Peak(30m): \${peak?.peakHeapMB || 0}MB heap, \${peak?.peakRssMB || 0}MB RSS\`;
+    info.innerHTML = `Heap: ${heap}MB | RSS: ${rss}MB | Peak(30m): ${peak?.peakHeapMB || 0}MB heap, ${peak?.peakRssMB || 0}MB RSS`;
   }
   if (thresholds && r.thresholds) {
-    thresholds.textContent = \`Warn: \${r.thresholds.warnHeapMB}MB | Restart: \${r.thresholds.restartHeapMB}MB | RSS hard: \${r.thresholds.rssHardLimitMB}MB | GC: \${r.thresholds.gcIntervalMs / 1000}s\`;
+    thresholds.textContent = `Warn: ${r.thresholds.warnHeapMB}MB | Restart: ${r.thresholds.restartHeapMB}MB | RSS hard: ${r.thresholds.rssHardLimitMB}MB | GC: ${r.thresholds.gcIntervalMs / 1000}s`;
   }
   const btnMin = document.getElementById('btnMinimum');
   if (btnFP) btnFP.style.opacity = isMin ? '0.3' : isMP ? '0.5' : '1';
@@ -1878,7 +1878,7 @@ async function switchMode(mode) {
   if (!confirm(`${action}? ${msgs[mode] || ''}`)) return;
   const r = await api('/api/mode', { method: 'POST', body: JSON.stringify({ mode, reason: 'dashboard_manual' }) });
   if (r?.success) {
-    toast(\`Mode: \${r.previousMode} → \${r.currentMode}\`, 'success');
+    toast(`Mode: ${r.previousMode} → ${r.currentMode}`, 'success');
     if (r.note) toast(r.note, 'info');
   } else {
     toast('Failed: ' + (r?.error || 'unknown'), 'error');
