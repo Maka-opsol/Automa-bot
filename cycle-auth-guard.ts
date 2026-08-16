@@ -72,8 +72,12 @@ function _defilterPng(raw: Buffer, width: number, height: number, bpp: number): 
 }
 
 /**
- * Sample 12 pixels from a PNG screenshot buffer in a 4x3 grid.
- * Returns array of [r, g, b] tuples, or null on failure.
+ * Sample ~35 pixels from a PNG screenshot buffer using a multi-strategy approach:
+ *   1) 4 corners (inset 3% from edges)
+ *   2) 1 centre pixel
+ *   3) 5x4 grid (20 samples, inset 8% from edges)
+ *   4) 10 random pixels (xorshift32, seeded from dimensions + time)
+ * Deduplicates coordinates that overlap. Returns array of [r, g, b] tuples, or null on failure.
  */
 function _samplePixelsFromPng(pngBuffer: Buffer): Array<[number, number, number]> | null {
   try {
@@ -109,23 +113,59 @@ function _samplePixelsFromPng(pngBuffer: Buffer): Array<[number, number, number]
     // CRITICAL: defilter to get actual pixel values, not raw filtered bytes
     const pixels = _defilterPng(raw, width, height, bpp);
 
-    // 4×3 grid, inset 10% from edges to avoid browser chrome
-    const cols = [0.15, 0.40, 0.65, 0.85];
-    const rows = [0.15, 0.45, 0.75];
     const stride = width * bpp;
     const samples: Array<[number, number, number]> = [];
+    const seen = new Set<string>(); // deduplicate coordinates
 
-    for (const fy of rows) {
-      for (const fx of cols) {
-        const x = Math.floor(width * fx);
-        const y = Math.floor(height * fy);
-        const start = y * stride + x * bpp;
-        if (start + 2 < pixels.length) {
-          samples.push([pixels[start], pixels[start + 1], pixels[start + 2]]);
-        }
+    function sampleAt(fx: number, fy: number) {
+      const x = Math.min(Math.floor(width * fx), width - 1);
+      const y = Math.min(Math.floor(height * fy), height - 1);
+      const key = `${x},${y}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      const start = y * stride + x * bpp;
+      if (start + 2 < pixels.length) {
+        samples.push([pixels[start], pixels[start + 1], pixels[start + 2]]);
       }
     }
-    return samples.length >= 8 ? samples : null;
+
+    // 1) Four corners (inset 3% to stay inside the viewport, not on the absolute edge)
+    const cornerInset = 0.03;
+    sampleAt(cornerInset, cornerInset);             // top-left
+    sampleAt(1 - cornerInset, cornerInset);         // top-right
+    sampleAt(cornerInset, 1 - cornerInset);         // bottom-left
+    sampleAt(1 - cornerInset, 1 - cornerInset);     // bottom-right
+
+    // 2) Centre of the screen
+    sampleAt(0.5, 0.5);
+
+    // 3) 5×4 grid (20 samples), inset 8% from edges to avoid browser chrome
+    const gridCols = [0.08, 0.27, 0.46, 0.65, 0.84];
+    const gridRows = [0.10, 0.35, 0.60, 0.85];
+    for (const fy of gridRows) {
+      for (const fx of gridCols) {
+        sampleAt(fx, fy);
+      }
+    }
+
+    // 4) 10 random pixels (seeded from dimensions for reproducibility within
+    //    a single call, but different each call via Date.now() xor)
+    const seed = (width * 31 + height * 17) ^ (Date.now() & 0xFFFF);
+    let rng = seed >>> 0;
+    function nextRand() {
+      // xorshift32
+      rng ^= rng << 13;
+      rng ^= rng >>> 17;
+      rng ^= rng << 5;
+      return (rng >>> 0) / 4294967296;
+    }
+    const randInset = 0.05; // stay 5% away from absolute edges
+    for (let i = 0; i < 10; i++) {
+      sampleAt(randInset + nextRand() * (1 - 2 * randInset),
+              randInset + nextRand() * (1 - 2 * randInset));
+    }
+
+    return samples.length >= 12 ? samples : null;
   } catch {
     return null;
   }
@@ -133,10 +173,10 @@ function _samplePixelsFromPng(pngBuffer: Buffer): Array<[number, number, number]
 
 /**
  * Take a screenshot and check if the page is visually blank.
- * Uses PNG pixel sampling (12 pixels, 4x3 grid) with variance-based detection.
- * Falls back to JPEG buffer size heuristic if PNG parsing fails.
+ * Uses PNG pixel sampling (~35 pixels: corners + centre + 5x4 grid + 10 random)
+ * with variance-based detection. Falls back to JPEG buffer size heuristic if PNG parsing fails.
  *
- * A page is blank only if ALL 12 sampled pixels have near-zero variance
+ * A page is blank only if ALL sampled pixels have near-zero variance
  * (standard deviation < 3 per RGB channel). This correctly handles:
  *   - White pages (all 255)
  *   - Black pages (all 0)
@@ -235,8 +275,8 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
     // ── BLANK PAGE DETECTION (pixel-based, must run BEFORE canvas check) ──
     // Flutter Web paints everything to <canvas>, so innerText is always empty.
     // Text-length heuristics are fundamentally broken for Flutter SPAs.
-    // Instead, sample 12 pixels from a screenshot. If pixel variance is
-    // near-zero (std < 3), the page is visually blank.
+    // Instead, sample ~35 pixels from a screenshot (corners, centre, grid, random).
+    // If pixel variance is near-zero (std < 3), the page is visually blank.
     // If even 1 pixel differs significantly, real content is rendered.
     const visuallyBlank = await _isPageVisuallyBlank(page);
     if (visuallyBlank) {
@@ -261,8 +301,8 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
  * decide whether to delegate to the tribunal (has content) or escalate
  * via reload/restart (blank canvas).
  *
- * Uses pixel-based detection: samples 12 pixels from a screenshot.
- * If pixel variance is near-zero (std < 3), the page is visually blank.
+ * Uses pixel-based detection: samples ~35 pixels (corners, centre, grid, random)
+ * from a screenshot. If pixel variance is near-zero (std < 3), the page is visually blank.
  */
 async function _isPageBlank(page: any): Promise<boolean> {
   return _isPageVisuallyBlank(page);
