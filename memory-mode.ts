@@ -448,10 +448,15 @@ async function _applyMode(mode: MemoryMode, reason: string): Promise<void> {
       }
     } catch { /* DB not ready */ }
 
-    // Aggressive memory shed
+    // Memory shed: clear caches (L0-L2) but NEVER close the browser.
+    // The browser IS the core question-solving pipeline. Without it,
+    // the cycle immediately crashes on screenshot/locator calls.
+    // The env-var disabling above already saved the real memory
+    // (35 modules won't load/run). At ~80-150MB heap there's no
+    // justification for nuking the browser.
     if (prev !== mode) {
-      const afterMB = await shedMemory(`minimum_activate:${reason}`, { maxLevel: 3, preserveBrowser: false });
-      _log(`Minimum mode memory shed: ${afterMB.toFixed(1)}MB`, 'ERROR');
+      const afterMB = await shedMemory(`minimum_activate:${reason}`, { maxLevel: 2, preserveBrowser: true });
+      _log(`Minimum mode memory shed (preserved browser): ${afterMB.toFixed(1)}MB`, 'ERROR');
     }
   } else if (mode === 'memory_protection') {
     // Disable heavy modules via env vars
