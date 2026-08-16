@@ -881,9 +881,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             try {
               _trackBrowserRestart();
               await closeBrowser?.();
-              const freshPage = await retryWithBackoff(launchBrowser, { maxRetries: 2 });
-              page = freshPage;
               _networkSetup = false;
+              page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
               if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
                 await network.setupInterception(page);
                 _networkSetup = true;
@@ -893,6 +892,19 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
             } catch (restartErr: any) {
               log(`Blank-page browser restart failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
+              // Browser is dead — attempt recovery via withBrowserRetry before next cycle
+              try {
+                _networkSetup = false;
+                page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+                if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
+                  await network.setupInterception(page);
+                  _networkSetup = true;
+                }
+                log('Blank-page restart: recovery via withBrowserRetry succeeded', 'INFO', 'cycle');
+              } catch (recoveryErr: any) {
+                log(`Blank-page restart: recovery also failed: ${recoveryErr.message || recoveryErr} — will break cycle`, 'ERROR', 'cycle');
+                break;
+              }
             }
             lastScreenshotChangeTime = Date.now();
             continue;
@@ -1968,9 +1980,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           try {
             _trackBrowserRestart();
             await closeBrowser?.();
-            const freshPage = await retryWithBackoff(launchBrowser, { maxRetries: 2 });
-            page = freshPage;
             _networkSetup = false;
+            page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
             if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
               await network.setupInterception(page);
               _networkSetup = true;
@@ -1980,6 +1991,19 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
           } catch (restartErr: any) {
             log(`Blank-page browser restart (step 3) failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
+            // Browser is dead — attempt recovery before next cycle
+            try {
+              _networkSetup = false;
+              page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+              if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
+                await network.setupInterception(page);
+                _networkSetup = true;
+              }
+              log('Blank-page step-3 restart: recovery via withBrowserRetry succeeded', 'INFO', 'cycle');
+            } catch (recoveryErr: any) {
+              log(`Blank-page step-3 restart: recovery also failed: ${recoveryErr.message || recoveryErr} — will break cycle`, 'ERROR', 'cycle');
+              break;
+            }
           }
           lastScreenshotChangeTime = Date.now();
           continue;
@@ -1989,9 +2013,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           try {
             _trackBrowserRestart();
             await closeBrowser?.();
-            const freshPage = await retryWithBackoff(launchBrowser, { maxRetries: 2 });
-            page = freshPage;
             _networkSetup = false;
+            page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
             if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
               await network.setupInterception(page);
               _networkSetup = true;
@@ -2001,6 +2024,19 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
           } catch (restartErr: any) {
             log(`Blank-page browser restart failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
+            // Browser is dead — attempt recovery before next cycle
+            try {
+              _networkSetup = false;
+              page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+              if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
+                await network.setupInterception(page);
+                _networkSetup = true;
+              }
+              log('Blank-page tribunal restart: recovery via withBrowserRetry succeeded', 'INFO', 'cycle');
+            } catch (recoveryErr: any) {
+              log(`Blank-page tribunal restart: recovery also failed: ${recoveryErr.message || recoveryErr} — will break cycle`, 'ERROR', 'cycle');
+              break;
+            }
           }
           lastScreenshotChangeTime = Date.now();
           continue;
