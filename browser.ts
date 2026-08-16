@@ -87,6 +87,7 @@ class BrowserManager {
   _healthCheckInterval: any;
   _memoryMonitorInterval: any;
   _disconnectedListeners: Array<(data?: any) => void>;
+  _intentionalClose: boolean;
   _fpFonts: string[] | null;
   _configInitialized: boolean;
 
@@ -109,6 +110,7 @@ class BrowserManager {
     this._healthCheckInterval = null;
     this._memoryMonitorInterval = null;
     this._disconnectedListeners = [];
+    this._intentionalClose = false;
     this._fpFonts = null;
     this._configInitialized = false;
   }
@@ -187,6 +189,8 @@ class BrowserManager {
       });
     }
     this.launching = true;
+    this._intentionalClose = false;
+    this.browserDisconnected = false;
     const launchAttempt = this.browserLaunchCount + 1;
     log(`Launching browser (attempt ${launchAttempt})...`, 'INFO', 'browser');
     await this.cleanup();
@@ -258,7 +262,7 @@ class BrowserManager {
     const log = getLog();
     const logError = getLogError();
     if (!this.browserInstance) return;
-    this.browserInstance.on('disconnected', () => { log('Browser process disconnected unexpectedly', 'ERROR', 'browser'); this.browserDisconnected = true; this.emit('disconnected'); });
+    this.browserInstance.on('disconnected', () => { if (!this._intentionalClose) { log('Browser process disconnected unexpectedly', 'ERROR', 'browser'); } this.browserDisconnected = true; this.emit('disconnected'); });
     this.browserInstance.on('error', (err: Error) => { logError('Browser process error', err); this.browserDisconnected = true; });
   }
 
@@ -325,6 +329,7 @@ class BrowserManager {
     const log = getLog();
     const saveSession = getSaveSession();
     log('Closing browser gracefully...', 'INFO', 'browser');
+    this._intentionalClose = true;
     if (this._healthCheckInterval) { clearInterval(this._healthCheckInterval); this._healthCheckInterval = null; }
     if (this._memoryMonitorInterval) { clearInterval(this._memoryMonitorInterval); this._memoryMonitorInterval = null; }
     // Skip session save if browser already disconnected (avoids Protocol error)
