@@ -919,8 +919,8 @@ async function performSelfHeal(options?: SelfHealOptions) {
     }
 
     // 9. Run critical validation suite on STAGED code (not live code)
-    //    Skipped in EXECUTIVE_MODE — speed over safety.
-    if (!executiveMode) {
+    //    Skipped in EXECUTIVE_MODE and ACCEPT_ANY_FIX — user chose to trust fixes.
+    if (!acceptAnyFix) {
       const validateFn = getValidateBeforePromotion();
         const validated = validateFn ? await validateFn(stagingSource) : { passed: true };
       if (!validated) {
@@ -933,13 +933,13 @@ async function performSelfHeal(options?: SelfHealOptions) {
         continue;
       }
     } else {
-      log('EXECUTIVE_MODE: skipping pre-promotion validation', 'WARN', 'self-heal');
+      log(`${executiveMode ? 'EXECUTIVE_MODE' : 'ACCEPT_ANY_FIX'}: skipping pre-promotion validation`, 'WARN', 'self-heal');
     }
 
     // 10. Adversarial testing (B4)
-    //     Skipped in EXECUTIVE_MODE.
+    //     Skipped in EXECUTIVE_MODE and ACCEPT_ANY_FIX.
     try {
-      if (getCONFIG().ADVERSARIAL_TESTER_ENABLED && !executiveMode) {
+      if (getCONFIG().ADVERSARIAL_TESTER_ENABLED && !acceptAnyFix) {
         const { testPatch: adversarialTest } = getAdversarialTester();
         for (const fix of safeFixes) {
           const advResult = await adversarialTest(fix.patch, fix.file);
