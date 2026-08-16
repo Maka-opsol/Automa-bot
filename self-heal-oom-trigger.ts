@@ -538,6 +538,28 @@ async function triggerBootHeal(): Promise<void> {
       _bootHealResult = anyHealed ? 'success' : 'failure';
     }
     _bootHealDone = true;
+
+    // ── Activate MINIMUM MODE if boot-time heal failed ──
+    // If we're in a death spiral AND self-heal couldn't fix it,
+    // the only option is to strip the bot down to nothing but the
+    // question-solving pipeline.
+    if (!anyHealed) {
+      const oomKills = getRecentOOMKillCount();
+      // Import threshold from memory-mode so it stays the single source of truth
+      let minThreshold = 3; // default
+      try { const mm = require('./memory-mode'); minThreshold = mm.MINIMUM_MODE_OOM_KILL_THRESHOLD ?? 3; } catch {}
+      if (oomKills >= minThreshold) {
+        try {
+          const memoryMode = require('./memory-mode');
+          if (memoryMode.activateMinimumMode) {
+            memoryMode.activateMinimumMode(`oom_death_spiral:${oomKills}_kills_heal_failed`);
+            log(`ACTIVATED MINIMUM MODE: ${oomKills} OOM kills + boot heal failed. Only question-solving pipeline active.`, 'ERROR');
+          }
+        } catch (minErr: any) {
+          log(`Failed to activate minimum mode: ${minErr.message || minErr}`, 'ERROR');
+        }
+      }
+    }
   }
 }
 
