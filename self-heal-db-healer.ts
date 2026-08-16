@@ -199,11 +199,18 @@ class DatabaseHealer {
   /**
    * Step 1: Run PRAGMA integrity_check. If it fails, attempt repair
    * via WAL checkpoint + REINDEX, then re-check.
+   * If repair still fails, attempt nuclear DB reset (backup + recreate).
    */
   async _checkIntegrity() { 
     try {
+      // Guard: if DB is not injected, nothing to check
+      if (!getDb()) {
+        log('Database not injected — skipping integrity check', 'WARN', 'db-healer');
+        return { ok: true, skipped: true };
+      }
+
       const result = getDb()?.pragma('integrity_check');
-      const status = result[0]?.integrity_check;
+      const status = result?.[0]?.integrity_check;
 
       if (status === 'ok') {
         log('Database integrity check: OK', 'DEBUG', 'db-healer');
@@ -233,19 +240,155 @@ class DatabaseHealer {
 
       // Re-check after repair attempts
       const recheck = getDb()?.pragma('integrity_check');
-      const recheckStatus = recheck[0]?.integrity_check;
+      const recheckStatus = recheck?.[0]?.integrity_check;
 
       if (recheckStatus === 'ok') {
         log('Database integrity restored after repair', 'INFO', 'db-healer');
         logAudit('Database integrity repaired successfully', 'db-healer');
+        // v11: Also run schema drift repair after integrity is restored —
+        // corrupted DBs often have missing tables/columns too
+        try {
+          const driftResult = this.repairSchemaDrift();
+          if (driftResult.columnsAdded > 0 || driftResult.tablesCreated > 0) {
+            log(`Post-repair schema drift fix: ${driftResult.tablesCreated} tables, ${driftResult.columnsAdded} columns`, 'INFO', 'db-healer');
+          }
+        } catch (driftErr: any) {
+          log(`Post-repair schema drift check failed: ${driftErr.message}`, 'WARN', 'db-healer');
+        }
         return { ok: true, status: recheckStatus, repaired: true };
       }
 
-      log(`Database integrity still broken after repair: ${JSON.stringify(recheck)}`, 'ERROR', 'db-healer');
-      logAudit('Database integrity repair failed - manual intervention needed', 'db-healer');
-      return { ok: false, status: recheckStatus, repaired: false };
+      log(`Database integrity still broken after WAL+REINDEX: ${JSON.stringify(recheck)}`, 'ERROR', 'db-healer');
+      logAudit('Database integrity repair failed - attempting nuclear reset', 'db-healer');
+
+      // v11: NUCLEAR OPTION — backup corrupted DB and recreate from schema
+      // This is the last resort when WAL checkpoint + REINDEX both fail.
+      try {
+        const resetResult = await this._nuclearDbReset();
+        if (resetResult.ok) {
+          log('Database nuclear reset SUCCEEDED — fresh DB created', 'INFO', 'db-healer');
+          logAudit('Database nuclear reset: corrupted DB backed up, fresh DB created', 'db-healer');
+          return { ok: true, status: 'nuclear_reset', repaired: true, nuclearReset: true };
+        }
+        log(`Database nuclear reset FAILED: ${resetResult.error}`, 'ERROR', 'db-healer');
+        return { ok: false, status: recheckStatus, repaired: false, nuclearResetAttempted: true };
+      } catch (nuclearErr: any) {
+        logError('Database nuclear reset threw error', nuclearErr);
+        return { ok: false, status: recheckStatus, repaired: false, nuclearResetAttempted: true, error: nuclearErr.message };
+      }
     } catch (err: any) {
       logError('Database integrity check threw error', err);
+      // v11: If the integrity check itself throws (not just returns non-ok),
+      // the DB connection may be broken. Try nuclear reset.
+      try {
+        const resetResult = await this._nuclearDbReset();
+        if (resetResult.ok) {
+          log('Database nuclear reset SUCCEEDED after integrity_check exception', 'INFO', 'db-healer');
+          return { ok: true, status: 'nuclear_reset_after_exception', repaired: true, nuclearReset: true };
+        }
+      } catch (resetErr: any) {
+        log(`Nuclear reset after exception also failed: ${resetErr.message}`, 'ERROR', 'db-healer');
+      }
+      return { ok: false, error: err.message };
+    }
+  }
+
+  /**
+   * Nuclear DB reset: back up the corrupted database file and create
+   * a fresh one with the known schema. This is the last resort when
+   * WAL checkpoint + REINDEX both fail to restore integrity.
+   *
+   * Returns { ok: true } on success, { ok: false, error: string } on failure.
+   */
+  async _nuclearDbReset(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const db = getDb();
+      if (!db) return { ok: false, error: 'No database reference' };
+
+      // Get the DB file path from better-sqlite3
+      const dbPath = (db as any).name;
+      if (!dbPath || typeof dbPath !== 'string') {
+        return { ok: false, error: 'Cannot determine DB file path' };
+      }
+
+      const fs = require('fs');
+      const path = require('path');
+
+      // 1. Back up the corrupted DB
+      const backupDir = path.join(path.dirname(dbPath), 'db-backups');
+      try { fs.mkdirSync(backupDir, { recursive: true }); } catch {}
+
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const backupPath = path.join(backupDir, `corrupted-${timestamp}.db`);
+
+      try {
+        fs.copyFileSync(dbPath, backupPath);
+        log(`Backed up corrupted DB to ${backupPath}`, 'INFO', 'db-healer');
+      } catch (copyErr: any) {
+        log(`Failed to backup corrupted DB: ${copyErr.message}`, 'WARN', 'db-healer');
+        // Continue anyway — we'll try to recreate
+      }
+
+      // Also back up WAL and SHM files if they exist
+      for (const ext of ['-wal', '-shm']) {
+        const walPath = dbPath + ext;
+        try {
+          if (fs.existsSync(walPath)) {
+            fs.copyFileSync(walPath, backupPath + ext);
+          }
+        } catch {}
+      }
+
+      // 2. Close the database connection
+      try { db.close(); } catch (closeErr: any) {
+        log(`Failed to close corrupted DB: ${closeErr.message}`, 'WARN', 'db-healer');
+      }
+
+      // 3. Delete the corrupted files
+      try {
+        fs.unlinkSync(dbPath);
+        for (const ext of ['-wal', '-shm']) {
+          try { fs.unlinkSync(dbPath + ext); } catch {}
+        }
+        log('Deleted corrupted DB files', 'INFO', 'db-healer');
+      } catch (delErr: any) {
+        log(`Failed to delete corrupted DB: ${delErr.message}`, 'WARN', 'db-healer');
+        return { ok: false, error: `Cannot delete corrupted DB: ${delErr.message}` };
+      }
+
+      // 4. Re-initialize the database via the database module
+      try {
+        const dbMod = _deps.database;
+        if (dbMod && typeof dbMod.initializeDatabase === 'function') {
+          dbMod.initializeDatabase();
+          log('Re-initialized database via database module', 'INFO', 'db-healer');
+        } else if (dbMod && typeof dbMod.init === 'function') {
+          dbMod.init();
+          log('Re-initialized database via database.init()', 'INFO', 'db-healer');
+        } else {
+          return { ok: false, error: 'No database initialization method found on database module' };
+        }
+      } catch (initErr: any) {
+        return { ok: false, error: `DB re-init failed: ${initErr.message}` };
+      }
+
+      // 5. Verify the new DB is healthy
+      try {
+        const freshDb = getDb();
+        if (!freshDb) return { ok: false, error: 'DB reference null after re-init' };
+        const freshCheck = freshDb.pragma('integrity_check');
+        if (freshCheck?.[0]?.integrity_check !== 'ok') {
+          return { ok: false, error: `Fresh DB also fails integrity: ${JSON.stringify(freshCheck)}` };
+        }
+        // 6. Recreate schema
+        this.repairSchemaDrift();
+        log('Fresh DB integrity verified and schema recreated', 'INFO', 'db-healer');
+      } catch (verifyErr: any) {
+        return { ok: false, error: `Fresh DB verification failed: ${verifyErr.message}` };
+      }
+
+      return { ok: true };
+    } catch (err: any) {
       return { ok: false, error: err.message };
     }
   }
@@ -611,18 +754,44 @@ class DatabaseHealer {
 
   /**
    * Failsafe health check function - returns true if database is healthy.
+   * v11: Made more resilient — handles null DB, exceptions, and triggers
+   * repair if a quick check fails.
    */
   async healthCheck() { 
     try {
-      const result = getDb()?.pragma('integrity_check');
-      if (result[0]?.integrity_check !== 'ok') {
-        throw new Error('Integrity check failed');
+      const db = getDb();
+      if (!db) {
+        // DB not injected yet — not a failure, just not ready
+        return true;
+      }
+      const result = db.pragma('integrity_check');
+      if (result?.[0]?.integrity_check !== 'ok') {
+        log('Failsafe health check: integrity NOT ok — triggering async repair', 'ERROR', 'db-healer');
+        // Fire off a repair in the background — don't block the health check
+        this._checkIntegrity().then((repairResult) => {
+          if (repairResult?.ok) {
+            log('Failsafe health check: async repair succeeded', 'INFO', 'db-healer');
+          } else {
+            log('Failsafe health check: async repair FAILED', 'ERROR', 'db-healer');
+          }
+        }).catch(() => {});
+        // Return false to signal unhealthy, but repair is running
+        return false;
       }
       // Quick query test
-      getDb()?.prepare('SELECT COUNT(*) FROM sqlite_master').get();
+      db.prepare('SELECT COUNT(*) FROM sqlite_master').get();
       return true;
     } catch (err: any) {
       logError('Database health check failed', err);
+      // v11: If the health check throws, the DB connection might be broken.
+      // Try async nuclear reset.
+      this._nuclearDbReset().then((resetResult) => {
+        if (resetResult.ok) {
+          log('Failsafe health check: nuclear reset succeeded after exception', 'INFO', 'db-healer');
+        } else {
+          log('Failsafe health check: nuclear reset also failed after exception', 'ERROR', 'db-healer');
+        }
+      }).catch(() => {});
       return false;
     }
   }
