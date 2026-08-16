@@ -5,9 +5,29 @@ function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function getCONFIG(): Record<string, any> { return _deps.config || require('./get-config'); }
 
 const { callMistralCodeGen, parseCodegenResponse } = require('./providers-codegen-mistral');
-const { callBazaarLinkCodeGenWithModel, getBazaarLinkModels } = require('./providers-codegen-bazaarlink');
 const blLimiter = require('./bazaarlink-rate-limiter');
 const { log, logError } = require('./logger');
+
+// ─── Lazy BazaarLink require (resilient to transform failures) ───
+// Top-level require('./providers-codegen-bazaarlink') crashes the entire
+// codegen-tribunal module if esbuild/tsx fails to transform it (e.g.
+// corrupted file on disk, OOM-damaged source). Instead, import lazily
+// so BazaarLink degrades gracefully — Mistral can still function.
+let _blModule: any = null;
+let _blLoadError: string | null = null;
+
+function _getBL(): any {
+  if (_blLoadError) return null; // already failed, don't retry
+  if (_blModule) return _blModule;
+  try {
+    _blModule = require('./providers-codegen-bazaarlink');
+    return _blModule;
+  } catch (err: any) {
+    _blLoadError = String(err.message || err).substring(0, 300);
+    log(`BazaarLink module failed to load (tribunal will skip BL): ${_blLoadError}`, 'ERROR', 'codegen');
+    return null;
+  }
+}
 
 // ─── IMPORTANT: Provider Scope ─────────────────────────────────────────
 // This tribunal is for CODE GENERATION ONLY.
@@ -75,8 +95,9 @@ function withTimeout(signal: any, timeoutMs: number): AbortController {
  */
 function discoverModels() {
   // BazaarLink models (codegen primary — 50 free req/day)
-  const blModels = getBazaarLinkModels();
-  const hasBazaarLink = !!getCONFIG().BAZAARLINK_API_KEY;
+  const bl = _getBL();
+  const blModels = bl?.getBazaarLinkModels?.() || [];
+  const hasBazaarLink = !!getCONFIG().BAZAARLINK_API_KEY && !!bl;
 
   return {
     blModels,
@@ -128,7 +149,7 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
       for (const modelSlug of models.blModels) {
         log(`Tribunal: spawning BL/${modelSlug}`, 'DEBUG', 'codegen');
         allPromises.push(
-          callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug)
+          _getBL().callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug)
             .then((result: any) => {
               // Debug: log what BazaarLink actually returned
               if (!result) {
@@ -321,8 +342,9 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
  */
 async function _callRawBazaarLink(prompt: string, signal: any, modelSlug: string) {
   try {
-    const { callBazaarLinkCodeGenWithModel } = require('./providers-codegen-bazaarlink');
-    const result = await callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug);
+    const bl = _getBL();
+    if (!bl) return null;
+    const result = await bl.callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug);
     if (!result) return null;
     const raw = typeof result === 'string' ? result : JSON.stringify(result);
     if (!raw || raw.trim().length === 0) return null;
