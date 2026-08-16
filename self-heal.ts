@@ -351,24 +351,55 @@ function verifyPromotedFiles(fixes: any, overlay?: any) {
 
 async function investigatePage() {  
   log('Investigating page for self-healing...', 'INFO', 'self-heal');
-  let page;
+  let isolatedBrowser: any = null;
+  let page: any = null;
   try {
     // Boot-time OOM heals run BEFORE the browser is initialised, so
     // _deps.browser is absent.  In that case return a log-only
     // investigation — the tribunal can still work from error patterns
     // and target-file hints (enrichInvestigationWithTargetFile).
-    const launcher = _deps.browser?.launchBrowser;
-    if (!launcher) {
-      log('No browser available for investigation (boot-time heal) — using log-based context', 'WARN', 'self-heal');
+    const config = getCONFIG();
+    if (!config.APP_URL) {
+      log('No APP_URL configured for investigation (boot-time heal) — using log-based context', 'WARN', 'self-heal');
       return { screenshot: null, html: null, url: null, bootTime: true };
     }
-    page = await launcher();
-    if (!page) {
-      log('Browser launch returned no page — using log-based context', 'WARN', 'self-heal');
-      return { screenshot: null, html: null, url: null, bootTime: true };
-    }
-    await (_deps.auth?.authenticate || (() => {}))(page);
-    await page.goto(getCONFIG().APP_URL + '/assignments', { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    // CRITICAL: Use an ISOLATED Playwright browser for investigation.
+    // The shared BrowserManager singleton is the cycle's browser — calling
+    // launchBrowser() kills it (cleanup()), and closeBrowser() kills it again.
+    // After the self-heal loop exhausts all attempts, the cycle's browser
+    // would be permanently dead with no re-launch path, causing
+    // "Browser disconnected" crashes on the next cycle iteration.
+    //
+    // By launching a separate chromium instance, the cycle's browser
+    // stays untouched throughout the entire self-heal process.
+    const { chromium } = require('playwright');
+    const os = require('os');
+    const path = require('path');
+    const userDataDir = path.join(os.tmpdir(), '.self-heal-investigate');
+    try { require('fs').mkdirSync(userDataDir, { recursive: true }); } catch {}
+
+    isolatedBrowser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-extensions',
+        '--single-process',
+      ],
+    });
+    const context = await isolatedBrowser.newContext({
+      viewport: { width: 1280, height: 720 },
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      ignoreHTTPSErrors: true,
+    });
+    page = await context.newPage();
+
+    // If auth module is available, try to authenticate
+    try { await (_deps.auth?.authenticate || (() => {}))(page); } catch {}
+    await page.goto(config.APP_URL + '/assignments', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(5000);
     const screenshot = await page.screenshot({ type: 'jpeg', quality: 30 });
     const base64 = screenshot.toString('base64');
@@ -378,8 +409,10 @@ async function investigatePage() {
     logError('Investigation failed', err);
     return null;
   } finally {
-    if (page) {
-      try { await (_deps.browser?.closeBrowser || (() => {}))(); } catch (e: any) { /* best effort */ }
+    // Only close the ISOLATED browser — never touch the shared singleton
+    if (page) { try { await page.close().catch(() => {}); } catch {} }
+    if (isolatedBrowser) {
+      try { await isolatedBrowser.close().catch(() => {}); } catch {}
     }
   }
 }
