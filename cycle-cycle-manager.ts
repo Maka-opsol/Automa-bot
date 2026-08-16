@@ -678,6 +678,14 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     let unknownStateCounter = 0; // Counts consecutive 'unknown' currentState results
     const MAX_UNKNOWN_STATE = 3; // After this many unknowns, force recovery
 
+    // v11: Blank-page escalation ladder — prevents infinite blank/wait loops
+    // Track consecutive blank-page detections separately from unknown states.
+    // Step 1 (count >= 2): reload MathU
+    // Step 2 (count >= 3): restart browser context entirely
+    let blankPageCounter = 0;
+    const BLANK_RELOAD_THRESHOLD = 2;  // After 2 blank checks → reload
+    const BLANK_RESTART_THRESHOLD = 3; // After 3 blank checks → restart browser context
+
     // v10: Restart-count tracker — triggers self-heal if too many browser
     // restarts happen in a short window (symptom of a deeper issue).
     let recentRestartTimes: number[] = [];
@@ -858,6 +866,49 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             _networkSetup = true;
           }
           if (CONFIG.FLUTTER_DPR_AUTO_CALIBRATE && dpr) { await dpr.calibrate(page); }
+        }
+        // v11: Check if auth guard detected a blank page.
+        // If so, skip the normal cycle and go straight to the escalation
+        // ladder — the tribunal will just return unknown/wait on a blank page.
+        const authGuardMod = getDep('authGuard');
+        if (authGuardMod?.consumeBlankPageFlag?.(page)) {
+          blankPageCounter++;
+          log(`Auth guard flagged blank page (escalation step ${blankPageCounter})`, 'WARN', 'cycle');
+          if (blankPageCounter >= BLANK_RESTART_THRESHOLD) {
+            // Step 2: Restart browser context entirely
+            log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — RESTARTING browser context`, 'ERROR', 'cycle');
+            blankPageCounter = 0;
+            try {
+              _trackBrowserRestart();
+              await closeBrowser?.();
+              const freshPage = await retryWithBackoff(launchBrowser, { maxRetries: 2 });
+              page = freshPage;
+              _networkSetup = false;
+              if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
+                await network.setupInterception(page);
+                _networkSetup = true;
+              }
+              await page.goto(CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za', { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await new Promise(r => setTimeout(r, 8000));
+              if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+            } catch (restartErr: any) {
+              log(`Blank-page browser restart failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
+            }
+            lastScreenshotChangeTime = Date.now();
+            continue;
+          } else if (blankPageCounter >= BLANK_RELOAD_THRESHOLD) {
+            // Step 1: Reload MathU
+            log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — reloading MathU`, 'WARN', 'cycle');
+            const targetUrl = CONFIG.APP_URL || CONFIG.BASE_URL;
+            if (targetUrl) {
+              await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+              await new Promise(r => setTimeout(r, 8000));
+              if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+            }
+            lastScreenshotChangeTime = Date.now();
+            continue;
+          }
+          // First blank: fall through to normal blank-page guard below
         }
       }
       if (handleCaptcha) await handleCaptcha(page);
@@ -1841,29 +1892,104 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           }
           continue; // Skip the wait action and re-evaluate on next iteration
         }
-      // blank_page escape hatch — same logic as unknown/error
+      // v11: blank_page ESCALATION LADDER
       // The tribunal returns currentState='blank_page' when the screenshot is
-      // blank/white (no content rendered). If we keep waiting, the page stays
-      // blank forever. Force a navigate to APP_URL to break the loop.
+      // blank/white (no content rendered). Instead of always navigating to
+      // APP_URL (which often produces another blank page), escalate:
+      //   Step 1 (count >= 2): reload MathU
+      //   Step 2 (count >= 3): restart browser context entirely
+      //   Step 3 (count >= 5): trigger full self-heal (code-patch pipeline)
       } else if (action.currentState === 'blank_page') {
-        unknownStateCounter++;
-        log(`blank_page state detected (${unknownStateCounter} consecutive). Navigating to APP_URL to break blank-page loop.`, 'WARN', 'cycle');
+        blankPageCounter++;
         unknownStateCounter = 0;
+        log(`blank_page state detected (${blankPageCounter} consecutive). Escalating...`, 'WARN', 'cycle');
+
+        if (blankPageCounter >= 5) {
+          // Step 3: Trigger full self-heal — something is fundamentally broken
+          log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — triggering full self-heal`, 'ERROR', 'cycle');
+          blankPageCounter = 0;
+          try {
+            const selfHealMod = getDep('selfHeal');
+            if (selfHealMod?.performSelfHeal && CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
+              selfHealMod.performSelfHeal({ skipRuntimeHeal: true }).then((result: any) => {
+                log(`Blank-page self-heal result: ${JSON.stringify(result?.summary || result)?.substring(0, 200)}`, 'INFO', 'cycle');
+              }).catch((err: any) => {
+                log(`Blank-page self-heal failed: ${err.message || err}`, 'ERROR', 'cycle');
+              });
+            }
+          } catch {}
+          // Also try browser restart as immediate recovery
+          try {
+            _trackBrowserRestart();
+            await closeBrowser?.();
+            const freshPage = await retryWithBackoff(launchBrowser, { maxRetries: 2 });
+            page = freshPage;
+            _networkSetup = false;
+            if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
+              await network.setupInterception(page);
+              _networkSetup = true;
+            }
+            await page.goto(CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await new Promise(r => setTimeout(r, 8000));
+            if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+          } catch (restartErr: any) {
+            log(`Blank-page browser restart (step 3) failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
+          }
+          lastScreenshotChangeTime = Date.now();
+          continue;
+        } else if (blankPageCounter >= BLANK_RESTART_THRESHOLD) {
+          // Step 2: Restart browser context entirely
+          log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — RESTARTING browser context`, 'ERROR', 'cycle');
+          try {
+            _trackBrowserRestart();
+            await closeBrowser?.();
+            const freshPage = await retryWithBackoff(launchBrowser, { maxRetries: 2 });
+            page = freshPage;
+            _networkSetup = false;
+            if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
+              await network.setupInterception(page);
+              _networkSetup = true;
+            }
+            await page.goto(CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await new Promise(r => setTimeout(r, 8000));
+            if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+          } catch (restartErr: any) {
+            log(`Blank-page browser restart failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
+          }
+          lastScreenshotChangeTime = Date.now();
+          continue;
+        } else if (blankPageCounter >= BLANK_RELOAD_THRESHOLD) {
+          // Step 1: Reload MathU
+          log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — reloading MathU`, 'WARN', 'cycle');
+          const targetUrl = CONFIG.APP_URL || CONFIG.BASE_URL;
+          if (targetUrl) {
+            try {
+              await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
+                log(`blank_page reload failed: ${e.message || e}`, 'WARN', 'cycle');
+              });
+              await new Promise(r => setTimeout(r, 8000));
+              if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+            } catch (navErr: any) {
+              log(`blank_page reload failed: ${navErr.message || navErr}`, 'WARN', 'cycle');
+            }
+          }
+          lastScreenshotChangeTime = Date.now();
+          continue;
+        }
+        // First blank page: navigate to APP_URL (original behavior)
         const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
         if (targetUrl) {
           try {
-            log(`blank_page escape: navigating to ${targetUrl}`, 'INFO', 'cycle');
+            log(`blank_page escape (step ${blankPageCounter}): navigating to ${targetUrl}`, 'INFO', 'cycle');
             await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
               log(`blank_page escape: navigation failed: ${e.message || e}`, 'WARN', 'cycle');
             });
-            // Wait for Flutter to paint after navigation
             await new Promise(r => setTimeout(r, 8000));
             if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
           } catch (navErr: any) {
             log(`blank_page escape failed: ${navErr.message || navErr}`, 'WARN', 'cycle');
           }
         }
-        // Clear any cached blank_page action so it doesn't get hit next cycle
         if (_actionCacheSig && actionCache?.evictEntry) {
           try { actionCache.evictEntry(_actionCacheSig); } catch {}
         }
@@ -1911,6 +2037,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         }
       } else {
         unknownStateCounter = 0;
+        blankPageCounter = 0; // Reset blank-page counter on any non-unknown/non-blank state
         // Auto-rearm: if screenshot changes within 60s of ban, clear the flag
         if (stagnationAutoBanTriggered && (Date.now() - lastScreenshotChangeTime) < 60000) {
           stagnationAutoBanTriggered = false;
