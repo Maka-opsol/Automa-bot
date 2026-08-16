@@ -1105,14 +1105,36 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // Before calling the tribunal (expensive AI call), check if we have
       // a cached action for this exact visual context. If hit, skip the AI
       // call entirely and use the saved action.
-      // EXCLUSION: Never use cached actions for blank_page state — the page
-      // is not rendered yet, so any cached action is meaningless. Caching a
-      // blank page creates an infinite wait loop (blank → cached wait → blank).
+      // EXCLUSION: Never use cached actions for blank_page or unknown states
+      // when the screenshot is effectively blank. A blank page creates an
+      // infinite wait loop (blank → cached wait → blank → cached wait).
+      // v11: Also detect near-blank screenshots via byte entropy — the
+      // tribunal may return 'unknown' instead of 'blank_page' for screenshots
+      // that barely pass the entropy check but are still blank to the eye.
       let _actionCacheSig: string | null = null;
       let _actionCacheHit = false;
       const actionCache = _getActionCache();
       const _isBlankPageState = currentState === 'blank_page';
-      if (!action && actionCache && currentState && !_isBlankPageState) {
+      // v11: Detect near-blank screenshots — if byte entropy is very low,
+      // treat as blank regardless of what currentState says
+      let _isNearBlankScreenshot = false;
+      try {
+        const buf = Buffer.from(base64, 'base64');
+        if (buf.length > 200) {
+          const sampleStart = Math.min(200, buf.length - 1);
+          const sampleLen = Math.min(4096, buf.length - sampleStart);
+          if (sampleLen > 0) {
+            const seen = new Set<number>();
+            for (let i = sampleStart; i < sampleStart + sampleLen; i++) { seen.add(buf[i]); }
+            // < 50 unique bytes = near-blank (tribunal uses < 40 for hard blank)
+            // This catches screenshots that barely pass the tribunal's check
+            // but are still visually blank/unrecognizable
+            _isNearBlankScreenshot = seen.size < 50;
+          }
+        }
+      } catch {}
+      const _isCacheExcluded = _isBlankPageState || _isNearBlankScreenshot || blankPageCounter > 0;
+      if (!action && actionCache && currentState && !_isCacheExcluded) {
         try {
           // Compute context signature from current state + screenshot
           // Use previous cycle's state as the context key (currentState is set from last cycle)
@@ -1450,7 +1472,12 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // ── EARLY EXIT: blank_page wait → navigate immediately ──
       // Don't waste 75s executing a 'wait' on a blank page. Navigate to
       // APP_URL right now and skip to the next loop iteration.
+      // v11: Set currentState = 'blank_page' before continue so the next
+      // cycle's action cache exclusion knows the page is blank. Without this,
+      // the cache would serve a stale 'unknown/wait' from a previous cycle.
       if (action.actionType === 'wait' && action.currentState === 'blank_page') {
+        currentState = 'blank_page';
+        blankPageCounter++;
         const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
         if (targetUrl) {
           log(`blank_page early exit: skipping 75s wait, navigating to ${targetUrl}`, 'INFO', 'cycle');
@@ -1603,7 +1630,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // - Failure: record failure count; evict if too many consecutive failures
       // GUARD: Never save blank_page actions — they're meaningless (page not
       // rendered) and caching them creates an infinite wait loop.
-      if (_actionCacheSig && actionCache && !_isBlankPageState) {
+      if (_actionCacheSig && actionCache && !_isCacheExcluded) {
         if (actionSuccess && !_actionCacheHit) {
           // Save new successful action to cache (only if it wasn't already from cache)
           // This builds the cache over time as the bot discovers working actions
@@ -1992,6 +2019,13 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         }
         if (_actionCacheSig && actionCache?.evictEntry) {
           try { actionCache.evictEntry(_actionCacheSig); } catch {}
+        }
+        // v11: Also flush any cached wait/unknown actions — they're
+        // poisoning the cache when the page is blank
+        if (actionCache?.flushActionsByType) {
+          try { actionCache.flushActionsByType('wait'); } catch {}
+        } else if (actionCache?.evictAll) {
+          try { actionCache.evictAll(); } catch {}
         }
         lastScreenshotChangeTime = Date.now();
         continue;
