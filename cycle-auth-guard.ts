@@ -9,8 +9,93 @@ function log(msg: string, level?: string, mod?: string) { _deps.logger?.log?.(ms
 function logError(msg: string, err: Error, ctx?: any) { _deps.logger?.logError?.(msg, err, ctx) ?? console.error(msg, err); }
 
 const { retryWithBackoff } = require('./providers-base');
+const zlib = require('zlib');
 
 let authAttempts = 0;
+
+// ─── Pixel-based blank page detection ───────────────────────────────────
+// Flutter Web renders everything to <canvas>, so innerText is always empty.
+// Text-length heuristics are fundamentally broken for Flutter SPAs.
+// Instead, sample 5 pixels from a screenshot. If all 5 are the same colour,
+// the page is visually blank (white, black, or any solid colour).
+// If even 1 pixel differs, real content has been rendered.
+
+/**
+ * Sample 5 pixels from a PNG screenshot buffer.
+ * Returns array of [r, g, b] tuples, or null on failure.
+ */
+function _samplePixelsFromPng(pngBuffer: Buffer): Array<[number, number, number]> | null {
+  try {
+    // Verify PNG signature
+    if (pngBuffer.length < 24 || pngBuffer[0] !== 0x89) return null;
+
+    let offset = 8; // skip PNG signature
+    let width = 0, height = 0;
+    const idatChunks: Buffer[] = [];
+
+    while (offset + 12 <= pngBuffer.length) {
+      const chunkLen = pngBuffer.readUInt32BE(offset);
+      const chunkType = pngBuffer.toString('ascii', offset + 4, offset + 8);
+      const chunkData = pngBuffer.slice(offset + 8, offset + 8 + chunkLen);
+      offset += 12 + chunkLen;
+
+      if (chunkType === 'IHDR') {
+        width = chunkData.readUInt32BE(0);
+        height = chunkData.readUInt32BE(4);
+      } else if (chunkType === 'IDAT') {
+        idatChunks.push(chunkData);
+      } else if (chunkType === 'IEND') {
+        break;
+      }
+    }
+
+    if (width < 10 || height < 10 || idatChunks.length === 0) return null;
+
+    const raw = zlib.inflateSync(Buffer.concat(idatChunks));
+    // bytes per pixel: color type 2 = RGB(3), 6 = RGBA(4), 0 = grayscale(1)
+    const colorType = pngBuffer[8 + 4 + 9]; // offset 8(sig) + 4(len) + 9(type byte in IHDR)
+    const bpp = (colorType === 6) ? 4 : (colorType === 2) ? 3 : 1;
+    const stride = width * bpp;
+
+    // 5 well-spread sample positions (avoid edges which may have browser chrome)
+    const positions = [
+      [Math.floor(width * 0.15), Math.floor(height * 0.15)],
+      [Math.floor(width * 0.45), Math.floor(height * 0.35)],
+      [Math.floor(width * 0.75), Math.floor(height * 0.55)],
+      [Math.floor(width * 0.25), Math.floor(height * 0.75)],
+      [Math.floor(width * 0.65), Math.floor(height * 0.25)],
+    ];
+
+    const pixels: Array<[number, number, number]> = [];
+    for (const [x, y] of positions) {
+      const rowStart = y * (stride + 1) + 1; // +1 for PNG filter byte per row
+      const pixStart = rowStart + x * bpp;
+      if (pixStart + 2 < raw.length) {
+        pixels.push([raw[pixStart], raw[pixStart + 1], raw[pixStart + 2]]);
+      }
+    }
+    return pixels.length >= 5 ? pixels : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Take a screenshot and check if 5 sampled pixels are all the same colour.
+ * If yes → page is visually blank. If no → content has been rendered.
+ */
+async function _isPageVisuallyBlank(page: any): Promise<boolean> {
+  try {
+    const buf = await page.screenshot({ type: 'png', fullPage: false });
+    const pixels = _samplePixelsFromPng(buf);
+    if (!pixels) return false; // can't determine — assume not blank
+    const [r0, g0, b0] = pixels[0];
+    const allSame = pixels.every(([r, g, b]) => r === r0 && g === g0 && b === b0);
+    return allSame;
+  } catch {
+    return false; // screenshot failed — assume not blank
+  }
+}
 
 // FIX: Track consecutive captcha failures across cycles to detect
 // captcha feedback loops that burn Render hours for nothing.
@@ -70,109 +155,23 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
 
   // Content-based validation: look for MathU app elements in the page
   try {
-    // ── BLANK PAGE DETECTION (must run BEFORE canvas check) ──
-    // A blank white Flutter canvas or loading spinner does NOT count as
-    // a valid authenticated session. Check for actual rendered content.
-    // CRITICAL: Flutter Web reports body height = viewport height (e.g. 768)
-    // even when the canvas is completely blank. Do NOT use contentHeight
-    // to detect blank Flutter pages — use text length instead.
-    const pageContentSignal = await page.evaluate(() => {
-      const body = document.body;
-      if (!body) return { blank: true, reason: 'no_body' };
-
-      const text = (body.innerText || '').trim();
-      const textLen = text.length;
-
-      // Check for loading spinner indicators (common in Flutter)
-      const html = body.innerHTML || '';
-      const hasSpinner = html.includes('loading') || html.includes('spinner') ||
-                         html.includes('progress') || html.includes('CircularProgressIndicator');
-
-      // Check for Flutter canvas elements
-      const canvases = document.querySelectorAll('canvas');
-      let hasFlutterCanvas = false;
-      for (const c of canvases) {
-        const cls = (c.className || '').toString();
-        if (cls.includes('flt') || cls.includes('flutter')) { hasFlutterCanvas = true; break; }
-      }
-      if (!hasFlutterCanvas && document.querySelector('flt-glass-pane')) hasFlutterCanvas = true;
-
-      return {
-        blank: false,
-        textLen,
-        hasSpinner,
-        hasFlutterCanvas,
-        // Heuristic: Flutter canvas with very little text = blank/unrendered
-        // (height is unreliable — Flutter always reports viewport height)
-        isBlankCanvas: hasFlutterCanvas && textLen < 100,
-        // Heuristic: if no text at all and no canvas, page is empty
-        isEmpty: textLen === 0 && !hasFlutterCanvas,
-      };
-    }).catch(() => null);
-
-    // If the page is a blank canvas or completely empty, NOT valid
-    if (pageContentSignal) {
-      if (pageContentSignal.isBlankCanvas) {
-        log('SPA check: Flutter canvas exists but page is BLANK (no content rendered) — session NOT valid', 'WARN', 'auth-guard');
-        return false;
-      }
-      if (pageContentSignal.isEmpty) {
-        log('SPA check: Page is completely empty — session NOT valid', 'WARN', 'auth-guard');
-        return false;
-      }
-    }
-
-    const hasAppShell = await page.evaluate(() => {
-      const body = document.body?.innerText || '';
-      const hasAssignments = body.includes('Assignments') || body.includes('assignments');
-      const hasCourses = body.includes('Courses') || body.includes('courses');
-      const hasCrawford = body.includes('Crawford') || body.includes('crawford');
-      // Also check for authenticated user indicators beyond nav labels
-      const hasDashboard = body.includes('Dashboard') || body.includes('dashboard');
-      const hasTopics = body.includes('Topics') || body.includes('topics');
-      const hasProfile = body.includes('Profile') || body.includes('profile');
-      const hasSignOut = body.includes('Sign out') || body.includes('sign out') || body.includes('Logout');
-      return hasAssignments || hasCourses || hasCrawford || hasDashboard || hasTopics || hasProfile || hasSignOut;
-    }).catch(() => false);
-
-    if (hasAppShell) {
-      log('SPA check: MathU app elements detected — session valid', 'DEBUG', 'auth-guard');
-      return true;
-    }
-
-    // ── FLUTTER CANVAS CHECK (only if content signals above didn't match) ──
-    // A Flutter canvas alone is NO longer sufficient. We already checked for
-    // blank canvas above. If we reach here, the canvas has some content but
-    // no recognizable MathU text. This could be a partially-loaded page.
-    // Only accept if there is substantial text content (not just a spinner).
-    if (pageContentSignal?.hasFlutterCanvas && !pageContentSignal?.hasSpinner) {
-      // Canvas exists, not blank, not spinning — could be a quiz or modal
-      // with non-standard text. Accept IF there's reasonable text content.
-      if (pageContentSignal.textLen > 50) {
-        log(`SPA check: Flutter canvas with ${pageContentSignal.textLen} chars text (no MathU labels) — accepting as likely valid`, 'DEBUG', 'auth-guard');
-        return true;
-      }
-      // Very little text with canvas but no MathU labels — probably loading
-      log('SPA check: Flutter canvas with minimal text and no MathU labels — session uncertain, treating as NOT valid', 'WARN', 'auth-guard');
+    // ── BLANK PAGE DETECTION (pixel-based, must run BEFORE canvas check) ──
+    // Flutter Web paints everything to <canvas>, so innerText is always empty.
+    // Text-length heuristics are fundamentally broken for Flutter SPAs.
+    // Instead, sample 5 pixels from a screenshot. If all 5 are the same colour,
+    // the page is visually blank. If even 1 differs, real content is rendered.
+    const visuallyBlank = await _isPageVisuallyBlank(page);
+    if (visuallyBlank) {
+      log('SPA check: Screenshot is visually blank (all 5 sampled pixels identical) — session NOT valid', 'WARN', 'auth-guard');
       return false;
     }
 
-    // No canvas, no app shell, no content — check for sign-in prompts
-    const hasSignInPrompt = await page.evaluate(() => {
-      const body = document.body?.innerText || '';
-      return body.includes('Sign in') || body.includes('sign in') ||
-             body.includes('Log in') || body.includes('log in') ||
-             body.includes('Enter your email');
-    }).catch(() => false);
-
-    if (hasSignInPrompt) {
-      log('SPA check: Sign-in prompt detected — session invalid', 'DEBUG', 'auth-guard');
-      return false;
-    }
-
-    // No canvas, no app shell, no sign-in, no content — page is likely still loading
-    log('SPA check: No Flutter canvas, no app elements, no sign-in — page still loading or unresponsive', 'WARN', 'auth-guard');
-    return false;
+    // Pixel check already confirmed the page is NOT visually blank.
+    // If we're on the SPA domain and the page has rendered pixels, the session
+    // is valid — the Flutter app is showing something (even if it's a quiz,
+    // modal, or non-standard layout the text-check couldn't detect).
+    log('SPA check: Page has rendered content (pixels differ) — session valid', 'DEBUG', 'auth-guard');
+    return true;
   } catch (err: any) {
     log(`SPA check: evaluate failed (${err.message}) — treating as NOT valid (was: assume valid)`, 'WARN', 'auth-guard');
     return false;
@@ -184,45 +183,11 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
  * decide whether to delegate to the tribunal (has content) or escalate
  * via reload/restart (blank canvas).
  *
- * CRITICAL: Flutter Web canvases report body height = viewport height (e.g. 768)
- * even when completely blank. We cannot rely on contentHeight to detect blank
- * Flutter pages. Instead, check text content length and Flutter canvas state.
+ * Uses pixel-based detection: samples 5 pixels from a screenshot.
+ * If all 5 are the same colour, the page is visually blank.
  */
 async function _isPageBlank(page: any): Promise<boolean> {
-  try {
-    const signal = await page.evaluate(() => {
-      const body = document.body;
-      if (!body) return { blank: true, reason: 'no_body' };
-      const text = (body.innerText || '').trim();
-      const textLen = text.length;
-
-      // Check for Flutter canvas
-      const canvases = document.querySelectorAll('canvas');
-      let hasFlutterCanvas = false;
-      for (const c of canvases) {
-        const cls = (c.className || '').toString();
-        if (cls.includes('flt') || cls.includes('flutter')) { hasFlutterCanvas = true; break; }
-      }
-      if (!hasFlutterCanvas && document.querySelector('flt-glass-pane')) hasFlutterCanvas = true;
-
-      // Check for loading spinner indicators
-      const html = body.innerHTML || '';
-      const hasSpinner = html.includes('loading') || html.includes('spinner') ||
-                         html.includes('progress') || html.includes('CircularProgressIndicator');
-
-      // Blank = Flutter canvas exists but very little text content
-      // (regardless of reported height — Flutter always reports viewport height)
-      // OR no canvas and no text at all
-      if (hasFlutterCanvas) {
-        // Flutter canvas with < 100 chars of text = blank/unrendered
-        // (100 chars allows for small UI elements while catching blank canvases)
-        return { blank: textLen < 100, reason: `flutter_canvas_textlen_${textLen}` };
-      }
-      // No canvas at all
-      return { blank: textLen === 0, reason: `no_canvas_textlen_${textLen}` };
-    }).catch(() => null);
-    return signal?.blank === true;
-  } catch { return false; }
+  return _isPageVisuallyBlank(page);
 }
 
 /**
