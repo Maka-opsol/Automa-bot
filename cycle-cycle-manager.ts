@@ -1111,6 +1111,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // v11: Also detect near-blank screenshots via byte entropy — the
       // tribunal may return 'unknown' instead of 'blank_page' for screenshots
       // that barely pass the entropy check but are still blank to the eye.
+      // v11.1: Also check for blank Flutter canvas via DOM (byte entropy
+      // misses these because the <canvas> element adds structural bytes).
       let _actionCacheSig: string | null = null;
       let _actionCacheHit = false;
       const actionCache = _getActionCache();
@@ -1127,13 +1129,30 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             const seen = new Set<number>();
             for (let i = sampleStart; i < sampleStart + sampleLen; i++) { seen.add(buf[i]); }
             // < 50 unique bytes = near-blank (tribunal uses < 40 for hard blank)
-            // This catches screenshots that barely pass the tribunal's check
-            // but are still visually blank/unrecognizable
             _isNearBlankScreenshot = seen.size < 50;
           }
         }
       } catch {}
-      const _isCacheExcluded = _isBlankPageState || _isNearBlankScreenshot || blankPageCounter > 0;
+      // v11.1: DOM-based Flutter blank detection (catches canvases that pass
+      // byte entropy but are visually blank — 0 semantics, minimal text)
+      let _isFlutterBlankDom = false;
+      if (!_isNearBlankScreenshot && !_isBlankPageState) {
+        try {
+          const domSignal = await page.evaluate(() => {
+            const text = (document.body?.innerText || '').trim();
+            if (text.length > 100) return false;
+            // Check for Flutter canvas
+            const canvases = document.querySelectorAll('canvas');
+            for (const c of canvases) {
+              const cls = (c.className || '').toString();
+              if (cls.includes('flt') || cls.includes('flutter')) return true;
+            }
+            return !!document.querySelector('flt-glass-pane');
+          }).catch(() => false);
+          _isFlutterBlankDom = !!domSignal;
+        } catch {}
+      }
+      const _isCacheExcluded = _isBlankPageState || _isNearBlankScreenshot || _isFlutterBlankDom || blankPageCounter > 0;
       if (!action && actionCache && currentState && !_isCacheExcluded) {
         try {
           // Compute context signature from current state + screenshot
