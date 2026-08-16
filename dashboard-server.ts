@@ -1774,7 +1774,7 @@ async function execActivate() {
   const input = document.getElementById('execKeyInput');
   const key = input?.value?.trim();
   if (!key) { toast('Enter the EXECUTIVE_KEY', 'error'); return; }
-  if (!confirm('ACTIVATE EXECUTIVE PRIVILEGES?\nThis will bypass ALL safety gates and push fixes directly to GitHub.')) return;
+  if (!confirm('ACTIVATE EXECUTIVE PRIVILEGES? This will bypass ALL safety gates and push fixes directly to GitHub.')) return;
   const r = await api('/api/executive/activate', { method: 'POST', body: JSON.stringify({ key }) });
   if (r?.success) {
     toast('EXECUTIVE PRIVILEGES ACTIVATED', 'warn');
