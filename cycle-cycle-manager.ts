@@ -985,7 +985,6 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           }
           // First blank: fall through to normal blank-page guard below
         }
-      }
       if (handleCaptcha) await handleCaptcha(page);
       // Resilience: CAPTCHA loop detection
       authCaptchaLoopGuard?.recordCaptcha?.();
