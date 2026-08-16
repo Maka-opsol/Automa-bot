@@ -261,11 +261,18 @@ class PatchMemory {
       }
 
       // Retrieve recent patches for comparison
-      const rows = getDb()?.prepare(`
-        SELECT * FROM patch_embeddings
-        ORDER BY timestamp DESC
-        LIMIT ?
-      `).all(MAX_RETRIEVE_FOR_SEARCH);
+      // v12: Wrap in try/catch — DB may not have the table yet, or prepare may fail
+      let rows: any[] | null = null;
+      try {
+        rows = getDb()?.prepare(`
+          SELECT * FROM patch_embeddings
+          ORDER BY timestamp DESC
+          LIMIT ?
+        `).all(MAX_RETRIEVE_FOR_SEARCH) ?? null;
+      } catch (dbErr: any) {
+        log(`searchSimilar: DB query failed (${dbErr.message || dbErr}). Skipping memory search.`, 'DEBUG', 'patch-memory');
+        return results;
+      }
 
       if (!rows || !Array.isArray(rows)) {
         return results;
