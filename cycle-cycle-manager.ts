@@ -1128,24 +1128,10 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         action = { actionType: 'wait', currentState: 'error', targetX: 0, targetY: 0 };
       }
 
-      // P-fix: When tribunal returns 'wait' for unknown/error state, run the full
-      // fallback chain (pixel → visual recovery → CSS selectors) BEFORE accepting
-      // the wait. This ensures the bot tries DOM/pixel-based recovery when AI
-      // providers can't determine the state (e.g., only text-only providers available).
-      if (action && action.actionType === 'wait' && (action.currentState === 'unknown' || action.currentState === 'error')) {
-        log('Tribunal returned wait for unknown state — running fallback chain', 'INFO', 'cycle');
-        try {
-          const fallbackAction = await getFallbackAction(page, currentState || undefined);
-          if (fallbackAction && fallbackAction.actionType && fallbackAction.actionType !== 'wait') {
-            log(`Fallback chain provided action: ${fallbackAction.actionType} at (${fallbackAction.targetX}, ${fallbackAction.targetY}) state=${fallbackAction.currentState}`, 'INFO', 'cycle');
-            action = fallbackAction;
-          } else {
-            log('Fallback chain returned wait — accepting tribunal wait', 'DEBUG', 'cycle');
-          }
-        } catch (fbErr: any) {
-          log(`Fallback chain failed: ${fbErr.message || fbErr}`, 'WARN', 'cycle');
-        }
-      }
+      // NOTE: When tribunal returns 'wait' for unknown/error state, we now RESPECT it.
+      // Previously we ran the fallback chain (pixel → visual recovery → CSS selectors)
+      // which often produced blind pixel clicks on unknown pages, making things worse.
+      // If the tribunal couldn't determine the state, waiting is the safest action.
 
       // Dashboard: check if action is banned
       try {
