@@ -819,22 +819,45 @@ async function abortSelfHealSession(reason: string): Promise<void> {
     abortedAt: Date.now(),
   });
 
-  // Return to memory protection immediately (or stay in minimum if DB says so)
-  // v5 FIX: await so browser is actually closed
-  // Check if minimum mode was active before this session
+  // Determine target mode after abort.
+  // v6 FIX: When self-heal fails completely (all_attempts_failed), escalate
+  // to MINIMUM mode — the bot just proved it can't fix itself, so strip
+  // everything non-essential. This matches the header contract:
+  //   "→ Minimum: when OOM death spiral detected AND self-heal fails"
+  // For other abort reasons (timeout, shutdown, etc.), return to the
+  // previous mode (memory_protection unless DB says minimum).
   let targetMode: MemoryMode = 'memory_protection';
-  try {
-    const dbMod = require('./database');
-    if (dbMod?.selectCalibration) {
-      const minRow = dbMod.selectCalibration.get(CALIBRATION_KEY_MINIMUM_MODE);
-      if (minRow) {
-        try {
-          const parsed = JSON.parse(minRow.value);
-          if (parsed.active) targetMode = 'minimum';
-        } catch {}
+  const isCompleteFailure = reason === 'all_attempts_failed';
+
+  if (isCompleteFailure) {
+    targetMode = 'minimum';
+    _log(`Self-heal completely failed — escalating to MINIMUM mode (not memory_protection)`, 'ERROR');
+    // Persist minimum mode to DB so it survives restarts
+    try {
+      const dbMod = require('./database');
+      if (dbMod?.upsertCalibration) {
+        dbMod.upsertCalibration.run(
+          CALIBRATION_KEY_MINIMUM_MODE,
+          JSON.stringify({ active: true, reason: `self_heal_abort:${reason}`, setAt: Date.now() }),
+          Date.now()
+        );
       }
-    }
-  } catch {}
+    } catch {}
+  } else {
+    // Check if minimum mode was active before this session
+    try {
+      const dbMod = require('./database');
+      if (dbMod?.selectCalibration) {
+        const minRow = dbMod.selectCalibration.get(CALIBRATION_KEY_MINIMUM_MODE);
+        if (minRow) {
+          try {
+            const parsed = JSON.parse(minRow.value);
+            if (parsed.active) targetMode = 'minimum';
+          } catch {}
+        }
+      }
+    } catch {}
+  }
   if (_currentMode !== targetMode) {
     await _applyMode(targetMode, `self_heal_abort:${reason}`);
     _restartTimers();
