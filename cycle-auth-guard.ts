@@ -49,7 +49,9 @@ function _isSpaDomain(url: string): boolean {
  *   1. Is the page on a known MathU SPA domain?
  *   2. Is the page NOT on a Microsoft login domain?
  *   3. Does the page body contain MathU app indicators?
- * If all pass → session is valid, no re-auth needed.
+ *   4. Is the page actually rendered (not blank Flutter canvas/spinner)?
+ * A Flutter canvas alone is NOT sufficient — it could be a blank white
+ * screen where the app failed to render. We must verify real content.
  */
 async function _isSpaSessionValid(page: any): Promise<boolean> {
   const url = page.url();
@@ -68,12 +70,69 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
 
   // Content-based validation: look for MathU app elements in the page
   try {
+    // ── BLANK PAGE DETECTION (must run BEFORE canvas check) ──
+    // A blank white Flutter canvas or loading spinner does NOT count as
+    // a valid authenticated session. Check for actual rendered content.
+    // CRITICAL: Flutter Web reports body height = viewport height (e.g. 768)
+    // even when the canvas is completely blank. Do NOT use contentHeight
+    // to detect blank Flutter pages — use text length instead.
+    const pageContentSignal = await page.evaluate(() => {
+      const body = document.body;
+      if (!body) return { blank: true, reason: 'no_body' };
+
+      const text = (body.innerText || '').trim();
+      const textLen = text.length;
+
+      // Check for loading spinner indicators (common in Flutter)
+      const html = body.innerHTML || '';
+      const hasSpinner = html.includes('loading') || html.includes('spinner') ||
+                         html.includes('progress') || html.includes('CircularProgressIndicator');
+
+      // Check for Flutter canvas elements
+      const canvases = document.querySelectorAll('canvas');
+      let hasFlutterCanvas = false;
+      for (const c of canvases) {
+        const cls = (c.className || '').toString();
+        if (cls.includes('flt') || cls.includes('flutter')) { hasFlutterCanvas = true; break; }
+      }
+      if (!hasFlutterCanvas && document.querySelector('flt-glass-pane')) hasFlutterCanvas = true;
+
+      return {
+        blank: false,
+        textLen,
+        hasSpinner,
+        hasFlutterCanvas,
+        // Heuristic: Flutter canvas with very little text = blank/unrendered
+        // (height is unreliable — Flutter always reports viewport height)
+        isBlankCanvas: hasFlutterCanvas && textLen < 100,
+        // Heuristic: if no text at all and no canvas, page is empty
+        isEmpty: textLen === 0 && !hasFlutterCanvas,
+      };
+    }).catch(() => null);
+
+    // If the page is a blank canvas or completely empty, NOT valid
+    if (pageContentSignal) {
+      if (pageContentSignal.isBlankCanvas) {
+        log('SPA check: Flutter canvas exists but page is BLANK (no content rendered) — session NOT valid', 'WARN', 'auth-guard');
+        return false;
+      }
+      if (pageContentSignal.isEmpty) {
+        log('SPA check: Page is completely empty — session NOT valid', 'WARN', 'auth-guard');
+        return false;
+      }
+    }
+
     const hasAppShell = await page.evaluate(() => {
       const body = document.body?.innerText || '';
       const hasAssignments = body.includes('Assignments') || body.includes('assignments');
       const hasCourses = body.includes('Courses') || body.includes('courses');
       const hasCrawford = body.includes('Crawford') || body.includes('crawford');
-      return hasAssignments || hasCourses || hasCrawford;
+      // Also check for authenticated user indicators beyond nav labels
+      const hasDashboard = body.includes('Dashboard') || body.includes('dashboard');
+      const hasTopics = body.includes('Topics') || body.includes('topics');
+      const hasProfile = body.includes('Profile') || body.includes('profile');
+      const hasSignOut = body.includes('Sign out') || body.includes('sign out') || body.includes('Logout');
+      return hasAssignments || hasCourses || hasCrawford || hasDashboard || hasTopics || hasProfile || hasSignOut;
     }).catch(() => false);
 
     if (hasAppShell) {
@@ -81,22 +140,24 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
       return true;
     }
 
-    const hasFlutterCanvas = await page.evaluate(() => {
-      const canvases = document.querySelectorAll('canvas');
-      for (const c of canvases) {
-        const cls = (c.className || '').toString();
-        if (cls.includes('flt') || cls.includes('flutter')) return true;
+    // ── FLUTTER CANVAS CHECK (only if content signals above didn't match) ──
+    // A Flutter canvas alone is NO longer sufficient. We already checked for
+    // blank canvas above. If we reach here, the canvas has some content but
+    // no recognizable MathU text. This could be a partially-loaded page.
+    // Only accept if there is substantial text content (not just a spinner).
+    if (pageContentSignal?.hasFlutterCanvas && !pageContentSignal?.hasSpinner) {
+      // Canvas exists, not blank, not spinning — could be a quiz or modal
+      // with non-standard text. Accept IF there's reasonable text content.
+      if (pageContentSignal.textLen > 50) {
+        log(`SPA check: Flutter canvas with ${pageContentSignal.textLen} chars text (no MathU labels) — accepting as likely valid`, 'DEBUG', 'auth-guard');
+        return true;
       }
-      const glassPane = document.querySelector('flt-glass-pane');
-      if (glassPane) return true;
+      // Very little text with canvas but no MathU labels — probably loading
+      log('SPA check: Flutter canvas with minimal text and no MathU labels — session uncertain, treating as NOT valid', 'WARN', 'auth-guard');
       return false;
-    }).catch(() => false);
-
-    if (hasFlutterCanvas) {
-      log('SPA check: Flutter canvas detected — assuming session valid', 'DEBUG', 'auth-guard');
-      return true;
     }
 
+    // No canvas, no app shell, no content — check for sign-in prompts
     const hasSignInPrompt = await page.evaluate(() => {
       const body = document.body?.innerText || '';
       return body.includes('Sign in') || body.includes('sign in') ||
@@ -109,12 +170,71 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
       return false;
     }
 
-    log('SPA check: No contradictory signals on SPA domain — assuming valid', 'DEBUG', 'auth-guard');
-    return true;
+    // No canvas, no app shell, no sign-in, no content — page is likely still loading
+    log('SPA check: No Flutter canvas, no app elements, no sign-in — page still loading or unresponsive', 'WARN', 'auth-guard');
+    return false;
   } catch (err: any) {
-    log(`SPA check: evaluate failed (${err.message}) — assuming valid`, 'WARN', 'auth-guard');
+    log(`SPA check: evaluate failed (${err.message}) — treating as NOT valid (was: assume valid)`, 'WARN', 'auth-guard');
+    return false;
+  }
+}
+
+/**
+ * Check if the page is blank/unrendered — used by ensureAuthenticated to
+ * decide whether to delegate to the tribunal (has content) or escalate
+ * via reload/restart (blank canvas).
+ *
+ * CRITICAL: Flutter Web canvases report body height = viewport height (e.g. 768)
+ * even when completely blank. We cannot rely on contentHeight to detect blank
+ * Flutter pages. Instead, check text content length and Flutter canvas state.
+ */
+async function _isPageBlank(page: any): Promise<boolean> {
+  try {
+    const signal = await page.evaluate(() => {
+      const body = document.body;
+      if (!body) return { blank: true, reason: 'no_body' };
+      const text = (body.innerText || '').trim();
+      const textLen = text.length;
+
+      // Check for Flutter canvas
+      const canvases = document.querySelectorAll('canvas');
+      let hasFlutterCanvas = false;
+      for (const c of canvases) {
+        const cls = (c.className || '').toString();
+        if (cls.includes('flt') || cls.includes('flutter')) { hasFlutterCanvas = true; break; }
+      }
+      if (!hasFlutterCanvas && document.querySelector('flt-glass-pane')) hasFlutterCanvas = true;
+
+      // Check for loading spinner indicators
+      const html = body.innerHTML || '';
+      const hasSpinner = html.includes('loading') || html.includes('spinner') ||
+                         html.includes('progress') || html.includes('CircularProgressIndicator');
+
+      // Blank = Flutter canvas exists but very little text content
+      // (regardless of reported height — Flutter always reports viewport height)
+      // OR no canvas and no text at all
+      if (hasFlutterCanvas) {
+        // Flutter canvas with < 100 chars of text = blank/unrendered
+        // (100 chars allows for small UI elements while catching blank canvases)
+        return { blank: textLen < 100, reason: `flutter_canvas_textlen_${textLen}` };
+      }
+      // No canvas at all
+      return { blank: textLen === 0, reason: `no_canvas_textlen_${textLen}` };
+    }).catch(() => null);
+    return signal?.blank === true;
+  } catch { return false; }
+}
+
+/**
+ * Check and clear the blank-page flag that ensureAuthenticated may have set.
+ * Returns true if the flag was set (indicating auth detected a blank page).
+ */
+function consumeBlankPageFlag(page: any): boolean {
+  if ((page as any)?._authBlankPage) {
+    (page as any)._authBlankPage = false;
     return true;
   }
+  return false;
 }
 
 async function ensureAuthenticated(page: any) {
@@ -155,10 +275,22 @@ async function ensureAuthenticated(page: any) {
     const redirectedToLogin = postRefreshUrl.includes('login.microsoftonline.com') || postRefreshUrl.includes('login.live.com');
 
     if (stillOnAppDomain && !redirectedToLogin) {
-      // Page is still on the app domain — session is likely valid, auth
-      // strategies just can't recognize the page layout. Let the tribunal
-      // handle it. Do NOT close the browser.
-      log('Auth returned false but page remains on app domain — continuing to tribunal', 'INFO', 'auth-guard');
+      // FIX: Before letting tribunal handle a "still on app domain" page,
+      // check if it's a blank/unrendered page. The tribunal will also fail
+      // on a blank canvas, returning unknown/wait in an infinite loop.
+      // If blank, report the exact state so the cycle manager can escalate.
+      const isBlank = await _isPageBlank(page);
+      if (isBlank) {
+        log('Auth returned false, page on app domain but BLANK — reporting blank_loading state (not delegating to tribunal)', 'WARN', 'auth-guard');
+        authAttempts = 0;
+        // Return page but attach a flag so the cycle manager knows to
+        // escalate (reload/restart) rather than entering the tribunal loop.
+        (page as any)._authBlankPage = true;
+        return page;
+      }
+      // Page has content — session is likely valid, auth strategies just
+      // can't recognize the layout. Let the tribunal handle it visually.
+      log('Auth returned false but page remains on app domain with content — continuing to tribunal', 'INFO', 'auth-guard');
       authAttempts = 0;
       return page;
     }
@@ -264,4 +396,4 @@ function getCaptchaFailureCount(): number {
   return _consecutiveCaptchaFailures;
 }
 
-module.exports = { ensureAuthenticated, handleCaptcha, resetCaptchaFailureCount, getCaptchaFailureCount, _injectDependencies };
+module.exports = { ensureAuthenticated, handleCaptcha, resetCaptchaFailureCount, getCaptchaFailureCount, consumeBlankPageFlag, _isPageBlank, _injectDependencies };
