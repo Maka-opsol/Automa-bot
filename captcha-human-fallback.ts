@@ -97,9 +97,24 @@ class HumanFallbackCaptcha {
     for (const session of pool) {
       try {
         await page.context().clearCookies();
-      await page.context().addCookies(session.cookies || []);
+        await page.context().addCookies(session.cookies || []);
         await page.goto(CONFIG.APP_URL, { waitUntil: 'domcontentloaded' });
-        if (await page.url().includes('/assignments')) return true;
+        // Wait for SPA to render and any redirects to complete
+        await new Promise(r => setTimeout(r, 3000));
+        const currentUrl = page.url();
+        // SPA-aware: MathU is a Flutter Web SPA — the URL never contains
+        // '/assignments'. If we landed on Microsoft login, the session is dead.
+        // Otherwise if we're still on the app domain, the session is valid.
+        const isMicrosoftLogin = currentUrl.includes('login.microsoftonline.com') || currentUrl.includes('login.live.com');
+        if (isMicrosoftLogin) continue;
+        try {
+          const appOrigin = new URL(CONFIG.APP_URL || '').origin;
+          const currentOrigin = new URL(currentUrl).origin;
+          if (currentOrigin === appOrigin) return true;
+        } catch {
+          // URL parse failed — if not on Microsoft login, assume valid
+          if (!isMicrosoftLogin) return true;
+        }
       } catch (_e: any) { /* non-critical, suppressed */ }
     }
     return false;
