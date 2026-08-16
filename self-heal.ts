@@ -859,7 +859,7 @@ async function performSelfHeal(options?: SelfHealOptions) {
     if (acceptAnyFix) {
       // EXECUTIVE_MODE or ACCEPT_ANY_FIX: skip audit entirely, trust all fixes
       safeFixes = fixes;
-      log(`${executiveMode ? 'EXECUTIVE_MODE' : 'ACCEPT_ANY_FIX'}: bypassing audit — applying all ${fixes.length} fix(es) directly`, 'WARN', 'self-heal');
+      log(`${executiveMode ? 'EXECUTIVE_MODE' : 'ACCEPT_ANY_FIX'}: bypassing audit — applying all ${fixes.length} fix(es) directly: ${fixes.map((f: any) => f.file).join(', ')}`, 'WARN', 'self-heal');
     } else {
       for (const fix of fixes) {
         const result = await auditFix(fix);
