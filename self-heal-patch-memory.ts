@@ -267,6 +267,10 @@ class PatchMemory {
         LIMIT ?
       `).all(MAX_RETRIEVE_FOR_SEARCH);
 
+      if (!rows || !Array.isArray(rows)) {
+        return results;
+      }
+
       // Compute similarities
       const scored = [];
       for (const row of rows) {
