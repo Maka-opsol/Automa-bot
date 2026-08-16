@@ -76,14 +76,13 @@ const _BACKUP_SCOPE_BASES = [
 /**
  * Build the full backup scope by combining the static base list with
  * any additional .ts/.js source files in the project root that aren't
- * already covered. This ensures new modules get backed up automatically.
+ * already covered.
  */
 function buildBackupScope(): string[] {
   const staticScope = new Set(
     _BACKUP_SCOPE_BASES.flatMap(f => [f + '.ts', f + '.js'])
   );
 
-  // Scan project root for additional source files
   try {
     const allFiles = fs.readdirSync(SOURCE_DIR);
     for (const file of allFiles) {
@@ -91,8 +90,8 @@ function buildBackupScope(): string[] {
           !file.endsWith('.test.ts') && !file.endsWith('.test.js') &&
           !file.endsWith('.d.ts') &&
           !staticScope.has(file) &&
-          !file.startsWith('test-') && // test helpers aren't critical
-          !file.startsWith('scripts-')) { // scripts aren't critical
+          !file.startsWith('test-') &&
+          !file.startsWith('scripts-')) {
         staticScope.add(file);
       }
     }
@@ -114,46 +113,38 @@ function getBACKUP_SCOPE(): string[] {
 
 // ─── Approval Queue (lazy-init on first use) ───
 let _approvalQueue: any = null;
-function getApprovalQueue() { 
+function getApprovalQueue() {
   if (!_approvalQueue) {
     _approvalQueue = new (getPatchApprovalQueue())(getDb());
   }
   return _approvalQueue;
 }
 
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 //  ATOMIC FILE OPERATIONS
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 
-/**
- * Atomically replace a file by writing to a temp file then renaming.
- * On the same filesystem, rename() is atomic — either the old file
- * or the new file exists, never a partial write.
- */
 function atomicReplaceFile(destPath: any, content: any) {
   const dir = path.dirname(destPath);
-  // Use a unique temp name in the SAME directory to ensure same-filesystem rename
   const tmpPath = path.join(dir, `.tmp-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`);
   try {
     fs.writeFileSync(tmpPath, content, 'utf8');
     fs.renameSync(tmpPath, destPath);
   } catch (err: any) {
-    // Clean up temp file if rename failed
     try { fs.unlinkSync(tmpPath); } catch (cleanupErr: any) { /* best effort */ }
     throw err;
   }
 }
 
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 //  BACKUP / ROLLBACK / PROMOTE  (pure fs, no child_process)
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 
-async function backupCode() { 
+async function backupCode() {
   const timestamp = Date.now();
   const backupPath = path.join(getBACKUP_DIR(), `backup-${timestamp}`);
   fs.mkdirSync(backupPath, { recursive: true });
 
-  // Rotate old backups
   try {
     const allBackups = fs.readdirSync(getBACKUP_DIR())
       .filter((f: any) => f.startsWith('backup-'))
@@ -181,7 +172,7 @@ async function backupCode() {
   return backupPath;
 }
 
-function restoreFromBackup(backupPath: any, overlay?: any) { 
+function restoreFromBackup(backupPath: any, overlay?: any) {
   const backupScope = getBACKUP_SCOPE();
   const isOverlay = !!overlay;
   for (const file of backupScope) {
@@ -190,7 +181,6 @@ function restoreFromBackup(backupPath: any, overlay?: any) {
       try {
         const content = fs.readFileSync(src, 'utf8');
         if (isOverlay) {
-          // Restore = remove from overlay (falls back to read-only original)
           overlay.removeFromOverlay(file);
           overlay.evictModule(file);
         } else {
@@ -201,13 +191,12 @@ function restoreFromBackup(backupPath: any, overlay?: any) {
         }
       } catch (err: any) {
         logError(`Atomic rollback failed for ${file}`, err);
-        // Continue restoring other files — partial rollback is better than none
       }
     }
   }
 }
 
-function copyToStaging() { 
+function copyToStaging() {
   const stagingSource = path.join(getSTAGING_DIR(), 'source');
   if (fs.existsSync(stagingSource)) {
     fs.rmSync(stagingSource, { recursive: true, force: true });
@@ -240,7 +229,6 @@ function promoteStaging(overlay?: any) {
       try {
         const content = fs.readFileSync(src, 'utf8');
         if (isOverlay) {
-          // On read-only FS: write to /tmp overlay instead of SOURCE_DIR
           const ok = overlay.writeToOverlay(file, content);
           if (ok) {
             promotedFiles.push(file);
@@ -248,7 +236,6 @@ function promoteStaging(overlay?: any) {
             failedFiles.push(file);
           }
         } else {
-          // Normal writable FS: atomic replace in place
           const dest = path.join(SOURCE_DIR, file);
           const destDir = path.dirname(dest);
           if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
@@ -267,7 +254,6 @@ function promoteStaging(overlay?: any) {
     return false;
   }
 
-  // Evict overlaid modules from require.cache so they reload on next require
   if (isOverlay) {
     const evicted = overlay.evictAllOverlaidModules();
     log(`Staging promoted to /tmp overlay (${promotedFiles.length} files, ${evicted} modules evicted from cache)`, 'INFO', 'self-heal');
@@ -277,12 +263,11 @@ function promoteStaging(overlay?: any) {
   return true;
 }
 
-function rollbackAndAlert(backupPath: any, patchId: any, overlay?: any) { 
+function rollbackAndAlert(backupPath: any, patchId: any, overlay?: any) {
   log('Rolling back to backup...', 'WARN', 'self-heal');
   restoreFromBackup(backupPath, overlay);
   logAudit('Rollback completed from ' + backupPath, 'self-heal');
   try { ((_deps.alerting?.sendAlert) || (() => {}))('Self-heal failed. Rolled back.'); } catch (e: any) { /* non-critical */ }
-  // Record rollback in patch memory so the system learns from it
   if (patchId) {
     try {
       const patchMemory = getPatchMemory();
@@ -293,16 +278,11 @@ function rollbackAndAlert(backupPath: any, patchId: any, overlay?: any) {
   }
 }
 
-/**
- * Verify promoted files are readable and have valid structure.
- * Catches corruption from mid-crash scenarios.
- */
 function verifyPromotedFiles(fixes: any, overlay?: any) {
   const targetFiles = fixes.map((f: any) => f.file);
   let allValid = true;
 
   for (const file of targetFiles) {
-    // When using overlay, verify from the overlay path
     let content: string | null = null;
     if (overlay) {
       content = overlay.readFromOverlay(file);
@@ -324,7 +304,6 @@ function verifyPromotedFiles(fixes: any, overlay?: any) {
     if (content.length < 50) {
       log(`Post-promotion verification WARNING: ${file} is suspiciously short (${content.length} chars)`, 'WARN', 'self-heal');
     }
-    // Verify the file starts with 'use strict' or a valid module pattern
     const trimmedStart = content.trimStart().substring(0, 20);
     const validStarts = ["'use strict'", '"use strict"', "'use strict';", '"use strict";', 'import ', 'export ', '//', '/*', '/**'];
     const hasValidStart = validStarts.some(s => trimmedStart.startsWith(s));
@@ -336,18 +315,14 @@ function verifyPromotedFiles(fixes: any, overlay?: any) {
   return allValid;
 }
 
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 //  INVESTIGATION
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 
-async function investigatePage() {  
+async function investigatePage() {
   log('Investigating page for self-healing...', 'INFO', 'self-heal');
   let page;
   try {
-    // Boot-time OOM heals run BEFORE the browser is initialised, so
-    // _deps.browser is absent.  In that case return a log-only
-    // investigation — the tribunal can still work from error patterns
-    // and target-file hints (enrichInvestigationWithTargetFile).
     const launcher = _deps.browser?.launchBrowser;
     if (!launcher) {
       log('No browser available for investigation (boot-time heal) — using log-based context', 'WARN', 'self-heal');
@@ -375,7 +350,7 @@ async function investigatePage() {
   }
 }
 
-function getRecentErrors() { 
+function getRecentErrors() {
   try {
     const stats = getProvidersStats().getStats();
     return `Last error count: ${stats.errors || 0}, consecutive failures: ${stats.consecutiveFailures || 0}`;
@@ -385,13 +360,64 @@ function getRecentErrors() {
 }
 
 /**
- * Error-pattern → likely target file mapping.
- * When no specific file is known, the tribunal prompt defaults to
- * "Target file to fix: Unknown" and shows no code. This map gives
- * the tribunal a fighting chance by pointing it at the right file.
- *
- * Entries are ordered by specificity — first match wins.
+ * Enhanced error context: gathers additional diagnostic data from the
+ * runtime environment to give the tribunal more signal about what's wrong.
  */
+function getEnhancedErrorContext(): string {
+  const parts: string[] = [];
+
+  // 1. Memory status
+  try {
+    const mem = process.memoryUsage();
+    parts.push(`Memory: RSS=${Math.round(mem.rss / 1024 / 1024)}MB, Heap=${Math.round(mem.heapUsed / 1024 / 1024)}/${Math.round(mem.heapTotal / 1024 / 1024)}MB`);
+  } catch {}
+
+  // 2. Provider stats summary
+  try {
+    const stats = getProvidersStats().getStats();
+    if (stats) {
+      parts.push(`Provider stats: ${stats.totalActions || 0} actions, ${stats.errors || 0} errors, ${stats.consecutiveFailures || 0} consecutive failures`);
+    }
+  } catch {}
+
+  // 3. Uptime
+  try {
+    const uptimeSec = Math.round(process.uptime());
+    parts.push(`Process uptime: ${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m`);
+  } catch {}
+
+  // 4. Degradation level (if available)
+  try {
+    const degradLadder = require('./self-heal-degradation-ladder');
+    if (degradLadder?.getCurrentLevel) {
+      const level = degradLadder.getCurrentLevel();
+      parts.push(`Degradation level: ${level?.name || level || 'unknown'}`);
+    }
+  } catch {}
+
+  // 5. Recent self-heal events (last 3)
+  try {
+    const db = getDb();
+    if (db) {
+      const recentEvents = db.prepare('SELECT phase, outcome, trigger_reason FROM self_heal_events ORDER BY timestamp DESC LIMIT 3').all();
+      if (recentEvents.length > 0) {
+        parts.push(`Recent self-heal events: ${recentEvents.map((e: any) => `${e.phase}=${e.outcome || '?'}`).join(', ')}`);
+      }
+    }
+  } catch {}
+
+  // 6. Circuit breaker state
+  try {
+    const cb = getHealerCircuitBreaker();
+    if (cb?.healerCircuitBreaker?.getState) {
+      const cbState = cb.healerCircuitBreaker.getState();
+      parts.push(`Circuit breaker: ${cbState.state} (failures: ${cbState.failureCount}, consecutive opens: ${cbState.consecutiveOpens})`);
+    }
+  } catch {}
+
+  return parts.length > 0 ? parts.join(' | ') : 'No additional context available';
+}
+
 const ERROR_TO_FILE_HINTS: Array<{ pattern: RegExp; files: string[] }> = [
   { pattern: /selector|click|wait_for|visible|locator/i, files: ['selectors.ts', 'browser.ts', 'cycle-action-executor.ts'] },
   { pattern: /auth|login|signin|token|jwt|session/i, files: ['auth-strategies-microsoft-v2.ts', 'auth-auth-manager.ts', 'auth.ts', 'jwt.ts'] },
@@ -402,21 +428,16 @@ const ERROR_TO_FILE_HINTS: Array<{ pattern: RegExp; files: string[] }> = [
   { pattern: /screenshot|page|navigate|goto/i, files: ['browser.ts', 'cycle-action-executor.ts'] },
   { pattern: /captcha/i, files: ['captcha-solver-external.ts', 'providers-detection-captcha-solver.ts'] },
   { pattern: /stagnat|repeat|loop|circular/i, files: ['cycle-stagnation.ts', 'cycle-cycle-manager.ts', 'progress-tracker.ts'] },
+  // v2: Additional patterns for better targeting
+  { pattern: /quota|rate.?limit|429|budget/i, files: ['openrouter-rate-limiter.ts', 'bazaarlink-rate-limiter.ts', 'providers-registry.ts', 'providers-health.ts'] },
+  { pattern: /require|module|cannot find|MODULE_NOT_FOUND/i, files: ['dependency-manager.ts', 'dependency-survivor.ts', 'container-modules.ts'] },
+  { pattern: /ECONNREFUSED|ENOTFOUND|network|fetch|socket/i, files: ['providers-base.ts', 'utils-fetch.ts', 'providers-dns-rotation.ts', 'network-ip-rotator.ts'] },
 ];
 
-/**
- * Enrich the raw investigation from investigatePage() with a likely
- * target file and its content, so the tribunal prompt isn't blind.
- *
- * Strategy:
- * 1. Try to read recent patch_memory entries for the most-commonly-fixed file
- * 2. Match error patterns against known file hints
- * 3. Fall back to 'Unknown' (the tribunal can still guess from HTML)
- */
 function enrichInvestigationWithTargetFile(investigation: any, errorLogs: string) {
   const enriched = { ...investigation };
 
-  // Try patch memory first — it knows which files were fixed before
+  // Try patch memory first
   try {
     const patchMem = getPatchMemory();
     if (patchMem && typeof patchMem.getMostFrequentTarget === 'function') {
@@ -450,35 +471,22 @@ function enrichInvestigationWithTargetFile(investigation: any, errorLogs: string
     }
   }
 
-  // No match found — tribunal will see 'Unknown' but can still work from HTML
   log('Investigation: no specific target file identified, tribunal will infer from HTML', 'DEBUG', 'self-heal');
   return enriched;
 }
 
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 //  TWO-LAYER AUDIT COORDINATION
-//
-//  Layer 1: Sandbox (deterministic, fast)
-//    - File-level: isPatchableFile (immutable/restricted/allowed)
-//    - Content-level: auditPatchContent (30+ blocked patterns)
-//    - Path traversal, syntax validation, size limit
-//
-//  Layer 2: AI Auditor (probabilistic, slower)
-//    - Keyword pre-filter (isObviouslyMalicious)
-//    - AI tribunal vote (multiple independent models)
-//
-//  For RESTRICTED files, Layer 2 results are submitted to the
-//  approval workflow which requires supermajority + no veto.
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 
 /**
  * Run the two-layer audit on a single fix.
- *
- * @param {Object} fix - { file, patch, change, generatingModel }
- * @returns {Promise<{ passed: boolean, reason?: string, approvalStatus?: string }>}
+ * v2: Now accepts cascade metadata — non-codegen patches get
+ * ENHANCED audit (more auditors, stricter thresholds, extra validation).
  */
-async function auditFix(fix: any) { 
+async function auditFix(fix: any, cascadeMetadata?: any) {
   const { file, patch } = fix;
+  const isNonCodegen = cascadeMetadata?.hasCodegenVote === false;
 
   // ── Layer 1: Sandbox (deterministic) ──
   const sandboxResult = await getExecutePatchInSandbox()(patch, file);
@@ -492,17 +500,15 @@ async function auditFix(fix: any) {
   }
 
   // ── Layer 2: AI Auditor (probabilistic) ──
-  // For restricted files, we need explicit votes for the approval workflow.
-  // For allowed files, a simple safe/unsafe is sufficient.
   let auditResult;
 
   if (sandboxResult.requiresApproval) {
-    // RESTRICTED file — need tribunal votes for approval workflow
     log(`Restricted file ${file}: requesting AI tribunal votes`, 'INFO', 'self-heal');
-    auditResult = await getAuditPatchWithVotes()(patch);
+    // Non-codegen patches for restricted files get the full tribunal with votes
+    auditResult = await getAuditPatchWithVotes()(patch, undefined, { isNonCodegen });
   } else {
-    // Allowed file — standard audit (keyword + single AI check)
-    auditResult = await getAuditPatch()(patch);
+    // Allowed file — standard audit
+    auditResult = await getAuditPatch()(patch, undefined, { isNonCodegen });
   }
 
   if (!auditResult.safe && !auditResult.is_safe) {
@@ -523,20 +529,12 @@ async function auditFix(fix: any) {
   return { passed: true };
 }
 
-/**
- * Handle approval for a restricted file using the PatchApprovalQueue.
- *
- * @param {Object} fix
- * @param {Object} auditResult - Must include `votes` array for restricted files
- * @returns {Promise<{ approved: boolean, reason: string }>}
- */
-async function handleRestrictedFileApproval(fix: any, auditResult: any) { 
+async function handleRestrictedFileApproval(fix: any, auditResult: any) {
   const queue = getApprovalQueue();
   const patchId = `sh-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const patchHash = crypto.createHash('sha256').update(fix.patch).digest('hex');
   const patchSize = Buffer.byteLength(fix.patch, 'utf8');
 
-  // Create approval request
   queue.requestApproval({
     patchId,
     targetFile: fix.file,
@@ -548,15 +546,12 @@ async function handleRestrictedFileApproval(fix: any, auditResult: any) {
     },
   });
 
-  // Submit AI auditor votes
   const votes = (auditResult.votes || []).map((v: any) => ({
     auditor: v.auditor || v.provider || 'unknown',
     safe: v.safe !== false && v.is_safe !== false,
     reason: v.reason || '',
   }));
 
-  // If no votes were collected (auditor returned safe but no vote details),
-  // create a single synthetic vote based on the overall result
   if (votes.length === 0) {
     votes.push({
       auditor: 'primary-auditor',
@@ -579,28 +574,11 @@ async function handleRestrictedFileApproval(fix: any, auditResult: any) {
   return decision;
 }
 
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 //  STAGING (no child_process — pure fs + sandbox validation)
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 
-/**
- * Apply validated fixes to the staging area.
- *
- * Security guarantees at this point:
- *   - Sandbox validated: file is patchable, content has no dangerous patterns,
- *     path traversal blocked, syntax valid, size < 50KB
- *   - AI auditor validated: no malicious intent detected
- *   - For restricted files: approval workflow granted
- *
- * We ONLY do full file replacement — no diff/patch command.
- * If a patch looks like a unified diff, we reject it (the tribunal should
- * generate full file content).
- *
- * @param {Array} fixes  - Validated fixes
- * @param {string} stagingSource - Path to staging source dir
- * @returns {boolean}
- */
-function applyFixesToStaging(fixes: any, stagingSource: any) { 
+function applyFixesToStaging(fixes: any, stagingSource: any) {
   log(`Applying ${fixes.length} validated fix(es) to staging...`, 'INFO', 'self-heal');
 
   for (const fix of fixes) {
@@ -617,7 +595,6 @@ function applyFixesToStaging(fixes: any, stagingSource: any) {
       return false;
     }
 
-    // Write the patch as full file content
     try {
       atomicReplaceFile(filePath, fix.patch);
       log(`Applied patch to ${fix.file} in staging (atomic full replacement)`, 'INFO', 'self-heal');
@@ -626,7 +603,6 @@ function applyFixesToStaging(fixes: any, stagingSource: any) {
       return false;
     }
 
-    // Record in database
     try {
       getInsertPatch().run(
         Date.now(), fix.change || 'Self-heal patch', fix.file,
@@ -640,20 +616,35 @@ function applyFixesToStaging(fixes: any, stagingSource: any) {
   return true;
 }
 
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 //  MAIN SELF-HEAL ORCHESTRATOR
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 
 let _healInProgress = false;
 
+// v2: Track consecutive tribunal failures across performSelfHeal invocations
+// (survives restarts via in-memory counter — resets on successful heal)
+let _consecutiveTribunalFailures = 0;
+
+/**
+ * Get the current consecutive tribunal failure count.
+ * Exposed for external query (dashboard, diagnostics).
+ */
+function getConsecutiveTribunalFailures(): number { return _consecutiveTribunalFailures; }
+
+/**
+ * Reset the consecutive tribunal failure counter.
+ * Called on successful heal or manual operator reset.
+ */
+function resetConsecutiveTribunalFailures() {
+  const prev = _consecutiveTribunalFailures;
+  _consecutiveTribunalFailures = 0;
+  if (prev > 0) {
+    log(`Consecutive tribunal failure counter reset (was ${prev})`, 'INFO', 'self-heal');
+  }
+}
+
 interface SelfHealOptions {
-  /**
-   * Skip the runtime heal fast-pass and go directly to the code-patch pipeline.
-   * Use when the caller has already run performRuntimeHeal() separately
-   * (e.g., self-heal-oom-trigger.ts Step 1 → Step 2).
-   * Without this, performSelfHeal() would re-run runtime heal, succeed,
-   * and return true WITHOUT ever calling the code-generation tribunal.
-   */
   skipRuntimeHeal?: boolean;
 }
 
@@ -661,15 +652,6 @@ async function performSelfHeal(options?: SelfHealOptions) {
   if (_healInProgress) { log('Self-heal already in progress, skipping', 'DEBUG', 'self-heal'); return false; }
 
   // v9: FAST PASS — runtime healing avenues (no /tmp, no code patches, no AI).
-  // These fix the most common runtime issues in seconds. Only if ALL fail do
-  // we fall through to the heavy code-patch pipeline.
-  // Importantly, runtime heals bypass the daily patch limit and cooldown —
-  // they're safe, non-destructive, and can run every time if needed.
-  //
-  // CRITICAL: When skipRuntimeHeal=true, we skip this entire block.
-  // The OOM trigger already ran performRuntimeHeal() in Step 1. If we
-  // ran it again here, it would succeed (clearing caches again), return
-  // true, and the code-patch pipeline (tribunal) would NEVER execute.
   if (!options?.skipRuntimeHeal) {
     try {
       log('Attempting runtime heal (fast pass)...', 'INFO', 'self-heal');
@@ -679,6 +661,7 @@ async function performSelfHeal(options?: SelfHealOptions) {
         log(`Runtime heal SUCCEEDED via: ${successes.map(r => r.avenue).join(', ')}`, 'INFO', 'self-heal');
         logAudit(`Runtime heal succeeded: ${successes.map(r => r.avenue).join(', ')}`, 'self-heal');
         _lastFailureTime = 0; // Reset cooldown on any successful heal
+        resetConsecutiveTribunalFailures(); // Reset tribunal failure tracking
         return true;
       }
       log('Runtime heal found no fixable issues — falling through to code-patch pipeline', 'INFO', 'self-heal');
@@ -689,11 +672,7 @@ async function performSelfHeal(options?: SelfHealOptions) {
     log('Skipping runtime heal fast-pass (skipRuntimeHeal=true) — going directly to code-patch pipeline', 'INFO', 'self-heal');
   }
 
-  // ── SLOW PATH: Code-patch pipeline (original behavior) ──
-  // v8-fix: On Render/ephemeral disks, source files are read-only (deployed from git).
-  // Use the /tmp overlay system: patches are written to /tmp/self-heal-overlay/,
-  // and a require() interceptor makes Node load them instead of the read-only
-  // originals. The overlay is repopulated from patch_history DB on each boot.
+  // ── SLOW PATH: Code-patch pipeline ──
   const isReadOnlyFs = !!(process.env.RENDER || process.env.RENDER_SERVICE_ID);
   let overlay: any = null;
   if (isReadOnlyFs) {
@@ -720,9 +699,15 @@ async function performSelfHeal(options?: SelfHealOptions) {
   }
   if (!checkSelfHealSafety()) return false;
 
-  // v4: If in memory_protection, request a self-heal session to get full power.
-  // This is the ONLY way to get full power automatically. The session has a
-  // 30-minute timeout and all progress is saved to DB to survive OOM kills.
+  // v2: In FULL CASCADE mode (3+ consecutive failures), bypass daily limit.
+  // This is a last-resort scenario — if the bot has failed 3 times in a row,
+  // the normal daily limit should not prevent it from using every available provider.
+  const isFullCascade = _consecutiveTribunalFailures >= 3;
+  if (isFullCascade) {
+    log(`FULL CASCADE MODE ACTIVE (${_consecutiveTribunalFailures} consecutive tribunal failures) — daily limit bypassed, all providers will be consulted`, 'WARN', 'self-heal');
+    logAudit(`Full cascade mode activated (attempt ${_consecutiveTribunalFailures})`, 'self-heal');
+  }
+
   const memoryMode = getMemoryMode();
   const sessionRequested = memoryMode.isMemoryProtection() && memoryMode.beginSelfHealSession('self_heal_triggered');
   if (sessionRequested) {
@@ -739,36 +724,38 @@ async function performSelfHeal(options?: SelfHealOptions) {
   let safeFixes: any[] = [];
   let lastTribunalError: string | null = null;
 
-  while (attempts < getCONFIG().SELF_HEAL_MAX_ATTEMPTS && !healed) {
+  // v2: Dynamic max attempts based on cascade state
+  // Normal: SELF_HEAL_MAX_ATTEMPTS (default 3)
+  // Full cascade: up to 5 attempts (more providers to try)
+  const maxAttempts = isFullCascade
+    ? Math.max(getCONFIG().SELF_HEAL_MAX_ATTEMPTS || 3, 5)
+    : (getCONFIG().SELF_HEAL_MAX_ATTEMPTS || 3);
+
+  while (attempts < maxAttempts && !healed) {
     attempts++;
 
-    // Backoff between retries: 5s, 10s, 15s... (avoids burning all attempts in seconds)
+    // Adaptive backoff: longer in cascade mode, shorter in normal mode
     if (attempts > 1) {
-      const backoffSec = attempts * 5;
-      log(`Self-heal attempt ${attempts}/${getCONFIG().SELF_HEAL_MAX_ATTEMPTS} (waiting ${backoffSec}s backoff)`, 'INFO', 'self-heal');
+      const baseBackoff = isFullCascade ? 8 : 5;
+      const backoffSec = attempts * baseBackoff;
+      log(`Self-heal attempt ${attempts}/${maxAttempts} (waiting ${backoffSec}s backoff${isFullCascade ? ' [CASCADE]' : ''})`, 'INFO', 'self-heal');
       await sleep(backoffSec * 1000);
     } else {
-      log(`Self-heal attempt ${attempts}/${getCONFIG().SELF_HEAL_MAX_ATTEMPTS}`, 'INFO', 'self-heal');
+      log(`Self-heal attempt ${attempts}/${maxAttempts}${isFullCascade ? ' [FULL CASCADE - all providers]' : ''}`, 'INFO', 'self-heal');
     }
 
     // Fast-fail: if BazaarLink budget is exhausted and Mistral also failed on
-    // the previous attempt, retrying is pointless — the outcome won't change.
+    // the previous attempt, retrying is pointless (UNLESS in full cascade mode,
+    // where non-codegen providers may still work).
     try {
       const blLimiter = require('./bazaarlink-rate-limiter');
-      if (blLimiter.isExhausted() && lastTribunalError !== null) {
+      if (blLimiter.isExhausted() && lastTribunalError !== null && !isFullCascade) {
         log(`Fast-fail: BazaarLink budget exhausted + previous Mistral failure (${lastTribunalError}). Retrying won't help.`, 'ERROR', 'self-heal');
         memoryMode.appendSelfHealProgress?.('fast_fail', { reason: 'bl_exhausted_plus_mistral_fail', lastError: lastTribunalError, attempt: attempts });
         break;
       }
     } catch {}
 
-    // ─── EXECUTIVE MODE & ACCEPT_ANY_FIX ─────────────────────────────
-    // EXECUTIVE_KEY: Nuclear option — must be INPUT on dashboard to activate.
-    // Skips ALL safety gates (audit, canary, adversarial, validation, diff-min)
-    // and pushes directly to GitHub. Only goal: get the fix onto GitHub ASAP.
-    //
-    // SELF_HEAL_ACCEPT_ANY_FIX (dashboard toggle): Softer option — skips
-    // audit/consensus but keeps other safety nets (canary, validation, adversarial).
     const executiveMode = isExecutiveMode();
     const acceptAnyFix = executiveMode || getCONFIG().SELF_HEAL_ACCEPT_ANY_FIX === true;
     if (executiveMode) {
@@ -778,8 +765,6 @@ async function performSelfHeal(options?: SelfHealOptions) {
     }
 
     // 1. Investigate the current page state
-    //    bootTime sentinel means no browser — proceed with log-based context
-    //    rather than wasting all 3 retry attempts on a missing browser.
     const investigation = await investigatePage();
     if (!investigation) {
       log('Investigation failed (unexpected error), retrying', 'ERROR', 'self-heal');
@@ -789,37 +774,40 @@ async function performSelfHeal(options?: SelfHealOptions) {
     if (investigation.bootTime) {
       log('Boot-time heal: proceeding with log-based investigation (no browser)', 'INFO', 'self-heal');
     }
-    // v4: Save investigation to DB (survives OOM)
     memoryMode.appendSelfHealProgress?.('investigation', { summary: investigation?.summary?.substring(0, 200), attempt: attempts });
 
-    // 2. Gather error context
+    // 2. Gather error context (v2: enhanced with runtime diagnostics)
     const errorLogs = getRecentErrors();
+    const enhancedContext = getEnhancedErrorContext();
+    const fullErrorContext = `${errorLogs}\n${enhancedContext}`;
 
     // 3. Build patch context from memory (D2: few-shot from past fixes)
     let patchContext = '';
     try {
       if (getCONFIG().PATCH_MEMORY_ENABLED) {
         const patchMem = getPatchMemory();
-        patchContext = await patchMem.buildContextForTribunal(errorLogs);
+        patchContext = await patchMem.buildContextForTribunal(fullErrorContext);
         if (patchContext) log('Patch memory provided similar past fixes', 'INFO', 'self-heal');
       }
     } catch (e: any) { /* non-critical */ }
 
     // 3b. Enrich investigation with likely target file + its content.
-    //     investigatePage() only returns {screenshot, html, url} —
-    //     the tribunal needs to know WHICH file to fix and WHAT it contains.
-    //     We infer the target from the most recent error pattern.
-    const enrichedInvestigation = enrichInvestigationWithTargetFile(investigation, errorLogs);
+    const enrichedInvestigation = enrichInvestigationWithTargetFile(investigation, fullErrorContext);
 
-    // 4. Generate fixes via AI tribunal (with abort signal for timeout)
+    // 4. Generate fixes via AI tribunal
+    // v2: Pass consecutiveFailures so the tribunal can activate full cascade
     let fixes: any[] | null = null;
     lastTribunalError = null;
-    const tribunalSignal = AbortSignal.timeout(getCONFIG().SELF_HEAL_TRIBUNAL_TIMEOUT_MS || 120_000);
+    const tribunalTimeout = isFullCascade
+      ? (getCONFIG().SELF_HEAL_TRIBUNAL_TIMEOUT_MS || 120_000) * 1.5  // 50% longer in cascade
+      : (getCONFIG().SELF_HEAL_TRIBUNAL_TIMEOUT_MS || 120_000);
+    const tribunalSignal = AbortSignal.timeout(tribunalTimeout);
     try {
       fixes = await getGenerateCodeFixViaTribunal()(
         enrichedInvestigation,
-        errorLogs + (patchContext ? '\n\n' + patchContext : ''),
-        tribunalSignal
+        fullErrorContext + (patchContext ? '\n\n' + patchContext : ''),
+        tribunalSignal,
+        { consecutiveFailures: _consecutiveTribunalFailures }
       );
     } catch (err: any) {
       if (err.name === 'TimeoutError' || err.name === 'AbortError') {
@@ -840,30 +828,49 @@ async function performSelfHeal(options?: SelfHealOptions) {
       continue;
     }
 
+    // v2: Track tribunal success for cascade state machine
+    // If we got here, the tribunal DID return fixes (even if they get blocked later)
+    // The consecutive failure counter only tracks complete pipeline failures.
+
     // v4: Save generated fixes to DB (survives OOM)
     memoryMode.appendSelfHealProgress?.('fixes_generated', {
       count: fixes.length,
       files: fixes.map((f: any) => f.file),
       attempt: attempts,
+      cascadeMode: isFullCascade,
+      cascadeMetadata: fixes[0]?._cascadeMetadata || null,
     });
 
-    // 5. Two-layer audit on each fix (sandbox → AI auditor → approval workflow)
+    // 5. Two-layer audit on each fix (sandbox -> AI auditor -> approval workflow)
+    // v2: Non-codegen patches get enhanced audit via cascadeMetadata
     safeFixes = [];
     const blockedFixes: any[] = [];
 
     if (acceptAnyFix) {
-      // EXECUTIVE_MODE or ACCEPT_ANY_FIX: skip audit entirely, trust all fixes
       safeFixes = fixes;
       log(`${executiveMode ? 'EXECUTIVE_MODE' : 'ACCEPT_ANY_FIX'}: bypassing audit — applying all ${fixes.length} fix(es) directly`, 'WARN', 'self-heal');
     } else {
       for (const fix of fixes) {
-        const result = await auditFix(fix);
+        const cascadeMeta = fix._cascadeMetadata || null;
+        const isNonCodegenPatch = cascadeMeta?.hasCodegenVote === false;
+
+        // v2: Log non-codegen patch warnings clearly
+        if (isNonCodegenPatch) {
+          log(`NON-CODEGEN PATCH from ${cascadeMeta.providers.join(', ')} for ${fix.file} — applying enhanced safety protocols`, 'WARN', 'self-heal');
+        }
+
+        const result = await auditFix(fix, cascadeMeta);
         if (result.passed) {
-          safeFixes.push(fix);
-          log(`Patch for ${fix.file} passed all audit layers`, 'INFO', 'self-heal');
+          // Tag the fix with its origin metadata for downstream tracking
+          safeFixes.push({
+            ...fix,
+            _isNonCodegen: isNonCodegenPatch,
+            _cascadeMetadata: cascadeMeta,
+          });
+          log(`Patch for ${fix.file} passed all audit layers${isNonCodegenPatch ? ' [NON-CODEGEN - enhanced safety]' : ''}`, 'INFO', 'self-heal');
         } else {
-          blockedFixes.push({ file: fix.file, reason: result.reason });
-          log(`Patch for ${fix.file} BLOCKED: ${result.reason}`, 'WARN', 'self-heal');
+          blockedFixes.push({ file: fix.file, reason: result.reason, isNonCodegen: isNonCodegenPatch });
+          log(`Patch for ${fix.file} BLOCKED: ${result.reason}${isNonCodegenPatch ? ' [NON-CODEGEN]' : ''}`, 'WARN', 'self-heal');
           if (getCONFIG().ALERT_ON_ERROR) {
             try { ((_deps.alerting?.sendAlert) || (() => {}))(`Self-heal blocked patch for ${fix.file}: ${result.reason}`); } catch (e: any) { /* non-critical */ }
           }
@@ -878,11 +885,12 @@ async function performSelfHeal(options?: SelfHealOptions) {
         null, fixes.length, 0, 0, null, null,
         `Blocked: ${blockedFixes.map(b => `${b.file}(${b.reason})`).join('; ')}`
       );
-      return false;
+      // v2: Don't increment consecutive failures for audit blocks — the tribunal worked,
+      // the safety system did its job. This is different from tribunal failures.
+      continue;
     }
 
     // 6. Minimize diffs before staging (B3)
-    //    Skipped in EXECUTIVE_MODE — speed over size.
     try {
       if (getCONFIG().DIFF_MINIMIZER_ENABLED && !executiveMode) {
         const { minimizePatch } = getDiffMinimizer();
@@ -902,7 +910,7 @@ async function performSelfHeal(options?: SelfHealOptions) {
       log('Diff minimization failed, using original patches', 'WARN', 'self-heal');
     }
 
-    // 7. Prepare staging area (copy current source to staging)
+    // 7. Prepare staging area
     const stagingSource = copyToStaging();
 
     // 8. Apply validated fixes to staging
@@ -913,8 +921,7 @@ async function performSelfHeal(options?: SelfHealOptions) {
       continue;
     }
 
-    // 9. Run critical validation suite on STAGED code (not live code)
-    //    Skipped in EXECUTIVE_MODE — speed over safety.
+    // 9. Run critical validation suite on STAGED code
     if (!executiveMode) {
       const validateFn = getValidateBeforePromotion();
         const validated = validateFn ? await validateFn(stagingSource) : { passed: true };
@@ -932,21 +939,37 @@ async function performSelfHeal(options?: SelfHealOptions) {
     }
 
     // 10. Adversarial testing (B4)
-    //     Skipped in EXECUTIVE_MODE.
+    // v2: Non-codegen patches ALWAYS get adversarial testing (even if config disabled)
+    //     because they are inherently less trustworthy.
+    const hasNonCodegenFix = safeFixes.some((f: any) => f._isNonCodegen);
     try {
-      if (getCONFIG().ADVERSARIAL_TESTER_ENABLED && !executiveMode) {
+      if ((getCONFIG().ADVERSARIAL_TESTER_ENABLED || hasNonCodegenFix) && !executiveMode) {
         const { testPatch: adversarialTest } = getAdversarialTester();
         for (const fix of safeFixes) {
           const advResult = await adversarialTest(fix.patch, fix.file);
           if (!advResult.passed) {
             const failedTypes = (advResult.results || []).filter((r: any) => !r.passed).map((r: any) => r.testType).join(', ');
             log(`Adversarial test failed for ${fix.file}: ${failedTypes}`, 'WARN', 'self-heal');
+            // v2: Non-codegen patches that fail adversarial testing are REJECTED
+            if (fix._isNonCodegen) {
+              log(`NON-CODEGEN patch for ${fix.file} REJECTED due to adversarial test failure (required for non-codegen)`, 'ERROR', 'self-heal');
+              safeFixes = safeFixes.filter((f: any) => f !== fix);
+              if (getCONFIG().ALERT_ON_ERROR) {
+                try { ((_deps.alerting?.sendAlert) || (() => {}))(`Non-codegen patch for ${fix.file} failed mandatory adversarial testing: ${failedTypes}`); } catch (e: any) {}
+              }
+              continue;
+            }
             if (getCONFIG().ALERT_ON_ERROR) {
               try { ((_deps.alerting?.sendAlert) || (() => {}))(`Patch for ${fix.file} failed adversarial testing`); } catch (e: any) { /* non-critical */ }
             }
           } else {
-            log(`Adversarial test passed for ${fix.file}`, 'INFO', 'self-heal');
+            log(`Adversarial test passed for ${fix.file}${fix._isNonCodegen ? ' [NON-CODEGEN - mandatory pass]' : ''}`, 'INFO', 'self-heal');
           }
+        }
+        // If all non-codegen patches were rejected, continue to next attempt
+        if (safeFixes.length === 0) {
+          log('All patches rejected (non-codegen adversarial failures), retrying', 'WARN', 'self-heal');
+          continue;
         }
       }
     } catch (e: any) {
@@ -954,7 +977,6 @@ async function performSelfHeal(options?: SelfHealOptions) {
     }
 
     // 11. Promote or enter canary
-    //     EXECUTIVE_MODE: always promote directly, no canary observation.
     let promotedDirectly = true;
     try {
       if (getCONFIG().CANARY_ROLLOUT_ENABLED && !executiveMode) {
@@ -984,7 +1006,6 @@ async function performSelfHeal(options?: SelfHealOptions) {
         continue;
       }
 
-      // Post-promotion verification: check files are valid after atomic write
       const verified = verifyPromotedFiles(safeFixes, overlay);
       if (!verified) {
         log('Post-promotion verification failed, rolling back to backup', 'ERROR', 'self-heal');
@@ -1001,12 +1022,7 @@ async function performSelfHeal(options?: SelfHealOptions) {
       log('Post-promotion verification passed', 'INFO', 'self-heal');
     }
 
-    // v10: HOT-SWAP — Make patches take effect IMMEDIATELY for already-loaded code.
-    // The /tmp overlay + require interceptor only affects FUTURE require() calls.
-    // Hot-swap uses Module._compile to overwrite old module exports in-place,
-    // so every existing `const foo = require('./foo')` sees the new code NOW.
-    // This is the reliability fix for Render: patches work instantly, not
-    // just after restart or re-require.
+    // v10: HOT-SWAP
     if (isReadOnlyFs && promotedDirectly) {
       try {
         const hotSwap = require('./self-heal-hot-swap');
@@ -1014,11 +1030,9 @@ async function performSelfHeal(options?: SelfHealOptions) {
         const swapSummary = hotSwap.hotSwapModules(swapFiles);
         if (swapSummary.totalSwapped > 0) {
           log(`Hot-swap applied ${swapSummary.totalSwapped}/${swapFiles.length} module(s) instantly`, 'INFO', 'self-heal');
-          // Verify the swaps are still good
           const verifyResult = hotSwap.verifyRecentSwaps();
           if (verifyResult.invalid > 0) {
             log(`Hot-swap verification: ${verifyResult.invalid} module(s) have issues after swap`, 'WARN', 'self-heal');
-            // Rollback the invalid ones
             for (const detail of verifyResult.details) {
               if (!detail.valid) {
                 const rolledBack = hotSwap.rollbackSwap(detail.file);
@@ -1038,32 +1052,15 @@ async function performSelfHeal(options?: SelfHealOptions) {
       }
     }
 
-    // v11: IMMEDIATE REDEPLOY — Commit patches to GitHub + trigger Render deploy.
-    //
-    // This is the ONLY correct way to complete a full self-heal on Render.
-    // The overlay + hot-swap heal the RUNNING instance, but a fresh deploy
-    // from GitHub is the only way to guarantee the fix persists across
-    // OOM kills and instance replacements.
-    //
-    // After pushing to GitHub and triggering the Render deploy API,
-    // a 5-minute SIGTERM watchdog starts. If Render doesn't send SIGTERM
-    // within 5 minutes (to replace this instance with the new deploy),
-    // the redeploy is logged as failed.
-    //
-    // The old deferred path (recordPatchForVerification → 5 cycles → deploy)
-    // is kept as a fallback for files that don't have overlay copies yet.
+    // v11: IMMEDIATE REDEPLOY
     if (isReadOnlyFs) {
       try {
         const gitDeploy = require('./self-heal-git-deploy');
-        // Inject deps if git-deploy hasn't been initialized with them yet
         if (_deps.logger || _deps.database) {
           try { gitDeploy._injectDependencies({ logger: _deps.logger, database: _deps.database, config: _deps.config }); } catch {}
         }
 
-        // Collect all patched file names
         const patchedFileNames = safeFixes.map((f: any) => f.file);
-
-        // Attempt immediate redeploy with ALL patched files
         const hasGithub = !!(process.env.GITHUB_TOKEN && process.env.GITHUB_REPO);
         const hasRender = !!(process.env.RENDER_API_KEY && process.env.RENDER_SERVICE_ID);
 
@@ -1075,7 +1072,6 @@ async function performSelfHeal(options?: SelfHealOptions) {
             log('Waiting for Render to SIGTERM this instance (5-minute watchdog active)...', 'INFO', 'self-heal');
           } else {
             log(`Immediate redeploy failed: ${redeployResult.details} — patches are active via overlay/hot-swap but NOT persisted to GitHub`, 'WARN', 'self-heal');
-            // Fallback: queue for deferred deploy as before
             let queuedCount = 0;
             for (const fix of safeFixes) {
               if (gitDeploy.isDeployAllowed(fix.file)) {
@@ -1088,7 +1084,6 @@ async function performSelfHeal(options?: SelfHealOptions) {
             }
           }
         } else {
-          // No GitHub/Render creds — queue for deferred deploy (old behavior)
           log('No GITHUB_TOKEN+REPO or RENDER_API_KEY+SERVICE_ID — cannot redeploy. Patches active via overlay only.', 'WARN', 'self-heal');
           let queuedCount = 0;
           for (const fix of safeFixes) {
@@ -1123,7 +1118,7 @@ async function performSelfHeal(options?: SelfHealOptions) {
       if (getCONFIG().PATCH_MEMORY_ENABLED) {
         const patchMem = getPatchMemory();
         for (const fix of safeFixes) {
-          await patchMem.storePatch(fix.id || String(Date.now()), errorLogs, fix.file, fix.patch, 'applied');
+          await patchMem.storePatch(fix.id || String(Date.now()), fullErrorContext, fix.file, fix.patch, 'applied');
         }
       }
     } catch (e: any) { /* non-critical */ }
@@ -1133,7 +1128,7 @@ async function performSelfHeal(options?: SelfHealOptions) {
       if (getCONFIG().HEAL_REWARD_TRACKER_ENABLED) {
         const rewardTracker = getRewardTracker();
         for (const fix of safeFixes) {
-          rewardTracker.recordStagingResult(fix.generatingModel || 'unknown', fix.id, 1);
+          rewardTracker.recordStagingResult(fix.generatingModel || fix._cascadeMetadata?.providers?.join('+') || 'unknown', fix.id, 1);
         }
       }
     } catch (e: any) { /* non-critical */ }
@@ -1141,12 +1136,23 @@ async function performSelfHeal(options?: SelfHealOptions) {
     healed = true;
     _patchesAppliedToday++;
 
-    // v4: Notify memory-mode that a fix was promoted.
-    // This is the ONLY path that justifies full power. The bot will
-    // stay in full power briefly for verification, then finalizeSelfHealSession()
-    // returns it to memory_protection.
+    // v2: Reset consecutive tribunal failures on success
+    resetConsecutiveTribunalFailures();
+
     memoryMode.promoteAfterSelfHealFix?.(safeFixes.map((f: any) => f.file));
     log('Fix promoted — self-heal session will finalize after verification.', 'INFO', 'self-heal');
+
+    // v2: Log cascade-specific success info
+    if (isFullCascade) {
+      const nonCodegenFixes = safeFixes.filter((f: any) => f._isNonCodegen);
+      if (nonCodegenFixes.length > 0) {
+        log(`FULL CASCADE SUCCESS: ${nonCodegenFixes.length} non-codegen fix(es) applied from ${nonCodegenFixes.map((f: any) => f._cascadeMetadata?.providers?.join(', ')).join('; ')}`, 'WARN', 'self-heal');
+        logAudit(`Full cascade success: non-codegen fixes from ${nonCodegenFixes.length} provider(s)`, 'self-heal');
+      } else {
+        log(`FULL CASCADE SUCCESS: codegen fix(es) found after ${_consecutiveTribunalFailures} prior failures`, 'INFO', 'self-heal');
+      }
+    }
+
     break;
   }
 
@@ -1154,12 +1160,27 @@ async function performSelfHeal(options?: SelfHealOptions) {
     log('Self-heal failed after max attempts.', 'ERROR', 'self-heal');
     _lastFailureTime = Date.now();
     rollbackAndAlert(backupPath, safeFixes[0]?.id, overlay);
-    // v4: Abort self-heal session on failure
+
+    // v2: Increment consecutive tribunal failure counter
+    _consecutiveTribunalFailures++;
+    log(`Consecutive tribunal failure count: ${_consecutiveTribunalFailures}`, 'ERROR', 'self-heal');
+
+    // v2: Log the escalation threshold
+    if (_consecutiveTribunalFailures === 3) {
+      log(`THRESHOLD REACHED: ${_consecutiveTribunalFailures} consecutive failures — next self-heal will activate FULL PROVIDER CASCADE (all providers including non-codegen)`, 'ERROR', 'self-heal');
+      logAudit(`Full cascade threshold reached (${_consecutiveTribunalFailures} failures)`, 'self-heal');
+      if (getCONFIG().ALERT_ON_ERROR) {
+        try { ((_deps.alerting?.sendAlert) || (() => {}))(`Self-heal failed ${_consecutiveTribunalFailures} times consecutively. Next attempt will use ALL available providers (full cascade).`); } catch (e: any) {}
+      }
+    } else if (_consecutiveTribunalFailures > 3) {
+      log(`FULL CASCADE FAILED (attempt ${_consecutiveTribunalFailures}) — all providers including non-codegen were tried`, 'CRITICAL', 'self-heal');
+    }
+
     memoryMode.abortSelfHealSession?.('all_attempts_failed');
     try { ((_deps.alerting?.sendAlert) || (() => {}))('Self-heal failed after all attempts. Rolled back.'); } catch (e: any) { /* non-critical */ }
     return false;
   } else {
-    _lastFailureTime = 0; // Reset cooldown on successful heal
+    _lastFailureTime = 0;
   }
 
   const duration = Date.now() - healStartTime;
@@ -1170,9 +1191,6 @@ async function performSelfHeal(options?: SelfHealOptions) {
   );
   logAudit(`Self-heal succeeded in ${duration}ms`, 'self-heal');
 
-  // v4: Finalize self-heal session — returns to MEMORY PROTECTION.
-  // The fix is already promoted; the bot proved it can handle this.
-  // Now it goes back to safe mode. Patch drafts are deleted from DB.
   memoryMode.finalizeSelfHealSession?.();
   log('Self-heal session FINALIZED — returning to MEMORY PROTECTION mode.', 'INFO', 'self-heal');
 
@@ -1184,13 +1202,6 @@ async function performSelfHeal(options?: SelfHealOptions) {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  RUNTIME HEALING AVENUES (non-code-fix)
-//
-//  These don't write to /tmp or patch source files. They fix runtime state:
-//    DB corruption, stale config, selector drift, module quarantine,
-//    provider discovery, degraded mode escalation, and auth refresh.
-//
-//  Each returns { healed: boolean, avenue: string, detail: string }.
-//  They run in parallel for speed. If ANY succeeds, the heal is a win.
 // ═══════════════════════════════════════════════════════════════════════════
 
 interface RuntimeHealResult {
@@ -1199,32 +1210,21 @@ interface RuntimeHealResult {
   detail: string;
 }
 
-/**
- * Avenue 1: Database integrity repair.
- * Checks critical tables exist, WAL isn't corrupted, and calibrations are readable.
- * Many runtime failures stem from subtle DB corruption after OOM kills.
- */
 async function runtimeHealDatabase(): Promise<RuntimeHealResult> {
   try {
     const db = getDb();
     if (!db) return { healed: false, avenue: 'db_repair', detail: 'no db' };
-
     let repairs = 0;
-
-    // Check WAL integrity
     try {
       const walResult = db.pragma('integrity_check');
       if (walResult?.[0]?.integrity_check !== 'ok') {
         log('DB integrity check failed — running emergency repair', 'WARN', 'self-heal');
-        // Dump and reimport is the safest repair for SQLite
         try { db.pragma('wal_checkpoint(TRUNCATE)'); repairs++; } catch {}
       }
     } catch (e: any) {
       log(`DB integrity check error: ${e.message}`, 'WARN', 'self-heal');
       try { db.pragma('wal_checkpoint(TRUNCATE)'); repairs++; } catch {}
     }
-
-    // Ensure critical tables exist
     const criticalTables = ['calibration', 'patch_history', 'self_heal_events', 'progress_log'];
     for (const table of criticalTables) {
       try {
@@ -1243,8 +1243,6 @@ async function runtimeHealDatabase(): Promise<RuntimeHealResult> {
         }
       }
     }
-
-    // Vacuum if fragmented (page count > 100 and free pages > 20%)
     try {
       const pageCount = db.pragma('page_count')?.[0]?.page_count || 0;
       const freePages = db.pragma('freelist_count')?.[0]?.freelist_count || 0;
@@ -1254,7 +1252,6 @@ async function runtimeHealDatabase(): Promise<RuntimeHealResult> {
         log(`DB vacuumed (${freePages} free pages reclaimed)`, 'INFO', 'self-heal');
       }
     } catch {}
-
     if (repairs > 0) {
       return { healed: true, avenue: 'db_repair', detail: `${repairs} repair(s) applied` };
     }
@@ -1264,18 +1261,12 @@ async function runtimeHealDatabase(): Promise<RuntimeHealResult> {
   }
 }
 
-/**
- * Avenue 2: Config reconciliation.
- * Reloads config from env/database and pushes updated values into runtime.
- * Fixes stale config after OOM (env vars lost) or config drift.
- */
 async function runtimeHealConfig(): Promise<RuntimeHealResult> {
   try {
     const configReconciler = require('./self-heal-config-reconciler')?.configReconciler;
     if (!configReconciler?.reconcileAll) {
       return { healed: false, avenue: 'config_reconcile', detail: 'module unavailable' };
     }
-
     const result = await configReconciler.reconcileAll();
     if (result?.fixesApplied > 0) {
       return { healed: true, avenue: 'config_reconcile', detail: `${result.fixesApplied} config fix(es)` };
@@ -1286,20 +1277,13 @@ async function runtimeHealConfig(): Promise<RuntimeHealResult> {
   }
 }
 
-/**
- * Avenue 3: Selector drift hot-fix.
- * Reloads selector JSON files and re-parses them. If selectors changed
- * on the website, this picks up the latest committed versions.
- */
 async function runtimeHealSelectors(): Promise<RuntimeHealResult> {
   try {
-    // Clear the cached selectors so they reload from disk on next use
     const selectorModule = require('./selectors');
     if (selectorModule._clearCache && typeof selectorModule._clearCache === 'function') {
       selectorModule._clearCache();
       return { healed: true, avenue: 'selector_reload', detail: 'selector cache cleared' };
     }
-    // If no explicit cache clear, try deleting from require.cache
     const selectorPath = require.resolve('./selectors');
     if (require.cache[selectorPath]) {
       delete require.cache[selectorPath];
@@ -1311,11 +1295,6 @@ async function runtimeHealSelectors(): Promise<RuntimeHealResult> {
   }
 }
 
-/**
- * Avenue 4: Module quarantine reset.
- * If a module was quarantined by runtime-module-quarantine.ts due to
- * repeated failures, this resets its failure count so it can be retried.
- */
 async function runtimeHealModuleQuarantine(): Promise<RuntimeHealResult> {
   try {
     const quarantine = require('./runtime-module-quarantine');
@@ -1330,54 +1309,27 @@ async function runtimeHealModuleQuarantine(): Promise<RuntimeHealResult> {
   }
 }
 
-/**
- * Avenue 5: Provider rediscovery & rate-limit reset.
- * Forces a full provider model refresh and clears any stuck rate-limits.
- * This is the most common runtime fix — providers go down and come back,
- * but the bot's cached availability state is stale.
- */
 async function runtimeHealProviders(): Promise<RuntimeHealResult> {
   try {
     let fixes = 0;
-
-    // 5a: Force provider model rediscovery
     const providerDiscovery = require('./providers-provider-discovery');
     if (providerDiscovery.refreshAllProviderModels) {
       await providerDiscovery.refreshAllProviderModels();
       fixes++;
       log('Provider rediscovery forced', 'INFO', 'self-heal');
     }
-
-    // 5b: Clear rate-limiter state (stuck rate-limits block providers permanently)
     try {
       const rateLimiter = require('./openrouter-rate-limiter');
-      if (rateLimiter.resetAll) {
-        rateLimiter.resetAll();
-        fixes++;
-        log('Rate limiter reset', 'INFO', 'self-heal');
-      }
+      if (rateLimiter.resetAll) { rateLimiter.resetAll(); fixes++; log('Rate limiter reset', 'INFO', 'self-heal'); }
     } catch {}
-
-    // 5c: Reset provider fallback chain (sometimes it gets stuck on a dead provider)
     try {
       const fallback = require('./providers-fallback');
-      if (fallback.resetFallbackIndex) {
-        fallback.resetFallbackIndex();
-        fixes++;
-        log('Provider fallback index reset', 'INFO', 'self-heal');
-      }
+      if (fallback.resetFallbackIndex) { fallback.resetFallbackIndex(); fixes++; log('Provider fallback index reset', 'INFO', 'self-heal'); }
     } catch {}
-
-    // 5d: Clear provider stats error counters (let the bot retry with clean slate)
     try {
       const stats = getProvidersStats();
-      if (stats.resetErrorCounts) {
-        stats.resetErrorCounts();
-        fixes++;
-        log('Provider error counters reset', 'INFO', 'self-heal');
-      }
+      if (stats.resetErrorCounts) { stats.resetErrorCounts(); fixes++; log('Provider error counters reset', 'INFO', 'self-heal'); }
     } catch {}
-
     if (fixes > 0) {
       return { healed: true, avenue: 'provider_reset', detail: `${fixes} provider fix(es)` };
     }
@@ -1387,18 +1339,12 @@ async function runtimeHealProviders(): Promise<RuntimeHealResult> {
   }
 }
 
-/**
- * Avenue 6: Auth token refresh.
- * Forces an immediate auth token refresh. Stale tokens cause 401s
- * that look like provider failures but aren't.
- */
 async function runtimeHealAuth(): Promise<RuntimeHealResult> {
   try {
     const authHealer = require('./self-heal-auth-healer')?.authHealer;
     if (!authHealer?.forceRefresh) {
       return { healed: false, avenue: 'auth_refresh', detail: 'module unavailable' };
     }
-
     const result = await authHealer.forceRefresh();
     if (result?.refreshed) {
       return { healed: true, avenue: 'auth_refresh', detail: 'auth token refreshed' };
@@ -1409,28 +1355,17 @@ async function runtimeHealAuth(): Promise<RuntimeHealResult> {
   }
 }
 
-/**
- * Avenue 7: Cache & memory flush.
- * Aggressively clears all in-memory caches (not code changes, pure runtime).
- * This frees stale references and corrupted cache entries that accumulate.
- */
 async function runtimeHealCacheFlush(): Promise<RuntimeHealResult> {
   try {
     let flushed = 0;
-
-    // Clear the main action cache
     try {
       const actionCache = require('./services-action-cache');
       if (actionCache.clear) { actionCache.clear(); flushed++; }
     } catch {}
-
-    // Clear math solution cache
     try {
       const mathCache = require('./math-solution-cache');
       if (mathCache.clear) { mathCache.clear(); flushed++; }
     } catch {}
-
-    // Clear module require.cache for hot-reloadable modules
     const hotReloadable = [
       'providers-config-loader', 'providers-registry', 'providers-fallback',
       'selectors', 'state-machine', 'config', 'get-config',
@@ -1438,16 +1373,10 @@ async function runtimeHealCacheFlush(): Promise<RuntimeHealResult> {
     for (const mod of hotReloadable) {
       try {
         const resolved = require.resolve('./' + mod);
-        if (require.cache[resolved]) {
-          delete require.cache[resolved];
-          flushed++;
-        }
+        if (require.cache[resolved]) { delete require.cache[resolved]; flushed++; }
       } catch {}
     }
-
-    // Force GC
     if (global.gc) { global.gc(); flushed++; }
-
     if (flushed > 0) {
       return { healed: true, avenue: 'cache_flush', detail: `${flushed} cache(s) cleared` };
     }
@@ -1457,12 +1386,6 @@ async function runtimeHealCacheFlush(): Promise<RuntimeHealResult> {
   }
 }
 
-/**
- * Run all runtime healing avenues in parallel.
- * Returns the first successful result, or null if all failed.
- * These are much faster than code-patch healing (seconds vs minutes)
- * and don't require /tmp overlay or code generation.
- */
 async function performRuntimeHeal(): Promise<{ healed: boolean; results: RuntimeHealResult[] }> {
   const avenues: Array<() => Promise<RuntimeHealResult>> = [
     runtimeHealDatabase,
@@ -1494,7 +1417,6 @@ async function performRuntimeHeal(): Promise<{ healed: boolean; results: Runtime
     }
   }
 
-  // Record in DB
   try {
     const successes = healed.filter(r => r.healed);
     getInsertSelfHealEvent()?.(
@@ -1508,9 +1430,9 @@ async function performRuntimeHeal(): Promise<{ healed: boolean; results: Runtime
   return { healed: anySuccess, results: healed };
 }
 
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 //  SAFETY LIMITS
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 
 const SELF_HEAL_DAILY_MAX_PATCHES = 5;
 const SELF_HEAL_COOLDOWN_AFTER_FAILURE_MS = 30 * 60 * 1000; // 30 min
@@ -1518,9 +1440,12 @@ let _patchesAppliedToday = 0;
 let _lastPatchDay = new Date().toDateString();
 let _lastFailureTime = 0;
 
-function checkSelfHealSafety() { 
-  // EXECUTIVE PRIVILEGES: bypass all safety limits — the operator has taken responsibility.
+function checkSelfHealSafety() {
   if (isExecutiveMode()) return true;
+
+  // v2: Full cascade bypasses daily limit (last resort)
+  if (_consecutiveTribunalFailures >= 3) return true;
+
   const today = new Date().toDateString();
   if (today !== _lastPatchDay) {
     _patchesAppliedToday = 0;
@@ -1538,16 +1463,13 @@ function checkSelfHealSafety() {
   return true;
 }
 
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 //  EXPORTS
-// ═══════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 
-// Build the final export object so that consumers always get a stable
-// reference — no post-require mutation of module.exports.performSelfHeal.
 let _exportedPerformSelfHeal = performSelfHeal;
 let _circuitBreakerWrapped = false;
 
-// Wire the healer circuit breaker if enabled (deferred — not at module scope)
 function _maybeWrapWithCircuitBreaker() {
   if (_circuitBreakerWrapped) return;
   _circuitBreakerWrapped = true;
@@ -1572,8 +1494,9 @@ module.exports = {
     _maybeWrapWithCircuitBreaker();
     return _exportedPerformSelfHeal;
   },
-  // v9: Expose runtime heal separately for fast-path use from cycle-manager
-  // (bypasses /tmp overlay, code patches, daily limits, and cooldown).
   performRuntimeHeal,
-  _injectDependencies
+  _injectDependencies,
+  // v2: Expose cascade state for dashboard/diagnostics
+  getConsecutiveTribunalFailures,
+  resetConsecutiveTribunalFailures,
 };
