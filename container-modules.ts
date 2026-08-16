@@ -504,8 +504,17 @@ function createContainer(): DIContainerType {
 
   c.register('authGuard', {
     factory: (deps: any) => {
+      // Defensive: clear require cache to avoid stale/circular partial modules.
+      // cycle-auth-guard used to top-level require('providers-base') which
+      // could cause circular partial loads during DI initialization.
+      const modPath = require.resolve('./cycle-auth-guard');
+      delete require.cache[modPath];
       const mod = require('./cycle-auth-guard');
-      mod._injectDependencies(deps);
+      if (typeof mod._injectDependencies === 'function') {
+        mod._injectDependencies(deps);
+      } else {
+        _log('[DI] WARNING: authGuard._injectDependencies not available — deps not injected', 'WARN', 'container-modules');
+      }
       return mod;
     },
     deps: ['config', 'logger', 'auth', 'browser', 'alerting'],
