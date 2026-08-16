@@ -145,6 +145,25 @@ async function ensureAuthenticated(page: any) {
     }
     const refreshed = await auth.refreshSession?.(page);
     if (refreshed) { authAttempts = 0; return page; }
+
+    // refreshSession (→ authenticate) returned false = "no strategy matched,
+    // delegating to vision tribunal". The page might still be usable — the
+    // tribunal can handle it visually. Check the actual page state before
+    // nuking the browser.
+    const postRefreshUrl = page.url();
+    const stillOnAppDomain = _isSpaDomain(postRefreshUrl);
+    const redirectedToLogin = postRefreshUrl.includes('login.microsoftonline.com') || postRefreshUrl.includes('login.live.com');
+
+    if (stillOnAppDomain && !redirectedToLogin) {
+      // Page is still on the app domain — session is likely valid, auth
+      // strategies just can't recognize the page layout. Let the tribunal
+      // handle it. Do NOT close the browser.
+      log('Auth returned false but page remains on app domain — continuing to tribunal', 'INFO', 'auth-guard');
+      authAttempts = 0;
+      return page;
+    }
+
+    // Genuinely unauthenticated (redirected to Microsoft login or unknown domain)
     await browser.closeBrowser?.();
     const newPage = await retryWithBackoff(browser.launchBrowser, { maxRetries: 2 });
     try {
