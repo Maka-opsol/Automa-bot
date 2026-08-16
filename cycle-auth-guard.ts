@@ -21,7 +21,47 @@ let authAttempts = 0;
 // If even 1 pixel differs, real content has been rendered.
 
 /**
- * Sample 5 pixels from a PNG screenshot buffer.
+ * Undo PNG row filters to get actual pixel values.
+ * PNG rows have a filter byte prefix (0=None, 1=Sub, 2=Up, 3=Average, 4=Paeth).
+ * The raw inflated data contains *filtered* bytes — not actual colors.
+ * Skipping defiltering reads garbage that appears uniformly zero/identical.
+ */
+function _defilterPng(raw: Buffer, width: number, height: number, bpp: number): Buffer {
+  const stride = width * bpp;
+  const out = Buffer.alloc(height * stride);
+  for (let y = 0; y < height; y++) {
+    const filter = raw[y * (stride + 1)];
+    const rs = y * (stride + 1) + 1; // raw row start (after filter byte)
+    const os = y * stride;            // output row start
+    for (let x = 0; x < stride; x++) {
+      const a = raw[rs + x];
+      const left  = x >= bpp       ? out[os + x - bpp] : 0;
+      const up    = y > 0          ? out[os - stride + x] : 0;
+      const upL   = (y > 0 && x >= bpp) ? out[os - stride + x - bpp] : 0;
+      let v: number;
+      switch (filter) {
+        case 0: v = a; break;
+        case 1: v = (a + left) & 0xFF; break;
+        case 2: v = (a + up) & 0xFF; break;
+        case 3: v = (a + ((left + up) >> 1)) & 0xFF; break;
+        case 4: {
+          const p = left + up - upL;
+          const pa = Math.abs(p - left), pb = Math.abs(p - up), pc = Math.abs(p - upL);
+          v = (pa <= pb && pa <= pc) ? (a + left) & 0xFF
+            : (pb <= pc) ? (a + up) & 0xFF
+            : (a + upL) & 0xFF;
+          break;
+        }
+        default: v = a;
+      }
+      out[os + x] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * Sample 12 pixels from a PNG screenshot buffer in a 4×3 grid.
  * Returns array of [r, g, b] tuples, or null on failure.
  */
 function _samplePixelsFromPng(pngBuffer: Buffer): Array<[number, number, number]> | null {
@@ -30,7 +70,7 @@ function _samplePixelsFromPng(pngBuffer: Buffer): Array<[number, number, number]
     if (pngBuffer.length < 24 || pngBuffer[0] !== 0x89) return null;
 
     let offset = 8; // skip PNG signature
-    let width = 0, height = 0;
+    let width = 0, height = 0, colorType = 0;
     const idatChunks: Buffer[] = [];
 
     while (offset + 12 <= pngBuffer.length) {
@@ -42,6 +82,7 @@ function _samplePixelsFromPng(pngBuffer: Buffer): Array<[number, number, number]
       if (chunkType === 'IHDR') {
         width = chunkData.readUInt32BE(0);
         height = chunkData.readUInt32BE(4);
+        colorType = chunkData[9];
       } else if (chunkType === 'IDAT') {
         idatChunks.push(chunkData);
       } else if (chunkType === 'IEND') {
@@ -52,45 +93,44 @@ function _samplePixelsFromPng(pngBuffer: Buffer): Array<[number, number, number]
     if (width < 10 || height < 10 || idatChunks.length === 0) return null;
 
     const raw = zlib.inflateSync(Buffer.concat(idatChunks));
-    // bytes per pixel: color type 2 = RGB(3), 6 = RGBA(4), 0 = grayscale(1)
-    const colorType = pngBuffer[8 + 4 + 9]; // offset 8(sig) + 4(len) + 9(type byte in IHDR)
     const bpp = (colorType === 6) ? 4 : (colorType === 2) ? 3 : 1;
+
+    // CRITICAL: defilter to get actual pixel values, not raw filtered bytes
+    const pixels = _defilterPng(raw, width, height, bpp);
+
+    // 4×3 grid, inset 10% from edges to avoid browser chrome
+    const cols = [0.15, 0.40, 0.65, 0.85];
+    const rows = [0.15, 0.45, 0.75];
     const stride = width * bpp;
+    const samples: Array<[number, number, number]> = [];
 
-    // 5 well-spread sample positions (avoid edges which may have browser chrome)
-    const positions = [
-      [Math.floor(width * 0.15), Math.floor(height * 0.15)],
-      [Math.floor(width * 0.45), Math.floor(height * 0.35)],
-      [Math.floor(width * 0.75), Math.floor(height * 0.55)],
-      [Math.floor(width * 0.25), Math.floor(height * 0.75)],
-      [Math.floor(width * 0.65), Math.floor(height * 0.25)],
-    ];
-
-    const pixels: Array<[number, number, number]> = [];
-    for (const [x, y] of positions) {
-      const rowStart = y * (stride + 1) + 1; // +1 for PNG filter byte per row
-      const pixStart = rowStart + x * bpp;
-      if (pixStart + 2 < raw.length) {
-        pixels.push([raw[pixStart], raw[pixStart + 1], raw[pixStart + 2]]);
+    for (const fy of rows) {
+      for (const fx of cols) {
+        const x = Math.floor(width * fx);
+        const y = Math.floor(height * fy);
+        const start = y * stride + x * bpp;
+        if (start + 2 < pixels.length) {
+          samples.push([pixels[start], pixels[start + 1], pixels[start + 2]]);
+        }
       }
     }
-    return pixels.length >= 5 ? pixels : null;
+    return samples.length >= 8 ? samples : null;
   } catch {
     return null;
   }
 }
 
 /**
- * Take a screenshot and check if 5 sampled pixels are all the same colour.
+ * Take a screenshot and check if all sampled pixels are the same colour.
  * If yes → page is visually blank. If no → content has been rendered.
  */
 async function _isPageVisuallyBlank(page: any): Promise<boolean> {
   try {
     const buf = await page.screenshot({ type: 'png', fullPage: false });
-    const pixels = _samplePixelsFromPng(buf);
-    if (!pixels) return false; // can't determine — assume not blank
-    const [r0, g0, b0] = pixels[0];
-    const allSame = pixels.every(([r, g, b]) => r === r0 && g === g0 && b === b0);
+    const samples = _samplePixelsFromPng(buf);
+    if (!samples) return false; // can't determine — assume not blank
+    const [r0, g0, b0] = samples[0];
+    const allSame = samples.every(([r, g, b]) => r === r0 && g === g0 && b === b0);
     return allSame;
   } catch {
     return false; // screenshot failed — assume not blank
