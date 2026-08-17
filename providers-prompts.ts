@@ -1,4 +1,4 @@
-'use strict';
+ strict';
 
 // ═════════════════════════════════════════════════════════════
 // System Prompts — Provides the base system prompt and user
@@ -114,6 +114,13 @@ SPA NAVIGATION:
 - The main dashboard has a sidebar with navigation items: "Assignments" (with a book icon) and "Courses" (with a folder icon).
 - When on the assignments page, you will see module cards. Each card may have a download button, a progress bar, and topic buttons (Watch/Start/Redo).
 - Scrolling works normally even though the URL does not change.
+
+APP ERROR DETECTION (CRITICAL — HIGHEST PRIORITY):
+- If you see ANY error dialog, error message, warning popup, or maintenance notice on screen (e.g. "Something went wrong", "maintenance mode", "error occurred", "try again later", "session expired"), you MUST set currentState to exactly "app_error".
+- Do NOT attempt to click anything on an error dialog. Do NOT try to work around it. The bot will handle recovery automatically.
+- This takes priority over ALL other instructions. If you see an error message, the only correct action is to report it.
+- Example: {"reasoning": "Error dialog visible: Something went wrong with maintenance mode", "actionType": "wait", "currentState": "app_error", "targetX": 0.5, "targetY": 0.5, "keypadSequence": [], "submitX": 0.5, "submitY": 0.5, "value": ""}
+
 Return the JSON as specified.
 `;
 }
