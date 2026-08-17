@@ -164,7 +164,7 @@ function _getTier2Flags(): string[] {
     '--no-sandbox',
     '--disable-setuid-sandbox',
     '--disable-dev-shm-usage',
-    '--disable-gpu',
+    // NOTE: --disable-gpu removed — breaks Flutter CanvasKit WebGL rendering
     '--single-process',
     '--headless=new',
     '--disable-software-rasterizer',
