@@ -10,7 +10,12 @@ const FLAG_GROUPS = {
     optional: ['--disable-hang-monitor', '--disable-ipc-flooding-protection', '--no-default-browser-check']
   },
   performance: {
-    optional: ['--disable-accelerated-2d-canvas', '--disable-gpu', '--disable-extensions', '--disable-infobars', '--disable-background-timer-throttling', '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding']
+    // NOTE: --disable-gpu and --disable-accelerated-2d-canvas are NOT included.
+    // This app uses Flutter CanvasKit which requires WebGL to render.
+    // --disable-gpu kills WebGL, leaving a permanently blank white canvas.
+    // Headless Chromium already uses SwiftShader (software GL) by default,
+    // so these flags are unnecessary AND destructive.
+    optional: ['--disable-extensions', '--disable-infobars', '--disable-background-timer-throttling', '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding']
   },
   compatibility: {
     // These flags are only included when explicitly opted in via allowDeprecated: true.
@@ -23,7 +28,7 @@ const FLAG_GROUPS = {
   }
 };
 
-// All flags that Chromium has removed or will remove.
+// All flags that Chromium has removed or will remove, OR that break critical functionality.
 // These are ALWAYS stripped, regardless of allowDeprecated setting.
 const DEPRECATED_FLAGS = new Set([
   '--enable-features=NetworkService,NetworkServiceInProcess',
@@ -31,6 +36,10 @@ const DEPRECATED_FLAGS = new Set([
   // They are now in DEPRECATED_FLAGS so they get properly filtered.
   '--disable-web-security',
   '--disable-features=IsolateOrigins,site-per-process',
+  // --disable-gpu kills WebGL, which Flutter CanvasKit requires to render.
+  // Headless Chromium uses SwiftShader (software GL) by default — this flag
+  // is unnecessary AND makes the app permanently blank.
+  '--disable-gpu',
 ]);
 
 // Flags that CHROMIUM_FLAGS env var commonly duplicates from FLAG_GROUPS.
