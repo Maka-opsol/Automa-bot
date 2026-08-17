@@ -123,7 +123,7 @@ if (!process.env.LOG_MAX_SIZE_MB) process.env.LOG_MAX_SIZE_MB = '10';
 if (!process.env.CHROMIUM_FLAGS) {
   process.env.CHROMIUM_FLAGS =
     '--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage '
-    + '--disable-gpu --disable-software-rasterizer '
+    // NOTE: --disable-gpu removed — breaks Flutter CanvasKit WebGL rendering
     + '--disable-extensions --disable-background-networking '
     + '--disable-default-apps --disable-sync '
     + '--disable-translate --disable-component-extensions-with-background-pages '
