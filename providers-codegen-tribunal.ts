@@ -162,16 +162,7 @@ async function generateCodeFixViaTribunal(investigationData: any, errorLogs: any
  * Separate function so the signal setup/teardown is clean.
  */
 async function _runFixConsensus(prompt: string, models: any, totalModels: number, signal: any) {
-  const allPromises: Promise<any>[] = [];
   let blSkipped = false;
-
-  // BazaarLink models (PRIMARY codegen provider)
-  // CHECK BUDGET BEFORE spawning API calls — if exhausted, skip entirely
-  // to avoid burning retry attempts on guaranteed failures.
-  //
-  // v7 FIX: Stagger BazaarLink requests with 3s delay between each.
-  // BazaarLink rate-limits aggressively (429) when 3+ requests hit
-  // simultaneously. Sequential with delay avoids this entirely.
   const BL_STAGGER_MS = 3000;
   const collected: Array<{ provider: string; fixes: any[]; error?: string }> = [];
 
