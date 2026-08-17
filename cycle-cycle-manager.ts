@@ -996,6 +996,39 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       if (modalSlayer) await modalSlayer.dismissAnyModal(page);
       if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
 
+      // ── Fast DOM error text check (free, ~5ms) ──
+      // Flutter renders to canvas so innerText is usually empty, BUT error
+      // dialogs sometimes leak text into overlay divs. This catches those
+      // cases without spending an API call on the vision tribunal.
+      try {
+        const errorText = await page.evaluate(() => {
+          const text = (document.body?.innerText || '').toLowerCase();
+          const errorPhrases = [
+            'something went wrong', 'maintenance mode', 'session expired',
+            'error occurred', 'try again later', 'service unavailable',
+            'please try closing the app',
+          ];
+          for (const phrase of errorPhrases) {
+            if (text.includes(phrase)) return phrase;
+          }
+          return null;
+        });
+        if (errorText) {
+          const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
+          log(`Fast DOM check: detected app error text "${errorText}" — reloading to recover`, 'WARN', 'cycle');
+          if (targetUrl) {
+            try {
+              await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+              await new Promise(r => setTimeout(r, 8000));
+              if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+            } catch {}
+          }
+          lastScreenshotChangeTime = Date.now();
+          lastProgressTime = Date.now();
+          continue;
+        }
+      } catch { /* evaluate may fail — not an error, proceed */ }
+
       // ── Blank-page guard ──
       // Flutter apps can report "stabilized" with height=0 (canvas not yet painted).
       // If we screenshot a blank page, every AI provider will fail to see anything.
@@ -1649,6 +1682,38 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           }
         }
         lastScreenshotChangeTime = Date.now();
+        continue;
+      }
+
+      // ── App Error Detection ──
+      // The vision tribunal can report currentState='app_error' when it
+      // sees error dialogs, maintenance notices, or "something went wrong"
+      // messages on screen. These are app-level errors that require a page
+      // reload — not clicks or self-heal. The app itself typically says
+      // "close the app and open it again", which means reload.
+      if (action.currentState === 'app_error') {
+        const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
+        log(`App error detected by tribunal: ${action.reasoning || 'error dialog visible'}. Reloading to recover.`, 'WARN', 'cycle');
+        if (targetUrl) {
+          try {
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
+              log(`App error recovery: navigation failed: ${e.message || e}`, 'WARN', 'cycle');
+            });
+            await new Promise(r => setTimeout(r, 8000));
+            if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+          } catch (navErr: any) {
+            log(`App error recovery failed: ${navErr.message || navErr}`, 'WARN', 'cycle');
+          }
+        } else {
+          // No URL configured — try a simple reload
+          try {
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+            await new Promise(r => setTimeout(r, 8000));
+            if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+          } catch {}
+        }
+        lastScreenshotChangeTime = Date.now();
+        lastProgressTime = Date.now(); // Reset progress timer — error recovery is progress
         continue;
       }
 
@@ -2506,10 +2571,16 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         logError('Zero-progress detector error (non-fatal)', zpErr);
       }
 
-      // Save session to pool
+      // Save session to pool (non-critical — never crash the cycle if browser died)
       if (humanCaptcha) {
-        const storage = await page.context().storageState();
-        humanCaptcha.saveSessionToPool(storage);
+        try {
+          const storage = await page.context().storageState();
+          humanCaptcha.saveSessionToPool(storage);
+        } catch (_sessionErr: any) {
+          // Browser may have been closed by self-heal, OOM, or crash —
+          // session pool save is best-effort only.
+          log(`Session pool save skipped: ${_sessionErr.message || _sessionErr}`, 'DEBUG', 'cycle');
+        }
       }
     }
 
