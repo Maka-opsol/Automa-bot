@@ -242,7 +242,8 @@ class BrowserManager {
 
   getReducedLaunchOptions() { 
     const CONFIG = getCONFIG();
-    const flags = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-extensions', '--disable-background-networking', `--window-size=${CONFIG.DISPLAY_WIDTH},${CONFIG.DISPLAY_HEIGHT}`];
+    // NOTE: --disable-gpu removed — breaks Flutter CanvasKit WebGL rendering
+    const flags = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-extensions', '--disable-background-networking', `--window-size=${CONFIG.DISPLAY_WIDTH},${CONFIG.DISPLAY_HEIGHT}`];
     if (CONFIG.HTTPS_PROXY) { flags.push(`--proxy-server=${CONFIG.HTTPS_PROXY}`); }
     const options = { headless: true, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000 };
 // @ts-expect-error
@@ -252,7 +253,8 @@ class BrowserManager {
 
   getMinimalLaunchOptions() { 
     const CONFIG = getCONFIG();
-    const options = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote', '--single-process'], timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 30000 };
+    // NOTE: --disable-gpu removed — breaks Flutter CanvasKit WebGL rendering
+    const options = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-zygote', '--single-process'], timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 30000 };
 // @ts-expect-error
     if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
     return options;
