@@ -63,8 +63,8 @@ ENV NODE_ENV=production \
     PORT=10000 \
     HEADLESS=true \
     MAX_MEMORY_MB=448 \
-    MEMORY_WARNING_THRESHOLD_MB=350 \
-    MEMORY_RESTART_THRESHOLD_MB=360 \
+    MEMORY_WARNING_THRESHOLD_MB=200 \
+    MEMORY_RESTART_THRESHOLD_MB=220 \
     MAX_UPTIME_HOURS=0 \
     MAX_CYCLES_BEFORE_RESTART=999999 \
     LOG_LEVEL=info \
@@ -77,9 +77,9 @@ ENV NODE_ENV=production \
     USER_DATA_DIR=/tmp/.browser-data \
     LOG_DIR=/tmp/mathu-logs \
     HEARTBEAT_FILE=/tmp/.heartbeat \
-    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion --js-flags=--max-old-space-size=128 --optimize-for-size --single-process"
+    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion --js-flags=--max-old-space-size=96 --optimize-for-size --single-process"
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -sf http://localhost:10000/health || exit 1
 
-CMD ["node", "--expose-gc", "--max-old-space-size=384", "--import", "tsx", "render-free-plan.ts"]
+CMD ["node", "--expose-gc", "--max-old-space-size=256", "--import", "tsx", "render-free-plan.ts"]
