@@ -69,6 +69,102 @@ let _interceptorInstalled = false;
 let _overlayFileCount = 0;
 let _pruneInterval: any = null;
 
+// ─── Syntax sanity check ─────────────────────────────────────────────────────
+
+/**
+ * Lightweight syntax sanity check for .ts overlay files.
+ * Catches truncated AI output that would kill esbuild with
+ * "Unterminated string literal" or similar transform errors.
+ *
+ * NOT a full parser — just checks:
+ *   1. No unterminated single/double quoted strings at EOF
+ *   2. Brace/bracket/paren balance isn't wildly off (suggests truncation)
+ *   3. File doesn't end mid-escape (trailing backslash)
+ *
+ * Returns true if the content looks syntactically sane enough to serve.
+ */
+function tsSyntaxSanityCheck(content: string): boolean {
+  if (!content || content.length < 20) return false;
+
+  // Check for trailing backslash (mid-escape = almost certainly truncated)
+  const trimmed = content.trimEnd();
+  if (trimmed.endsWith('\\')) return false;
+
+  let braces = 0, parens = 0, brackets = 0;
+  let inSingle = false, inDouble = false, inTemplate = false;
+  let inLineComment = false, inBlockComment = false;
+
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+    const next = i + 1 < content.length ? content[i + 1] : '';
+
+    // Handle comments (only when not inside strings)
+    if (!inSingle && !inDouble && !inTemplate) {
+      if (inBlockComment) {
+        if (ch === '*' && next === '/') { inBlockComment = false; i++; }
+        continue;
+      }
+      if (inLineComment) {
+        if (ch === '\n') inLineComment = false;
+        continue;
+      }
+      if (ch === '/' && next === '/') { inLineComment = true; i++; continue; }
+      if (ch === '/' && next === '*') { inBlockComment = true; i++; continue; }
+    }
+
+    // Skip escaped chars inside strings
+    if ((inSingle || inDouble || inTemplate) && ch === '\\') {
+      i++; // skip next char
+      continue;
+    }
+
+    // String delimiters
+    if (!inSingle && !inDouble && !inTemplate && !inLineComment && !inBlockComment) {
+      // Track delimiters for balance
+      if (ch === '{') braces++;
+      else if (ch === '}') braces--;
+      else if (ch === '(') parens++;
+      else if (ch === ')') parens--;
+      else if (ch === '[') brackets++;
+      else if (ch === ']') brackets--;
+    }
+
+    if (ch === "'" && !inDouble && !inTemplate && !inLineComment && !inBlockComment) inSingle = !inSingle;
+    else if (ch === '"' && !inSingle && !inTemplate && !inLineComment && !inBlockComment) inDouble = !inDouble;
+    else if (ch === '`' && !inSingle && !inDouble && !inLineComment && !inBlockComment) inTemplate = !inTemplate;
+  }
+
+  // If still inside a single or double quote at EOF, string is unterminated
+  if (inSingle || inDouble) return false;
+
+  // Template literals can legitimately span to EOF (e.g. a template string at end of file)
+  // so we don't check inTemplate.
+
+  // Wildly unbalanced delimiters suggest truncation or corruption.
+  // Allow some slack (comments, regex literals, etc. can throw off simple counting)
+  if (braces < -5 || parens < -5 || brackets < -5) return false;
+  // Many more opening than closing = likely truncated
+  if (braces - 0 > 20 || parens - 0 > 20 || brackets - 0 > 20) return false;
+
+  return true;
+}
+
+/** Valid ways a .ts file can start (first non-whitespace chars) */
+const VALID_TS_STARTS = [
+  "'use strict'", '"use strict"',
+  'import ', 'export ',
+  '//', '/*',
+  'const ', 'let ', 'var ',
+  'function ', 'async ', 'class ',
+  'type ', 'interface ', 'enum ',
+  'declare ', 'namespace ',
+];
+
+function hasValidTSHeader(content: string): boolean {
+  const head = content.trimStart();
+  return VALID_TS_STARTS.some(s => head.startsWith(s));
+}
+
 // ─── Core: Write a patched file to the overlay ────────────────────────────
 
 /**
@@ -86,6 +182,30 @@ function writeToOverlay(relativeFilePath: string, content: string): boolean {
   if (!resolved.startsWith(OVERLAY_DIR + path.sep) && resolved !== OVERLAY_DIR) {
     log(`Overlay write BLOCKED (path traversal): ${relativeFilePath}`, 'ERROR', 'self-heal-overlay');
     return false;
+  }
+
+  // Content integrity: reject garbage that would kill esbuild on next require.
+  // OOM heap corruption can produce strings with null bytes or truncated headers.
+  // AI-generated patches can be malformed JSON wrapped in TS syntax.
+  if (!content || typeof content !== 'string' || content.length < 20) {
+    log(`Overlay write BLOCKED (content too short, ${content?.length || 0} chars): ${relativeFilePath}`, 'ERROR', 'self-heal-overlay');
+    return false;
+  }
+  if (content.includes('\0')) {
+    log(`Overlay write BLOCKED (contains null bytes — OOM corruption?): ${relativeFilePath}`, 'ERROR', 'self-heal-overlay');
+    return false;
+  }
+  if (relativeFilePath.endsWith('.ts')) {
+    // Header check: must start with a recognized TS pattern
+    if (!hasValidTSHeader(content)) {
+      log(`Overlay write BLOCKED (bad TS header): ${relativeFilePath}`, 'ERROR', 'self-heal-overlay');
+      return false;
+    }
+    // Syntax sanity check: catch truncated AI output (unterminated strings, wildly unbalanced braces)
+    if (!tsSyntaxSanityCheck(content)) {
+      log(`Overlay write BLOCKED (fails syntax sanity check — likely truncated): ${relativeFilePath}`, 'ERROR', 'self-heal-overlay');
+      return false;
+    }
   }
 
   try {
@@ -192,6 +312,36 @@ function installInterceptor(): boolean {
       // Check if an overlay exists for this file
       const overlayPath = path.resolve(OVERLAY_DIR, relativePath);
       if (fs.existsSync(overlayPath)) {
+        // Validate the overlay file is readable and not empty/truncated.
+        // OOM heap corruption or bad AI patches can write garbage,
+        // which then kills esbuild transforms with "Unterminated string literal".
+        try {
+          const stat = fs.statSync(overlayPath);
+          // A valid providers-prompts.ts is ~8KB+. If an overlay is < 50 bytes,
+          // it's almost certainly corruption, not a real patch.
+          if (stat.size < 50) {
+            log(`Overlay INVALID (too small, ${stat.size}b): ${relativePath} — skipping, using original`, 'ERROR', 'self-heal-overlay');
+            return originalPath;
+          }
+          // Validate .ts overlay files: header check + syntax sanity.
+          // This catches corrupted overlays (truncated AI output, OOM corruption)
+          // that would kill esbuild with "Unterminated string literal".
+          if (relativePath.endsWith('.ts')) {
+            const content = fs.readFileSync(overlayPath, 'utf8');
+            if (!hasValidTSHeader(content)) {
+              log(`Overlay INVALID (bad TS header): ${relativePath} — skipping, using original`, 'ERROR', 'self-heal-overlay');
+              return originalPath;
+            }
+            if (!tsSyntaxSanityCheck(content)) {
+              log(`Overlay INVALID (syntax sanity check failed — likely truncated): ${relativePath} — skipping, using original`, 'ERROR', 'self-heal-overlay');
+              return originalPath;
+            }
+          }
+        } catch (readErr: any) {
+          // Can't even stat/read the overlay — skip it
+          log(`Overlay UNREADABLE: ${relativePath} — ${readErr.code || readErr.message}, using original`, 'ERROR', 'self-heal-overlay');
+          return originalPath;
+        }
         return overlayPath;
       }
 
