@@ -36,11 +36,23 @@ function getMailTransporter() {
   return mailTransporter;
 }
 
+const ALERT_FETCH_TIMEOUT_MS = 8000; // 8s — fail fast on blocked/slow networks
+
+async function fetchWithAlertTimeout(url: string, init: any) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('ALERT_TIMEOUT')), ALERT_FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function sendNtfyAlert(message: any, title = 'MathU Bot Alert', priority = 3) { 
   if (!ntfyTopic) return;
   if (!fetch) { log('ntfy alert skipped: fetch not available', 'WARN', 'alerting'); return; }
   try {
-    await fetch(`https://ntfy.sh/${encodeURIComponent(ntfyTopic)}`, {
+    await fetchWithAlertTimeout(`https://ntfy.sh/${encodeURIComponent(ntfyTopic)}`, {
       method: 'POST',
       headers: {
         'Title': title,
@@ -50,9 +62,9 @@ async function sendNtfyAlert(message: any, title = 'MathU Bot Alert', priority =
       },
       body: message,
     });
-    log(`📢 Sent ntfy alert to topic "${ntfyTopic}"`, 'DEBUG', 'alerting');
+    log(`Sent ntfy alert to topic "${ntfyTopic}"`, 'DEBUG', 'alerting');
   } catch (e: any) {
-    logError('Failed to send ntfy alert', e);
+    log(`ntfy alert skipped: ${e.code || e.name || e.message}`.substring(0, 120), 'DEBUG', 'alerting');
   }
 }
 
@@ -84,13 +96,13 @@ async function sendSlackAlert(message: any) {
   if (!getCONFIG.SLACK_WEBHOOK_URL) return;
   if (!fetch) { log('Slack alert skipped: fetch not available', 'WARN', 'alerting'); return; }
   try {
-    await fetch(getCONFIG.SLACK_WEBHOOK_URL, {
+    await fetchWithAlertTimeout(getCONFIG.SLACK_WEBHOOK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: `🚨 MathU Bot Alert: ${message}` }),
+      body: JSON.stringify({ text: `MathU Bot Alert: ${message}` }),
     });
   } catch (e: any) {
-    logError('Failed to send Slack alert', e);
+    log(`Slack alert skipped: ${e.code || e.name || e.message}`.substring(0, 120), 'DEBUG', 'alerting');
   }
 }
 
@@ -100,20 +112,17 @@ async function sendTelegramAlert(message: any) {
   if (!token || !chatId) return;
   if (!fetch) { log('Telegram alert skipped: fetch not available', 'WARN', 'alerting'); return; }
   try {
-    // Token is required in the URL path by the Telegram Bot API.
-    // The logger's redactSensitive() will scrub it from log output.
-    // chat_id is sent in the POST body (not URL) to limit token exposure.
     const url = `https://api.telegram.org/bot${token}/sendMessage`;
-    await fetch(url, {
+    await fetchWithAlertTimeout(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: chatId,
-        text: `🚨 MathU Bot Alert: ${message}`,
+        text: `MathU Bot Alert: ${message}`,
       }),
     });
   } catch (e: any) {
-    logError('Failed to send Telegram alert', e);
+    log(`Telegram alert skipped: ${e.code || e.name || e.message}`.substring(0, 120), 'DEBUG', 'alerting');
   }
 }
 
