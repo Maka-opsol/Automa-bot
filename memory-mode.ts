@@ -159,6 +159,7 @@ let _modeChangeCallbacks: Array<(mode: string, reason: string) => void> = [];
 let _isShuttingDown = false;
 let _browserClosedByProtection = false; // v3: track if we closed the browser
 let _selfHealSessionActive = false; // v4: track if a self-heal session owns full power
+let _shedInProgress = false; // v8: mutex — prevent concurrent shedMemory from multiple monitors
 
 // ── Log helper ──
 function _log(msg: string, level: string = 'INFO') {
@@ -220,6 +221,27 @@ function isMinimumMode(): boolean {
  *   If preserveBrowser is true, maxLevel is clamped to 2.
  */
 async function shedMemory(reason: string = 'unknown', options?: {
+  preserveBrowser?: boolean;
+  targetMB?: number;
+  maxLevel?: number;
+}): Promise<number> {
+  // v8: Mutex — three independent monitors (heap guardian, render-free-plan,
+  // cycle-manager) can all trigger shedMemory concurrently. Without a lock,
+  // this causes double browser closes, concurrent about:blank navigations,
+  // and race conditions on _browserClosedByProtection.
+  if (_shedInProgress) {
+    _log(`shedMemory(${reason}): skipped — another shed is already in progress`, 'DEBUG');
+    return process.memoryUsage().heapUsed / 1024 / 1024;
+  }
+  _shedInProgress = true;
+  try {
+    return await _shedMemoryImpl(reason, options);
+  } finally {
+    _shedInProgress = false;
+  }
+}
+
+async function _shedMemoryImpl(reason: string = 'unknown', options?: {
   preserveBrowser?: boolean;
   targetMB?: number;
   maxLevel?: number;
@@ -702,10 +724,11 @@ async function beginSelfHealSession(reason: string): Promise<boolean> {
   } catch { /* non-critical */ }
 
   // Switch to appropriate mode for healing
-  // From minimum: go to memory_protection (safer, still disables heavy self-heal
-  //   but re-enables the minimum-only keys like workers, telemetry, etc.)
-  // From memory_protection: go to full_power (existing behavior)
-  const healMode: MemoryMode = wasMinimum ? 'memory_protection' : 'full_power';
+  // v8: ALWAYS use memory_protection thresholds (200/220) for self-heal.
+  // Using full_power (350/400) on a 256MB heap is suicidal — the bot
+  // will OOM-kill itself while trying to heal. The re-enabled subsystems
+  // work fine under memory_protection GC cadence (15s).
+  const healMode: MemoryMode = 'memory_protection';
   // v5 FIX: await the mode switch (it's async now)
   await _applyMode(healMode, `self_heal_begin:${reason}`);
   _log(`SELF-HEAL SESSION STARTED: ${reason}. Promoted from ${wasMinimum ? 'MINIMUM' : 'MEMORY PROTECTION'} to ${healMode} for up to ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min. SAVE ALL PROGRESS TO DB.`, 'WARN');
