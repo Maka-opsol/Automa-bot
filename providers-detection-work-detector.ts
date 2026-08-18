@@ -4,21 +4,28 @@ function _injectDependencies(deps) {
   Object.assign(_deps, deps);
 }
 
-function detectWorkEnvironment() {
+function detectWork() {
   // Check for Flutter Web canvas rendering
-  if (document.querySelector('canvas#flutterCanvas')) {
-    return 'FLUTTER_WEB';
+  const canvas = document.querySelector('canvas');
+  if (canvas && canvas.getContext) {
+    _deps.logger.debug('Detected Flutter Web canvas rendering');
+    return true;
   }
-  
-  // Fallback to default detection
-  if (document.body.innerText.includes('MathU Infinity')) {
-    return 'MATHU_APP';
-  }
-  
-  return 'UNKNOWN';
+
+  // Fallback to existing detection logic
+  const workIndicators = [
+    'assignment',
+    'exercise',
+    'problem',
+    'question',
+    'task'
+  ];
+
+  const pageContent = document.body.innerText.toLowerCase();
+  return workIndicators.some(indicator => pageContent.includes(indicator));
 }
 
 module.exports = {
   _injectDependencies,
-  detectWorkEnvironment
+  detectWork
 };
