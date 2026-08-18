@@ -1,15 +1,28 @@
 const _deps = {};
 
 function _injectDependencies(deps) {
-  Object.assign(_deps, deps);
+  _deps.logger = deps.logger;
+  _deps.config = deps.config;
+  _deps.browser = deps.browser;
 }
 
-function detectWorkPage() {
-  const url = _deps.browser.getCurrentUrl();
-  return url.includes('app.mathu.co.za/assignments');
+function detectWorkInProgress() {
+  // Check for Flutter Web canvas rendering
+  const canvas = document.querySelector('canvas');
+  if (canvas && canvas.getContext) {
+    return true;
+  }
+
+  // Fallback to existing detection logic
+  const activeElement = document.activeElement;
+  if (activeElement && activeElement.tagName === 'INPUT') {
+    return true;
+  }
+
+  return false;
 }
 
 module.exports = {
   _injectDependencies,
-  detectWorkPage
+  detectWorkInProgress
 };
