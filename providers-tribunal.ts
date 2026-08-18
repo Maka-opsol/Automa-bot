@@ -314,6 +314,25 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   const providerNames = providers.map((p: any) => `${p.name}(${(p.healthScore || 0).toFixed(2)})`).join(', ');
   log(`Tribunal: consulting ${providers.length} provider(s) [${providerNames}]`, 'INFO', 'tribunal');
 
+  // ── Pre-provider memory shield ──
+  // v8: If heap is above 70% of max-old-space-size, force a page reload
+  // (L2 shed) BEFORE calling providers. Provider calls allocate large
+  // base64 strings and JSON responses. If we're already at 70%+ heap,
+  // the provider call itself will push us past the hard threshold
+  // and into OOM kill territory.
+  const NODE_HEAP_LIMIT_MB = 256; // matches Dockerfile --max-old-space-size=256
+  const PRE_CALL_SHED_THRESHOLD = NODE_HEAP_LIMIT_MB * 0.7; // 179MB
+  const preCallHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+  if (preCallHeapMB > PRE_CALL_SHED_THRESHOLD) {
+    log(`Pre-provider memory shield: heap=${preCallHeapMB.toFixed(1)}MB > ${PRE_CALL_SHED_THRESHOLD.toFixed(0)}MB — forcing L2 page reload before tribunal calls`, 'WARN', 'tribunal');
+    try {
+      const memoryMode = require('./memory-mode');
+      await memoryMode.shedMemory('pre-tribunal-shield', { preserveBrowser: true, maxLevel: 2 });
+    } catch (e: any) {
+      log(`Pre-tribunal shed failed: ${e.message}`, 'WARN', 'tribunal');
+    }
+  }
+
   // --- Consult all providers in parallel ---
   // FIX: Add overall timeout so slow providers don't block the tribunal forever.
   const TRIBUNAL_TIMEOUT_MS = 120000; // 120s total — don't cut off slow free-tier providers
@@ -450,4 +469,4 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   };
 }
 
-module.exports = { runTribunal }
+module.exports = { runTribunal };
