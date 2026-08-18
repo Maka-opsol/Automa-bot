@@ -945,7 +945,9 @@ async function checkAfterTursoSync(selectCalibration: any, upsertCalibration: an
       try {
         const parsed = JSON.parse(minRow.value);
         if (parsed.active && _currentMode !== 'minimum') {
-          await _applyMode('minimum', `db_restored_minimum:${parsed.reason || 'unknown'}`);
+          // Pass the ORIGINAL reason through — don't prepend a restore prefix.
+          // Prepending caused reason accumulation (db_restored_minimum:db_restored_minimum:...)
+          await _applyMode('minimum', parsed.reason || 'db_restore');
           _restartTimers();
           _log('Restored MINIMUM mode from database (Turso recovery)', 'ERROR');
           return;
@@ -959,13 +961,13 @@ async function checkAfterTursoSync(selectCalibration: any, upsertCalibration: an
       try {
         const parsed = JSON.parse(modeRow.value);
         if (parsed.mode === 'minimum' && _currentMode !== 'minimum') {
-          await _applyMode('minimum', `db_restored_mode:${parsed.reason || 'unknown'}`);
+          await _applyMode('minimum', parsed.reason || 'db_restore');
           _restartTimers();
           _log('Restored MINIMUM mode from database (mode field)', 'ERROR');
           return;
         }
         if (parsed.mode === 'memory_protection' && _currentMode !== 'memory_protection') {
-          await _applyMode('memory_protection', `db_restored:${parsed.reason || 'unknown'}`);
+          await _applyMode('memory_protection', parsed.reason || 'db_restore');
           _restartTimers();
           _log('Restored MEMORY PROTECTION mode from database (Turso recovery)', 'WARN');
           return;
@@ -1088,7 +1090,7 @@ function init(): void {
           try {
             const parsed = JSON.parse(minRow.value);
             if (parsed.active) {
-              _applyMode('minimum', `db_boot_minimum:${parsed.reason || 'unknown'}`).catch(() => {});
+              _applyMode('minimum', parsed.reason || 'db_boot').catch(() => {});
               _log('Starting in MINIMUM mode (restored from database)', 'ERROR');
               _checkForActiveSelfHealSession();
               _restartTimers();
