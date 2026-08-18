@@ -1,24 +1,24 @@
-const _deps = { logger: null, config: null, browser: null };
+const _deps = {};
 
 function _injectDependencies(deps) {
-  _deps.logger = deps.logger;
-  _deps.config = deps.config;
-  _deps.browser = deps.browser;
+  Object.assign(_deps, deps);
 }
 
-function detectWorkPage() {
-  const currentUrl = _deps.browser.getCurrentUrl();
-  const isAssignmentsPage = currentUrl.includes('https://app.mathu.co.za/assignments');
-
-  if (isAssignmentsPage) {
-    _deps.logger.debug('Detected MathU assignments page');
-    return true;
+function detectWorkEnvironment() {
+  // Check for Flutter Web canvas rendering
+  if (document.querySelector('canvas#flutterCanvas')) {
+    return 'FLUTTER_WEB';
   }
-
-  return false;
+  
+  // Fallback to default detection
+  if (document.body.innerText.includes('MathU Infinity')) {
+    return 'MATHU_APP';
+  }
+  
+  return 'UNKNOWN';
 }
 
 module.exports = {
   _injectDependencies,
-  detectWorkPage
+  detectWorkEnvironment
 };
