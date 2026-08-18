@@ -10,23 +10,22 @@ function _injectDependencies(deps) {
   _deps.browser = deps.browser;
 }
 
-function detectWorkInProgress() {
-  // Check for Flutter Web canvas rendering
-  const canvas = document.querySelector('canvas');
-  if (canvas && canvas.style.display !== 'none') {
-    return true;
+function detectWorkEnvironment() {
+  // Check for Flutter Web canvas environment
+  if (document.querySelector('canvas') && document.body.innerText.trim() === '') {
+    _deps.logger.debug('Detected Flutter Web canvas rendering environment');
+    return 'flutter-web-canvas';
   }
 
-  // Fallback to existing detection logic
-  const activeElement = document.activeElement;
-  if (activeElement && activeElement.tagName === 'INPUT') {
-    return true;
+  // Existing detection logic...
+  if (_deps.browser.isMobile()) {
+    return 'mobile';
   }
 
-  return false;
+  return 'desktop';
 }
 
 module.exports = {
   _injectDependencies,
-  detectWorkInProgress
+  detectWorkEnvironment
 };
