@@ -114,7 +114,6 @@ function githubApi(method: string, apiPath: string, body?: any): Promise<any> {
 
       if (body) {
         options.headers['Content-Type'] = 'application/json';
-        options.body = JSON.stringify(body);
       }
 
       const req = https.request(url, options, (res: any) => {
@@ -166,6 +165,13 @@ function githubApi(method: string, apiPath: string, body?: any): Promise<any> {
         log(`GitHub API ${method} ${apiPath} timed out after ${GITHUB_API_MAX_RETRIES} attempts`, 'ERROR', 'self-heal-git-deploy');
         resolve(null);
       });
+
+      // Write request body BEFORE ending the request.
+      // Node's https.request ignores options.body — we must use req.write().
+      if (body) {
+        const payload = JSON.stringify(body);
+        req.write(payload);
+      }
 
       req.end();
     }
