@@ -18,7 +18,8 @@ function detectWork() {
     'exercise',
     'problem',
     'question',
-    'task'
+    'quiz',
+    'test'
   ];
 
   const pageContent = document.body.innerText.toLowerCase();
