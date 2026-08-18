@@ -1,25 +1,31 @@
-const _deps = {};
+const _deps = {
+  logger: null,
+  config: null,
+  browser: null
+};
 
 function _injectDependencies(deps) {
-  Object.assign(_deps, deps);
+  _deps.logger = deps.logger;
+  _deps.config = deps.config;
+  _deps.browser = deps.browser;
 }
 
-function detectWorkPage() {
-  const url = window.location.href;
-  const isAssignmentsPage = url.includes('/assignments');
-  
-  if (isAssignmentsPage) {
-    _deps.logger.debug('Detected MathU Infinity assignments page');
-    return {
-      type: 'work',
-      context: 'assignments'
-    };
+function detectWorkInProgress() {
+  // Check for Flutter Web canvas rendering
+  const canvas = document.querySelector('canvas');
+  if (canvas && canvas.getContext) {
+    return true;
   }
-  
-  return null;
+
+  // Fallback to document visibility
+  if (document.visibilityState === 'visible') {
+    return true;
+  }
+
+  return false;
 }
 
 module.exports = {
   _injectDependencies,
-  detectWorkPage
+  detectWorkInProgress
 };
