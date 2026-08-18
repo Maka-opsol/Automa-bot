@@ -1,7 +1,9 @@
-const _deps = {};
+const _deps = { logger: null, config: null, browser: null };
 
 function _injectDependencies(deps) {
-  Object.assign(_deps, deps);
+  _deps.logger = deps.logger;
+  _deps.config = deps.config;
+  _deps.browser = deps.browser;
 }
 
 function detectWorkInProgress() {
@@ -12,10 +14,10 @@ function detectWorkInProgress() {
     return true;
   }
 
-  // Fallback to original detection logic
-  const baseElement = document.querySelector('base[href]');
-  if (baseElement) {
-    _deps.logger.debug('Detected base href element');
+  // Fallback to existing detection logic
+  const activeElements = document.querySelectorAll('[aria-busy="true"], [data-loading="true"]');
+  if (activeElements.length > 0) {
+    _deps.logger.debug(`Detected ${activeElements.length} active elements`);
     return true;
   }
 
