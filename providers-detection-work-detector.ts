@@ -1,8 +1,4 @@
-const _deps = {
-  logger: null,
-  config: null,
-  browser: null
-};
+const _deps = { logger: null, config: null, browser: null };
 
 function _injectDependencies(deps) {
   _deps.logger = deps.logger;
@@ -10,22 +6,22 @@ function _injectDependencies(deps) {
   _deps.browser = deps.browser;
 }
 
-function detectWorkInProgress() {
-  // Check for Flutter Web canvas rendering
-  const canvas = document.querySelector('canvas');
-  if (canvas && canvas.getContext) {
-    return true;
+function detectWorkEnvironment() {
+  // Check for Flutter Web canvas environment
+  if (document.querySelector('canvas') && document.body.innerText.trim() === '') {
+    _deps.logger.debug('Detected Flutter Web canvas rendering environment');
+    return 'flutter-web-canvas';
   }
 
-  // Fallback to document visibility
-  if (document.visibilityState === 'visible') {
-    return true;
+  // Existing detection logic...
+  if (document.querySelector('.assignment-container')) {
+    return 'assignment-page';
   }
 
-  return false;
+  return 'unknown';
 }
 
 module.exports = {
   _injectDependencies,
-  detectWorkInProgress
+  detectWorkEnvironment
 };
