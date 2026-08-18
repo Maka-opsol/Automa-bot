@@ -4,23 +4,18 @@ function _injectDependencies(deps) {
   Object.assign(_deps, deps);
 }
 
-function detectWorkInProgress() {
+function detectWorkPage() {
   // Check for Flutter Web canvas rendering
   const canvas = document.querySelector('canvas');
-  if (canvas && canvas.style.display !== 'none') {
+  if (canvas && canvas.id === 'flutterCanvas') {
     return true;
   }
 
-  // Fallback to URL-based detection
-  const currentUrl = window.location.href;
-  if (currentUrl.includes('/assignments')) {
-    return true;
-  }
-
-  return false;
+  // Fallback to URL check
+  return window.location.pathname.includes('/assignments');
 }
 
 module.exports = {
   _injectDependencies,
-  detectWorkInProgress
+  detectWorkPage
 };
