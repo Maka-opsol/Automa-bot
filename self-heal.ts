@@ -789,12 +789,14 @@ async function performSelfHeal(options?: SelfHealOptions) {
     }
 
     // Fast-fail: if BazaarLink budget is exhausted and Mistral also failed on
-    // the previous attempt, retrying is pointless — the outcome won't change.
+    // the previous attempt, AND we're already past the fallback threshold
+    // (attempt >= 2 means non-codegen fallback was already tried), retrying
+    // is pointless — the outcome won't change.
     try {
       const blLimiter = require('./bazaarlink-rate-limiter');
-      if (blLimiter.isExhausted() && lastTribunalError !== null) {
-        log(`Fast-fail: BazaarLink budget exhausted + previous Mistral failure (${lastTribunalError}). Retrying won't help.`, 'ERROR', 'self-heal');
-        memoryMode.appendSelfHealProgress?.('fast_fail', { reason: 'bl_exhausted_plus_mistral_fail', lastError: lastTribunalError, attempt: attempts });
+      if (blLimiter.isExhausted() && lastTribunalError !== null && attempts >= 2) {
+        log(`Fast-fail: BazaarLink budget exhausted + previous failure (${lastTribunalError}) + non-codegen fallback already attempted. Retrying won't help.`, 'ERROR', 'self-heal');
+        memoryMode.appendSelfHealProgress?.('fast_fail', { reason: 'bl_exhausted_plus_fallback_failed', lastError: lastTribunalError, attempt: attempts });
         break;
       }
     } catch {}
@@ -849,6 +851,10 @@ async function performSelfHeal(options?: SelfHealOptions) {
     const enrichedInvestigation = enrichInvestigationWithTargetFile(investigation, errorLogs);
 
     // 4. Generate fixes via AI tribunal (with abort signal for timeout)
+    // On attempt 2+, allow falling back to non-codegen general providers
+    // (Groq, z.ai, NVIDIA, etc.) if BazaarLink+Mistral both fail. On the
+    // first attempt we try dedicated codegen providers only — they produce
+    // much better patches. Fallback only kicks in on repeated failures.
     let fixes: any[] | null = null;
     lastTribunalError = null;
     const tribunalSignal = AbortSignal.timeout(getCONFIG().SELF_HEAL_TRIBUNAL_TIMEOUT_MS || 120_000);
@@ -856,7 +862,8 @@ async function performSelfHeal(options?: SelfHealOptions) {
       fixes = await getGenerateCodeFixViaTribunal()(
         enrichedInvestigation,
         errorLogs + (patchContext ? '\n\n' + patchContext : ''),
-        tribunalSignal
+        tribunalSignal,
+        { allowNonCodegenFallback: attempts >= 2 },
       );
     } catch (err: any) {
       if (err.name === 'TimeoutError' || err.name === 'AbortError') {
