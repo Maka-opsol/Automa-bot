@@ -356,9 +356,16 @@ function verifyPromotedFiles(fixes: any, overlay?: any) {
     if (content.length < 50) {
       log(`Post-promotion verification WARNING: ${file} is suspiciously short (${content.length} chars)`, 'WARN', 'self-heal');
     }
-    // Verify the file starts with 'use strict' or a valid module pattern
+    // Verify the file starts with a valid TS/JS pattern
     const trimmedStart = content.trimStart().substring(0, 20);
-    const validStarts = ["'use strict'", '"use strict"', "'use strict';", '"use strict";', 'import ', 'export ', '//', '/*', '/**'];
+    const validStarts = [
+      "'use strict'", '"use strict"',
+      'import ', 'export ',
+      '//', '/*',
+      'const ', 'let ', 'var ',
+      'function ', 'async ', 'class ',
+      'type ', 'interface ', 'enum ',
+    ];
     const hasValidStart = validStarts.some(s => trimmedStart.startsWith(s));
     if (!hasValidStart) {
       log(`Post-promotion verification WARNING: ${file} does not start with a recognized pattern (starts with: "${trimmedStart.substring(0, 30)}")`, 'WARN', 'self-heal');
