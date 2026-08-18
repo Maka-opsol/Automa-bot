@@ -11,7 +11,18 @@ const CONFIG = require('./get-config');
 const fs = require('fs');
 const path = require('path');
 
-const _CHECKPOINT_PATH = process.env.CHECKPOINT_FILE || (CONFIG && CONFIG.CHECKPOINT_FILE) || path.join(require('os').tmpdir(), 'checkpoint.json');
+const _os = require('os');
+const _CHECKPOINT_PATH = (() => {
+  // Priority: env var > config > /tmp default
+  let p = process.env.CHECKPOINT_FILE || (CONFIG && CONFIG.CHECKPOINT_FILE) || '';
+  if (!p) p = path.join(_os.tmpdir(), 'checkpoint.json');
+  // v12-FIX: Ensure absolute path. On Render, the source dir is read-only
+  // and a relative 'checkpoint.json' would fail with EACCES.
+  if (!path.isAbsolute(p)) {
+    p = path.join(_os.tmpdir(), p);
+  }
+  return p;
+})();
 
 function saveCheckpoint(data: any) { 
   const tmp = _CHECKPOINT_PATH + '.tmp';
