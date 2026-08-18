@@ -38,6 +38,14 @@ function _getBL(): any {
 //   - Mistral: dedicated codegen provider
 //   - OpenRouter is NOT used here — it's for the vision/general tribunal only.
 //   - Cloudflare, Gemini, etc. are NOT codegen providers — never call them here.
+//
+// FALLBACK: If ALL dedicated codegen providers fail AND the caller indicates
+// this is a repeated failure (not first attempt), we fall back to non-codegen
+// vision/general providers (Groq, z.ai, NVIDIA, Cloudflare, Gemini, OpenRouter)
+// from the general registry. These providers use the same codegen prompt but
+// their raw text output is parsed via parseCodegenResponse() instead of
+// extractJSON/validateActionResponse. This ensures self-heal never gets
+// stuck in a retry loop when both BazaarLink and Mistral are down.
 
 // ─── Default timeout for tribunal calls when no external signal is provided ───
 const DEFAULT_TRIBUNAL_TIMEOUT_MS = 120_000; // 2 minutes
@@ -138,20 +146,32 @@ function discoverModels() {
 //  For generating CODE FIXES only. Returns validated fix objects.
 // ═══════════════════════════════════════════════════════════
 
-async function generateCodeFixViaTribunal(investigationData: any, errorLogs: any, signal?: any) { 
+async function generateCodeFixViaTribunal(
+  investigationData: any,
+  errorLogs: any,
+  signal?: any,
+  options?: { allowNonCodegenFallback?: boolean },
+) {
   const models = discoverModels();
 
   const totalModels = models.blModels.length
     + (models.hasMistral ? 1 : 0);
 
   const blModelList = models.blModels.join(', ');
-  log(`\u{1f9e0} CODEGEN TRIBUNAL: Consulting ${totalModels} models — BazaarLink [${blModelList}]${models.hasMistral ? ' + Mistral' : ''}...`, 'INFO', 'codegen');
+  log(`\u{1f9e0} CODEGEN TRIBUNAL: Consulting ${totalModels} models — BazaarLink [${blModelList}]${models.hasMistral ? ' + Mistral' : ''}${options?.allowNonCodegenFallback ? ' (non-codegen fallback ENABLED)' : ''}...`, 'INFO', 'codegen');
 
   const prompt = buildCodeGenPrompt(investigationData, errorLogs);
   const ctl = withTimeout(signal, DEFAULT_TRIBUNAL_TIMEOUT_MS);
 
   try {
-    return await _runFixConsensus(prompt, models, totalModels, ctl.signal);
+    const result = await _runFixConsensus(prompt, models, totalModels, ctl.signal);
+    // If dedicated codegen providers all failed AND caller allows fallback,
+    // try non-codegen providers from the general registry.
+    if (!result && options?.allowNonCodegenFallback) {
+      log('Dedicated codegen providers exhausted — falling back to non-codegen providers from general registry', 'WARN', 'codegen');
+      return await _fallbackToGeneralProviders(prompt, ctl.signal);
+    }
+    return result;
   } finally {
     (ctl as any)._cleanup?.();
   }
@@ -272,6 +292,145 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
   if (best) {
     // Single model returned fixes — use it (better than nothing during OOM)
     log(`\u26a0\ufe0f Single-model fix from ${best.providers[0]} for ${best.fix.file}.`, 'WARN', 'codegen');
+    return [best.fix];
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FALLBACK: Non-codegen providers from the general registry
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * When both BazaarLink (budget exhausted / all 429) and Mistral (down / key
+ * missing) have failed, this function grabs healthy providers from the general
+ * registry (Groq, z.ai, NVIDIA, Cloudflare, Gemini, OpenRouter, ...) and asks
+ * them the SAME codegen prompt.
+ *
+ * Key differences from the normal vision pipeline:
+ *   - We pass `validate: false` so the provider returns raw text instead of
+ *     going through extractJSON -> validateActionResponse (which expects
+ *     actionType/targetX/targetY).
+ *   - We parse the raw text with parseCodegenResponse() which understands
+ *     { file, change, patch } arrays.
+ *   - We still run the fix through validateFixArray() and PATCHABLE_PREFIXES.
+ *   - We cap at 3 providers to avoid burning the entire registry on a codegen
+ *     task that most vision models are not optimised for.
+ *   - We track results in the health system so repeated failures trigger
+ *     circuit breakers normally.
+ */
+const FALLBACK_MAX_PROVIDERS = 3;
+
+async function _fallbackToGeneralProviders(prompt: string, signal: any): Promise<any[] | null> {
+  let registry: any;
+  try {
+    registry = require('./providers-registry');
+  } catch (err: any) {
+    log(`Fallback: cannot load providers-registry: ${err.message || err}`, 'ERROR', 'codegen');
+    return null;
+  }
+
+  const { getAvailableProviders, recordProviderResult, addProviderFailure } = registry;
+
+  let providers: Array<{ name: string; fn: any; healthScore?: number }>;
+  try {
+    providers = await getAvailableProviders();
+  } catch (err: any) {
+    log(`Fallback: getAvailableProviders failed: ${err.message || err}`, 'ERROR', 'codegen');
+    return null;
+  }
+
+  if (!providers || providers.length === 0) {
+    log('Fallback: no general providers available after health filtering', 'ERROR', 'codegen');
+    return null;
+  }
+
+  // Cap to top-N by health score to avoid burning the entire registry
+  const capped = providers
+    .sort((a: any, b: any) => (b.healthScore || 0) - (a.healthScore || 0))
+    .slice(0, FALLBACK_MAX_PROVIDERS);
+
+  log(`Fallback: trying ${capped.length} general provider(s): ${capped.map((p: any) => p.name).join(', ')}`, 'INFO', 'codegen');
+
+  const collected: Array<{ provider: string; fixes: any[]; error?: string }> = [];
+
+  // Call providers sequentially to avoid hammering all at once
+  for (const provider of capped) {
+    if (signal?.aborted) break;
+    const start = Date.now();
+    try {
+      // CRITICAL: pass validate:false so the provider returns raw text.
+      // Vision providers normally run extractJSON -> validateActionResponse
+      // which expects {actionType, currentState, targetX, targetY}.
+      // We want the RAW text so we can parse it as codegen output.
+      const rawText = await provider.fn(
+        null,           // no image -- codegen is text-only
+        prompt,
+        signal,
+        { validate: false },
+      );
+      const latency = Date.now() - start;
+
+      if (!rawText || typeof rawText !== 'string' || rawText.trim().length === 0) {
+        log(`Fallback ${provider.name}: empty response (${latency}ms)`, 'WARN', 'codegen');
+        recordProviderResult(provider.name, false, latency);
+        collected.push({ provider: provider.name, fixes: [], error: 'empty_response' });
+        continue;
+      }
+
+      // Parse with the codegen parser (not extractJSON)
+      const parsed = parseCodegenResponse(rawText);
+      const fixes = validateFixArray(parsed);
+
+      if (fixes.length > 0) {
+        log(`Fallback ${provider.name}: got ${fixes.length} valid fix(es) (${latency}ms)`, 'INFO', 'codegen');
+        recordProviderResult(provider.name, true, latency);
+        collected.push({ provider: provider.name, fixes });
+      } else {
+        log(`Fallback ${provider.name}: response parsed but 0 valid fixes (${latency}ms, raw=${rawText.length} chars)`, 'WARN', 'codegen');
+        recordProviderResult(provider.name, false, latency);
+        collected.push({ provider: provider.name, fixes: [], error: 'no_valid_fixes' });
+      }
+    } catch (err: any) {
+      const latency = Date.now() - start;
+      const errMsg = String(err.message || err).substring(0, 200);
+      log(`Fallback ${provider.name} failed: ${errMsg} (${latency}ms)`, 'WARN', 'codegen');
+      recordProviderResult(provider.name, false, latency);
+      addProviderFailure(provider.name, err);
+      collected.push({ provider: provider.name, fixes: [], error: errMsg });
+    }
+  }
+
+  // Check if any fallback provider returned valid fixes
+  const validResponses = collected.filter(c => c.fixes.length > 0);
+  if (validResponses.length === 0) {
+    const errors = collected.filter(c => c.error).map(c => `${c.provider}: ${c.error}`);
+    log(`Fallback: all ${capped.length} general providers failed. ${errors.join('; ').substring(0, 500)}`, 'ERROR', 'codegen');
+    return null;
+  }
+
+  log(`Fallback: ${validResponses.length}/${capped.length} general provider(s) returned valid fixes`, 'INFO', 'codegen');
+
+  // Same consensus logic as primary: pick the most-agreed fix, or single best
+  const fixVotes = new Map();
+  for (const resp of validResponses) {
+    for (const fix of resp.fixes) {
+      const key = `${fix.file}::${fix.patch.substring(0, 80)}`;
+      if (!fixVotes.has(key)) { fixVotes.set(key, { fix, count: 0, providers: [] }); }
+      const entry = fixVotes.get(key);
+      entry.count++;
+      entry.providers.push(resp.provider);
+    }
+  }
+  const sortedVotes = [...fixVotes.values()].sort((a, b) => b.count - a.count);
+  const best = sortedVotes[0];
+
+  if (best && best.count > 1) {
+    log(`CONSENSUS (fallback): ${best.count}/${validResponses.length} providers (${best.providers.join(', ')}) agree on ${best.fix.file}`, 'INFO', 'codegen');
+    return [best.fix];
+  }
+  if (best) {
+    log(`Single-model fallback fix from ${best.providers[0]} for ${best.fix.file}`, 'WARN', 'codegen');
     return [best.fix];
   }
   return null;
