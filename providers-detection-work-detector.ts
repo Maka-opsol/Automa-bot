@@ -1,21 +1,30 @@
-const _deps = {};
+const _deps = {
+  logger: null,
+  config: null,
+  browser: null
+};
 
 function _injectDependencies(deps) {
-  Object.assign(_deps, deps);
+  _deps.logger = deps.logger;
+  _deps.config = deps.config;
+  _deps.browser = deps.browser;
 }
 
-function detectWorkPage() {
-  // Check for Flutter Web canvas rendering
-  const canvas = document.querySelector('canvas');
-  if (canvas && canvas.id === 'flutterCanvas') {
-    return true;
+function detectWorkEnvironment() {
+  // Check for Flutter Web canvas environment
+  if (document.querySelector('canvas#flutterCanvas')) {
+    return 'FLUTTER_WEB';
   }
 
-  // Fallback to URL check
-  return window.location.pathname.includes('/assignments');
+  // Existing detection logic
+  if (window.location.href.includes('assignments')) {
+    return 'ASSIGNMENTS_PAGE';
+  }
+
+  return 'UNKNOWN';
 }
 
 module.exports = {
   _injectDependencies,
-  detectWorkPage
+  detectWorkEnvironment
 };
