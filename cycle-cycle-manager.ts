@@ -386,14 +386,23 @@ function requestStop() {  stopRequested = true; }
 //   instead of L3 (close browser) which would destroy quiz state.
 //   Returns true if memory was high AND recovery was attempted.
 async function checkMemoryAndRecover(CONFIG: any, log: any, clearCache: any, preserveBrowser: boolean = false): Promise<boolean> {
+  // v8: Use memory-mode thresholds instead of CONFIG env vars.
+  // CONFIG.MEMORY_RESTART_THRESHOLD_MB comes from Dockerfile env (was 360MB)
+  // and is far too high. memory-mode thresholds are mode-aware and
+  // coordinated with the heap guardian and render-free-plan monitor.
+  let restartMB = CONFIG.MEMORY_RESTART_THRESHOLD_MB;
+  try {
+    const memoryMode = require('./memory-mode');
+    restartMB = memoryMode.getThresholds().restartHeapMB;
+  } catch {}
   const used = process.memoryUsage().heapUsed / 1024 / 1024;
-  if (used > CONFIG.MEMORY_RESTART_THRESHOLD_MB) {
-    log(`Memory high (${used.toFixed(0)}MB) -- shedding memory (preserveBrowser=${preserveBrowser})`, 'WARN', 'cycle');
+  if (used > restartMB) {
+    log(`Memory high (${used.toFixed(0)}MB > ${restartMB}MB) -- shedding (preserveBrowser=${preserveBrowser})`, 'WARN', 'cycle');
     try {
       const memoryMode = require('./memory-mode');
       await memoryMode.shedMemory('cycle-check-memory', {
         preserveBrowser,
-        targetMB: CONFIG.MEMORY_RESTART_THRESHOLD_MB - 30, // aim 30MB below threshold
+        targetMB: restartMB - 30,
       });
     } catch { /* memory-mode not available */ }
     if (clearCache) clearCache();
