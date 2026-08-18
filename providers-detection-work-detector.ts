@@ -1,31 +1,25 @@
-const _deps = {
-  logger: null,
-  config: null,
-  browser: null
-};
+const _deps = {};
 
 function _injectDependencies(deps) {
-  _deps.logger = deps.logger;
-  _deps.config = deps.config;
-  _deps.browser = deps.browser;
+  Object.assign(_deps, deps);
 }
 
-function detectWorkEnvironment() {
-  // Check for Flutter Web canvas environment
-  if (document.querySelector('canvas') && document.body.innerText.trim() === '') {
-    _deps.logger.debug('Detected Flutter Web canvas rendering environment');
-    return 'flutter-web-canvas';
+function detectWorkPage() {
+  const url = window.location.href;
+  const isAssignmentsPage = url.includes('/assignments');
+  
+  if (isAssignmentsPage) {
+    _deps.logger.debug('Detected MathU Infinity assignments page');
+    return {
+      type: 'work',
+      context: 'assignments'
+    };
   }
-
-  // Fallback to default detection
-  if (window.location.href.includes('assignments')) {
-    return 'assignment-page';
-  }
-
-  return 'unknown';
+  
+  return null;
 }
 
 module.exports = {
   _injectDependencies,
-  detectWorkEnvironment
+  detectWorkPage
 };
