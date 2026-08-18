@@ -77,27 +77,67 @@ function validateFix(fix: any) {
     log(`Fix rejected: ${file} does not match patchable prefixes (overlay would block it)`, 'DEBUG', 'codegen');
     return false;
   }
+
+  // v12-OOM-FIX: Reject fixes for files that don't exist on disk.
+  // The AI has NO visibility into the codebase and will hallucinate
+  // file names. Without this check, the fix passes validation,
+  // reaches applyFixesToStaging, gets skipped silently, and then
+  // promoteStaging used to write ALL 100+ files to overlay.
+  try {
+    const { PROJECT_ROOT } = require('./project-root');
+    const fullPath = require('path').join(PROJECT_ROOT, file);
+    if (!require('fs').existsSync(fullPath)) {
+      log(`Fix rejected: ${file} does not exist on disk (AI hallucinated file name)`, 'WARN', 'codegen');
+      return false;
+    }
+  } catch (e: any) {
+    // If we can't check existence (e.g. project-root missing),
+    // allow the fix through — don't make things worse.
+  }
+
   if (!fix.change || typeof fix.change !== 'string') return false;
   if (!fix.patch || typeof fix.patch !== 'string') return false;
   if (fix.patch.trim().length < 5) return false;
   return true;
 }
 
-function validateFixArray(parsed: any) { 
+function validateFixArray(parsed: any) {
   if (!parsed) return [];
-  if (Array.isArray(parsed)) return parsed.filter(validateFix);
-  // Some providers wrap the array in an object — try common wrappers
-  if (typeof parsed === 'object') {
+  let fixes: any[] = [];
+  if (Array.isArray(parsed)) {
+    fixes = parsed.filter(validateFix);
+  } else if (typeof parsed === 'object') {
     for (const key of ['fixes', 'patches', 'results', 'data', 'response']) {
       if (Array.isArray(parsed[key])) {
         const extracted = parsed[key].filter(validateFix);
-        if (extracted.length > 0) return extracted;
+        if (extracted.length > 0) { fixes = extracted; break; }
       }
     }
     // Single fix object (not wrapped in array)
-    if (validateFix(parsed)) return [parsed];
+    if (fixes.length === 0 && validateFix(parsed)) fixes = [parsed];
   }
-  return [];
+
+  // v12-OOM-FIX: Reject bulk-hallucinated responses.
+  // The AI has no codebase visibility. When it hallucinates, it returns
+  // patches for 10-60+ files (full file rewrites of 100KB+ each).
+  // This single check prevents the most dangerous OOM pattern.
+  const MAX_FIXES_PER_RESPONSE = 3;
+  const MAX_TOTAL_PATCH_CHARS = 100_000; // 100KB
+
+  if (fixes.length > MAX_FIXES_PER_RESPONSE) {
+    log(`Fix array TRUNCATED: ${fixes.length} fixes exceeds max ${MAX_FIXES_PER_RESPONSE}. ` +
+      `AI likely hallucinated bulk rewrites. Keeping first ${MAX_FIXES_PER_RESPONSE} only.`, 'WARN', 'codegen');
+    fixes = fixes.slice(0, MAX_FIXES_PER_RESPONSE);
+  }
+
+  const totalChars = fixes.reduce((sum: number, f: any) => sum + (f.patch?.length || 0), 0);
+  if (totalChars > MAX_TOTAL_PATCH_CHARS) {
+    log(`Fix array REJECTED: total patch size ${totalChars} chars exceeds ${MAX_TOTAL_PATCH_CHARS} limit. ` +
+      `AI returned full-file rewrites instead of targeted fixes.`, 'ERROR', 'codegen');
+    return [];
+  }
+
+  return fixes;
 }
 
 /**
@@ -602,21 +642,25 @@ function buildCodeGenPrompt(investigationData: any, errorLogs: any) {
     prompt += `INSTRUCTIONS:\n`;
     prompt += `1. Identify the exact bug in the file above.\n`;
     prompt += `2. Propose a fix.\n`;
-    prompt += `3. Return a JSON ARRAY of objects. Each object must have:\n`;
-    prompt += `- "file": (string) relative path from project root\n`;
+    prompt += `3. Return a JSON ARRAY with a SINGLE object. The object must have:\n`;
+    prompt += `- "file": "${targetFile}" (exact filename — do NOT invent other filenames)\n`;
     prompt += `- "change": (string) human-readable description of the fix\n`;
-    prompt += `- "patch": (string) a UNIFIED DIFF patch (lines starting with + or -)\n`;
+    prompt += `- "patch": (string) the COMPLETE file content with the fix applied\n`;
+    prompt += `CRITICAL: Return the FULL file content in "patch", not a diff. Not a snippet. The entire file.\n`;
+    prompt += `CRITICAL: Only fix ${targetFile}. Do NOT return patches for other files.\n`;
     prompt += `If no fix is possible, return exactly: []\n`;
     prompt += `Return ONLY the JSON array. No markdown fences, no explanation.\n`;
   } else {
-    prompt += `\nNo specific target file identified. You must infer which file(s) to fix from the error context above.\n`;
+    prompt += `\nNo specific target file identified. You must infer which file to fix from the error context above.\n`;
     prompt += `INSTRUCTIONS:\n`;
-    prompt += `1. Analyze the error and identify the likely source file.\n`;
-    prompt += `2. Propose a fix with a unified diff patch.\n`;
-    prompt += `3. Return a JSON ARRAY of objects. Each object must have:\n`;
-    prompt += `- "file": (string) relative path from project root\n`;
+    prompt += `1. Analyze the error and identify the single most likely source file.\n`;
+    prompt += `2. Propose ONE fix only.\n`;
+    prompt += `3. Return a JSON ARRAY with a SINGLE object. The object must have:\n`;
+    prompt += `- "file": (string) the exact filename (e.g. "providers-detection-work-detector.ts")\n`;
     prompt += `- "change": (string) human-readable description of the fix\n`;
-    prompt += `- "patch": (string) a UNIFIED DIFF patch (lines starting with + or -)\n`;
+    prompt += `- "patch": (string) the COMPLETE file content with the fix applied\n`;
+    prompt += `CRITICAL: Return the FULL file content in "patch", not a diff. Not a snippet. The entire file.\n`;
+    prompt += `CRITICAL: Return ONLY ONE fix for ONE file. Do NOT return patches for multiple files.\n`;
     prompt += `Only return [] if you truly cannot identify any file to fix.\n`;
     prompt += `Return ONLY the JSON array. No markdown fences, no explanation.\n`;
   }
