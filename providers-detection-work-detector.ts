@@ -17,12 +17,12 @@ function detectWorkEnvironment() {
     return 'flutter-web-canvas';
   }
 
-  // Existing detection logic...
-  if (_deps.browser.isMobile()) {
-    return 'mobile';
+  // Fallback to default detection
+  if (window.location.href.includes('assignments')) {
+    return 'assignment-page';
   }
 
-  return 'desktop';
+  return 'unknown';
 }
 
 module.exports = {
