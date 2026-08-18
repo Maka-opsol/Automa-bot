@@ -1,24 +1,24 @@
-const _deps = {};
+const _deps = { logger: null, config: null, browser: null };
 
 function _injectDependencies(deps) {
-  Object.assign(_deps, deps);
+  _deps.logger = deps.logger;
+  _deps.config = deps.config;
+  _deps.browser = deps.browser;
 }
 
-function detectWorkEnvironment() {
-  // Check for Flutter Web canvas environment
-  if (document.querySelector('canvas#flutterCanvas')) {
-    return 'flutter-web-canvas';
+function detectWorkPage() {
+  const currentUrl = _deps.browser.getCurrentUrl();
+  const isAssignmentsPage = currentUrl.includes('https://app.mathu.co.za/assignments');
+
+  if (isAssignmentsPage) {
+    _deps.logger.debug('Detected MathU assignments page');
+    return true;
   }
-  
-  // Fallback to default detection
-  if (document.body.innerHTML.includes('flutter')) {
-    return 'flutter-web';
-  }
-  
-  return 'unknown';
+
+  return false;
 }
 
 module.exports = {
   _injectDependencies,
-  detectWorkEnvironment
+  detectWorkPage
 };
