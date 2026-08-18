@@ -179,10 +179,46 @@ async function pushTombstoneBeforeDeath(): Promise<void> {
  */
 async function checkMemory(options?: { preserveBrowser?: boolean }): Promise<boolean> {
   const preserveBrowser = options?.preserveBrowser ?? false;
-  const heapMB = getHeapUsedMB();
+  const mem = process.memoryUsage();
+  const heapMB = mem.heapUsed / 1024 / 1024;
+  const rssMB = mem.rss / 1024 / 1024;
   const thresholds = _getThresholds();
   const softThreshold = (getCONFIG().HEAP_GUARDIAN_SOFT_THRESHOLD_MB as number) || thresholds.softMB;
   const hardThreshold = (getCONFIG().HEAP_GUARDIAN_HARD_THRESHOLD_MB as number) || thresholds.hardMB;
+
+  // v8: RSS-based hard kill. On 512MB, if RSS > 430MB, the kernel OOM
+  // killer is imminent. Close the browser immediately regardless of heap.
+  // RSS includes Chromium native memory that heap monitoring can't see.
+  const RSS_HARD_KILL_MB = 430;
+  if (rssMB >= RSS_HARD_KILL_MB) {
+    log(`RSS HARD LIMIT: ${getMemorySnapshot()} (rss=${rssMB.toFixed(1)}MB > ${RSS_HARD_KILL_MB}MB)`, 'FATAL');
+    try {
+      const memoryMode = require('./memory-mode');
+      memoryMode.recordOOMExit(heapMB, rssMB);
+      // Force L3 (close browser) — don't preserve it, kernel is about to kill us
+      await memoryMode.shedMemory(`rss-hard-limit:${rssMB.toFixed(0)}MB`, { preserveBrowser: false, maxLevel: 3 });
+      if (global.gc) { try { global.gc(); } catch {} }
+    } catch { /* best effort */ }
+    const afterMB = getHeapUsedMB();
+    const afterRSS = process.memoryUsage().rss / 1024 / 1024;
+    if (afterRSS >= RSS_HARD_KILL_MB - 30) {
+      // Still critical after browser close — preserve and exit
+      log(`RSS still critical after browser close: ${afterRSS.toFixed(1)}MB. Preserving and exiting.`, 'FATAL');
+      try {
+        const guardian = require('./survival-restart-guardian');
+        if (guardian?.preserveBeforeExit) {
+          guardian.preserveBeforeExit('OOM_RSS_HARD_LIMIT').finally(() => {
+            const origExit = (process as any)._originalExit || process.exit.bind(process);
+            origExit(137);
+          });
+          return true;
+        }
+      } catch {}
+      const origExit = (process as any)._originalExit || process.exit.bind(process);
+      origExit(137);
+    }
+    log(`RSS recovered after browser close: ${afterRSS.toFixed(1)}MB`, 'INFO');
+  }
 
   // Hard threshold — euthanasia
   if (heapMB >= hardThreshold) {
