@@ -236,52 +236,75 @@ function copyToStaging() {
   return stagingSource;
 }
 
-function promoteStaging(overlay?: any) {
+function promoteStaging(overlay?: any, patchedFiles?: string[]) {
   const stagingSource = path.join(getSTAGING_DIR(), 'source');
   const promotedFiles = [];
   const failedFiles = [];
   const isOverlay = !!overlay;
 
-  const backupScope = getBACKUP_SCOPE();
-  for (const file of backupScope) {
+  // v12-OOM-FIX: Only promote files that were ACTUALLY PATCHED.
+  // The old code iterated the entire backupScope (~100+ files) and
+  // wrote ALL of them to the overlay on every attempt — even when
+  // ZERO files were patched. This caused ~500KB-1MB of string
+  // allocations per attempt, triggering OOM kills.
+  //
+  // If patchedFiles is provided, only those files are promoted.
+  // If not provided (shouldn't happen), fall back to backupScope.
+  const filesToPromote = patchedFiles && patchedFiles.length > 0
+    ? patchedFiles
+    : getBACKUP_SCOPE();
+
+  for (const file of filesToPromote) {
     const src = path.join(stagingSource, file);
-    if (fs.existsSync(src)) {
-      try {
-        const content = fs.readFileSync(src, 'utf8');
-        if (isOverlay) {
-          // On read-only FS: write to /tmp overlay instead of SOURCE_DIR
-          const ok = overlay.writeToOverlay(file, content);
-          if (ok) {
-            promotedFiles.push(file);
-          } else {
-            failedFiles.push(file);
-          }
-        } else {
-          // Normal writable FS: atomic replace in place
-          const dest = path.join(SOURCE_DIR, file);
-          const destDir = path.dirname(dest);
-          if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
-          atomicReplaceFile(dest, content);
+    if (!fs.existsSync(src)) {
+      log(`Promotion: ${file} not in staging (expected for overlay-only patches)`, 'DEBUG', 'self-heal');
+      // For overlay mode, the patch content comes from safeFixes[].patch,
+      // not from staging. Fall through to overlay write with staging content
+      // only if file exists in staging.
+      if (isOverlay) continue;
+      failedFiles.push(file);
+      continue;
+    }
+    try {
+      const content = fs.readFileSync(src, 'utf8');
+      if (isOverlay) {
+        // On read-only FS: write to /tmp overlay instead of SOURCE_DIR
+        const ok = overlay.writeToOverlay(file, content);
+        if (ok) {
           promotedFiles.push(file);
+        } else {
+          // Prefix-blocked files are expected — don't count as failures
+          // that abort the entire promotion. Only real I/O errors are failures.
+          log(`Promotion: ${file} blocked by overlay policy (non-fatal)`, 'DEBUG', 'self-heal');
         }
-      } catch (err: any) {
-        logError(`Promotion failed for ${file}`, err);
-        failedFiles.push(file);
+      } else {
+        // Normal writable FS: atomic replace in place
+        const dest = path.join(SOURCE_DIR, file);
+        const destDir = path.dirname(dest);
+        if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+        atomicReplaceFile(dest, content);
+        promotedFiles.push(file);
       }
+    } catch (err: any) {
+      logError(`Promotion failed for ${file}`, err);
+      failedFiles.push(file);
     }
   }
 
+  // v12-OOM-FIX: Only fail promotion on REAL I/O errors, not policy blocks.
+  // Prefix-blocked files are filtered out by validateFix() upstream, but
+  // if any slip through, they shouldn't abort the entire promotion.
   if (failedFiles.length > 0) {
-    log(`Promotion had ${failedFiles.length} failures: ${failedFiles.join(', ')}`, 'ERROR', 'self-heal');
+    log(`Promotion had ${failedFiles.length} real failure(s): ${failedFiles.join(', ')}`, 'ERROR', 'self-heal');
     return false;
   }
 
   // Evict overlaid modules from require.cache so they reload on next require
   if (isOverlay) {
     const evicted = overlay.evictAllOverlaidModules();
-    log(`Staging promoted to /tmp overlay (${promotedFiles.length} files, ${evicted} modules evicted from cache)`, 'INFO', 'self-heal');
+    log(`Staging promoted to /tmp overlay (${promotedFiles.length} patched file(s), ${evicted} modules evicted from cache)`, 'INFO', 'self-heal');
   } else {
-    log(`Staging promoted to production (${promotedFiles.length} files, all atomic)`, 'INFO', 'self-heal');
+    log(`Staging promoted to production (${promotedFiles.length} file(s), all atomic)`, 'INFO', 'self-heal');
   }
   return true;
 }
@@ -632,6 +655,7 @@ async function handleRestrictedFileApproval(fix: any, auditResult: any) {
  *     path traversal blocked, syntax valid, size < 50KB
  *   - AI auditor validated: no malicious intent detected
  *   - For restricted files: approval workflow granted
+ *   - File existence validated: target file exists on disk (v12-OOM-FIX)
  *
  * We ONLY do full file replacement — no diff/patch command.
  * If a patch looks like a unified diff, we reject it (the tribunal should
@@ -639,10 +663,11 @@ async function handleRestrictedFileApproval(fix: any, auditResult: any) {
  *
  * @param {Array} fixes  - Validated fixes
  * @param {string} stagingSource - Path to staging source dir
- * @returns {boolean}
+ * @returns {{ ok: boolean, patchedFiles: string[] }}
  */
-function applyFixesToStaging(fixes: any, stagingSource: any) { 
+function applyFixesToStaging(fixes: any, stagingSource: any) {
   log(`Applying ${fixes.length} validated fix(es) to staging...`, 'INFO', 'self-heal');
+  const patchedFiles: string[] = [];
 
   for (const fix of fixes) {
     const filePath = path.join(stagingSource, fix.file);
@@ -655,16 +680,17 @@ function applyFixesToStaging(fixes: any, stagingSource: any) {
     // Reject unified diffs — we only support full file replacement for safety
     if (fix.patch.trimStart().startsWith('---')) {
       log(`Patch for ${fix.file} is a unified diff — only full file replacement is supported. Rejecting.`, 'WARN', 'self-heal');
-      return false;
+      return { ok: false, patchedFiles: [] };
     }
 
     // Write the patch as full file content
     try {
       atomicReplaceFile(filePath, fix.patch);
-      log(`Applied patch to ${fix.file} in staging (atomic full replacement)`, 'INFO', 'self-heal');
+      patchedFiles.push(fix.file);
+      log(`Applied patch to ${fix.file} in staging (atomic full replacement, ${fix.patch.length} chars)`, 'INFO', 'self-heal');
     } catch (err: any) {
       logError(`Failed to write patch for ${fix.file}`, err);
-      return false;
+      return { ok: false, patchedFiles };
     }
 
     // Record in database (non-fatal)
@@ -674,7 +700,9 @@ function applyFixesToStaging(fixes: any, stagingSource: any) {
     );
   }
 
-  return true;
+  // v12-OOM-FIX: Return the list of files we actually patched so
+  // promoteStaging() only writes those files (not all 100+).
+  return { ok: true, patchedFiles };
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -950,12 +978,28 @@ async function performSelfHeal(options?: SelfHealOptions) {
     const stagingSource = copyToStaging();
 
     // 8. Apply validated fixes to staging
-    const applyOk = applyFixesToStaging(safeFixes, stagingSource);
+    const { ok: applyOk, patchedFiles } = applyFixesToStaging(safeFixes, stagingSource);
     if (!applyOk) {
       log('Apply to staging failed, rolling back', 'WARN', 'self-heal');
       rollbackAndAlert(backupPath, safeFixes[0]?.id, overlay);
       continue;
     }
+
+    // v12-OOM-FIX: If NO files were actually patched (all skipped because
+    // the AI hallucinated non-existent files), abort before promotion.
+    // The old code returned true from applyFixesToStaging even when 0 files
+    // were written, then promoteStaging wrote ALL 100+ files to overlay.
+    if (patchedFiles.length === 0) {
+      log(`All ${safeFixes.length} fix(es) skipped (target files don't exist in staging). AI likely hallucinated file names. Aborting this attempt.`, 'WARN', 'self-heal');
+      _recordHealEvent(
+        Date.now(), 'core', 'failed', 'All target files non-existent',
+        null, safeFixes.length, 0, 0, null, null,
+        `Non-existent targets: ${safeFixes.map((f: any) => f.file).join(', ')}`
+      );
+      lastTribunalError = 'all_targets_nonexistent';
+      continue;
+    }
+    log(`Successfully patched ${patchedFiles.length} file(s) in staging: ${patchedFiles.join(', ')}`, 'INFO', 'self-heal');
 
     // 9. Run critical validation suite on STAGED code (not live code)
     //    Skipped in EXECUTIVE_MODE and ACCEPT_ANY_FIX — user chose to trust fixes.
@@ -1021,7 +1065,7 @@ async function performSelfHeal(options?: SelfHealOptions) {
     }
 
     if (promotedDirectly) {
-      const promotedOk = promoteStaging(overlay);
+      const promotedOk = promoteStaging(overlay, patchedFiles);
       if (!promotedOk) {
         log('Promotion failed (atomic write errors), rolling back', 'ERROR', 'self-heal');
         rollbackAndAlert(backupPath, safeFixes[0]?.id, overlay);
