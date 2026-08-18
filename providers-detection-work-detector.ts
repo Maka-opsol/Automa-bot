@@ -1,10 +1,12 @@
-const _deps = {};
+const _deps = { logger: null, config: null, browser: null };
 
 function _injectDependencies(deps) {
-  Object.assign(_deps, deps);
+  _deps.logger = deps.logger;
+  _deps.config = deps.config;
+  _deps.browser = deps.browser;
 }
 
-function detectWork() {
+function detectWorkInProgress() {
   // Check for Flutter Web canvas rendering
   const canvas = document.querySelector('canvas');
   if (canvas && canvas.getContext) {
@@ -13,20 +15,15 @@ function detectWork() {
   }
 
   // Fallback to existing detection logic
-  const workIndicators = [
-    'assignment',
-    'exercise',
-    'problem',
-    'question',
-    'quiz',
-    'test'
-  ];
+  const activeElement = document.activeElement;
+  if (activeElement && activeElement.tagName === 'INPUT') {
+    return true;
+  }
 
-  const pageContent = document.body.innerText.toLowerCase();
-  return workIndicators.some(indicator => pageContent.includes(indicator));
+  return false;
 }
 
 module.exports = {
   _injectDependencies,
-  detectWork
+  detectWorkInProgress
 };
