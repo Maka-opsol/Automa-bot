@@ -1,4 +1,8 @@
-const _deps = {};
+const _deps = {
+  logger: null,
+  config: null,
+  browser: null
+};
 
 function _injectDependencies(deps) {
   _deps.logger = deps.logger;
@@ -6,23 +10,21 @@ function _injectDependencies(deps) {
   _deps.browser = deps.browser;
 }
 
-function detectWorkInProgress() {
-  // Check for Flutter Web canvas rendering
-  const canvas = document.querySelector('canvas');
-  if (canvas && canvas.getContext) {
-    return true;
+function detectWorkEnvironment() {
+  // Check for Flutter Web canvas environment
+  if (document.querySelector('canvas#flutterCanvas')) {
+    return 'FLUTTER_WEB_CANVAS';
   }
 
-  // Fallback to existing detection logic
-  const activeElement = document.activeElement;
-  if (activeElement && activeElement.tagName === 'INPUT') {
-    return true;
+  // Fallback to default detection
+  if (window.location.href.includes('app.mathu.co.za')) {
+    return 'MATHU_APP';
   }
 
-  return false;
+  return 'UNKNOWN';
 }
 
 module.exports = {
   _injectDependencies,
-  detectWorkInProgress
+  detectWorkEnvironment
 };
