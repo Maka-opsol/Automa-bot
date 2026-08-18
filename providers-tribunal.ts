@@ -9,11 +9,47 @@ function _getLogger() { if (!_logger) _logger = require('./logger'); return _log
 
 // Lazy providers-base - loaded on first use
 let _providersBase: any = null;
-function _getProvidersBase() { if (!_providersBase) _providersBase = require('./providers-base'); return _providersBase; }
+let _baseFailed = false;
+function _getProvidersBase() {
+  if (_baseFailed) return null;
+  if (!_providersBase) {
+    try {
+      _providersBase = require('./providers-base');
+    } catch (err: any) {
+      _getLogger().log(`providers-base failed to load: ${String(err.message || err).substring(0, 200)}`, 'ERROR', 'tribunal');
+      _baseFailed = true;
+      return null;
+    }
+  }
+  return _providersBase;
+}
 
 // Lazy providers-prompts - loaded on first use
+// Guarded: if the module is corrupted (OOM heap damage, bad overlay),
+// fall back to a minimal prompt so the tribunal can still function.
 let _prompts: any = null;
-function _getPrompts() { if (!_prompts) _prompts = require('./providers-prompts'); return _prompts; }
+let _promptsFailed = false;
+function _getPrompts() {
+  if (_promptsFailed) return _getFallbackPrompts();
+  if (!_prompts) {
+    try {
+      _prompts = require('./providers-prompts');
+    } catch (err: any) {
+      _getLogger().log(`providers-prompts failed to load, using minimal fallback: ${String(err.message || err).substring(0, 200)}`, 'ERROR', 'tribunal');
+      _promptsFailed = true;
+      return _getFallbackPrompts();
+    }
+  }
+  return _prompts;
+}
+
+/** Minimal prompt stubs when providers-prompts.ts is corrupted. */
+function _getFallbackPrompts() {
+  return {
+    getSystemPrompt: () => 'You are an AI assistant controlling a web browser to solve math problems on a website. Analyze the screenshot and decide the next action. Return JSON with actionType, currentState, reasoning, targetX, targetY, confidence.',
+    getUserInstruction: () => 'Analyze the screenshot. Return a JSON object with: actionType (click/type/wait/scroll/navigate/submit/done/solve), currentState (describe what you see), reasoning (why), targetX, targetY (pixel coordinates), confidence (0-1).',
+  };
+}
 
 // Lazy health module - loaded on first use
 let _healthMod: any = null;
@@ -250,7 +286,7 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
     return { actionType: 'wait', currentState: 'blank_page', reasoning: 'Screenshot is blank/white — page not rendered yet', targetX: 0, targetY: 0 };
   }
 
-  const { safeCall } = _getProvidersBase();
+  const base = _getProvidersBase();
   const { getSystemPrompt, getUserInstruction } = _getPrompts();
 
   // --- Get health-weighted providers from registry ---
@@ -259,6 +295,15 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
     log('No providers available after health filtering.', 'ERROR', 'tribunal');
     return { actionType: 'wait', currentState: 'error', reasoning: 'No providers', targetX: 0, targetY: 0 };
   }
+
+  // If providers-base is corrupted (OOM heap damage), we can't use
+  // safeCall with retries. Call providers directly with basic timeout.
+  const safeCall = base?.safeCall || ((fn: any, _label: any, opts: any) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('timeout')), opts?.timeoutMs || 60000);
+    (opts?.signal || signal)?.addEventListener?.('abort', () => controller.abort(), { once: true });
+    return fn(controller.signal).finally(() => clearTimeout(timer));
+  });
 
   // --- Build prompt ---
   let mapHint = '';
@@ -405,4 +450,4 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   };
 }
 
-module.exports = { runTribunal };
+module.exports = { runTribunal }
