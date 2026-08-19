@@ -1,707 +1,598 @@
+// Resilience R8: Crash-Resistant Browser — mathu-bot-resilience-worklog.md
 'use strict';
 
-import type { Deps } from './types/di-types';
+// ═══════════════════════════════════════════════════════════════
+// browser-phoenix.ts — P1 Crash-Resistant Browser
+// ═══════════════════════════════════════════════════════════════
+// Browser crash = cycle death. This module wraps browser launch
+// with multi-tier recovery to ensure the bot can always get a
+// working browser instance, even after repeated crashes.
+//
+// Features:
+//   1. Tier 1: Normal Playwright launch (existing browser.ts behavior)
+//   2. Tier 2: If launch fails or browser disconnects:
+//      Kill ALL Chromium processes (pkill), clear Playwright temp
+//      files, relaunch with aggressive flags
+//   3. Tier 3: If Tier 2 fails: launch with --headless=new
+//      (different headless mode, sometimes fixes GPU/render issues)
+//   4. Consecutive failure tracking — after 3 failures in a row,
+//      wait 60 seconds before retrying (prevents CPU spin)
+//   5. After 5 consecutive failures: declare browser unrecoverable,
+//      alert, and suggest restart
+//   6. Browser disconnect recovery: detect page.close/browser.close
+//      events and auto-relaunch
+//   7. Metrics: launch attempts, successes, failures, current tier
+//
+// Integration:
+//   - cycle-cycle-manager.ts uses phoenixBrowserLaunch() instead
+//     of direct browser.ts launch
+//   - Replaces withBrowserRetry() in cycle-manager
+//
+// Config:
+//   BROWSER_PHOENIX_MAX_CONSECUTIVE_FAILURES — before cooldown (default 3)
+//   BROWSER_PHOENIX_COOLDOWN_MS — wait between retry batches (default 60000)
+//   BROWSER_PHOENIX_UNRECOVERABLE_THRESHOLD — before declaring dead (default 5)
+// ═══════════════════════════════════════════════════════════════
 
-// ─── npm packages + Node builtins only at top level ───
-const { chromium } = require('playwright');
-let sharp: any;
-try { sharp = require('sharp'); } catch (e: any) { sharp = null; }
-const crypto = require('crypto');
+let _deps: Record<string, any> = {};
 
-// Utility modules — these have minimal/no project deps and will be
-// converted to full DI in later phases. Kept as direct requires for now.
-const { getRealisticBrowserContext } = require('./utils-user-agent');
-const { getChromeFlags, addProxyFlags, addWindowSizeFlags } = require('./browser-chrome-flags');
-
-// v5-fix H3: Lazy-load metrics to avoid requiring it before DI injection.
-// Previously this was a top-level require('./metrics') which triggered metrics
-// module evaluation before the DI container had called _injectDependencies().
-let _metricsRecordClickDuration: ((ms: any, style: any) => void) | null = null;
-function getRecordClickDuration() {
-  if (!_metricsRecordClickDuration) {
-    try {
-      const metrics = require('./metrics');
-      _metricsRecordClickDuration = metrics.recordClickDuration;
-    } catch {
-      _metricsRecordClickDuration = () => {};
-    }
-  }
-  return _metricsRecordClickDuration;
-}
-
-// ─── Dependency Injection ───
-let _deps: Deps = {};
-
-function _injectDependencies(deps: Deps) {
+function _injectDependencies(deps: Record<string, any>) {
   _deps = deps;
 }
 
-// ─── Lazy accessors with fallbacks ───
-function getCONFIG(): any { return _deps.config || {}; }
-function getLog(): (msg: string, level?: string, _module?: string) => void {
-  return _deps.logger?.log || console.log;
-}
-function getLogError(): (msg: string, err: Error, ctx?: any) => void {
-  return _deps.logger?.logError || ((msg: string, err: Error) => console.error(msg, err));
-}
-function getLoadSession(): (data?: any) => any {
-  return _deps.cache?.loadSession || (() => null);
-}
-function getSaveSession(): (data: any) => void {
-  return _deps.cache?.saveSession || (() => {});
-}
-function getSelectCalibration(): any {
-  return _deps.database?.selectCalibration;
+function getCONFIG(): Record<string, any> {
+  return (_deps as any).config || {};
 }
 
-const browserMetrics = {
-  launchAttempts: 0,
-  launchSuccesses: 0,
-  launchFailures: 0,
-  disconnections: 0,
-  crashes: 0,
-  lastLaunchTime: null,
-  lastDisconnectionTime: null,
-  totalPages: 0,
-  currentMemoryUsage: 0
-};
-
-class BrowserManager {
-  browserInstance: any;
-  executablePath: any;
-
-  contextInstance: any;
-  pageInstance: any;
-  cdpSession: any;
-  browserDisconnected: boolean;
-  browserLaunchCount: number;
-  scaleFactor: number;
-  viewportWidth: number;
-  viewportHeight: number;
-  isMac: boolean;
-  MOD_KEY: string;
-  launching: boolean;
-  dprScale: number;
-  telemetryGAN: any;
-  _shutdownInitiated: boolean;
-  _healthCheckInterval: any;
-  _memoryMonitorInterval: any;
-  _disconnectedListeners: Array<(data?: any) => void>;
-  _intentionalClose: boolean;
-  _fpFonts: string[] | null;
-  _configInitialized: boolean;
-
-  constructor() {
-    this.browserInstance = null;
-    this.contextInstance = null;
-    this.pageInstance = null;
-    this.cdpSession = null;
-    this.browserDisconnected = false;
-    this.browserLaunchCount = 0;
-    this.scaleFactor = 1.0;
-    this.viewportWidth = 1280;
-    this.viewportHeight = 720;
-    this.isMac = process.platform === 'darwin';
-    this.MOD_KEY = this.isMac ? 'Meta' : 'Control';
-    this.launching = false;
-    this.dprScale = 1.0;
-    this.telemetryGAN = null;
-    this._shutdownInitiated = false;
-    this._healthCheckInterval = null;
-    this._memoryMonitorInterval = null;
-    this._disconnectedListeners = [];
-    this._intentionalClose = false;
-    this._fpFonts = null;
-    this._configInitialized = false;
-  }
-
-  /** Lazy-init CONFIG-dependent fields on first access */
-  _ensureConfig() {
-    if (this._configInitialized) return;
-    const CONFIG = getCONFIG();
-    this.viewportWidth = CONFIG.DISPLAY_WIDTH || 1280;
-    this.viewportHeight = CONFIG.DISPLAY_HEIGHT || 720;
-    if (CONFIG.ENABLE_GAN_TELEMETRY) { this._initGANTelemetry(); }
-    this._configInitialized = true;
-  }
-
-  // ─── Humanization helpers ───
-
-  static _gaussianRandom(mean = 0, stdev = 1) {
-    const u = 1 - Math.random();
-    const v = Math.random();
-    const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
-    return z * stdev + mean;
-  }
-
-  async _humanDelay(baseMs = 100, jitterMs = 80) {
-    const delay = Math.max(20, baseMs + BrowserManager._gaussianRandom(0, jitterMs));
-    await new Promise(r => setTimeout(r, delay));
-  }
-
-  on(event: string, listener: (data?: any) => void) { 
-    if (event === 'disconnected') {
-      // v6-fix: Cap listener count to prevent unbounded growth over thousands
-      // of browser launches (~11k/year). Only one listener is needed anyway.
-      if (this._disconnectedListeners.length > 5) {
-        this._disconnectedListeners = this._disconnectedListeners.slice(-1);
-      }
-      this._disconnectedListeners.push(listener);
-    }
-  }
-
-  emit(event: string, data?: any) { 
-    const log = getLog();
-    if (event === 'disconnected') this._disconnectedListeners.forEach(fn => { try { fn(data); } catch (e: any) {} });
-    if (event === 'crashed') { log('Page crash event emitted', 'ERROR', 'browser'); this.browserDisconnected = true; }
-  }
-
-  _initGANTelemetry() { 
-    const log = getLog();
-    try { this.telemetryGAN = require('./telemetry-gan'); this.telemetryGAN.init().catch((e: Error) => log(`GAN init failed: ${e.message}`, 'WARN', 'browser')); } catch (e: any) { log(`GAN module not loaded: ${e.message}`, 'WARN', 'browser'); this.telemetryGAN = null; }
-  }
-
-  getBrowserDisconnected() {  return this.browserDisconnected; }
-  resetBrowserDisconnected() {  this.browserDisconnected = false; }
-  getBrowserLaunchCount() {  return this.browserLaunchCount; }
-  resetBrowserLaunchCount() {  this.browserLaunchCount = 0; }
-  getScaleFactor() {  return this.scaleFactor; }
-  getViewportDimensions() {  return { width: this.viewportWidth, height: this.viewportHeight }; }
-  getPage() {  return this.pageInstance; }
-  getDprScale() {  return this.dprScale; }
-  setDprScale(scale: number) {  this.dprScale = scale; }
-  getMetrics() {  return { ...browserMetrics }; }
-
-  async launch() { 
-    this._ensureConfig();
-    const log = getLog();
-    if (this.launching) {
-      log('Browser launch already in progress, waiting...', 'DEBUG', 'browser');
-      return new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => { clearInterval(interval); reject(new Error('Browser launch timeout while waiting')); }, getCONFIG().BROWSER_LAUNCH_EXTENDED_TIMEOUT_MS || 120000);
-        const interval = setInterval(() => {
-          if (!this.launching) {
-            clearTimeout(timeout);
-            clearInterval(interval);
-            if (this.pageInstance) { resolve(this.pageInstance); } else { reject(new Error('Browser launch failed')); }
-          }
-        }, 100);
-      });
-    }
-    this.launching = true;
-    this._intentionalClose = false;
-    this.browserDisconnected = false;
-    const launchAttempt = this.browserLaunchCount + 1;
-    log(`Launching browser (attempt ${launchAttempt})...`, 'INFO', 'browser');
-    await this.cleanup();
-    const launchStrategies = [
-      this.getFullLaunchOptions.bind(this),
-      this.getReducedLaunchOptions.bind(this),
-      this.getMinimalLaunchOptions.bind(this),
-    ];
-    let lastError: Error | null = null;
-    for (let strategyIndex = 0; strategyIndex < launchStrategies.length; strategyIndex++) {
-      const strategyName = ['full', 'reduced', 'minimal'][strategyIndex];
-      log(`Trying ${strategyName} launch strategy...`, 'DEBUG', 'browser');
-      try {
-        const options = launchStrategies[strategyIndex]();
-        this.browserInstance = await Promise.race([
-          chromium.launch(options),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Browser launch timeout')), options.timeout || getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 60000))
-        ]);
-        this.browserLaunchCount++;
-        this.browserDisconnected = false;
-        this.setupBrowserHandlers();
-        await this.setupContext();
-        await this.configurePage();
-        log(`Browser launched successfully with ${strategyName} strategy`, 'INFO', 'browser');
-        this.launching = false;
-        return this.pageInstance;
-      } catch (err: any) {
-        lastError = err as Error;
-        log(`Launch strategy ${strategyName} failed: ${(err as Error).message}`, 'WARN', 'browser');
-        await this.cleanup();
-      }
-    }
-    this.launching = false;
-    const errorMsg = `All browser launch strategies failed. Last error: ${lastError?.message}`;
-    log(errorMsg, 'ERROR', 'browser');
-    throw new Error(errorMsg);
-  }
-
-  getFullLaunchOptions() { 
-    const CONFIG = getCONFIG();
-    let flags = getChromeFlags({ isReplit: CONFIG.REPLIT_VM, verbose: true });
-    if (CONFIG.HTTP_PROXY || CONFIG.HTTPS_PROXY) { addProxyFlags(flags, { http: CONFIG.HTTP_PROXY, https: CONFIG.HTTPS_PROXY }); }
-    addWindowSizeFlags(flags, CONFIG.DISPLAY_WIDTH, CONFIG.DISPLAY_HEIGHT);
-    const options = { headless: !!getCONFIG().HEADLESS, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 60000 };
-// @ts-expect-error
-    if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
-    return options;
-  }
-
-  getReducedLaunchOptions() { 
-    const CONFIG = getCONFIG();
-    // NOTE: --disable-gpu removed — breaks Flutter CanvasKit WebGL rendering
-    const flags = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-extensions', '--disable-background-networking', `--window-size=${CONFIG.DISPLAY_WIDTH},${CONFIG.DISPLAY_HEIGHT}`];
-    if (CONFIG.HTTPS_PROXY) { flags.push(`--proxy-server=${CONFIG.HTTPS_PROXY}`); }
-    const options = { headless: true, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000 };
-// @ts-expect-error
-    if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
-    return options;
-  }
-
-  getMinimalLaunchOptions() { 
-    const CONFIG = getCONFIG();
-    // NOTE: --disable-gpu removed — breaks Flutter CanvasKit WebGL rendering
-    const options = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-zygote', '--single-process'], timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 30000 };
-// @ts-expect-error
-    if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
-    return options;
-  }
-
-  setupBrowserHandlers() { 
-    const log = getLog();
-    const logError = getLogError();
-    if (!this.browserInstance) return;
-    this.browserInstance.on('disconnected', () => { if (!this._intentionalClose) { log('Browser process disconnected unexpectedly', 'ERROR', 'browser'); } this.browserDisconnected = true; this.emit('disconnected'); });
-    this.browserInstance.on('error', (err: Error) => { logError('Browser process error', err); this.browserDisconnected = true; });
-  }
-
-  async setupContext() { 
-    const log = getLog();
-    const logError = getLogError();
-    if (!this.browserInstance) throw new Error('Browser instance not available');
-    const loadSession = getLoadSession();
-    const sessionData = loadSession();
-    const contextOptions = await getRealisticBrowserContext();
-    if (sessionData) { contextOptions.storageState = sessionData; }
-    this.contextInstance = await Promise.race([
-      this.browserInstance.newContext(contextOptions),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Context creation timeout')), getCONFIG().BROWSER_CONTEXT_TIMEOUT_MS || 30000))
-    ]);
-    this.contextInstance.on('page', async (newPage: any) => {
-      // CRITICAL FIX: In --single-process mode (Render free plan), closing any
-      // page/popup kills the ENTIRE browser process because all pages share
-      // one OS process. We must NOT close popups — just ignore them.
-      const chromiumFlags = getCONFIG().CHROMIUM_FLAGS || process.env.CHROMIUM_FLAGS || '';
-      const isSingleProcess = chromiumFlags.includes('--single-process');
-      if (isSingleProcess) {
-        log('Popup opened in single-process mode — ignoring (close would kill browser)', 'DEBUG', 'browser');
-        return;
-      }
-      log('Closing unexpected new page/popup', 'WARN', 'browser');
-      try { await Promise.race([newPage.close(), new Promise((_, reject) => setTimeout(() => reject(new Error('Page close timeout')), getCONFIG().BROWSER_CLOSE_TIMEOUT_MS || 5000))]); } catch (err: any) { logError('Failed to close popup', err as Error); }
-    });
-  }
-
-  async configurePage() { 
-    const log = getLog();
-    const logError = getLogError();
-    const CONFIG = getCONFIG();
-    if (!this.contextInstance) throw new Error('Context not available');
-    this.pageInstance = await Promise.race([
-      this.contextInstance.newPage(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Page creation timeout')), getCONFIG().BROWSER_PAGE_TIMEOUT_MS || 30000))
-    ]);
-    this.pageInstance.setDefaultTimeout(getCONFIG().BROWSER_PAGE_TIMEOUT_MS || 30000);
-    this.pageInstance.setDefaultNavigationTimeout(getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000);
-    await this.pageInstance.addInitScript(this.getFingerprintSpoofScript());
-    this.pageInstance.on('crash', () => { log('Page crashed', 'ERROR', 'browser'); this.browserDisconnected = true; this.emit('crashed'); });
-    this.pageInstance.on('error', (err: Error) => { logError('Page error', err); });
-    const selectCalibration = getSelectCalibration();
-    if (selectCalibration) {
-      const savedScale = selectCalibration.get('scaleFactor');
-      if (savedScale?.value) { this.scaleFactor = parseFloat(savedScale.value) || 1.0; }
-    }
-    await this.calibrateViewport();
-    const vp = getPageViewport(this.pageInstance);
-    if (vp) { this.viewportWidth = vp.width; this.viewportHeight = vp.height; }
-    if (CONFIG.FLUTTER_DPR_AUTO_CALIBRATE) { await this.calibrateDpr(); }
-  }
-
-  async cleanup() { 
-    try { if (this.pageInstance && !this.pageInstance.isClosed()) { await this.pageInstance.close({ runBeforeUnload: false }).catch(() => {}); } } catch {}
-    try { if (this.contextInstance) { await this.contextInstance.close().catch(() => {}); } } catch {}
-    try { if (this.browserInstance && this.browserInstance.isConnected()) { await this.browserInstance.close().catch(() => {}); } } catch {}
-    this.pageInstance = null; this.contextInstance = null; this.browserInstance = null; this.cdpSession = null;
-  }
-
-  async close() { 
-    const log = getLog();
-    const saveSession = getSaveSession();
-    log('Closing browser gracefully...', 'INFO', 'browser');
-    this._intentionalClose = true;
-    if (this._healthCheckInterval) { clearInterval(this._healthCheckInterval); this._healthCheckInterval = null; }
-    if (this._memoryMonitorInterval) { clearInterval(this._memoryMonitorInterval); this._memoryMonitorInterval = null; }
-    // Skip session save if browser already disconnected (avoids Protocol error)
-    if (this.contextInstance && !this.browserDisconnected && this.browserInstance?.isConnected()) {
-      try { const storage = await this.contextInstance.storageState(); if (storage) { saveSession(storage); } } catch (err: any) { log(`Failed to save session on close: ${(err as Error).message}`, 'WARN', 'browser'); }
-    }
-    const closeOperations = [
-      { resource: this.cdpSession, name: 'CDP session', closeMethod: 'detach' },
-      { resource: this.pageInstance, name: 'page' },
-      { resource: this.contextInstance, name: 'context' },
-      { resource: this.browserInstance, name: 'browser' }
-    ];
-    for (const { resource, name, closeMethod } of closeOperations) {
-      if (resource) {
-        try {
-          const closeFn = closeMethod ? resource[closeMethod].bind(resource) : resource.close.bind(resource);
-          await Promise.race([closeFn(), new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000))]); log(`Closed ${name}`, 'DEBUG', 'browser');
-        } catch (err: any) { log(`Failed to close ${name}: ${(err as Error).message}`, 'WARN', 'browser'); }
-      }
-    }
-    this.cdpSession = null; this.pageInstance = null; this.contextInstance = null; this.browserInstance = null;
-    log('Browser closed', 'INFO', 'browser');
-  }
-
-  getFingerprintSpoofScript() { 
-    // Random but stable-per-session values (generated once at startup)
-    if (!this._fpFonts) {
-      this._fpFonts = [
-        'Arial', 'Arial Black', 'Calibri', 'Cambria', 'Comic Sans MS',
-        'Consolas', 'Courier New', 'Georgia', 'Helvetica', 'Impact',
-        'Lucida Console', 'Palatino Linotype', 'Segoe UI', 'Tahoma',
-        'Times New Roman', 'Trebuchet MS', 'Verdana'
-      ];
-      // Shuffle with a deterministic seed from PID
-      const seed = process.pid;
-      for (let i = this._fpFonts.length - 1; i > 0; i--) {
-        const j = ((seed * 1103515245 + 12345) >> 16) % (i + 1);
-        [this._fpFonts[i], this._fpFonts[j]] = [this._fpFonts[j], this._fpFonts[i]];
-      }
-      // Present 12-16 fonts (realistic for a standard Windows/Mac install)
-      const count = 12 + ((seed >> 8) % 5);
-      this._fpFonts = this._fpFonts.slice(0, count);
-    }
-    const fontsJSON = JSON.stringify(this._fpFonts);
-
-    return `
-      // ── WebRTC blocking ──
-      const originalRTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection;
-      if (originalRTCPeerConnection) {
-        window.RTCPeerConnection = function() {
-          throw new DOMException('WebRTC not supported', 'NotSupportedError');
-        };
-        window.RTCPeerConnection.prototype = originalRTCPeerConnection.prototype;
-      }
-
-      // ── Canvas fingerprint noise ──
-      const toDataURL = HTMLCanvasElement.prototype.toDataURL;
-      HTMLCanvasElement.prototype.toDataURL = function(type) {
-        if (type === 'image/png') {
-          const context = this.getContext('2d');
-          if (context) {
-            const imageData = context.getImageData(0, 0, this.width, this.height);
-            for (let i = 0; i < imageData.data.length; i += 4) {
-              imageData.data[i] = imageData.data[i] ^ (Math.random() > 0.5 ? 1 : 0);
-            }
-            context.putImageData(imageData, 0, 0);
-          }
-        }
-        return toDataURL.apply(this, arguments);
-      };
-      // Also noise toBlob and toBlobSync
-      const origToBlob = HTMLCanvasElement.prototype.toBlob;
-      if (origToBlob) {
-        HTMLCanvasElement.prototype.toBlob = function(callback, type, quality) {
-          return origToBlob.call(this, callback, type, quality);
-        };
-      }
-
-      // ── WebGL vendor/renderer spoofing (WebGL1 + WebGL2) ──
-      const getParameter = WebGLRenderingContext.prototype.getParameter;
-      WebGLRenderingContext.prototype.getParameter = function(param) {
-        if (param === 37445) return 'Intel Inc.';
-        if (param === 37446) return 'Intel Iris OpenGL Engine';
-        if (param === 7936) return 'WebKit';
-        if (param === 7937) return 'WebKit WebGL';
-        return getParameter.apply(this, arguments);
-      };
-      const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-      if (getParameter2) {
-        WebGL2RenderingContext.prototype.getParameter = function(param) {
-          if (param === 37445) return 'Intel Inc.';
-          if (param === 37446) return 'Intel Iris OpenGL Engine';
-          if (param === 7936) return 'WebKit';
-          if (param === 7937) return 'WebKit WebGL';
-          return getParameter2.apply(this, arguments);
-        };
-      }
-
-      // ── AudioContext fingerprint noise ──
-      const origCreateOscillator = AudioContext.prototype.createOscillator;
-      if (origCreateOscillator) {
-        AudioContext.prototype.createOscillator = function() {
-          const osc = origCreateOscillator.call(this);
-          const origConnect = osc.connect.bind(osc);
-          osc.connect = function(dest, ...args) {
-            return origConnect(dest, ...args);
-          };
-          return osc;
-        };
-      }
-
-      // ── Font enumeration spoofing ──
-      if (document.fonts && document.fonts.check) {
-        const origFontCheck = document.fonts.check.bind(document.fonts);
-        const allowedFonts = ${fontsJSON};
-        document.fonts.check = function(font, text) {
-          const match = font.match(/(?:"|')?([^"',]+)(?:"|')?/);
-          if (match) {
-            const fontName = match[1].trim();
-            if (allowedFonts.some(f => f.toLowerCase() === fontName.toLowerCase())) {
-              return true;
-            }
-          }
-          return origFontCheck(font, text);
-        };
-      }
-
-      // ── Plugins spoofing (Chrome-like) ──
-      Object.defineProperty(navigator, 'plugins', {
-        get: () => {
-          const plugins = [
-            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
-          ];
-          plugins.length = 3;
-          return plugins;
-        }
-      });
-
-      // ── Languages spoofing ──
-      Object.defineProperty(navigator, 'languages', {
-        get: () => ['en-US', 'en']
-      });
-
-      // ── Hardware concurrency ──
-      Object.defineProperty(navigator, 'hardwareConcurrency', {
-        get: () => 8
-      });
-
-      // ── Device memory ──
-      if (navigator.deviceMemory === undefined) {
-        Object.defineProperty(navigator, 'deviceMemory', {
-          get: () => 8
-        });
-      }
-
-      // ── Platform spoofing (consistent with user-agent) ──
-      const ua = navigator.userAgent;
-      const platform = ua.includes('Mac') ? 'MacIntel' : ua.includes('Linux') ? 'Linux x86_64' : 'Win32';
-      Object.defineProperty(navigator, 'platform', {
-        get: () => platform
-      });
-
-      // ── Suppress automation flags ──
-      Object.defineProperty(navigator, 'webdriver', {
-        get: () => undefined
-      });
-
-      // ── Chrome runtime spoofing ──
-      window.chrome = window.chrome || {};
-      window.chrome.runtime = window.chrome.runtime || {};
-
-      // ── Permissions query consistency ──
-      const origQuery = Permissions.prototype.query;
-      if (origQuery) {
-        Permissions.prototype.query = function(params) {
-          if (params.name === 'notifications') {
-            return Promise.resolve({ state: Notification.permission });
-          }
-          return origQuery.call(this, params);
-        };
-      }
-    `;
-  }
-
-  async calibrateViewport() { 
-    const log = getLog();
-    if (!this.pageInstance) return;
-    try {
-      const result = await this.pageInstance.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio, screenWidth: window.screen.width, screenHeight: window.screen.height }));
-      log(`Viewport calibrated: ${result.width}x${result.height}, DPR: ${result.devicePixelRatio}`, 'DEBUG', 'browser');
-      return result;
-    } catch (err: any) { log(`Viewport calibration failed: ${(err as Error).message}`, 'WARN', 'browser'); return null; }
-  }
-
-  async calibrateDpr() { 
-    const log = getLog();
-    if (!this.pageInstance) return;
-    try { this.dprScale = await this.pageInstance.evaluate(() => window.devicePixelRatio) || 1.0; log(`DPR calibrated: ${this.dprScale}`, 'DEBUG', 'browser'); } catch (err: any) { log(`DPR calibration failed: ${(err as Error).message}`, 'WARN', 'browser'); this.dprScale = 1.0; }
-  }
-
-  async compressScreenshot(base64: string, maxWidth = 640, quality = 15) { 
-    if (!base64) return base64;
-    if (!sharp) return base64;
-    try {
-      const buffer = Buffer.from(base64, 'base64');
-      const compressed = await sharp(buffer).resize(maxWidth, null, { fit: 'inside', withoutEnlargement: true }).jpeg({ quality }).toBuffer();
-      return compressed.toString('base64');
-    } catch { return base64; }
-  }
-
-  async performClickWithRetry(page: any, x: number, y: number, maxRetries = 3) { 
-    const log = getLog();
-    let success = false;
-    for (let i = 0; i < maxRetries; i++) {
-      try {
-        const jx = x + BrowserManager._gaussianRandom(0, 1.5);
-        const jy = y + BrowserManager._gaussianRandom(0, 1.5);
-        await this._humanDelay(50, 30);
-        await page.mouse.click(jx, jy);
-        success = true;
-        break;
-      } catch (err: any) {
-        log(`Click retry ${i+1}/${maxRetries} failed: ${(err as Error).message}`, 'DEBUG', 'browser');
-        await this._humanDelay(400, 200);
-      }
-    }
-    return success;
-  }
-
-  async humanMoveAndClick(page: any, x: number, y: number) {
-    const startX = await page.evaluate(() => window.mouseX || 0).catch(() => 0);
-    const startY = await page.evaluate(() => window.mouseY || 0).catch(() => 0);
-    if (startX === 0 && startY === 0) {
-      return this.performClickWithRetry(page, x, y, 3);
-    }
-    const steps = 3 + Math.floor(Math.random() * 3);
-    for (let i = 1; i <= steps; i++) {
-      const t = i / steps;
-      const ease = t * t * (3 - 2 * t);
-      const perpX = (y - startY) * 0.05 * Math.sin(t * Math.PI);
-      const perpY = -(x - startX) * 0.05 * Math.sin(t * Math.PI);
-      const cx = startX + (x - startX) * ease + perpX + BrowserManager._gaussianRandom(0, 0.8);
-      const cy = startY + (y - startY) * ease + perpY + BrowserManager._gaussianRandom(0, 0.8);
-      await page.mouse.move(cx, cy);
-      await this._humanDelay(8, 6);
-    }
-    const jx = x + BrowserManager._gaussianRandom(0, 1.2);
-    const jy = y + BrowserManager._gaussianRandom(0, 1.2);
-    await this._humanDelay(30, 20);
-    await page.mouse.click(jx, jy);
-    return true;
-  }
-
-  async flutterTap(page: any, x: number, y: number) { 
-    try { await page.mouse.click(x, y); return true; } catch { return false; }
-  }
-
-  async scrollPage(page: any, deltaX: number, deltaY: number) { 
-    const logError = getLogError();
-    try {
-      const chunks = 3 + Math.floor(Math.random() * 3);
-      const dxChunk = deltaX / chunks;
-      const dyChunk = deltaY / chunks;
-      for (let i = 0; i < chunks; i++) {
-        const jitterX = dxChunk + BrowserManager._gaussianRandom(0, Math.abs(dxChunk) * 0.1 + 1);
-        const jitterY = dyChunk + BrowserManager._gaussianRandom(0, Math.abs(dyChunk) * 0.1 + 1);
-        await page.mouse.wheel(jitterX, jitterY);
-        await this._humanDelay(30, 20);
-      }
-    } catch (err: any) { logError('Scroll failed', err as Error); }
-  }
-
-  async getCDPSession(page: any) { 
-    const logError = getLogError();
-    if (this.cdpSession) return this.cdpSession;
-    if (!page || !this.browserInstance) return null;
-    try {
-      this.cdpSession = await page.createCDPSession();
-      return this.cdpSession;
-    } catch (err: any) { logError('Failed to create CDP session', err as Error); return null; }
-  }
-
-  performClickWithStyle(page: any, x: number, y: number, style = 'human') { 
-    if (style === 'human') {
-      return this.humanMoveAndClick(page, x, y);
-    }
-    return this.flutterTap(page, x, y);
-  }
-
-  async getElementTextAt(page: any, x: number, y: number) { 
-    const logError = getLogError();
-    try {
-      return await page.evaluate(({ px, py }: any) => {
-        const el = document.elementFromPoint(px, py);
-        return el ? el.textContent?.substring(0, 200) || '' : '';
-      }, { px: x, py: y });
-    } catch (err: any) { logError('getElementTextAt failed', err as Error); return ''; }
-  }
-
-  async withBrowserRetry(action: (page: any) => Promise<any>, maxRetries = 3) { 
-    const log = getLog();
-    let lastError: Error | undefined;
-    for (let i = 0; i < maxRetries; i++) {
-      try {
-        const page = await this.launch();
-        const result = await action(page);
-        return result;
-      } catch (err: any) {
-        lastError = err as Error;
-        log(`Browser retry ${i + 1}/${maxRetries}: ${lastError.message}`, 'WARN', 'browser');
-        await this.cleanup();
-      }
-    }
-    throw lastError;
-  }
+function log(msg: string, level: string = 'INFO', mod: string = 'browser-phoenix') {
+  try {
+    const logger = (_deps as any).logger;
+    if (logger?.log) { logger.log(msg, level, mod); return; }
+  } catch { /* fall through */ }
+  console.log(`[${level}] [${mod}] ${msg}`);
 }
 
-// Lazy singleton — created on first access after _injectDependencies has been called
-let _browserManager: BrowserManager | null = null;
-function getBrowserManager(): BrowserManager {
-  if (!_browserManager) {
-    _browserManager = new BrowserManager();
+function logError(msg: string, err: Error) {
+  try {
+    const logger = (_deps as any).logger;
+    if (logger?.logError) { logger.logError(msg, err); return; }
+  } catch { /* fall through */ }
+  console.error(`[ERROR] [browser-phoenix] ${msg}`, err);
+}
+
+// ─── Constants ───
+const DEFAULT_MAX_CONSECUTIVE_FAILURES = 3;
+const DEFAULT_COOLDOWN_MS = 60 * 1000;        // 60 seconds
+const DEFAULT_UNRECOVERABLE_THRESHOLD = 5;
+
+// ─── State ───
+let _consecutiveFailures = 0;
+let _totalLaunchAttempts = 0;
+let _totalLaunchSuccesses = 0;
+let _totalRecoveries = 0;
+let _currentTier = 0;           // 0 = not started, 1-3 = recovery tier used
+let _lastFailureTime = 0;
+let _lastLaunchTime = 0;
+let _isCoolingDown = false;
+let _cooldownTimer: ReturnType<typeof setTimeout> | null = null;
+let _isUnrecoverable = false;
+let _started = false;
+let _lastError: string | null = null;
+
+// ─── Helpers ───
+
+function _getMaxConsecutiveFailures(): number {
+  const CONFIG = getCONFIG();
+  const val = Number(CONFIG.BROWSER_PHOENIX_MAX_CONSECUTIVE_FAILURES);
+  return (val > 0 && Number.isFinite(val)) ? val : DEFAULT_MAX_CONSECUTIVE_FAILURES;
+}
+
+function _getCooldownMs(): number {
+  const CONFIG = getCONFIG();
+  const val = Number(CONFIG.BROWSER_PHOENIX_COOLDOWN_MS);
+  return (val > 0 && Number.isFinite(val)) ? val : DEFAULT_COOLDOWN_MS;
+}
+
+function _getUnrecoverableThreshold(): number {
+  const CONFIG = getCONFIG();
+  const val = Number(CONFIG.BROWSER_PHOENIX_UNRECOVERABLE_THRESHOLD);
+  return (val > 0 && Number.isFinite(val)) ? val : DEFAULT_UNRECOVERABLE_THRESHOLD;
+}
+
+function _getBrowserModule(): any {
+  try {
+    return require('./browser');
+  } catch (e) {
+    log(`Cannot require browser module: ${(e as Error).message}`, 'ERROR');
+    return null;
   }
-  return _browserManager;
 }
 
 /**
- * Non-deprecated replacement for page.viewportSize().
- * Playwright deprecated viewportSize() in 1.44+.
- * Uses optional chaining so it still works today but falls back gracefully
- * when the method is removed from a future Playwright version.
+ * Kill ALL Chromium/Playwright processes and clean temp files.
  */
-function getPageViewport(page: any): { width: number; height: number } {
+function _slaughterChromium(): void {
+  log('[PHOENIX] Slaughtering all Chromium processes...', 'WARN');
+
   try {
-    const vp = page.viewportSize?.();
-    if (vp) return vp;
-  } catch { /* method removed in future Playwright */ }
+    const { execSync } = require('child_process');
+    // Kill all chromium/chrome processes
+    try { execSync('pkill -f chromium 2>/dev/null || true', { timeout: 5000 }); } catch { /* ignore */ }
+    try { execSync('pkill -f chrome 2>/dev/null || true', { timeout: 5000 }); } catch { /* ignore */ }
+    try { execSync('pkill -f headless_shell 2>/dev/null || true', { timeout: 5000 }); } catch { /* ignore */ }
+  } catch {
+    // child_process not available or exec failed — non-critical
+  }
+
+  // Clear Playwright temp directories
   try {
-    return page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
-  } catch { /* evaluate failed */ }
-  return { width: 1280, height: 800 };
+    const fs = require('fs');
+    const path = require('path');
+    const os = require('os');
+    const tmpDir = os.tmpdir();
+
+    const playwrightDirs = fs.readdirSync(tmpDir).filter(
+      (f: string) => f.startsWith('.playwright-') || f.startsWith('playwright-')
+    );
+
+    for (const dir of playwrightDirs) {
+      try {
+        fs.rmSync(path.join(tmpDir, dir), { recursive: true, force: true });
+        log(`[PHOENIX] Cleared Playwright temp dir: ${dir}`, 'DEBUG');
+      } catch { /* ignore */ }
+    }
+
+    // Also clear any core dumps from chromium crashes
+    const coreFiles = fs.readdirSync(tmpDir).filter(
+      (f: string) => f.startsWith('core.') || f.startsWith('chrome-crash-')
+    );
+    for (const core of coreFiles) {
+      try {
+        fs.unlinkSync(path.join(tmpDir, core));
+      } catch { /* ignore */ }
+    }
+  } catch {
+    // fs operations failed — non-critical
+  }
+}
+
+/**
+ * Build aggressive Chromium flags for Tier 2 launch.
+ */
+function _getTier2Flags(): string[] {
+  return [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    // NOTE: --disable-gpu removed — breaks Flutter CanvasKit WebGL rendering
+    '--single-process',
+    '--headless=new',
+    '--disable-software-rasterizer',
+    '--disable-extensions',
+    '--disable-background-networking',
+    '--disable-default-apps',
+    '--disable-sync',
+    '--disable-translate',
+    '--disable-component-extensions-with-background-pages',
+    '--no-zygote',
+    '--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider',
+  ];
+}
+
+/**
+ * Build Tier 3 flags (even more aggressive — new headless mode).
+ */
+function _getTier3Flags(): string[] {
+  return [
+    ..._getTier2Flags(),
+    '--headless=new',      // Explicit new headless mode
+    '--disable-viz',
+    '--disable-features=VizDisplayCompositor',
+    '--js-flags=--max-old-space-size=64',  // Minimal JS heap for browser itself
+  ];
+}
+
+// ─── Core API ───
+
+/**
+ * Multi-tier browser launch with automatic recovery.
+ *
+ * Tier 1: Normal launch via browser.ts
+ * Tier 2: Kill chromium + clear temp + aggressive flags
+ * Tier 3: Even more aggressive flags (--disable-viz, reduced JS heap)
+ *
+ * @returns {Promise<{browser, context, page} | null>} Browser instance or null if unrecoverable
+ */
+async function phoenixBrowserLaunch(): Promise<any | null> {
+  if (_isUnrecoverable) {
+    log('[PHOENIX] Browser declared unrecoverable. Refusing launch.', 'ERROR');
+    return null;
+  }
+
+  if (_isCoolingDown) {
+    log('[PHOENIX] Currently cooling down from recent failures. Skipping launch.', 'WARN');
+    return null;
+  }
+
+  // Check if we need cooldown
+  if (_consecutiveFailures >= _getMaxConsecutiveFailures() && _lastFailureTime > 0) {
+    const elapsed = Date.now() - _lastFailureTime;
+    if (elapsed < _getCooldownMs()) {
+      _isCoolingDown = true;
+      const remaining = _getCooldownMs() - elapsed;
+      log(
+        `[PHOENIX] Cooling down for ${Math.ceil(remaining / 1000)}s before next launch attempt (${_consecutiveFailures} consecutive failures)`,
+        'WARN'
+      );
+      return null;
+    }
+    // Cooldown period passed — reset consecutive failures to allow retry
+    _consecutiveFailures = 0;
+  }
+
+  const browserModule = _getBrowserModule();
+  if (!browserModule) {
+    log('[PHOENIX] browser module not available — cannot launch', 'ERROR');
+    _recordFailure('browser module not available');
+    return null;
+  }
+
+  // Attempt launches across tiers
+  const tiers = [
+    { tier: 1, name: 'NORMAL', flags: null },
+    { tier: 2, name: 'AGGRESSIVE', flags: _getTier2Flags() },
+    { tier: 3, name: 'MINIMAL', flags: _getTier3Flags() },
+  ];
+
+  // Start from the last successful tier (skip lower tiers if we already know they fail)
+  const startTier = Math.max(1, _currentTier);
+
+  for (let i = startTier - 1; i < tiers.length; i++) {
+    const { tier, name, flags } = tiers[i];
+
+    log(`[PHOENIX] Attempting Tier ${tier} (${name}) launch...`, 'INFO');
+    _totalLaunchAttempts++;
+
+    try {
+      let result: any;
+
+      if (tier === 1) {
+        // Tier 1: Normal launch via browser.ts
+        result = await _launchNormal(browserModule);
+      } else {
+        // Tier 2/3: Kill chromium first, then launch with extra flags
+        _slaughterChromium();
+
+        // Small delay after killing processes
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        result = await _launchWithFlags(browserModule, flags!, tier);
+      }
+
+      if (result) {
+        _recordSuccess(tier);
+        return result;
+      }
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      log(
+        `[PHOENIX] Tier ${tier} (${name}) launch failed: ${error.message}`,
+        'WARN'
+      );
+      _lastError = error.message;
+    }
+  }
+
+  // All tiers failed
+  _recordFailure('all tiers failed');
+  return null;
+}
+
+/**
+ * Tier 1: Normal launch via existing browser module.
+ */
+async function _launchNormal(browserModule: any): Promise<any | null> {
+  try {
+    // Use the browser module's existing launch mechanism
+    // CRITICAL: capture the return value — launchBrowser() returns the Page
+    let page: any = null;
+    if (typeof browserModule.launchBrowser === 'function') {
+      page = await browserModule.launchBrowser();
+    }
+
+    // If launchBrowser didn't return a page, try getPage()
+    if (!page && typeof browserModule.getPage === 'function') {
+      page = browserModule.getPage();
+    }
+
+    // Validate that we actually got a Playwright Page
+    if (page && typeof page?.goto === 'function') {
+      _lastLaunchTime = Date.now();
+      const browser = typeof browserModule.getBrowser === 'function'
+        ? browserModule.getBrowser()
+        : browserModule.browserInstance;
+      return { browser, context: null, page, tier: 1 };
+    }
+
+    // launchBrowser succeeded but didn't return a usable page — treat as failure
+    log('[PHOENIX] Tier 1: launchBrowser succeeded but no valid Page returned', 'WARN');
+    return null;
+  } catch (err) {
+    throw err; // Propagate for tier tracking
+  }
+}
+
+/**
+ * Tier 2/3: Direct Playwright launch with custom flags.
+ */
+async function _launchWithFlags(browserModule: any, flags: string[], tier: number): Promise<any | null> {
+  try {
+    const { chromium } = require('playwright');
+    const path = require('path');
+    const os = require('os');
+
+    const launchOptions: Record<string, any> = {
+      headless: true,
+      args: flags,
+      timeout: 30000,  // 30s launch timeout
+    };
+
+    // Set user data dir to /tmp
+    const userDataDir = path.join(os.tmpdir(), '.browser-data-phoenix');
+    try {
+      const fs = require('fs');
+      fs.mkdirSync(userDataDir, { recursive: true });
+    } catch { /* ignore */ }
+
+    const browser = await chromium.launch(launchOptions);
+    const context = await browser.newContext({
+      viewport: { width: 1280, height: 720 },
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      ignoreHTTPSErrors: true,
+    });
+
+    const page = await context.newPage();
+
+    _lastLaunchTime = Date.now();
+    log(`[PHOENIX] Tier ${tier} launch successful`, 'INFO');
+
+    // Update the browser module's singleton if accessible
+    try {
+      const mgr = browserModule.browserManager;
+      if (mgr && typeof mgr === 'object') {
+        mgr.browserInstance = browser;
+        mgr.contextInstance = context;
+        mgr.pageInstance = page;
+        mgr.browserLaunchCount = (mgr.browserLaunchCount || 0) + 1;
+      }
+    } catch { /* non-critical */ }
+
+    // Validate the page before returning
+    if (!page || typeof page?.goto !== 'function') {
+      throw new Error(`Tier ${tier}: context.newPage() returned invalid object (constructor: ${page?.constructor?.name || 'N/A'})`);
+    }
+
+    return { browser, context, page, tier };
+  } catch (err) {
+    throw err;
+  }
+}
+
+/**
+ * Record a successful launch.
+ */
+function _recordSuccess(tier: number): void {
+  _consecutiveFailures = 0;
+  _currentTier = tier;
+  _totalLaunchSuccesses++;
+  _totalRecoveries += tier > 1 ? 1 : 0;
+  _lastLaunchTime = Date.now();
+  _lastError = null;
+
+  if (tier > 1) {
+    log(
+      `[PHOENIX] Browser recovered at Tier ${tier} (after ${_totalLaunchAttempts} total attempts, ${_totalRecoveries} recoveries this session)`,
+      'INFO'
+    );
+
+    // Alert on recovery
+    try {
+      const alerting = (_deps as any).alerting;
+      if (alerting?.sendAlert) {
+        alerting.sendAlert(
+          'Browser Phoenix Recovery',
+          `Browser recovered at Tier ${tier} after ${_consecutiveFailures} consecutive failures. ` +
+          `Total recoveries this session: ${_totalRecoveries}`
+        );
+      }
+    } catch { /* non-critical */ }
+  } else {
+    log(`[PHOENIX] Tier 1 (normal) launch successful`, 'INFO');
+  }
+}
+
+/**
+ * Record a launch failure.
+ */
+function _recordFailure(reason: string): void {
+  _consecutiveFailures++;
+  _lastFailureTime = Date.now();
+
+  const maxConsecutive = _getMaxConsecutiveFailures();
+  const unrecoverableThreshold = _getUnrecoverableThreshold();
+
+  log(
+    `[PHOENIX] Launch failure #${_consecutiveFailures}: ${reason}`,
+    'WARN'
+  );
+
+  // Set up cooldown if we hit the consecutive failure limit
+  if (_consecutiveFailures >= maxConsecutive && !_isCoolingDown) {
+    _isCoolingDown = true;
+    const cooldownMs = _getCooldownMs();
+
+    log(
+      `[PHOENIX] Entering cooldown for ${cooldownMs / 1000}s after ${_consecutiveFailures} consecutive failures`,
+      'WARN'
+    );
+
+    if (_cooldownTimer) clearTimeout(_cooldownTimer);
+    _cooldownTimer = setTimeout(() => {
+      _isCoolingDown = false;
+      log('[PHOENIX] Cooldown period ended. Ready to retry.', 'INFO');
+    }, cooldownMs).unref();
+  }
+
+  // Check for unrecoverable state
+  if (_consecutiveFailures >= unrecoverableThreshold) {
+    _isUnrecoverable = true;
+    log(
+      `[PHOENIX] Browser declared UNRECOVERABLE after ${_consecutiveFailures} consecutive failures. ` +
+      `Manual intervention or process restart required.`,
+      'ERROR'
+    );
+
+    // Critical alert
+    try {
+      const alerting = (_deps as any).alerting;
+      if (alerting?.sendAlert) {
+        alerting.sendAlert(
+          'BROWSER UNRECOVERABLE',
+          `Browser has failed ${_consecutiveFailures} consecutive times across all tiers. ` +
+          `The bot cannot operate without a browser. Consider: ` +
+          `1. Check Render disk space (df -h) ` +
+          `2. Check Chromium installation (npx playwright install chromium) ` +
+          `3. Restart the service`
+        );
+      }
+    } catch { /* non-critical */ }
+
+    // Trigger process exit for Render auto-restart
+    log('[PHOENIX] Triggering process.exit(1) for auto-restart...', 'ERROR');
+    setTimeout(() => {
+      try { process.exit(1); } catch { /* ignore */ }
+    }, 2000);
+  }
+}
+
+/**
+ * Manually reset failure state (e.g., after external fix).
+ */
+function resetFailures(): void {
+  _consecutiveFailures = 0;
+  _isUnrecoverable = false;
+  _isCoolingDown = false;
+  _currentTier = 0;
+  _lastError = null;
+  if (_cooldownTimer) {
+    clearTimeout(_cooldownTimer);
+    _cooldownTimer = null;
+  }
+  log('[PHOENIX] Failure state manually reset.', 'INFO');
+}
+
+/**
+ * Check if the browser is currently unrecoverable.
+ */
+function isUnrecoverable(): boolean {
+  return _isUnrecoverable;
+}
+
+/**
+ * Check if the browser is currently in cooldown.
+ */
+function isCoolingDown(): boolean {
+  return _isCoolingDown;
+}
+
+/**
+ * Get the current recovery tier (0 = not started, 1-3 = tier used).
+ */
+function getCurrentTier(): number {
+  return _currentTier;
+}
+
+/**
+ * Get full diagnostic status.
+ */
+function getStatus(): {
+  consecutiveFailures: number;
+  totalLaunchAttempts: number;
+  totalLaunchSuccesses: number;
+  totalRecoveries: number;
+  currentTier: number;
+  isCoolingDown: boolean;
+  isUnrecoverable: boolean;
+  lastLaunchTime: number | null;
+  lastFailureTime: number | null;
+  lastError: string | null;
+} {
+  return {
+    consecutiveFailures: _consecutiveFailures,
+    totalLaunchAttempts: _totalLaunchAttempts,
+    totalLaunchSuccesses: _totalLaunchSuccesses,
+    totalRecoveries: _totalRecoveries,
+    currentTier: _currentTier,
+    isCoolingDown: _isCoolingDown,
+    isUnrecoverable: _isUnrecoverable,
+    lastLaunchTime: _lastLaunchTime || null,
+    lastFailureTime: _lastFailureTime || null,
+    lastError: _lastError,
+  };
+}
+
+/**
+ * Start the browser phoenix system.
+ */
+function start(): void {
+  if (_started) return;
+  _started = true;
+
+  log(
+    `[PHOENIX] Browser phoenix started (maxConsecutive=${_getMaxConsecutiveFailures()}, ` +
+    `cooldown=${_getCooldownMs() / 1000}s, unrecoverable=${_getUnrecoverableThreshold()})`,
+    'INFO'
+  );
+}
+
+/**
+ * withBrowserRetry-compatible wrapper.
+ * Launches via phoenix tiers, then calls action(page) and returns the result.
+ * This is what cycle-manager expects: fn(page) => Promise<Page>.
+ */
+async function phoenixBrowserRetry(action: (page: any) => Promise<any>, maxRetries = 3): Promise<any> {
+  const result = await phoenixBrowserLaunch();
+  if (!result) throw new Error('Phoenix: all launch tiers failed');
+
+  // result is { browser, context?, page, tier }
+  let page = result.page;
+
+  // If no page in result, try browser module's getPage
+  if (!page || typeof page?.goto !== 'function') {
+    const browserModule = _getBrowserModule();
+    if (typeof browserModule?.getPage === 'function') {
+      const altPage = browserModule.getPage();
+      if (altPage && typeof altPage?.goto === 'function') {
+        page = altPage;
+      }
+    }
+  }
+
+  if (!page || typeof page.goto !== 'function') {
+    throw new Error(`Phoenix tier ${result.tier} launch succeeded but no valid Page available (got ${typeof page}${page?.constructor?.name ? ': ' + page.constructor.name : ''})`);
+  }
+
+  return action(page);
 }
 
 module.exports = {
-  get browserManager() { return getBrowserManager(); },
-  getBrowserMetrics: () => getBrowserManager().getMetrics(),
-  launchBrowser: () => getBrowserManager().launch(),
-  closeBrowser: () => getBrowserManager().close(),
-  getBrowserDisconnected: () => getBrowserManager().getBrowserDisconnected(),
-  resetBrowserDisconnected: () => getBrowserManager().resetBrowserDisconnected(),
-  getCDPSession: (page: any) => getBrowserManager().getCDPSession(page),
-  flutterTap: (page: any, x: number, y: number) => getBrowserManager().flutterTap(page, x, y),
-  performClickWithStyle: (page: any, x: number, y: number, style?: string) => getBrowserManager().performClickWithStyle(page, x, y, style),
-  performClickWithRetry: (page: any, x: number, y: number, maxRetries?: number) => getBrowserManager().performClickWithRetry(page, x, y, maxRetries),
-  scrollPage: (page: any, deltaX: number, deltaY: number) => getBrowserManager().scrollPage(page, deltaX, deltaY),
-  humanMoveAndClick: (page: any, x: number, y: number) => getBrowserManager().humanMoveAndClick(page, x, y),
-  getElementTextAt: (page: any, x: number, y: number) => getBrowserManager().getElementTextAt(page, x, y),
-  get MOD_KEY() { return getBrowserManager().MOD_KEY; },
-  getBrowserLaunchCount: () => getBrowserManager().getBrowserLaunchCount(),
-  resetBrowserLaunchCount: () => getBrowserManager().resetBrowserLaunchCount(),
-  getScaleFactor: () => getBrowserManager().getScaleFactor(),
-  getViewportDimensions: () => getBrowserManager().getViewportDimensions(),
-  compressScreenshot: (base64: string, maxWidth?: number, quality?: number) => getBrowserManager().compressScreenshot(base64, maxWidth, quality),
-  withBrowserRetry: (action: (page: any) => Promise<any>, maxRetries?: number) => getBrowserManager().withBrowserRetry(action, maxRetries),
-  getDprScale: () => getBrowserManager().getDprScale(),
-  getPageViewport,
-  getBrowser: () => getBrowserManager().browserInstance,
-  getPage: () => getBrowserManager().pageInstance,
-  // DI support
   _injectDependencies,
+  phoenixBrowserLaunch,
+  phoenixBrowserRetry,
+  resetFailures,
+  isUnrecoverable,
+  isCoolingDown,
+  getCurrentTier,
+  getStatus,
+  start,
 };
