@@ -15,7 +15,11 @@ class FlutterNetworkInterceptor {
     this.apiEndpoints = new Set();
   }
 
-  async setupInterception(page: any) { 
+  async setupInterception(page: any) {
+    if (typeof page?.route !== 'function') {
+      log('Network interceptor skipped: page does not support route()', 'WARN', 'network');
+      return;
+    }
     await page.route('**/*', (route: any) => {
       const request = route.request();
       const url = request.url();
