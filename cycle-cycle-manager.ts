@@ -451,6 +451,10 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   const { resetCycleProviderState, getStats, updateStats, determineNextAction } = _providersDep;
   const _browserDep = getDep('browser') || {};
   const { launchBrowser, closeBrowser, getBrowserDisconnected, resetBrowserDisconnected, getBrowserLaunchCount, withBrowserRetry, resetBrowserLaunchCount } = _browserDep;
+  // Safe browser launch: phoenix > withBrowserRetry > plain launchBrowser.
+  // All call sites use this instead of raw withBrowserRetry to avoid
+  // "launchFn is not a function" when browser dep isn't fully injected.
+  const safeBrowserRetry = browserPhoenix?.phoenixBrowserRetry || withBrowserRetry || launchBrowser || (async (fn: any) => { throw new Error('No browser launch function available'); });
   const { clearCache } = getDep('cache') || {};
   const { ensureAuthenticated, handleCaptcha, authenticate } = getDep('authGuard') || {};
   const { executeAction } = getDep('actionExecutor') || {};
@@ -622,8 +626,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     } catch {}
 
     // Resilience: use browser-phoenix multi-tier launch if available
-    const launchFn = browserPhoenix?.phoenixBrowserRetry || withBrowserRetry;
-    page = await launchFn(async (p: any) => {
+    page = await safeBrowserRetry(async (p: any) => {
       if (authenticate) await authenticate(p);
       if (checkpoint && checkpoint.url) { await p.goto(checkpoint.url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}); }
       return p;
@@ -838,7 +841,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           if (memoryMode.wasBrowserClosedByProtection()) {
             await closeBrowser();
             _networkSetup = false;
-            page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+            page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
             browserLastRestart = Date.now();
             _trackBrowserRestart();
             memoryMode.clearBrowserClosedFlag();
@@ -848,7 +851,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         } catch { /* memory-mode not available, do full restart to be safe */
           await closeBrowser();
           _networkSetup = false;
-          page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+          page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
           browserLastRestart = Date.now();
           _trackBrowserRestart();
         }
@@ -858,7 +861,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         log('Restarting browser for stability', 'INFO', 'cycle');
         await closeBrowser();
         _networkSetup = false;
-        page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+        page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
         browserLastRestart = Date.now();
         _trackBrowserRestart();
         if (typeof resetBrowserLaunchCount === 'function') resetBrowserLaunchCount();
@@ -920,7 +923,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               _trackBrowserRestart();
               await closeBrowser?.();
               _networkSetup = false;
-              page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+              page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
               if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
                 await network.setupInterception(page);
                 _networkSetup = true;
@@ -932,7 +935,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               log(`Blank-page self-heal restart failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
               try {
                 _networkSetup = false;
-                page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+                page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
                 if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
                   await network.setupInterception(page);
                   _networkSetup = true;
@@ -954,7 +957,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               _trackBrowserRestart();
               await closeBrowser?.();
               _networkSetup = false;
-              page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+              page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
               if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
                 await network.setupInterception(page);
                 _networkSetup = true;
@@ -967,7 +970,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               // Browser is dead — attempt recovery via withBrowserRetry before next cycle
               try {
                 _networkSetup = false;
-                page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+                page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
                 if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
                   await network.setupInterception(page);
                   _networkSetup = true;
@@ -1649,7 +1652,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             _trackBrowserRestart();
             await closeBrowser?.();
             _networkSetup = false;
-            page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+            page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
             if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
               await network.setupInterception(page);
               _networkSetup = true;
@@ -1661,7 +1664,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             log(`blank_page browser restart failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
             try {
               _networkSetup = false;
-              page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+              page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
               if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) { await network.setupInterception(page); _networkSetup = true; }
             } catch { break; }
           }
@@ -2185,7 +2188,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             _trackBrowserRestart();
             await closeBrowser?.();
             _networkSetup = false;
-            page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+            page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
             if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
               await network.setupInterception(page);
               _networkSetup = true;
@@ -2197,7 +2200,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             log(`Blank-page browser restart (step 3) failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
             try {
               _networkSetup = false;
-              page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+              page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
               if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) { await network.setupInterception(page); _networkSetup = true; }
             } catch (recoveryErr: any) {
               log(`Blank-page step-3 restart: recovery also failed: ${recoveryErr.message || recoveryErr} — will break cycle`, 'ERROR', 'cycle');
@@ -2214,7 +2217,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             _trackBrowserRestart();
             await closeBrowser?.();
             _networkSetup = false;
-            page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+            page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
             if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
               await network.setupInterception(page);
               _networkSetup = true;
@@ -2226,7 +2229,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             log(`Blank-page browser restart failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
             try {
               _networkSetup = false;
-              page = await withBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+              page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
               if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) { await network.setupInterception(page); _networkSetup = true; }
             } catch (recoveryErr: any) {
               log(`Blank-page tribunal restart: recovery also failed: ${recoveryErr.message || recoveryErr} — will break cycle`, 'ERROR', 'cycle');
