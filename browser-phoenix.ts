@@ -294,25 +294,28 @@ async function phoenixBrowserLaunch(): Promise<any | null> {
 async function _launchNormal(browserModule: any): Promise<any | null> {
   try {
     // Use the browser module's existing launch mechanism
+    // CRITICAL: capture the return value — launchBrowser() returns the Page
+    let page: any = null;
     if (typeof browserModule.launchBrowser === 'function') {
-      await browserModule.launchBrowser();
+      page = await browserModule.launchBrowser();
     }
 
-    // Try to get a working page
-    if (typeof browserModule.getPage === 'function') {
-      const page = browserModule.getPage();
-      if (page) {
-        _lastLaunchTime = Date.now();
-        return { browser: browserModule.browserInstance, page, tier: 1 };
-      }
+    // If launchBrowser didn't return a page, try getPage()
+    if (!page && typeof browserModule.getPage === 'function') {
+      page = browserModule.getPage();
     }
 
-    // If launchBrowser doesn't return anything useful, check if the browser instance exists
-    if (browserModule.browserInstance) {
+    // Validate that we actually got a Playwright Page
+    if (page && typeof page?.goto === 'function') {
       _lastLaunchTime = Date.now();
-      return { browser: browserModule.browserInstance, tier: 1 };
+      const browser = typeof browserModule.getBrowser === 'function'
+        ? browserModule.getBrowser()
+        : browserModule.browserInstance;
+      return { browser, context: null, page, tier: 1 };
     }
 
+    // launchBrowser succeeded but didn't return a usable page — treat as failure
+    log('[PHOENIX] Tier 1: launchBrowser succeeded but no valid Page returned', 'WARN');
     return null;
   } catch (err) {
     throw err; // Propagate for tier tracking
@@ -353,11 +356,20 @@ async function _launchWithFlags(browserModule: any, flags: string[], tier: numbe
     _lastLaunchTime = Date.now();
     log(`[PHOENIX] Tier ${tier} launch successful`, 'INFO');
 
-    // Also update the browser module's internal state if possible
-    if (browserModule.browserInstance === undefined || browserModule.browserInstance === null) {
-      browserModule.browserInstance = browser;
-      browserModule.contextInstance = context;
-      browserModule.pageInstance = page;
+    // Update the browser module's singleton if accessible
+    try {
+      const mgr = browserModule.browserManager;
+      if (mgr && typeof mgr === 'object') {
+        mgr.browserInstance = browser;
+        mgr.contextInstance = context;
+        mgr.pageInstance = page;
+        mgr.browserLaunchCount = (mgr.browserLaunchCount || 0) + 1;
+      }
+    } catch { /* non-critical */ }
+
+    // Validate the page before returning
+    if (!page || typeof page?.goto !== 'function') {
+      throw new Error(`Tier ${tier}: context.newPage() returned invalid object (constructor: ${page?.constructor?.name || 'N/A'})`);
     }
 
     return { browser, context, page, tier };
@@ -552,19 +564,22 @@ async function phoenixBrowserRetry(action: (page: any) => Promise<any>, maxRetri
   const result = await phoenixBrowserLaunch();
   if (!result) throw new Error('Phoenix: all launch tiers failed');
 
-  // result is { browser, context?, page, tier } or { browser, tier } (tier 1 fallback)
+  // result is { browser, context?, page, tier }
   let page = result.page;
 
-  // Tier 1 sometimes doesn't return page directly — try to get it from browser module
-  if (!page) {
+  // If no page in result, try browser module's getPage
+  if (!page || typeof page?.goto !== 'function') {
     const browserModule = _getBrowserModule();
     if (typeof browserModule?.getPage === 'function') {
-      page = browserModule.getPage();
+      const altPage = browserModule.getPage();
+      if (altPage && typeof altPage?.goto === 'function') {
+        page = altPage;
+      }
     }
   }
 
   if (!page || typeof page.goto !== 'function') {
-    throw new Error(`Phoenix tier ${result.tier} launch succeeded but no valid Page available`);
+    throw new Error(`Phoenix tier ${result.tier} launch succeeded but no valid Page available (got ${typeof page}${page?.constructor?.name ? ': ' + page.constructor.name : ''})`);
   }
 
   return action(page);
