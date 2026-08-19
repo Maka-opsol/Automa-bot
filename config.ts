@@ -590,7 +590,8 @@ const env = envalid.cleanEnv(process.env, {
   DEGRADATION_LADDER_ENABLED: bool({ default: true }),
   SELF_DEPLOY_ENABLED: bool({ default: false }),
   EXECUTIVE_KEY: str({ default: '' }),
-  SELF_HEAL_ACCEPT_ANY_FIX: bool({ default: false }),
+  // ACCEPT_ANY_FIX removed from config — now session-only in-memory flag
+  // in self-heal.ts. Resets to false on every restart. Opt-in via dashboard.
   // Critical patch consensus safety timeouts
   CRITICAL_CONSENSUS_COOLING_OFF_MS: num({ default: 5 * 60 * 1000 }),
   CRITICAL_CONSENSUS_VERIFY_WINDOW_MS: num({ default: 10 * 60 * 1000 }),
@@ -852,7 +853,7 @@ const _configStore: Record<string, any> = {
   DEGRADATION_LADDER_ENABLED: env.DEGRADATION_LADDER_ENABLED,
   SELF_DEPLOY_ENABLED: env.SELF_DEPLOY_ENABLED,
   EXECUTIVE_KEY: env.EXECUTIVE_KEY || '',
-  SELF_HEAL_ACCEPT_ANY_FIX: env.SELF_HEAL_ACCEPT_ANY_FIX,
+  // ACCEPT_ANY_FIX removed — now session-only in-memory flag in self-heal.ts
   CRITICAL_CONSENSUS_COOLING_OFF_MS: env.CRITICAL_CONSENSUS_COOLING_OFF_MS,
   CRITICAL_CONSENSUS_VERIFY_WINDOW_MS: env.CRITICAL_CONSENSUS_VERIFY_WINDOW_MS,
   // Cloudinary screenshot storage
