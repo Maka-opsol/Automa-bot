@@ -631,7 +631,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       return p;
     });
 
-    if (CONFIG.ENABLE_NETWORK_INTERCEPT && !_networkSetup && network) {
+    if (CONFIG.ENABLE_NETWORK_INTERCEPT && !_networkSetup && network && typeof page?.route === 'function') {
       await network.setupInterception(page);
       _networkSetup = true;
     }
