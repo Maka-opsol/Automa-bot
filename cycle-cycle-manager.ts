@@ -584,7 +584,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   runtimeHeapGuardian?.checkMemory?.();
   const cycleStart = Date.now();
   cycleStartTime = cycleStart;
-  resetBrowserDisconnected();
+  resetBrowserDisconnected?.();
   stateMachine.resetDeadlock();
   resetStagnationState?.();
   await stateMachine.initialize();
