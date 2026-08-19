@@ -33,6 +33,22 @@ function getCONFIG(): Record<string, any> { return _deps.config || require('./ge
 function isExecutiveMode(): boolean {
   try { return !!require('./dashboard-server').isExecutivePrivilegesActive?.(); } catch { return false; }
 }
+
+/**
+ * ACCEPT_ANY_FIX: In-memory session-only flag.
+ * - Defaults to false on every restart/redeploy (opt-in).
+ * - Cannot be persisted via config panel — must be actively toggled per session.
+ * - Controlled via dashboard Turn ON / Turn OFF buttons.
+ */
+let _acceptAnyFixSession = false;
+function setAcceptAnyFixSession(value: boolean): void {
+  _acceptAnyFixSession = !!value;
+  log(`ACCEPT_ANY_FIX ${value ? 'ACTIVATED' : 'DEACTIVATED'} (session-only, resets on restart)`, value ? 'WARN' : 'INFO', 'self-heal');
+}
+function isAcceptAnyFixSession(): boolean {
+  return _acceptAnyFixSession;
+}
+
 function getMemoryMode(): any { return require('./memory-mode'); }
 function getGenerateCodeFixViaTribunal() { return _deps.codegenTribunal?.generateCodeFixViaTribunal || require('./providers-codegen-tribunal').generateCodeFixViaTribunal; }
 function getExecutePatchInSandbox() { return _deps.sandboxExecutor?.executePatchInSandbox || require('./sandbox-executor').executePatchInSandbox; }
@@ -841,10 +857,12 @@ async function performSelfHeal(options?: SelfHealOptions) {
     // Skips ALL safety gates (audit, canary, adversarial, validation, diff-min)
     // and pushes directly to GitHub. Only goal: get the fix onto GitHub ASAP.
     //
-    // SELF_HEAL_ACCEPT_ANY_FIX (dashboard toggle): Softer option — skips
+    // ACCEPT_ANY_FIX (session-only in-memory flag): Softer option — skips
     // audit/consensus but keeps other safety nets (canary, validation, adversarial).
+    // OPT-IN: defaults to false on every restart. Must be toggled ON per session
+    // via the dashboard. Cannot be persisted.
     const executiveMode = isExecutiveMode();
-    const acceptAnyFix = executiveMode || getCONFIG().SELF_HEAL_ACCEPT_ANY_FIX === true;
+    const acceptAnyFix = executiveMode || isAcceptAnyFixSession();
     if (executiveMode) {
       log('EXECUTIVE PRIVILEGES ACTIVE — all safety gates bypassed, targeting fastest GitHub push', 'WARN', 'self-heal');
     } else if (acceptAnyFix) {
@@ -1670,5 +1688,7 @@ module.exports = {
   // v9: Expose runtime heal separately for fast-path use from cycle-manager
   // (bypasses /tmp overlay, code patches, daily limits, and cooldown).
   performRuntimeHeal,
+  setAcceptAnyFixSession,
+  isAcceptAnyFixSession,
   _injectDependencies
 };
