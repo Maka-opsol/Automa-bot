@@ -451,6 +451,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   const { resetCycleProviderState, getStats, updateStats, determineNextAction } = _providersDep;
   const _browserDep = getDep('browser') || {};
   const { launchBrowser, closeBrowser, getBrowserDisconnected, resetBrowserDisconnected, getBrowserLaunchCount, withBrowserRetry, resetBrowserLaunchCount } = _browserDep;
+  const browserPhoenix = getDep('browserPhoenix');
   // Safe browser launch: phoenix > withBrowserRetry > plain launchBrowser.
   // All call sites use this instead of raw withBrowserRetry to avoid
   // "launchFn is not a function" when browser dep isn't fully injected.
@@ -519,7 +520,6 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   const policyStateGuard = getDep('policyStateGuard');
   const authCaptchaLoopGuard = getDep('authCaptchaLoopGuard');
   const authTokenGraveyard = getDep('authTokenGraveyard');
-  const browserPhoenix = getDep('browserPhoenix');
 
   // ─── Degradation Level Check (Response 3) ───
   const degradationLadder = _getDegradationLadder();
