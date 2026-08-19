@@ -443,6 +443,25 @@ function clearBrowserClosedFlag(): void {
   _browserClosedByProtection = false;
 }
 
+/**
+ * Strip accumulated prefixes from DB-stored reasons.
+ * Historical bug: each Turso sync prepended 'db_restored_minimum:' to the
+ * stored reason, creating strings like
+ *   db_restored_minimum:db_restored_minimum:db_restored_minimum:original
+ * Also strips accumulated 'restored:' prefixes from persistent-config path.
+ */
+function sanitizeReason(reason: string): string {
+  if (!reason || typeof reason !== 'string') return reason || 'unknown';
+  let cleaned = reason;
+  while (cleaned.startsWith('db_restored_minimum:')) {
+    cleaned = cleaned.slice('db_restored_minimum:'.length);
+  }
+  while (cleaned.startsWith('restored:')) {
+    cleaned = cleaned.slice('restored:'.length);
+  }
+  return cleaned || reason;
+}
+
 // ── Apply mode: set env vars, persist, AND shed memory ──
 async function _applyMode(mode: MemoryMode, reason: string): Promise<void> {
   const prev = _currentMode;
@@ -947,7 +966,7 @@ async function checkAfterTursoSync(selectCalibration: any, upsertCalibration: an
         if (parsed.active && _currentMode !== 'minimum') {
           // Pass the ORIGINAL reason through — don't prepend a restore prefix.
           // Prepending caused reason accumulation (db_restored_minimum:db_restored_minimum:...)
-          await _applyMode('minimum', parsed.reason || 'db_restore');
+          await _applyMode('minimum', sanitizeReason(parsed.reason || 'db_restore'));
           _restartTimers();
           _log('Restored MINIMUM mode from database (Turso recovery)', 'ERROR');
           return;
@@ -961,13 +980,13 @@ async function checkAfterTursoSync(selectCalibration: any, upsertCalibration: an
       try {
         const parsed = JSON.parse(modeRow.value);
         if (parsed.mode === 'minimum' && _currentMode !== 'minimum') {
-          await _applyMode('minimum', parsed.reason || 'db_restore');
+          await _applyMode('minimum', sanitizeReason(parsed.reason || 'db_restore'));
           _restartTimers();
           _log('Restored MINIMUM mode from database (mode field)', 'ERROR');
           return;
         }
         if (parsed.mode === 'memory_protection' && _currentMode !== 'memory_protection') {
-          await _applyMode('memory_protection', parsed.reason || 'db_restore');
+          await _applyMode('memory_protection', sanitizeReason(parsed.reason || 'db_restore'));
           _restartTimers();
           _log('Restored MEMORY PROTECTION mode from database (Turso recovery)', 'WARN');
           return;
@@ -1090,7 +1109,7 @@ function init(): void {
           try {
             const parsed = JSON.parse(minRow.value);
             if (parsed.active) {
-              _applyMode('minimum', parsed.reason || 'db_boot').catch(() => {});
+              _applyMode('minimum', sanitizeReason(parsed.reason || 'db_boot')).catch(() => {});
               _log('Starting in MINIMUM mode (restored from database)', 'ERROR');
               _checkForActiveSelfHealSession();
               _restartTimers();
@@ -1103,10 +1122,10 @@ function init(): void {
 
     const persisted = persistConfig.getMode();
     if (persisted.current === 'minimum') {
-      _applyMode('minimum', `restored:${persisted.reason}`).catch(() => {});
+      _applyMode('minimum', sanitizeReason(persisted.reason || 'persist_restore')).catch(() => {});
       _log('Starting in MINIMUM mode (restored from persistent storage)', 'ERROR');
     } else if (persisted.current === 'memory_protection') {
-      _applyMode('memory_protection', `restored:${persisted.reason}`).catch(() => {});
+      _applyMode('memory_protection', sanitizeReason(persisted.reason || 'persist_restore')).catch(() => {});
       _log('Restored MEMORY PROTECTION mode from persistent storage', 'INFO');
     } else if (persistConfig.wasRecentlyOOMKilled()) {
       // Check OOM kill count — if very high, go straight to minimum
