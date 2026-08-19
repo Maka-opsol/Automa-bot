@@ -166,6 +166,10 @@ function recordProcessStop(reason: string): void {
  * Analyze the process_lifecycle table to count OOM kills.
  * An OOM kill is a 'start' event that has NO corresponding 'stop' event
 // from the same PID within a reasonable time window.
+ *
+ * IMPORTANT: The current process's own PID is EXCLUDED — it has a 'start'
+ * event but no 'stop' event yet (because it's still running). Without this
+ * exclusion, the count is always >= 1 (false positive).
  */
 function getRecentOOMKillCount(windowMs: number = 30 * 60 * 1000): number {
   try {
@@ -174,17 +178,18 @@ function getRecentOOMKillCount(windowMs: number = 30 * 60 * 1000): number {
 
     const windowStart = Date.now() - windowMs;
 
-    // Count start events without a matching stop event from the same PID
+    // Count start events without a matching stop event from the same PID.
+    // Exclude the CURRENT PID — it has no stop event because it's still running.
     // A stop event from the same PID proves graceful shutdown.
     // No stop event = killed (OOM SIGKILL or crash).
     const row = db.prepare(`
       SELECT COUNT(*) as cnt FROM process_lifecycle
-      WHERE event = 'start' AND timestamp > ?
+      WHERE event = 'start' AND timestamp > ? AND pid != ?
       AND pid NOT IN (
         SELECT pid FROM process_lifecycle
         WHERE event = 'stop' AND timestamp > ?
       )
-    `).get(windowStart, windowStart);
+    `).get(windowStart, process.pid, windowStart);
 
     return row?.cnt || 0;
   } catch (e: any) {
