@@ -56,6 +56,7 @@ const CALIBRATION_KEY_MINIMUM_MODE = 'minimum_mode_active'; // persists minimum 
 const OOM_RECOVERY_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const HEARTBEAT_RECOVERY_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
 const MINIMUM_MODE_OOM_KILL_THRESHOLD = 3; // 3+ OOM kills in window = auto minimum
+const MINIMUM_MODE_DB_TTL_MS = 30 * 60 * 1000; // 30 minutes — DB-persisted minimum mode expires after this
 
 // ── Mode thresholds ──
 type MemoryMode = 'full_power' | 'memory_protection' | 'minimum';
@@ -963,13 +964,20 @@ async function checkAfterTursoSync(selectCalibration: any, upsertCalibration: an
     if (minRow) {
       try {
         const parsed = JSON.parse(minRow.value);
-        if (parsed.active && _currentMode !== 'minimum') {
-          // Pass the ORIGINAL reason through — don't prepend a restore prefix.
-          // Prepending caused reason accumulation (db_restored_minimum:db_restored_minimum:...)
-          await _applyMode('minimum', sanitizeReason(parsed.reason || 'db_restore'));
-          _restartTimers();
-          _log('Restored MINIMUM mode from database (Turso recovery)', 'ERROR');
-          return;
+        if (parsed.active) {
+          // v7: TTL check — expired minimum mode should not be restored
+          const setAt = parsed.setAt || parsed.ts || 0;
+          const age = Date.now() - setAt;
+          if (age > MINIMUM_MODE_DB_TTL_MS) {
+            _log(`DB MINIMUM mode expired (${Math.round(age / 60000)}min). Clearing.`, 'WARN');
+            try { upsertCalibration.run(CALIBRATION_KEY_MINIMUM_MODE, '', Date.now()); } catch {}
+          } else if (_currentMode !== 'minimum') {
+            // Pass the ORIGINAL reason through — don't prepend a restore prefix.
+            await _applyMode('minimum', sanitizeReason(parsed.reason || 'db_restore'));
+            _restartTimers();
+            _log(`Restored MINIMUM mode from database (Turso recovery, ${Math.round(age / 60000)}min old)`, 'ERROR');
+            return;
+          }
         }
       } catch { /* parse error */ }
     }
@@ -1109,11 +1117,22 @@ function init(): void {
           try {
             const parsed = JSON.parse(minRow.value);
             if (parsed.active) {
-              _applyMode('minimum', sanitizeReason(parsed.reason || 'db_boot')).catch(() => {});
-              _log('Starting in MINIMUM mode (restored from database)', 'ERROR');
-              _checkForActiveSelfHealSession();
-              _restartTimers();
-              return;
+              // v7: TTL check — if persisted minimum mode is older than 30 minutes,
+              // clear it and boot normally. The original condition may be transient
+              // (e.g., OOM, self-heal failure) and a fresh start may succeed.
+              const setAt = parsed.setAt || parsed.ts || 0;
+              const age = Date.now() - setAt;
+              if (age > MINIMUM_MODE_DB_TTL_MS) {
+                _log(`Persisted MINIMUM mode expired (${Math.round(age / 60000)}min old > ${MINIMUM_MODE_DB_TTL_MS / 60000}min TTL). Clearing and booting normally.`, 'WARN');
+                try { dbMod.upsertCalibration.run(CALIBRATION_KEY_MINIMUM_MODE, '', Date.now()); } catch {}
+                // Fall through to normal boot logic below
+              } else {
+                _applyMode('minimum', sanitizeReason(parsed.reason || 'db_boot')).catch(() => {});
+                _log(`Starting in MINIMUM mode (restored from database, ${Math.round(age / 60000)}min old, TTL=${MINIMUM_MODE_DB_TTL_MS / 60000}min)`, 'ERROR');
+                _checkForActiveSelfHealSession();
+                _restartTimers();
+                return;
+              }
             }
           } catch {}
         }
@@ -1222,6 +1241,7 @@ module.exports = {
   AUTO_DOWNGRADE_HEAP_MB,
   AUTO_DOWNGRADE_RSS_MB,
   MINIMUM_MODE_OOM_KILL_THRESHOLD,
+  MINIMUM_MODE_DB_TTL_MS,
   SELF_HEAL_SESSION_TIMEOUT_MS,
   CALIBRATION_KEY_MINIMUM_MODE,
 };
