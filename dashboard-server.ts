@@ -309,7 +309,6 @@ const SAFE_CONFIG_KEYS = new Set([
   'HEADLESS', 'AUTO_INSTALL_DEPENDENCIES',
   // Mode & feature flags (safe to toggle from dashboard)
   'DEGRADED_MODE', 'SELF_HEAL_ENABLED', 'ENABLE_STATUS_SERVER',
-  'SELF_HEAL_ACCEPT_ANY_FIX',
 
   // Human emulation
   'HUMAN_MOUSE_JITTER_PX', 'HUMAN_MOUSE_STEPS',
@@ -386,7 +385,7 @@ const CONFIG_KEY_META: Record<string, { group: string; label: string; type: 'num
   ENABLE_BLACKBOX:              { group: 'Self-Heal', label: 'Blackbox', type: 'boolean', desc: 'Enable blackbox testing' },
   ENABLE_EXPLORATION_PASS:      { group: 'Self-Heal', label: 'Exploration Pass', type: 'boolean', desc: 'Periodic UI exploration' },
   ENABLE_ADAPTIVE_PERFORMANCE:  { group: 'Self-Heal', label: 'Adaptive Performance', type: 'boolean', desc: 'Adjust timing dynamically' },
-  SELF_HEAL_ACCEPT_ANY_FIX: { group: 'Self-Heal', label: 'Accept Any Fix', type: 'boolean', desc: 'Skip audit/consensus — apply any fix the tribunal returns' },
+
   // Logging
   LOG_LEVEL:                    { group: 'Logging', label: 'Log Level', type: 'string', desc: 'debug, info, warn, error' },
   LOG_MAX_SIZE_MB:             { group: 'Logging', label: 'Max Log Size (MB)', type: 'number', desc: 'Max size per log file' },
@@ -834,7 +833,7 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
                 executiveMode: isExecutivePrivilegesActive(),
                 executiveConfigured: !!process.env.EXECUTIVE_KEY,
                 executiveActivatedAt: _executiveActivatedAt,
-                acceptAnyFix: (() => { try { return require('./get-config').SELF_HEAL_ACCEPT_ANY_FIX === true; } catch { return false; } })(),
+                acceptAnyFix: (() => { try { return require('./self-heal').isAcceptAnyFixSession(); } catch { return false; } })(),
                 selfHealEnabled: (() => { try { return require('./get-config').SELF_HEAL_ENABLED; } catch { return true; } })(),
                 sessionActive: memoryMode.isSelfHealSessionActive?.() ?? false,
                 currentMode: memoryMode.getMode?.() ?? 'unknown',
@@ -1218,6 +1217,25 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
+  // ── Accept Any Fix (session-only, in-memory) ──
+  if (pathname === '/api/self-heal/accept-any-fix' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, (body) => {
+        try {
+          const data = JSON.parse(body);
+          const value = !!data.value;
+          const { setAcceptAnyFixSession, isAcceptAnyFixSession } = require('./self-heal');
+          setAcceptAnyFixSession(value);
+          log(`ACCEPT_ANY_FIX ${value ? 'activated' : 'deactivated'} via dashboard (session-only)`, value ? 'WARN' : 'INFO', 'dashboard');
+          jsonRes(res, { success: true, acceptAnyFix: isAcceptAnyFixSession() });
+        } catch (e: any) {
+          jsonRes(res, { error: e.message || 'Failed' }, 500);
+        }
+      });
+    });
+    return true;
+  }
+
   // ── Generic command endpoint (legacy compat) ──
   if (pathname === '/api/command' && req.method === 'POST') {
     authWrap(() => {
@@ -1545,13 +1563,13 @@ function getDashboardHTML(): string {
         <button class="btn danger" id="execActivateBtn" onclick="execActivate()">Activate</button>
         <button class="btn" id="execDeactivateBtn" onclick="execDeactivate()" style="display:none">Deactivate</button>
       </div>
-      <div class="stat-row"><span class="stat-label">Accept Any Fix</span><span id="shAcceptAny" class="stat-value">-</span></div>
+      <div class="stat-row"><span class="stat-label">Accept Any Fix</span><span id="shAcceptAny" class="stat-value">-</span><button class="btn sm danger" id="acceptAnyOnBtn" onclick="turnOnAcceptAny()" style="margin-left:8px;display:none">Turn ON</button><button class="btn sm" id="acceptAnyOffBtn" onclick="turnOffAcceptAny()" style="margin-left:8px;display:none">Turn OFF</button></div>
       <div class="stat-row"><span class="stat-label">Self-Heal Session</span><span id="shSession" class="stat-value">-</span></div>
       <div class="stat-row"><span class="stat-label">Memory Mode</span><span id="shMemoryMode" class="stat-value">-</span></div>
       <div class="stat-row"><span class="stat-label">BazaarLink Budget</span><span id="shBLBudget" class="stat-value">-</span></div>
       <div style="margin-top:8px;font-size:11px;color:var(--text2);line-height:1.4">
         <b>Executive Privileges</b>: input the EXECUTIVE_KEY to bypass ALL safety gates (audit, canary, validation, limits) and push fixes directly to GitHub. More privileges will be added later.<br>
-        <b>Accept Any Fix</b> (toggle in Configuration): skip audit/consensus only, keep other safety nets.
+        <b>Accept Any Fix</b> (session-only): skip audit/consensus only, keep other safety nets. <b>Resets to OFF on every restart.</b> Must opt-in each session.
       </div>
     </div>
   </div>
@@ -1962,6 +1980,24 @@ async function toggleBoolConfig(key, newValue) {
   toast(r?.success ? key + ' = ' + newValue : 'Failed: ' + (r?.error||''), r?.success ? 'success' : 'error');
   if (r?.success) loadConfigKeys();
 }
+async function turnOnAcceptAny() {
+  const r = await api('/api/self-heal/accept-any-fix', { method: 'POST', body: JSON.stringify({ value: true }) });
+  if (r?.success) {
+    toast('Accept Any Fix ON (session-only — resets on restart)', 'warn');
+    refreshFullStatus();
+  } else {
+    toast('Failed: ' + (r?.error||''), 'error');
+  }
+}
+async function turnOffAcceptAny() {
+  const r = await api('/api/self-heal/accept-any-fix', { method: 'POST', body: JSON.stringify({ value: false }) });
+  if (r?.success) {
+    toast('Accept Any Fix turned OFF', 'success');
+    refreshFullStatus();
+  } else {
+    toast('Failed: ' + (r?.error||''), 'error');
+  }
+}
 
 // ── Raw Responses ──
 let _lastRawResponseCount = 0;
@@ -2087,8 +2123,10 @@ async function refreshAll() {
         exInput.style.display = 'none';
       }
       const aaEl = document.getElementById('shAcceptAny');
-      if (shc.acceptAnyFix) { aaEl.textContent = 'ON'; aaEl.className = 'stat-value orange'; }
-      else { aaEl.textContent = 'off'; aaEl.className = 'stat-value'; }
+      const aaOnBtn = document.getElementById('acceptAnyOnBtn');
+      const aaOffBtn = document.getElementById('acceptAnyOffBtn');
+      if (shc.acceptAnyFix) { aaEl.textContent = 'ON'; aaEl.className = 'stat-value orange'; aaOnBtn.style.display = 'none'; aaOffBtn.style.display = ''; }
+      else { aaEl.textContent = 'off'; aaEl.className = 'stat-value green'; aaOnBtn.style.display = ''; aaOffBtn.style.display = 'none'; }
       const ssEl = document.getElementById('shSession');
       if (shc.sessionActive) { ssEl.textContent = 'ACTIVE'; ssEl.className = 'stat-value yellow'; }
       else { ssEl.textContent = 'idle'; ssEl.className = 'stat-value green'; }
