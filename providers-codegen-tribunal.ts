@@ -653,14 +653,20 @@ function buildCodeGenPrompt(investigationData: any, errorLogs: any) {
   } else {
     prompt += `\nNo specific target file identified. You must infer which file to fix from the error context above.\n`;
     prompt += `INSTRUCTIONS:\n`;
-    prompt += `1. Analyze the error and identify the single most likely source file.\n`;
+    prompt += `1. Analyze the error and identify the single most likely source file. Match the error to the module responsible.\n`;
+    prompt += `   - Blank/white screenshots or page loading issues → selectors-*.ts or browser-*.ts\n`;
+    prompt += `   - Auth/login failures → auth-*.ts or cycle-auth-guard.ts\n`;
+    prompt += `   - Provider API errors or vision failures → providers-*.ts (NOT providers-detection-work-detector.ts unless the error specifically mentions work detection)\n`;
+    prompt += `   - Memory/OOM issues → these CANNOT be fixed by patching (blocked files). Return [].\n`;
+    prompt += `   - Self-heal system bugs → self-heal-*.ts (only allowed: self-heal-degradation-ladder.ts)\n`;
     prompt += `2. Propose ONE fix only.\n`;
     prompt += `3. Return a JSON ARRAY with a SINGLE object. The object must have:\n`;
-    prompt += `- "file": (string) the exact filename (e.g. "providers-detection-work-detector.ts")\n`;
+    prompt += `- "file": (string) the exact filename from the ALLOWED PREFIXES list in the codebase context\n`;
     prompt += `- "change": (string) human-readable description of the fix\n`;
     prompt += `- "patch": (string) the COMPLETE file content with the fix applied\n`;
     prompt += `CRITICAL: Return the FULL file content in "patch", not a diff. Not a snippet. The entire file.\n`;
     prompt += `CRITICAL: Return ONLY ONE fix for ONE file. Do NOT return patches for multiple files.\n`;
+    prompt += `DO NOT default to providers-detection-work-detector.ts unless the error is specifically about work/activity detection.\n`;
     prompt += `Only return [] if you truly cannot identify any file to fix.\n`;
     prompt += `Return ONLY the JSON array. No markdown fences, no explanation.\n`;
   }
