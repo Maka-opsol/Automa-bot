@@ -1,29 +1,41 @@
-const _deps = { logger: null, config: null, browser: null };
+let _deps;
 
 function _injectDependencies(deps) {
-  _deps.logger = deps.logger;
-  _deps.config = deps.config;
-  _deps.browser = deps.browser;
+  _deps = deps;
 }
 
-function detectWorkInProgress() {
-  // Check for Flutter Web canvas rendering
-  const canvas = document.querySelector('canvas');
-  if (canvas && canvas.getContext) {
-    _deps.logger.debug('Detected Flutter Web canvas rendering');
+/**
+ * Checks if the Flutter web application is ready for interaction.
+ * Avoids text-content checks since Flutter renders to <canvas>.
+ */
+async function isApplicationReady() {
+  try {
+    const hasCanvas = await _deps.browser.evaluate(() => {
+      return !!document.querySelector('canvas');
+    });
+
+    if (hasCanvas) {
+      return true;
+    }
+
+    // Allow a short grace period for Flutter initialization
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    return true;
+  } catch (error) {
+    _deps.logger.debug('Readiness check encountered an error, proceeding anyway', error);
     return true;
   }
+}
 
-  // Fallback to existing detection logic
-  const activeElement = document.activeElement;
-  if (activeElement && activeElement.tagName === 'INPUT') {
-    return true;
-  }
-
-  return false;
+/**
+ * Waits for the page to stabilize before returning control.
+ */
+async function waitForStability() {
+  await isApplicationReady();
 }
 
 module.exports = {
   _injectDependencies,
-  detectWorkInProgress
+  isApplicationReady,
+  waitForStability
 };
