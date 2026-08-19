@@ -35,7 +35,7 @@ function _getPrompts() {
     try {
       _prompts = require('./providers-prompts');
     } catch (err: any) {
-      _getLogger().log(`providers-prompts failed to load, using minimal fallback: ${String(err.message || err).substring(0, 200)}`, 'ERROR', 'tribunal');
+      _getLogger().log(`providers-prompts failed to load, using minimal fallback: ${String(err.message || err).substring(0, 200)}`, 'WARN', 'tribunal');
       _promptsFailed = true;
       return _getFallbackPrompts();
     }
@@ -47,7 +47,7 @@ function _getPrompts() {
 function _getFallbackPrompts() {
   return {
     getSystemPrompt: () => 'You are an AI assistant controlling a web browser to solve math problems on a website. Analyze the screenshot and decide the next action. Return JSON with actionType, currentState, reasoning, targetX, targetY, confidence.',
-    getUserInstruction: () => 'Analyze the screenshot. Return a JSON object with: actionType (click/type/wait/scroll/navigate/submit/done/solve), currentState (describe what you see), reasoning (why), targetX, targetY (pixel coordinates), confidence (0-1).',
+    getUserInstruction: () => 'Analyze the screenshot. Return a JSON object with: actionType (click/input_email/input_password/keypad_input/flutter_tap/flutter_swipe/scroll_vertical/scroll_horizontal/wait), currentState (describe what you see), reasoning (why), targetX, targetY (pixel coordinates), confidence (0-1). AUTH: On login pages, ALWAYS click "Sign in with Microsoft". NEVER type in phone number fields.',
   };
 }
 
@@ -452,6 +452,21 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   // --- Build and return the winning action ---
   // FIX: Strip internal tracking metadata from the returned action
   const { _model, _healthScore, _latency, ...cleanRep } = rep as any;
+
+  // Validate actionType — reject unrecognized actions to prevent
+  // "Unknown action" warnings in the executor. Fall back to 'wait'.
+  const VALID_ACTIONS = new Set([
+    'click', 'input_email', 'input_password', 'keypad_input',
+    'scroll_vertical', 'scroll_horizontal', 'wait',
+    'flutter_swipe', 'flutter_tap',
+  ]);
+  const safeActionType = VALID_ACTIONS.has(cleanRep.actionType)
+    ? cleanRep.actionType
+    : 'wait';
+  if (safeActionType !== cleanRep.actionType) {
+    log(`Tribunal: unrecognized actionType "${cleanRep.actionType}" from ${valid[0]?._model || 'unknown'} — falling back to 'wait'`, 'WARN', 'tribunal');
+  }
+
   const reasoningPrefix = valid.length === 1
     ? `Tribunal (1 model - ${valid[0]._model}, w=${consensus.winnerWeight.toFixed(2)})`
     : `Tribunal (${consensus.clusterSize}/${consensus.totalVoters} models, ${consensus.agreementPct}% agreement)`;
@@ -459,7 +474,7 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   return {
     currentState: cleanRep.currentState,
     reasoning: `${reasoningPrefix}: ${cleanRep.reasoning}`,
-    actionType: cleanRep.actionType,
+    actionType: safeActionType,
     targetX: cleanRep.targetX ?? 0,
     targetY: cleanRep.targetY ?? 0,
     value: cleanRep.value ?? '',
