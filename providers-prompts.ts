@@ -1,4 +1,4 @@
- strict';
+'use strict';
 
 // ═════════════════════════════════════════════════════════════
 // System Prompts — Provides the base system prompt and user
@@ -84,8 +84,7 @@ function _buildBaseUserInstruction(): string {
   return `
 Look at the screenshot. What is the next logical action to advance toward completing the module?
 Consider:
-- If you see "Sign in with Microsoft", click it.
-- If you see email/password fields, fill them.
+- AUTH: If you see a login page, ALWAYS click "Sign in with Microsoft". NEVER type in a phone number field — the bot does not use phone sign-in. If you see email/password fields after Microsoft sign-in, fill them using input_email/input_password.
 - If you see a video thumbnail/poster (with a play button overlay), CLICK on the video to open it. Once the video player appears with playback controls, you MUST WAIT for exactly 2 minutes 59 seconds before taking any action. After waiting, look for a back arrow (<) in the top-left corner of the video player or an X button — click it to dismiss/close the video and return to the exercise or topic list.
 - If you see a question, click the correct answer or use the on-screen keypad.
 - If you see a "Next" or "Continue" button, click it.
