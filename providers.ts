@@ -38,8 +38,9 @@ async function determineNextAction(base64Image: string, pageUrl: string | null =
   const CONFIG = getCONFIG();
   const logError = getLogError();
   const { compressScreenshot } = getBrowser();
+  const _compress = typeof compressScreenshot === 'function' ? compressScreenshot : (img: string, _w?: number, _q?: number) => img;
   const { getCachedAction, setCachedAction } = getCache();
-  const compressed = await compressScreenshot(base64Image, 768, 30);
+  const compressed = await _compress(base64Image, 768, 30);
   const cached = getCachedAction(base64Image);
   if (cached) return cached;
   const key = `action:${crypto.createHash('sha256').update(compressed).digest('hex')}`;
