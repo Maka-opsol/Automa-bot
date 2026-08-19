@@ -166,8 +166,8 @@ IMPORTANT CODEBASE RULES (violation = rejected fix):\
    providers.ts, providers-codegen-*.ts, memory-mode.ts, self-heal.ts,\
    auth.ts, get-config.ts, alerting.ts, progress-tracker.ts, etc.\
 \
-5. UNIFIED DIFF FORMAT: Patches must be valid unified diffs.\
-   Lines starting with '-' are removed, '+' are added, ' ' are context.\
+5. COMPLETE FILE REPLACEMENT: The "patch" field must be the ENTIRE file content.\
+   Not a diff, not a snippet. Include 'use strict' at top and module.exports at bottom.\
 \
 6. FLUTTER WEB SPA: The target app renders to <canvas>. document.body.innerText\
    is always empty. URL never changes. Do not suggest text-content checks.\
