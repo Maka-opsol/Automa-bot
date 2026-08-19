@@ -448,7 +448,10 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   const log = loggerDep.log || console.log;
   const logError = loggerDep.logError || console.error;
   const _providersDep = getDep('providers') || {};
-  const { resetCycleProviderState, getStats, updateStats, determineNextAction } = _providersDep;
+  const getStats = _providersDep.getStats || (() => ({ cycleCount: 0, errors: 0 }));
+  const updateStats = _providersDep.updateStats || (() => {});
+  const determineNextAction = _providersDep.determineNextAction || null;
+  const resetCycleProviderState = _providersDep.resetCycleProviderState || (() => {});
   const _browserDep = getDep('browser') || (() => { try { return require('./browser'); } catch { return {}; } })();
   const { launchBrowser, closeBrowser, getBrowserDisconnected, resetBrowserDisconnected, getBrowserLaunchCount, withBrowserRetry, resetBrowserLaunchCount } = _browserDep;
   const browserPhoenix = getDep('browserPhoenix') || (() => { try { return require('./browser-phoenix'); } catch { return null; } })();
@@ -461,7 +464,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   const { recoverIfStuck, resetStagnationState } = getDep('stagnation') || {};
   const { trackModuleProgress } = getDep('moduleTracking') || {};
   const _smDep = getDep('stateMachine') || {};
-  const { stateMachine, STATES } = _smDep;
+  const stateMachine = _smDep.stateMachine || { resetDeadlock: () => {}, initialize: async () => {}, transition: async () => {} };
+  const STATES = _smDep.STATES || {};
   const alertingDep = getDep('alerting') || {};
   const sendAlert = alertingDep.sendAlert || (() => {});
   const { performSelfHeal } = getDep('selfHeal') || {};
@@ -631,11 +635,18 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       return p;
     });
 
-    if (CONFIG.ENABLE_NETWORK_INTERCEPT && !_networkSetup && network && typeof page?.route === 'function') {
+    // Validate that page is a real Playwright Page (not a browser manager or null).
+    // Phoenix tier 2 recovery or lazy-require fallbacks may return non-Page objects.
+    const isRealPage = page && typeof page?.goto === 'function' && typeof page?.url === 'function' && typeof page?.evaluate === 'function';
+    if (!isRealPage) {
+      throw new Error(`Browser launch did not return a valid Playwright Page (got ${typeof page}${page?.constructor?.name ? ': ' + page.constructor.name : ''})`);
+    }
+
+    if (CONFIG.ENABLE_NETWORK_INTERCEPT && !_networkSetup && network && typeof page.route === 'function') {
       await network.setupInterception(page);
       _networkSetup = true;
     }
-    if (CONFIG.FLUTTER_DPR_AUTO_CALIBRATE && dpr) { await dpr.calibrate(page); }
+    if (CONFIG.FLUTTER_DPR_AUTO_CALIBRATE && dpr) { await dpr.calibrate(page).catch((e: any) => { log(`DPR calibration skipped: ${e.message}`, 'WARN', 'cycle'); }); }
 
     // Navigate to app if browser landed on about:blank (fresh start OR post-self-heal)
     // Even with a checkpoint, self-heal may have killed the browser and re-launched
@@ -838,7 +849,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         try {
           const memoryMode = require('./memory-mode');
           if (memoryMode.wasBrowserClosedByProtection()) {
-            await closeBrowser();
+            if (typeof closeBrowser === 'function') await closeBrowser();
             _networkSetup = false;
             page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
             browserLastRestart = Date.now();
@@ -848,17 +859,17 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             log('Memory shed preserved browser (mid-quiz) — continuing without restart', 'INFO', 'cycle');
           }
         } catch { /* memory-mode not available, do full restart to be safe */
-          await closeBrowser();
+          if (typeof closeBrowser === 'function') await closeBrowser();
           _networkSetup = false;
           page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
           browserLastRestart = Date.now();
           _trackBrowserRestart();
         }
       }
-      if (getBrowserDisconnected()) throw new Error('Browser disconnected');
-      if (getBrowserLaunchCount() > 10 || (Date.now() - browserLastRestart) > browserRestartInterval) {
+      if (typeof getBrowserDisconnected === 'function' && getBrowserDisconnected()) throw new Error('Browser disconnected');
+      if ((typeof getBrowserLaunchCount === 'function' && getBrowserLaunchCount() > 10) || (Date.now() - browserLastRestart) > browserRestartInterval) {
         log('Restarting browser for stability', 'INFO', 'cycle');
-        await closeBrowser();
+        if (typeof closeBrowser === 'function') await closeBrowser();
         _networkSetup = false;
         page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
         browserLastRestart = Date.now();
@@ -1312,7 +1323,12 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             // created a triple-nested timeout race where the outer one fired ~10ms
             // before the inner, aborting the tribunal right as it computed consensus
             // and orphaning a valid result in favor of pixel-fallback.
-            action = await determineNextAction(base64, page.url(), explorationMode ? explorationMap : null);
+            if (!determineNextAction) {
+              log('determineNextAction not available — using fallback action', 'WARN', 'cycle');
+              action = await getFallbackAction(page, currentState || undefined);
+            } else {
+              action = await determineNextAction(base64, page.url(), explorationMode ? explorationMap : null);
+            }
             // If tribunal internally failed and returned a wait/error fallback, try pixel fallback
             if (action?.actionType === 'wait' && action?.reasoning?.includes('tribunal failure')) {
               logError('Tribunal returned fallback wait, trying pixel fallback', new Error(action.reasoning || ''));
@@ -1553,7 +1569,6 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               consecutiveTribunalFailures++;
               updateStats({ mathVerifyFailed: (getStats().mathVerifyFailed || 0) + 1 });
               // Continue to next loop iteration (re-screenshot and retry)
-              await sleep(CONFIG.BETWEEN_STEPS_MS * wm);
               continue;
             } else if (verifyResult.correct && verifyResult.method !== 'unknown') {
               log(`Math verification PASSED (method=${verifyResult.method}, conf=${verifyResult.confidence.toFixed(2)})`, 'INFO', 'cycle');
@@ -1589,9 +1604,9 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
 
       // Quota bargaining
-      if (quotaBargain && !quotaBargain.canUseProvider('openrouter') && !quotaBargain.canUseProvider('mistral')) {
+      if (quotaBargain && typeof quotaBargain.canUseProvider === 'function' && !quotaBargain.canUseProvider('openrouter') && !quotaBargain.canUseProvider('mistral')) {
         log('Quota exhausted. Finding new free models...', 'WARN', 'cycle');
-        const newModels = await quotaBargain.findNewFreeModels();
+        const newModels = typeof quotaBargain.findNewFreeModels === 'function' ? await quotaBargain.findNewFreeModels() : [];
         if (newModels.length > 0) {
           resetCycleProviderState();
           for (const model of newModels) {
@@ -1760,7 +1775,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         // Canvas parsing fallback
         if (!actionSuccess && canvas && dpr) {
           const canvasData = await canvas.parseTextAndButtons(base64);
-          if (canvasData.watchButton) {
+          if (canvasData?.watchButton) {
             const coords = dpr.getJitteredClick(canvasData.watchButton.centerX, canvasData.watchButton.centerY);
             await page.mouse.click(coords.x, coords.y);
             actionSuccess = true;
