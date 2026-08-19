@@ -543,10 +543,37 @@ function start(): void {
   );
 }
 
+/**
+ * withBrowserRetry-compatible wrapper.
+ * Launches via phoenix tiers, then calls action(page) and returns the result.
+ * This is what cycle-manager expects: fn(page) => Promise<Page>.
+ */
+async function phoenixBrowserRetry(action: (page: any) => Promise<any>, maxRetries = 3): Promise<any> {
+  const result = await phoenixBrowserLaunch();
+  if (!result) throw new Error('Phoenix: all launch tiers failed');
+
+  // result is { browser, context?, page, tier } or { browser, tier } (tier 1 fallback)
+  let page = result.page;
+
+  // Tier 1 sometimes doesn't return page directly — try to get it from browser module
+  if (!page) {
+    const browserModule = _getBrowserModule();
+    if (typeof browserModule?.getPage === 'function') {
+      page = browserModule.getPage();
+    }
+  }
+
+  if (!page || typeof page.goto !== 'function') {
+    throw new Error(`Phoenix tier ${result.tier} launch succeeded but no valid Page available`);
+  }
+
+  return action(page);
+}
+
 module.exports = {
   _injectDependencies,
   phoenixBrowserLaunch,
-  phoenixBrowserRetry: phoenixBrowserLaunch,  // Alias — cycle-manager expects this name
+  phoenixBrowserRetry,
   resetFailures,
   isUnrecoverable,
   isCoolingDown,
