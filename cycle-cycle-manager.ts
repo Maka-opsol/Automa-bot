@@ -449,13 +449,12 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   const logError = loggerDep.logError || console.error;
   const _providersDep = getDep('providers') || {};
   const { resetCycleProviderState, getStats, updateStats, determineNextAction } = _providersDep;
-  const _browserDep = getDep('browser') || {};
+  const _browserDep = getDep('browser') || (() => { try { return require('./browser'); } catch { return {}; } })();
   const { launchBrowser, closeBrowser, getBrowserDisconnected, resetBrowserDisconnected, getBrowserLaunchCount, withBrowserRetry, resetBrowserLaunchCount } = _browserDep;
-  const browserPhoenix = getDep('browserPhoenix');
+  const browserPhoenix = getDep('browserPhoenix') || (() => { try { return require('./browser-phoenix'); } catch { return null; } })();
   // Safe browser launch: phoenix > withBrowserRetry > plain launchBrowser.
-  // All call sites use this instead of raw withBrowserRetry to avoid
-  // "launchFn is not a function" when browser dep isn't fully injected.
-  const safeBrowserRetry = browserPhoenix?.phoenixBrowserRetry || withBrowserRetry || launchBrowser || (async (fn: any) => { throw new Error('No browser launch function available'); });
+  // Falls back to lazy require('./browser') if DI didn't inject the dep.
+  const safeBrowserRetry = browserPhoenix?.phoenixBrowserRetry || withBrowserRetry || launchBrowser || (async (fn: any) => { throw new Error('No browser launch function available — browser module failed to load'); });
   const { clearCache } = getDep('cache') || {};
   const { ensureAuthenticated, handleCaptcha, authenticate } = getDep('authGuard') || {};
   const { executeAction } = getDep('actionExecutor') || {};
