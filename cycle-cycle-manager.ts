@@ -453,7 +453,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   const determineNextAction = _providersDep.determineNextAction || null;
   const resetCycleProviderState = _providersDep.resetCycleProviderState || (() => {});
   const _browserDep = getDep('browser') || (() => { try { return require('./browser'); } catch { return {}; } })();
-  const { launchBrowser, closeBrowser, getBrowserDisconnected, resetBrowserDisconnected, getBrowserLaunchCount, withBrowserRetry, resetBrowserLaunchCount } = _browserDep;
+  const { launchBrowser, closeBrowser, getBrowserDisconnected, resetBrowserDisconnected, getBrowserLaunchCount, withBrowserRetry, resetBrowserLaunchCount, getPage } = _browserDep;
   const browserPhoenix = getDep('browserPhoenix') || (() => { try { return require('./browser-phoenix'); } catch { return null; } })();
   // Safe browser launch: phoenix > withBrowserRetry > plain launchBrowser.
   // Falls back to lazy require('./browser') if DI didn't inject the dep.
@@ -637,7 +637,18 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
     // Validate that page is a real Playwright Page (not a browser manager or null).
     // Phoenix tier 2 recovery or lazy-require fallbacks may return non-Page objects.
-    const isRealPage = page && typeof page?.goto === 'function' && typeof page?.url === 'function' && typeof page?.evaluate === 'function';
+    let isRealPage = page && typeof page?.goto === 'function' && typeof page?.url === 'function' && typeof page?.evaluate === 'function';
+    if (!isRealPage) {
+      // Last-ditch: try to get page from browser module's singleton
+      try {
+        const altPage = typeof getPage === 'function' ? getPage() : null;
+        if (altPage && typeof altPage?.goto === 'function' && typeof altPage?.url === 'function') {
+          log('Recovered valid Page from browser.getPage() after initial launch returned non-Page', 'WARN', 'cycle');
+          page = altPage;
+          isRealPage = true;
+        }
+      } catch {}
+    }
     if (!isRealPage) {
       throw new Error(`Browser launch did not return a valid Playwright Page (got ${typeof page}${page?.constructor?.name ? ': ' + page.constructor.name : ''})`);
     }
