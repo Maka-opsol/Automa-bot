@@ -919,9 +919,22 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const authGuardMod = getDep('authGuard');
       const isBlank = authGuardMod?.peekBlankPageFlag?.(page);
       if (isBlank) {
-        // Blank flag IS set — consume it and enter the escalation ladder
+        // v14 FIX: Defense-in-depth — verify the page is ACTUALLY blank right now.
+        // The auth-guard sets the flag during a pre-refresh blank check, but
+        // refreshSession may have loaded content since then, making the flag
+        // stale. Verify with a fresh pixel check before escalating.
+        let actuallyBlank = true;
+        try {
+          if (typeof authGuardMod?._isPageBlank === 'function') {
+            actuallyBlank = await authGuardMod._isPageBlank(page);
+          }
+        } catch { /* non-critical — if check fails, trust the flag */ }
+        // Consume the flag regardless (prevent re-processing)
         authGuardMod?.consumeBlankPageFlag?.(page);
-        blankPageCounter++;
+        if (!actuallyBlank) {
+          log('Auth guard blank flag was STALE — page now has content. Skipping escalation.', 'WARN', 'cycle');
+        } else {
+          blankPageCounter++;
           log(`Auth guard flagged blank page (escalation step ${blankPageCounter})`, 'WARN', 'cycle');
           if (blankPageCounter >= BLANK_SELF_HEAL_THRESHOLD) {
             // Step 3: Trigger full self-heal — something is fundamentally broken
@@ -1021,6 +1034,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           }
           // First blank: fall through to normal blank-page guard below
         }
+      } // end if (isBlank) — v14: now wraps verification + escalation ladder
       if (handleCaptcha) await handleCaptcha(page);
       // Resilience: CAPTCHA loop detection
       authCaptchaLoopGuard?.recordCaptcha?.();
