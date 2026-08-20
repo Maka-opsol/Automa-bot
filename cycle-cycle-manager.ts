@@ -910,12 +910,15 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
       // v12: Blank-page counter management via auth guard flags.
       // peekBlankPageFlag checks without consuming. consumeBlankPageFlag checks AND clears.
+      // v13 FIX: Do NOT reset blankPageCounter when peek returns false.
+      // The flag is only set in specific auth-guard paths — if the page is blank
+      // but the flag wasn't set (e.g., refreshSession "succeeded" on a blank page),
+      // resetting the counter here prevents escalation and creates an infinite loop.
+      // The counter is now only reset when the tribunal confirms a non-blank page
+      // (at line ~2352, where action.currentState is not blank_page/unknown).
       const authGuardMod = getDep('authGuard');
       const isBlank = authGuardMod?.peekBlankPageFlag?.(page);
-      if (!isBlank) {
-        // No blank flag — page is valid, reset counter
-        blankPageCounter = 0;
-      } else {
+      if (isBlank) {
         // Blank flag IS set — consume it and enter the escalation ladder
         authGuardMod?.consumeBlankPageFlag?.(page);
         blankPageCounter++;
