@@ -492,23 +492,44 @@ const ERROR_TO_FILE_HINTS: Array<{ pattern: RegExp; files: string[] }> = [
 ];
 
 /**
+ * Get files that were recently patched (within cooldown window).
+ * Used to prevent codegen from repeatedly targeting the same file.
+ */
+const RECENT_PATCH_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+
+function _getRecentlyPatchedFiles(): Set<string> {
+  try {
+    const dbMod = require('./database');
+    if (!dbMod?.db?.prepare) return new Set();
+    const cutoff = Date.now() - RECENT_PATCH_COOLDOWN_MS;
+    const rows = dbMod.db.prepare(
+      `SELECT DISTINCT file FROM patch_embeddings WHERE timestamp > ? AND status IN ('applied', 'pending')`
+    ).all(cutoff);
+    if (!Array.isArray(rows)) return new Set();
+    return new Set(rows.map((r: any) => r.file).filter(Boolean));
+  } catch { return new Set(); }
+}
+
+/**
  * Enrich the raw investigation from investigatePage() with a likely
  * target file and its content, so the tribunal prompt isn't blind.
  *
  * Strategy:
  * 1. Try to read recent patch_memory entries for the most-commonly-fixed file
  * 2. Match error patterns against known file hints
- * 3. Fall back to 'Unknown' (the tribunal can still guess from HTML)
+ * 3. Skip files that were recently patched (cooldown to prevent loops)
+ * 4. Fall back to 'Unknown' (the tribunal can still guess from HTML)
  */
 function enrichInvestigationWithTargetFile(investigation: any, errorLogs: string) {
   const enriched = { ...investigation };
+  const recentlyPatched = _getRecentlyPatchedFiles();
 
   // Try patch memory first — it knows which files were fixed before
   try {
     const patchMem = getPatchMemory();
     if (patchMem && typeof patchMem.getMostFrequentTarget === 'function') {
       const frequentTarget = patchMem.getMostFrequentTarget();
-      if (frequentTarget) {
+      if (frequentTarget && !recentlyPatched.has(frequentTarget)) {
         const filePath = path.join(SOURCE_DIR, frequentTarget);
         if (fs.existsSync(filePath)) {
           enriched.targetFile = frequentTarget;
@@ -516,14 +537,20 @@ function enrichInvestigationWithTargetFile(investigation: any, errorLogs: string
           log(`Investigation enriched with patch-memory target: ${frequentTarget}`, 'DEBUG', 'self-heal');
           return enriched;
         }
+      } else if (frequentTarget && recentlyPatched.has(frequentTarget)) {
+        log(`Skipping patch-memory target ${frequentTarget} — recently patched (cooldown ${RECENT_PATCH_COOLDOWN_MS / 60000}min)`, 'WARN', 'self-heal');
       }
     }
   } catch (e: any) { /* non-critical */ }
 
-  // Fall back to error-pattern matching
+  // Fall back to error-pattern matching (with cooldown filter)
   for (const entry of ERROR_TO_FILE_HINTS) {
     if (entry.pattern.test(errorLogs)) {
       for (const candidate of entry.files) {
+        if (recentlyPatched.has(candidate)) {
+          log(`Skipping error-pattern target ${candidate} — recently patched (cooldown)`, 'WARN', 'self-heal');
+          continue;
+        }
         const filePath = path.join(SOURCE_DIR, candidate);
         if (fs.existsSync(filePath)) {
           try {
@@ -691,8 +718,15 @@ async function handleRestrictedFileApproval(fix: any, auditResult: any) {
 function applyFixesToStaging(fixes: any, stagingSource: any) {
   log(`Applying ${fixes.length} validated fix(es) to staging...`, 'INFO', 'self-heal');
   const patchedFiles: string[] = [];
+  const recentlyPatched = _getRecentlyPatchedFiles();
 
   for (const fix of fixes) {
+    // Reject patches targeting recently-patched files (cooldown)
+    if (recentlyPatched.has(fix.file)) {
+      log(`Patch targets ${fix.file} which was recently patched (cooldown ${RECENT_PATCH_COOLDOWN_MS / 60000}min). Rejecting.`, 'WARN', 'self-heal');
+      return { ok: false, patchedFiles: [] };
+    }
+
     const filePath = path.join(stagingSource, fix.file);
 
     if (!fs.existsSync(filePath)) {
