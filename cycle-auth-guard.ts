@@ -363,7 +363,14 @@ async function ensureAuthenticated(page: any) {
       throw new Error('Max authentication attempts exceeded');
     }
     const refreshed = await auth.refreshSession?.(page);
-    if (refreshed) { authAttempts = 0; return page; }
+    if (refreshed) {
+      authAttempts = 0;
+      // v14 FIX: Clear stale blank flag from pre-refresh check (line 350).
+      // refreshSession succeeded and presumably loaded content — the
+      // pre-refresh blank detection is no longer relevant.
+      (page as any)._authBlankPage = false;
+      return page;
+    }
 
     // refreshSession (→ authenticate) returned false = "no strategy matched,
     // delegating to vision tribunal". The page might still be usable — the
@@ -389,6 +396,11 @@ async function ensureAuthenticated(page: any) {
       }
       // Page has content — session is likely valid, auth strategies just
       // can't recognize the layout. Let the tribunal handle it visually.
+      // v14 FIX: Clear stale blank flag from pre-refresh check (line 350).
+      // The post-refresh check confirmed the page has content, so the
+      // pre-refresh blank flag is stale and must be cleared to prevent
+      // the cycle manager from falsely incrementing blankPageCounter.
+      (page as any)._authBlankPage = false;
       log('Auth returned false but page remains on app domain with content — continuing to tribunal', 'INFO', 'auth-guard');
       authAttempts = 0;
       return page;
