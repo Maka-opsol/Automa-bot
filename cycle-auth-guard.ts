@@ -342,6 +342,13 @@ async function ensureAuthenticated(page: any) {
       authAttempts = 0;
       return page;
     }
+    // SPA invalid — check if the page is blank BEFORE re-authenticating.
+    // If blank, set the flag so cycle-manager's peekBlankPageFlag can catch it
+    // and skip the tribunal (which would also see blank and waste API calls).
+    const preRefreshBlank = await _isPageBlank(page);
+    if (preRefreshBlank) {
+      (page as any)._authBlankPage = true;
+    }
     log('SPA session invalid, re-authenticating...', 'WARN', 'auth-guard');
   } else {
     if (url.includes('/assignments')) { authAttempts = 0; return page; }
