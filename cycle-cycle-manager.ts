@@ -659,6 +659,33 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     }
     if (CONFIG.FLUTTER_DPR_AUTO_CALIBRATE && dpr) { await dpr.calibrate(page).catch((e: any) => { log(`DPR calibration skipped: ${e.message}`, 'WARN', 'cycle'); }); }
 
+    // v14: Wait for the page to render visible content after any navigation.
+    // Flutter CanvasKit renders to a <canvas> element which starts as a blank
+    // rectangle (all-black or all-white pixels) and takes several seconds to
+    // paint the UI. This function polls the page using pixel-variance detection
+    // until content appears or the timeout expires.
+    // Returns true if page rendered, false if still blank after timeout.
+    async function _waitForRenderedPage(pg: any, timeoutMs: number = 15000): Promise<boolean> {
+      try {
+        const authGuard = getDep('authGuard');
+        if (typeof authGuard?._isPageBlank !== 'function') return true;
+        const deadline = Date.now() + timeoutMs;
+        let checks = 0;
+        while (Date.now() < deadline) {
+          try {
+            if (!(await authGuard._isPageBlank(pg))) {
+              if (checks > 0) log(`Page rendered after ${checks} blank poll(s)`, 'DEBUG', 'cycle');
+              return true;
+            }
+          } catch { break; }
+          checks++;
+          if (Date.now() < deadline) await new Promise(r => setTimeout(r, 2000));
+        }
+        log(`Page still blank after ${timeoutMs / 1000}s (${checks} polls)`, 'WARN', 'cycle');
+        return false;
+      } catch { return true; }
+    }
+
     // Navigate to app if browser landed on about:blank (fresh start OR post-self-heal)
     // Even with a checkpoint, self-heal may have killed the browser and re-launched
     // to about:blank. If we're on about:blank, we MUST navigate — the checkpoint
@@ -670,27 +697,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
           log(`Initial navigation failed: ${e.message || e}`, 'WARN', 'cycle');
         });
-        // Flutter apps need extra time after domcontentloaded to paint the canvas.
-        // Wait for the page to actually have visible content before entering the cycle.
-        log('Fresh start: waiting for Flutter canvas to render...', 'DEBUG', 'cycle');
-        for (let w = 0; w < 10; w++) {
-          await new Promise(r => setTimeout(r, 2000)); // 2s per check, max 20s
-          try {
-            const h = await page.evaluate(() => Math.max(
-              document.body?.scrollHeight || 0,
-              document.body?.offsetHeight || 0,
-              document.documentElement?.scrollHeight || 0
-              // NOTE: do NOT include clientHeight — it returns viewport height
-              // (always ~768px), not content height. On a blank page, content
-              // scrollHeight/offsetHeight are 0 but clientHeight is nonzero,
-              // which would falsely declare the page as "has content".
-            ));
-            if (h > 0) {
-              log(`Fresh start: page height=${h}px after ${(w + 1) * 2}s — proceeding`, 'INFO', 'cycle');
-              break;
-            }
-          } catch { break; }
-        }
+        // v14: Use pixel-based render check instead of height heuristic.
+        // The old scrollHeight check returned true for blank canvases that
+        // had nonzero body height from the <canvas> element itself.
+        log('Fresh start: waiting for Flutter canvas to render...', 'INFO', 'cycle');
+        await _waitForRenderedPage(page, 20000);
       } else {
         log('Fresh start at about:blank — no BASE_URL or APP_URL configured', 'WARN', 'cycle');
       }
@@ -944,6 +955,10 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             try {
               const selfHealMod = getDep('selfHeal');
               if (selfHealMod?.performSelfHeal && CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
+                // v14: Reset circuit breaker — blank-page escalation is an emergency.
+                // The breaker may be OPEN from a previous failed heal, which would
+                // silently return false without executing any healing.
+                try { require('./self-heal-circuit-breaker').healerCircuitBreaker?.reset?.(); } catch {}
                 selfHealRunning = true;
                 const healResult = await selfHealMod.performSelfHeal({ skipRuntimeHeal: true });
                 selfHealRunning = false;
@@ -1138,6 +1153,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           }
         }
       }
+
+      // v14: NEVER take a screenshot of a blank page. Wait for CanvasKit to render
+      // before capturing. This is the universal chokepoint — every cycle path
+      // flows through here before the tribunal sees the screenshot.
+      await _waitForRenderedPage(page, 12000);
 
       const beforeUrl = page.url();
       let screenshot = await page.screenshot({ type: 'jpeg', quality: 20 });
@@ -1669,6 +1689,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           try {
             const selfHealMod = getDep('selfHeal');
             if (selfHealMod?.performSelfHeal && CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
+              // v14: Reset circuit breaker for blank-page emergency
+              try { require('./self-heal-circuit-breaker').healerCircuitBreaker?.reset?.(); } catch {}
               selfHealRunning = true;
               const healResult = await selfHealMod.performSelfHeal({ skipRuntimeHeal: true });
               selfHealRunning = false;
@@ -2216,6 +2238,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           try {
             const selfHealMod = getDep('selfHeal');
             if (selfHealMod?.performSelfHeal && CONFIG.SELF_HEAL_ENABLED && !selfHealRunning) {
+              // v14: Reset circuit breaker for blank-page emergency
+              try { require('./self-heal-circuit-breaker').healerCircuitBreaker?.reset?.(); } catch {}
               selfHealRunning = true;
               const healResult = await selfHealMod.performSelfHeal({ skipRuntimeHeal: true });
               selfHealRunning = false;
@@ -2555,6 +2579,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             // DIRECT full self-heal - bypass _isDesperatelyBroken, bypass
             // consecutive failure count, bypass circuit breaker.
             if (CONFIG.SELF_HEAL_ENABLED) {
+              // v14: Use try/finally to guarantee selfHealRunning is reset.
+              // The outer catch (zpErr) at line ~2647 does NOT reset it,
+              // so a throw from require('./self-heal') would stick it at true
+              // for the rest of the process lifetime.
+              try {
               selfHealRunning = true;
               const selfHealMod = require('./self-heal');
 
@@ -2610,7 +2639,9 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                   log(`Zero-progress full heal threw: ${fullErr.message}`, 'ERROR', 'cycle');
                 }
               }
-              selfHealRunning = false;
+              } finally {
+                selfHealRunning = false;
+              }
             }
 
             // Force a page reload after heal to break any visual loop
