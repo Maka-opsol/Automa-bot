@@ -1380,6 +1380,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             // If tribunal internally failed and returned a wait/error fallback, try pixel fallback
             if (action?.actionType === 'wait' && action?.reasoning?.includes('tribunal failure')) {
               logError('Tribunal returned fallback wait, trying pixel fallback', new Error(action.reasoning || ''));
+            // v14: Feed tribunal failure to self-heal error buffer
+            try { (getDep('selfHeal') || require('./self-heal'))?.pushSelfHealError?.(`tribunal fallback wait: ${action.reasoning || 'unknown'}`, 'tribunal'); } catch {}
               action = await getFallbackAction(page, currentState || undefined);
             }
           } catch (err: any) {
@@ -1393,6 +1395,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               }
             }
             logError('Tribunal failed, using fallback', err);
+            // v14: Feed tribunal error to self-heal error buffer
+            try { (getDep('selfHeal') || require('./self-heal'))?.pushSelfHealError?.(`tribunal exception: ${err?.message || String(err)}`, 'tribunal'); } catch {}
             action = await getFallbackAction(page, currentState || undefined);
           }
         }
@@ -2698,6 +2702,17 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     const isHealable = errorType?.healable ?? err.healable ?? false;
     const errorCode = errorType?.code || err.code || 'E_UNKNOWN';
     logError(`Cycle error (${errorCode})`, err);
+    // v14: Push error into self-heal's error buffer so the codegen
+    // tribunal gets actual error messages (not just a count) when
+    // diagnosing what went wrong. This is the #1 improvement:
+    // "Send actual error logs, not a count."
+    try {
+      const selfHealMod = getDep('selfHeal') || require('./self-heal');
+      if (selfHealMod?.pushSelfHealError) {
+        const errMsg = err?.message || String(err);
+        selfHealMod.pushSelfHealError(`${errorCode}: ${errMsg}`, 'cycle-manager');
+      }
+    } catch {}
     // Resilience: report failure to cascade breaker
     cascadeBreaker?.recordFailure?.('cycleManager', err);
     // Resilience: report failure to module quarantine
