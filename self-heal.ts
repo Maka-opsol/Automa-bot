@@ -1,4 +1,4 @@
-'use strict';
+ strict';
 const { sleep } = require('./utils-sleep');
 
 let _deps: Record<string, any> = {};
@@ -462,10 +462,48 @@ async function investigatePage() {
   }
 }
 
+// v14: Error message buffer — stores actual error messages for rich diagnosis.
+// The cycle-manager pushes errors here via pushSelfHealError().
+// getRecentErrors() includes these in the tribunal prompt.
+const _errorBuffer: Array<{ msg: string; ts: number; source?: string }> = [];
+const ERROR_BUFFER_MAX = 15;
+const ERROR_BUFFER_WINDOW_MS = 30 * 60 * 1000; // 30 min
+
+/**
+ * Push an error message into the self-heal error buffer.
+ * Called by cycle-manager when errors occur.
+ * Messages are deduplicated by first 100 chars to avoid spam.
+ */
+function pushSelfHealError(msg: string, source?: string) {
+  try {
+    const now = Date.now();
+    const key = msg.substring(0, 100);
+    // Deduplicate: skip if same first 100 chars in last 5 entries
+    const recent = _errorBuffer.slice(-5);
+    if (recent.some(e => e.msg.substring(0, 100) === key)) return;
+    _errorBuffer.push({ msg: msg.substring(0, 2000), ts: now, source: source || undefined });
+    // Trim
+    while (_errorBuffer.length > ERROR_BUFFER_MAX) _errorBuffer.shift();
+    // Age-prune
+    const cutoff = Date.now() - ERROR_BUFFER_WINDOW_MS;
+    while (_errorBuffer.length > 0 && _errorBuffer[0].ts < cutoff) _errorBuffer.shift();
+  } catch { /* non-critical */ }
+}
+
 function getRecentErrors() { 
   try {
     const stats = getProvidersStats().getStats();
-    return `Last error count: ${stats.errors || 0}, consecutive failures: ${stats.consecutiveFailures || 0}`;
+    let result = `Last error count: ${stats.errors || 0}, consecutive failures: ${stats.consecutiveFailures || 0}`;
+    // v14: Include actual error messages from the buffer
+    if (_errorBuffer.length > 0) {
+      const recent = _errorBuffer.slice(-8); // last 8 errors
+      result += '\n\nRecent error messages:\n';
+      for (const e of recent) {
+        const ageMin = Math.round((Date.now() - e.ts) / 60000);
+        result += `  [${ageMin}min ago${e.source ? ` | ${e.source}` : ''}] ${e.msg}\n`;
+      }
+    }
+    return result;
   } catch (e: any) {
     return 'No error details available';
   }
@@ -564,9 +602,131 @@ function enrichInvestigationWithTargetFile(investigation: any, errorLogs: string
     }
   }
 
-  // No match found — tribunal will see 'Unknown' but can still work from HTML
-  log('Investigation: no specific target file identified, tribunal will infer from HTML', 'DEBUG', 'self-heal');
+  // No match found — v14: include file listing so AI can choose
+  try {
+    const allowedPrefixes = require('./self-heal-codebase-context').ALLOWED_PREFIXES || [];
+    const files: string[] = [];
+    try {
+      const entries = fs.readdirSync(SOURCE_DIR).filter(f => f.endsWith('.ts'));
+      for (const f of entries) {
+        if (allowedPrefixes.some((p: string) => f.startsWith(p)) && !recentlyPatched.has(f)) {
+          files.push(f);
+        }
+      }
+    } catch {}
+    if (files.length > 0) {
+      enriched.fileListing = files.join('\n');
+      log(`Investigation: no target file identified. Sending ${files.length} file listing to AI.`, 'INFO', 'self-heal');
+    }
+  } catch {}
+
+  // v14: Always gather import context if we have a target file
+  if (enriched.targetFile && enriched.fileContent) {
+    try {
+      enriched.importContext = _getImportContext(enriched.fileContent);
+    } catch {}
+  }
+
   return enriched;
+}
+
+// v14: Extract import lines from file content and read the first 30 lines
+// of each imported local module for cross-file context.
+function _getImportContext(fileContent: string): string {
+  try {
+    const lines = fileContent.split('\n');
+    const importLines = lines.filter(l => /^(?:const|let|import|require\()/.test(l.trim()) || /from ['"]\.\//.test(l));
+    if (importLines.length === 0) return '';
+    // Extract local module names from require('./x') and from './x'
+    const localModules: string[] = [];
+    for (const line of importLines) {
+      const matches = line.matchAll(/require\(['"]\.\/(.+?)['"]\)|from ['"]\.\/(.+?)['"]\)/g);
+      for (const m of matches) {
+        const mod = (m[1] || m[2] || '').replace(/\.(ts|js)$/, '');
+        if (mod && !localModules.includes(mod) && localModules.length < 5) localModules.push(mod);
+      }
+    }
+    if (localModules.length === 0) return '';
+    let ctx = 'Imported modules (first 25 lines each):\n';
+    for (const mod of localModules) {
+      const modPath = path.join(SOURCE_DIR, mod + '.ts');
+      if (fs.existsSync(modPath)) {
+        try {
+          const content = fs.readFileSync(modPath, 'utf8');
+          const header = content.split('\n').slice(0, 25).join('\n');
+          ctx += `--- ${mod}.ts ---\n${header}\n---\n`;
+        } catch {}
+      }
+    }
+    return ctx;
+  } catch { return ''; }
+}
+
+/**
+ * v14: Apply a unified diff to a file's content.
+ * Handles @@ -oldStart,oldCount +newStart,newCount @@ hunks.
+ * Returns the patched content, or null if the diff couldn't be applied.
+ */
+function _applyUnifiedDiff(originalContent: string, diff: string): string | null {
+  try {
+    const origLines = originalContent.split('\n');
+    const diffLines = diff.split('\n');
+    let offset = 0; // cumulative line offset from applied hunks
+    let hunksApplied = 0;
+    let i = 0;
+    while (i < diffLines.length) {
+      // Skip header lines (--- a/..., +++ b/...)
+      if (diffLines[i].startsWith('---') || diffLines[i].startsWith('+++')) { i++; continue; }
+      // Parse hunk header @@ -oldStart[,oldCount] +newStart[,newCount] @@
+      const hunkMatch = diffLines[i].match(/^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+      if (!hunkMatch) { i++; continue; }
+      const oldCount = hunkMatch[1] ? parseInt(hunkMatch[1], 10) : 1;
+      i++;
+      // Apply hunk: process context/remove/add lines
+      let oldIdx = 0;
+      const newLines: string[] = [];
+      while (i < diffLines.length && oldIdx < oldCount) {
+        const line = diffLines[i];
+        if (line.startsWith(' ')) {
+          // Context line — must match original
+          const origLine = origLines[offset + oldIdx];
+          if (origLine === undefined) return null;
+          newLines.push(line.substring(1));
+          oldIdx++;
+        } else if (line.startsWith('-')) {
+          // Remove line — verify it matches
+          const origLine = origLines[offset + oldIdx];
+          if (origLine === undefined) return null;
+          // Soft match: compare trimmed (ignore whitespace differences)
+          if (origLine.trim() !== line.substring(1).trim()) {
+            log(`Diff mismatch at line ${offset + oldIdx + 1}: expected '${line.substring(1).trim().substring(0, 50)}', got '${origLine.trim().substring(0, 50)}'`, 'WARN', 'self-heal');
+            // Try to continue — soft mismatch
+          }
+          oldIdx++;
+        } else if (line.startsWith('+')) {
+          // Add line
+          newLines.push(line.substring(1));
+        } else {
+          // No prefix = context line
+          const origLine = origLines[offset + oldIdx];
+          if (origLine === undefined) return null;
+          newLines.push(line);
+          oldIdx++;
+        }
+        i++;
+      }
+      if (oldIdx !== oldCount) return null; // incomplete hunk
+      // Splice the new lines into the original
+      const spliceStart = offset;
+      origLines.splice(spliceStart, oldCount, ...newLines);
+      offset = spliceStart + newLines.length;
+      hunksApplied++;
+    }
+    return hunksApplied > 0 ? origLines.join('\n') : null;
+  } catch (err: any) {
+    log(`Unified diff application failed: ${err.message}`, 'WARN', 'self-heal');
+    return null;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -734,20 +894,33 @@ function applyFixesToStaging(fixes: any, stagingSource: any) {
       continue;
     }
 
-    // Reject unified diffs — we only support full file replacement for safety
+    // v14: Support unified diffs OR full file replacement
     if (fix.patch.trimStart().startsWith('---')) {
-      log(`Patch for ${fix.file} is a unified diff — only full file replacement is supported. Rejecting.`, 'WARN', 'self-heal');
-      return { ok: false, patchedFiles: [] };
-    }
-
-    // Write the patch as full file content
-    try {
-      atomicReplaceFile(filePath, fix.patch);
-      patchedFiles.push(fix.file);
-      log(`Applied patch to ${fix.file} in staging (atomic full replacement, ${fix.patch.length} chars)`, 'INFO', 'self-heal');
-    } catch (err: any) {
-      logError(`Failed to write patch for ${fix.file}`, err);
-      return { ok: false, patchedFiles };
+      // Unified diff — apply surgically
+      try {
+        const original = fs.readFileSync(filePath, 'utf8');
+        const patched = _applyUnifiedDiff(original, fix.patch);
+        if (!patched) {
+          log(`Unified diff for ${fix.file} failed to apply (line mismatch). Rejecting.`, 'WARN', 'self-heal');
+          return { ok: false, patchedFiles: [] };
+        }
+        atomicReplaceFile(filePath, patched);
+        patchedFiles.push(fix.file);
+        log(`Applied unified diff to ${fix.file} in staging (${fix.patch.split('\n').filter(l => l.startsWith('+')).length} additions, ${fix.patch.split('\n').filter(l => l.startsWith('-')).length} removals)`, 'INFO', 'self-heal');
+      } catch (err: any) {
+        logError(`Failed to apply diff for ${fix.file}`, err);
+        return { ok: false, patchedFiles };
+      }
+    } else {
+      // Full file replacement
+      try {
+        atomicReplaceFile(filePath, fix.patch);
+        patchedFiles.push(fix.file);
+        log(`Applied full replacement to ${fix.file} in staging (${fix.patch.length} chars)`, 'INFO', 'self-heal');
+      } catch (err: any) {
+        logError(`Failed to write patch for ${fix.file}`, err);
+        return { ok: false, patchedFiles };
+      }
     }
 
     // Record in database (non-fatal)
@@ -943,6 +1116,15 @@ async function performSelfHeal(options?: SelfHealOptions) {
     // first attempt we try dedicated codegen providers only — they produce
     // much better patches. Fallback only kicks in on repeated failures.
     let fixes: any[] | null = null;
+    // v14: Build feedback info for iterative retries.
+    // CRITICAL: Construct feedbackInfo BEFORE resetting lastTribunalError.
+    // On attempt 2+, lastTribunalError still holds the error from the
+    // previous attempt — this is exactly what the AI needs to improve.
+    const feedbackInfo = (attempts > 1 && lastTribunalError) ? {
+      lastError: lastTribunalError,
+      lastFixPreview: safeFixes.length > 0 ? JSON.stringify(safeFixes[0].patch || '').substring(0, 300) : undefined,
+    } : undefined;
+    // Reset for THIS attempt — will be set if this attempt fails
     lastTribunalError = null;
     const tribunalSignal = AbortSignal.timeout(getCONFIG().SELF_HEAL_TRIBUNAL_TIMEOUT_MS || 120_000);
     try {
@@ -950,7 +1132,7 @@ async function performSelfHeal(options?: SelfHealOptions) {
         enrichedInvestigation,
         errorLogs + (patchContext ? '\n\n' + patchContext : ''),
         tribunalSignal,
-        { allowNonCodegenFallback: attempts >= 2 },
+        { allowNonCodegenFallback: attempts >= 2, feedbackInfo },
       );
     } catch (err: any) {
       if (err.name === 'TimeoutError' || err.name === 'AbortError') {
@@ -1724,5 +1906,6 @@ module.exports = {
   performRuntimeHeal,
   setAcceptAnyFixSession,
   isAcceptAnyFixSession,
+  pushSelfHealError,
   _injectDependencies
 };
