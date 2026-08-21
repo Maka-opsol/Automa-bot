@@ -190,7 +190,7 @@ async function generateCodeFixViaTribunal(
   investigationData: any,
   errorLogs: any,
   signal?: any,
-  options?: { allowNonCodegenFallback?: boolean },
+  options?: { allowNonCodegenFallback?: boolean; feedbackInfo?: { lastError?: string; lastFixPreview?: string } },
 ) {
   const models = discoverModels();
 
@@ -200,7 +200,8 @@ async function generateCodeFixViaTribunal(
   const blModelList = models.blModels.join(', ');
   log(`\u{1f9e0} CODEGEN TRIBUNAL: Consulting ${totalModels} models — BazaarLink [${blModelList}]${models.hasMistral ? ' + Mistral' : ''}${options?.allowNonCodegenFallback ? ' (non-codegen fallback ENABLED)' : ''}...`, 'INFO', 'codegen');
 
-  const prompt = buildCodeGenPrompt(investigationData, errorLogs);
+  const prompt = buildCodeGenPrompt(investigationData, errorLogs, options?.feedbackInfo);
+  const screenshot = investigationData?.screenshot || null;  // v14: JPEG base64
   const ctl = withTimeout(signal, DEFAULT_TRIBUNAL_TIMEOUT_MS);
 
   try {
@@ -240,7 +241,7 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
         }
         log(`Tribunal: calling BL/${modelSlug}`, 'DEBUG', 'codegen');
         try {
-          const result = await _getBL().callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug);
+          const result = await _getBL().callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug, screenshot);
           if (!result) {
             log(`BL/${modelSlug}: parseCodegenResponse returned null`, 'WARN', 'codegen');
           } else if (Array.isArray(result)) {
@@ -495,7 +496,7 @@ async function _fallbackToGeneralProviders(prompt: string, signal: any): Promise
  * @param {boolean} [options.responseFormatJson=false] - Request JSON response format
  * @returns {Promise<string|null>} Raw text from the first successful model, or null
  */
-async function consultTribunalRaw(prompt: string, signal?: any, options?: { timeoutMs?: number; responseFormatJson?: boolean }) {
+async function consultTribunalRaw(prompt: string, signal?: any, options?: { timeoutMs?: number; responseFormatJson?: boolean; screenshot?: string }) {
   const timeoutMs = options?.timeoutMs || DEFAULT_TRIBUNAL_TIMEOUT_MS;
 
   const models = discoverModels();
@@ -521,7 +522,7 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
           await _sleep(BL_STAGGER_MS);
         }
         log(`Tribunal raw: calling BL/${modelSlug}`, 'DEBUG', 'codegen');
-        blCollected.push(await _callRawBazaarLink(prompt, ctl.signal, modelSlug));
+        blCollected.push(await _callRawBazaarLink(prompt, ctl.signal, modelSlug, options?.screenshot));
       }
     } else if (models.hasBazaarLink) {
       log('Tribunal raw: BazaarLink budget exhausted — skipping', 'WARN', 'codegen');
@@ -575,11 +576,11 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
 /**
  * Call a BazaarLink model for raw text (not fix-validated).
  */
-async function _callRawBazaarLink(prompt: string, signal: any, modelSlug: string) {
+async function _callRawBazaarLink(prompt: string, signal: any, modelSlug: string, imageBase64?: string) {
   try {
     const bl = _getBL();
     if (!bl) return null;
-    const result = await bl.callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug);
+    const result = await bl.callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug, imageBase64);
     if (!result) return null;
     const raw = typeof result === 'string' ? result : JSON.stringify(result);
     if (!raw || raw.trim().length === 0) return null;
@@ -617,12 +618,14 @@ function _getCodebaseContext(): string {
   return _codebaseContext;
 }
 
-function buildCodeGenPrompt(investigationData: any, errorLogs: any) {
+function buildCodeGenPrompt(investigationData: any, errorLogs: any, feedbackInfo?: { lastError?: string; lastFixPreview?: string }) {
   const url = investigationData?.url || null;
   const html = investigationData?.html ? String(investigationData.html).substring(0, 1500) : null;
   const targetFile = investigationData?.targetFile || null;
-  const fileContent = investigationData?.fileContent ? String(investigationData.fileContent).substring(0, 8000) : null;
+  const fileContent = investigationData?.fileContent ? String(investigationData.fileContent).substring(0, 12000) : null;
   const isBootTime = !!investigationData?.bootTime;
+  const fileListing = investigationData?.fileListing || null;
+  const importContext = investigationData?.importContext || null;
 
   let contextLines: string[] = [];
   contextLines.push(`- Error/reason: ${errorLogs || 'Unknown recurring failure'}`);
@@ -630,43 +633,53 @@ function buildCodeGenPrompt(investigationData: any, errorLogs: any) {
   if (html) contextLines.push(`- HTML snippet: ${html}`);
   if (isBootTime) contextLines.push(`- NOTE: This is a boot-time heal (no browser available). Diagnose from error patterns only.`);
 
+  // v14: Iterative feedback — tell AI what went wrong last time
+  if (feedbackInfo?.lastError) {
+    contextLines.push(`- PREVIOUS ATTEMPT FAILED: ${feedbackInfo.lastError}`);
+    if (feedbackInfo.lastFixPreview) {
+      contextLines.push(`- PREVIOUS FIX (rejected): ${feedbackInfo.lastFixPreview}`);
+    }
+  }
+
   let prompt = `You are a senior Node.js/TypeScript developer diagnosing and fixing an automation bot.\n`;
-  // Inject codebase architecture context so models generate valid fixes
   const ctx = _getCodebaseContext();
   if (ctx) prompt += `${ctx}\n`;
   prompt += `CONTEXT:\n${contextLines.join('\n')}\n`;
 
+  // v14: File listing when no target identified
+  if (!targetFile && fileListing) {
+    prompt += `\nAvailable files (choose ONE to fix):\n${fileListing}\n`;
+  }
+
   if (targetFile && fileContent) {
     prompt += `\nTarget file to fix: ${targetFile}\n`;
     prompt += `--- BEGIN FILE: ${targetFile} ---\n${fileContent}\n--- END FILE ---\n`;
+    // v14: Include import context for cross-file understanding
+    if (importContext) {
+      prompt += `\n${importContext}\n`;
+    }
     prompt += `INSTRUCTIONS:\n`;
     prompt += `1. Identify the exact bug in the file above.\n`;
     prompt += `2. Propose a fix.\n`;
     prompt += `3. Return a JSON ARRAY with a SINGLE object. The object must have:\n`;
     prompt += `- "file": "${targetFile}" (exact filename — do NOT invent other filenames)\n`;
     prompt += `- "change": (string) human-readable description of the fix\n`;
-    prompt += `- "patch": (string) the COMPLETE file content with the fix applied\n`;
-    prompt += `CRITICAL: Return the FULL file content in "patch", not a diff. Not a snippet. The entire file.\n`;
+    prompt += `- "patch": (string) EITHER a unified diff OR the complete file content\n`;
+    prompt += `PATCH FORMAT: You may return a unified diff (starting with --- a/${targetFile}) for surgical edits,\n`;
+    prompt += `OR the complete file content for full replacement. Prefer unified diffs for small changes.\n`;
     prompt += `CRITICAL: Only fix ${targetFile}. Do NOT return patches for other files.\n`;
     prompt += `If no fix is possible, return exactly: []\n`;
     prompt += `Return ONLY the JSON array. No markdown fences, no explanation.\n`;
   } else {
-    prompt += `\nNo specific target file identified. You must infer which file to fix from the error context above.\n`;
+    prompt += `\nNo specific target file identified. Choose from the file list above.\n`;
     prompt += `INSTRUCTIONS:\n`;
-    prompt += `1. Analyze the error and identify the single most likely source file. Match the error to the module responsible.\n`;
-    prompt += `   - Blank/white screenshots or page loading issues → selectors-*.ts or browser-*.ts\n`;
-    prompt += `   - Auth/login failures → auth-*.ts or cycle-auth-guard.ts\n`;
-    prompt += `   - Provider API errors or vision failures → providers-*.ts (NOT providers-detection-work-detector.ts unless the error specifically mentions work detection)\n`;
-    prompt += `   - Memory/OOM issues → these CANNOT be fixed by patching (blocked files). Return [].\n`;
-    prompt += `   - Self-heal system bugs → self-heal-*.ts (only allowed: self-heal-degradation-ladder.ts)\n`;
+    prompt += `1. Analyze the error and identify the single most likely source file.\n`;
     prompt += `2. Propose ONE fix only.\n`;
-    prompt += `3. Return a JSON ARRAY with a SINGLE object. The object must have:\n`;
-    prompt += `- "file": (string) the exact filename from the ALLOWED PREFIXES list in the codebase context\n`;
-    prompt += `- "change": (string) human-readable description of the fix\n`;
-    prompt += `- "patch": (string) the COMPLETE file content with the fix applied\n`;
-    prompt += `CRITICAL: Return the FULL file content in "patch", not a diff. Not a snippet. The entire file.\n`;
-    prompt += `CRITICAL: Return ONLY ONE fix for ONE file. Do NOT return patches for multiple files.\n`;
-    prompt += `DO NOT default to providers-detection-work-detector.ts unless the error is specifically about work/activity detection.\n`;
+    prompt += `3. Return a JSON ARRAY with a SINGLE object:\n`;
+    prompt += `- "file": (string) the exact filename from the available files list\n`;
+    prompt += `- "change": (string) human-readable description\n`;
+    prompt += `- "patch": (string) EITHER a unified diff OR the complete file content\n`;
+    prompt += `DO NOT default to providers-detection-work-detector.ts unless the error specifically mentions work detection.\n`;
     prompt += `Only return [] if you truly cannot identify any file to fix.\n`;
     prompt += `Return ONLY the JSON array. No markdown fences, no explanation.\n`;
   }
@@ -674,4 +687,4 @@ function buildCodeGenPrompt(investigationData: any, errorLogs: any) {
   return prompt;
 }
 
-module.exports = { generateCodeFixViaTribunal, consultTribunalRaw, _injectDependencies };
+module.exports = { generateCodeFixViaTribunal, buildCodeGenPrompt, consultTribunalRaw, _injectDependencies };
