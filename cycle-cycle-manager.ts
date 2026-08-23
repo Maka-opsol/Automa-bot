@@ -2660,6 +2660,24 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         logError('Zero-progress detector error (non-fatal)', zpErr);
       }
 
+      // v15: Self-improvement cycle — make the bot stronger, not just alive.
+      // Runs every 2 hours if conditions are met (enough data, no recent
+      // rollback, daily limit not reached). Analyzes performance bottlenecks
+      // and asks the codegen tribunal to implement improvements.
+      try {
+        const improver = getDep('selfHealImprover') || (() => { try { return require('./self-heal-improver'); } catch { return null; } })();
+        if (improver?.shouldImprove?.()) {
+          log('Triggering self-improvement cycle...', 'INFO', 'cycle');
+          const improved = await improver.performSelfImprovement();
+          if (improved) {
+            log('Self-improvement applied successfully', 'INFO', 'cycle');
+          }
+        }
+      } catch (impErr: any) {
+        // Self-improvement must NEVER crash the cycle loop
+        log(`Self-improvement error (non-fatal): ${impErr.message || impErr}`, 'DEBUG', 'cycle');
+      }
+
       // Save session to pool (non-critical — never crash the cycle if browser died)
       if (humanCaptcha) {
         try {
