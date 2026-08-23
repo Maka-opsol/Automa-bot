@@ -166,8 +166,11 @@ IMPORTANT CODEBASE RULES (violation = rejected fix):\
    providers.ts, providers-codegen-*.ts, memory-mode.ts, self-heal.ts,\
    auth.ts, get-config.ts, alerting.ts, progress-tracker.ts, etc.\
 \
-5. COMPLETE FILE REPLACEMENT: The "patch" field must be the ENTIRE file content.\
-   Not a diff, not a snippet. Include 'use strict' at top and module.exports at bottom.\
+5. PATCH FORMAT: The "patch" field can be EITHER:\
+   a) A unified diff (starting with --- a/filename) for surgical edits — PREFERRED for small changes.\
+   b) The COMPLETE file content for full replacement — use for large rewrites.\
+   For diffs, include @@ -old +new @@ hunk headers.\
+   For full replacement, include 'use strict' at top and module.exports at bottom.\
 \
 6. FLUTTER WEB SPA: The target app renders to <canvas>. document.body.innerText\
    is always empty. URL never changes. Do not suggest text-content checks.\
