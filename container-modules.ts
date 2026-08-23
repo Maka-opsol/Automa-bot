@@ -661,7 +661,8 @@ function createContainer(): DIContainerType {
     ['self-heal-self-deploy', 'selfDeploy', ['config', 'logger', 'database', 'alerting']],
     ['self-heal-selector-drift', 'selectorDrift', ['config', 'logger', 'database']],
     ['self-heal-blackbox-replay', 'blackboxReplay', ['config', 'logger', 'database']],
-    ['self-heal-critical-shadow-mode', 'criticalShadowMode', ['config', 'logger', 'database']],
+    ['self-heal-critical-shadow-mode', 'criticalShadowMode', ['config', 'logger', 'database']  ],
+    ['self-heal-improver',            'selfHealImprover',    ['config', 'logger', 'database', 'providersStats'], ['sandboxExecutor', 'codegenTribunal', 'patchMemory', 'canary', 'selfHealAuditor']],
   ];
 
   // ModuleTuple is now [requirePath, containerName, deps, optionalDeps?]
