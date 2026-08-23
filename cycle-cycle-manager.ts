@@ -71,6 +71,128 @@ const OR_PARK_CHECK_INTERVAL_MS = 60000; // Check for midnight every 60s
 let _zeroProgressHealTriggered = false;
 const ZERO_PROGRESS_STUCK_MS = 10 * 60 * 1000;       // 10 minutes
 const ZERO_PROGRESS_MIN_CYCLES = 15;                  // 15 cycles × 40s = 10min
+
+/* ── OOM-Surviving Cycle State Snapshot ──────────────────────────────────
+ * Writes critical in-memory state to the calibration DB (Turso-synced)
+ * every cycle. On OOM kill, the SIGKILL wipes /tmp and all JS heaps, but
+ * the DB survives. The next process reads the snapshot on first cycle
+ * and resumes with correct failure counts, error patterns, and park state.
+ *
+ * What gets persisted (compact JSON, ~1-3 KB):
+ *   - consecutiveFailures: so self-heal thresholds work across OOM
+ *   - _recentErrorCodes: last 10 codes for transient-vs-structural check
+ *   - _orParked / _orParkedDate: so parked state survives
+ *   - _zeroProgressHealTriggered: so we don't re-trigger immediately
+ *   - explorationMode: boolean flag
+ *
+ * NOT persisted (intentionally):
+ *   - explorationMap: can be huge; re-discovered quickly via state machine
+ *   - selfHealRunning: always false at cycle boundary (serialized state)
+ *   - _networkSetup: always false at cycle start anyway
+ */
+const CYCLE_STATE_DB_KEY = 'cycle_state_snapshot';
+const CYCLE_STATE_MAX_AGE_MS = 2 * 60 * 60 * 1000; // 2 hours — stale snapshots are ignored
+let _cycleStateRestored = false;
+
+function _snapshotCycleState() {
+  try {
+    const db = getDep('database');
+    if (!db?.upsertCalibration) return;
+
+    const snapshot = {
+      v: 1,
+      ts: Date.now(),
+      pid: process.pid,
+      cf: consecutiveFailures,
+      errors: _recentErrorCodes.slice(-10),   // last 10 entries
+      orParked: _orParked,
+      orDate: _orParkedDate,
+      zpTriggered: _zeroProgressHealTriggered,
+      explMode: explorationMode,
+      memMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+    };
+
+    db.upsertCalibration.run(CYCLE_STATE_DB_KEY, JSON.stringify(snapshot), Date.now());
+  } catch {
+    // DB write failure is non-fatal — /tmp checkpoint is the primary path,
+    // this is the OOM-survival backup path.
+  }
+}
+
+function _restoreCycleState(log: any) {
+  if (_cycleStateRestored) return; // Only restore once per process lifetime
+  _cycleStateRestored = true;
+
+  try {
+    const db = getDep('database');
+    if (!db?.selectCalibration) return;
+
+    const row = db.selectCalibration.get(CYCLE_STATE_DB_KEY);
+    if (!row?.value) return;
+
+    const snap = JSON.parse(row.value);
+    if (!snap?.ts || snap.v !== 1) return;
+
+    const age = Date.now() - snap.ts;
+    if (age > CYCLE_STATE_MAX_AGE_MS) {
+      log(`Cycle state snapshot is stale (${Math.round(age / 60000)}min old), ignoring`, 'DEBUG', 'cycle');
+      return;
+    }
+
+    // Restore consecutive failures — the most critical piece.
+    // Without this, OOM resets the counter and self-heal thresholds are blind.
+    if (typeof snap.cf === 'number' && snap.cf > 0) {
+      const oldVal = consecutiveFailures;
+      consecutiveFailures = snap.cf;
+      log(`OOM-restore: consecutiveFailures ${oldVal} → ${snap.cf} (from snapshot ${Math.round(age / 1000)}s ago)`, 'INFO', 'cycle');
+    }
+
+    // Restore error code buffer — enables transient-vs-structural discrimination
+    if (Array.isArray(snap.errors) && snap.errors.length > 0) {
+      const now = Date.now();
+      let restored = 0;
+      for (const e of snap.errors) {
+        if (e?.code && e?.ts && (now - e.ts) < RECENT_ERROR_WINDOW_MS) {
+          _recentErrorCodes.push(e);
+          restored++;
+        }
+      }
+      if (restored > 0) {
+        // Re-trim to window/cap
+        while (_recentErrorCodes.length > 0 && now - _recentErrorCodes[0].ts > RECENT_ERROR_WINDOW_MS) _recentErrorCodes.shift();
+        while (_recentErrorCodes.length > RECENT_ERROR_MAX) _recentErrorCodes.shift();
+        log(`OOM-restore: ${restored} error codes restored to buffer (${_recentErrorCodes.length} total)`, 'INFO', 'cycle');
+      }
+    }
+
+    // Restore OR park state — avoids re-checking budget on every post-OOM cycle
+    if (snap.orParked && snap.orDate) {
+      const todayUTC = new Date().toISOString().slice(0, 10);
+      if (snap.orDate === todayUTC) {
+        _orParked = true;
+        _orParkedDate = snap.orDate;
+        log(`OOM-restore: OR park state restored (parked for ${snap.orDate})`, 'INFO', 'cycle');
+      }
+      // If date is yesterday, park expired naturally — don't restore
+    }
+
+    // Restore zero-progress trigger — prevents immediate re-trigger after OOM
+    if (snap.zpTriggered) {
+      _zeroProgressHealTriggered = true;
+      log('OOM-restore: zero-progress heal trigger restored (will not re-trigger)', 'INFO', 'cycle');
+    }
+
+    // Restore exploration mode
+    if (snap.explMode) {
+      explorationMode = true;
+      log('OOM-restore: exploration mode restored', 'INFO', 'cycle');
+    }
+
+    log(`Cycle state restored from DB snapshot (age: ${Math.round(age / 1000)}s, heap was ${snap.memMB}MB, PID ${snap.pid})`, 'INFO', 'cycle');
+  } catch {
+    // Restore failure is non-fatal — the bot starts clean, which is safe
+  }
+}
 const ZERO_PROGRESS_VOTES_NEEDED = 2;
 
 /**
@@ -607,6 +729,12 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   try {
     const checkpoint = loadCheckpoint?.();
     if (checkpoint) { log(`Resuming from checkpoint at ${new Date(checkpoint.savedAt).toISOString()}`, 'INFO', 'cycle'); }
+
+    // v16: Restore cycle manager state from DB snapshot (OOM-survival).
+    // This runs once per process lifetime. On a clean start, the snapshot
+    // is empty or stale and nothing happens. After an OOM kill, this
+    // restores consecutiveFailures, error buffer, park state, etc.
+    _restoreCycleState(log);
 
     // v9: PROACTIVE RUNTIME HEAL on restart-loop detection.
     // If the bot has restarted frequently, something is wrong in runtime state
@@ -2851,6 +2979,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
     }
   } finally {
+    // v16: Snapshot cycle state to DB (OOM-survival).
+    // Runs every cycle. Writes ~1-3 KB to the calibration table.
+    // If the process is SIGKILL'd (OOM), this is the last state that survives.
+    _snapshotCycleState();
+
     // v6: Clear mid-quiz flag so monitors don't preserve browser after cycle ends
     try { const memoryMode = require('./memory-mode'); memoryMode.setMidQuiz(false); } catch {}
     if (closeBrowser) await closeBrowser();
@@ -2860,4 +2993,4 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   }
 }
 
-module.exports = { runCycle, requestStop, isOrParked: () => _orParked, _injectDependencies };
+module.exports = { runCycle, requestStop, isOrParked: () => _orParked, _injectDependencies, restoreCycleState: _restoreCycleState };
