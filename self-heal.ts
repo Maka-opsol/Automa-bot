@@ -1,4 +1,4 @@
- strict';
+'use strict';
 const { sleep } = require('./utils-sleep');
 
 let _deps: Record<string, any> = {};
@@ -51,6 +51,7 @@ function isAcceptAnyFixSession(): boolean {
 
 function getMemoryMode(): any { return require('./memory-mode'); }
 function getGenerateCodeFixViaTribunal() { return _deps.codegenTribunal?.generateCodeFixViaTribunal || require('./providers-codegen-tribunal').generateCodeFixViaTribunal; }
+function getConsultTribunalRaw() { return _deps.codegenTribunal?.consultTribunalRaw || (() => { try { return require('./providers-codegen-tribunal').consultTribunalRaw; } catch { return null; } })(); }
 function getExecutePatchInSandbox() { return _deps.sandboxExecutor?.executePatchInSandbox || require('./sandbox-executor').executePatchInSandbox; }
 function getAuditPatchWithVotes() { return _deps.auditor?.auditPatchWithVotes || require('./self-heal-auditor').auditPatchWithVotes; }
 function getAuditPatch() { return _deps.auditor?.auditPatch || require('./self-heal-auditor').auditPatch; }
@@ -643,23 +644,181 @@ function _getImportContext(fileContent: string): string {
       const matches = line.matchAll(/require\(['"]\.\/(.+?)['"]\)|from ['"]\.\/(.+?)['"]\)/g);
       for (const m of matches) {
         const mod = (m[1] || m[2] || '').replace(/\.(ts|js)$/, '');
-        if (mod && !localModules.includes(mod) && localModules.length < 5) localModules.push(mod);
+        if (mod && !localModules.includes(mod) && localModules.length < 8) localModules.push(mod);
       }
     }
     if (localModules.length === 0) return '';
-    let ctx = 'Imported modules (first 25 lines each):\n';
+    let ctx = 'Imported modules (first 50 lines each):\n';
     for (const mod of localModules) {
       const modPath = path.join(SOURCE_DIR, mod + '.ts');
       if (fs.existsSync(modPath)) {
         try {
           const content = fs.readFileSync(modPath, 'utf8');
-          const header = content.split('\n').slice(0, 25).join('\n');
+          const header = content.split('\n').slice(0, 50).join('\n');
           ctx += `--- ${mod}.ts ---\n${header}\n---\n`;
         } catch {}
       }
     }
     return ctx;
   } catch { return ''; }
+}
+
+// v15: Two-pass AI file identification.
+// When enrichInvestigationWithTargetFile() can't find a target file,
+// we ask the AI to pick one from the file listing, then read its
+// full content + import context before generating the actual fix.
+// Since all codegen providers are free and latency doesn't matter for
+// a daemon, this extra API call is essentially free.
+
+/**
+ * Build a prompt for the file-identification pass (pass 1 of 2).
+ * The AI sees errors + file listing and returns a filename.
+ */
+function _buildFileIdPrompt(errorLogs: string, fileListing: string, codebaseCtx: string): string {
+  let prompt = `You are diagnosing an automation bot. Given the error below, pick the SINGLE most likely source file that needs to be fixed.
+
+`;
+  if (codebaseCtx) prompt += `${codebaseCtx}
+`;
+  prompt += `ERROR:
+${errorLogs}
+
+`;
+  prompt += `AVAILABLE FILES (choose ONE):
+${fileListing}
+
+`;
+  prompt += `INSTRUCTIONS:
+`;
+  prompt += `1. Read the error carefully and match it to the most likely file.
+`;
+  prompt += `2. Consider the file naming conventions (cycle-*, providers-*, selectors-*, etc.).
+`;
+  prompt += `3. Return ONLY the filename — nothing else. No explanation, no JSON, no markdown.
+`;
+  prompt += `EXAMPLE: cycle-action-executor.ts
+`;
+  return prompt;
+}
+
+/**
+ * Extract a filename from the AI's response.
+ * Handles various formats: plain filename, JSON string, markdown code block, etc.
+ */
+function _parseFileIdResponse(raw: string, availableFiles: string[]): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  let candidate = raw.trim();
+
+  // Strip markdown fences: ```filename.ts``` or ```json\n"filename.ts"\n```
+  const fenceMatch = candidate.match(/^```(?:\w*)?\s*\n?(.*?)\n?\s*```$/s);
+  if (fenceMatch) candidate = fenceMatch[1].trim();
+
+  // Strip JSON quotes: "filename.ts"
+  if (/^".*"$/.test(candidate)) candidate = candidate.slice(1, -1);
+
+  // Strip leading "file:" or "target:" labels
+  candidate = candidate.replace(/^(?:file|target|filename)\s*[:=]\s*/i, '');
+
+  // Take only the first line if multi-line
+  candidate = candidate.split('\n')[0].trim();
+
+  // Strip any leading ./ or path segments
+  candidate = candidate.replace(/^.+\//, '');
+
+  // Direct match against available files
+  if (availableFiles.includes(candidate)) return candidate;
+
+  // Fuzzy match: try stripping .ts extension and re-adding it
+  const stripped = candidate.replace(/\.(ts|js)$/, '');
+  const withTs = stripped + '.ts';
+  if (availableFiles.includes(withTs)) return withTs;
+
+  // Substring match: if the AI returned something like "action-executor.ts" 
+  // but the actual file is "cycle-action-executor.ts"
+  for (const f of availableFiles) {
+    if (f.endsWith(candidate) || f.includes(stripped)) return f;
+  }
+
+  return null;
+}
+
+/**
+ * Two-pass file identification: ask AI which file to fix, then read it.
+ *
+ * Pass 1: Send error context + file listing → AI returns a filename.
+ * Pass 2: Read that file's full content + import context → return enriched investigation.
+ *
+ * If the AI fails or returns a filename that doesn't exist, falls back
+ * to returning the original investigation unchanged (the fix-generation
+ * prompt will still include the file listing for a single-pass attempt).
+ */
+async function _aiIdentifyTargetFile(
+  investigation: any,
+  errorLogs: string,
+  signal?: any,
+): Promise<any> {
+  const fileListing = investigation?.fileListing;
+  if (!fileListing) return investigation;
+
+  const availableFiles = fileListing.split('\n').map((f: string) => f.trim()).filter(Boolean);
+  if (availableFiles.length === 0) return investigation;
+
+  const consultRaw = getConsultTribunalRaw();
+  if (!consultRaw) {
+    log('Two-pass file ID: consultTribunalRaw unavailable, skipping', 'WARN', 'self-heal');
+    return investigation;
+  }
+
+  // Get codebase context for the identification prompt
+  let codebaseCtx = '';
+  try { codebaseCtx = require('./self-heal-codebase-context').CODEBASE_CONTEXT || ''; } catch {}
+
+  const prompt = _buildFileIdPrompt(errorLogs, fileListing, codebaseCtx);
+  log(`Two-pass file ID: asking AI to identify target from ${availableFiles.length} files...`, 'INFO', 'self-heal');
+
+  try {
+    const raw = await consultRaw(prompt, signal, { timeoutMs: 45_000 });
+    if (!raw) {
+      log('Two-pass file ID: AI returned empty response', 'WARN', 'self-heal');
+      return investigation;
+    }
+
+    const chosen = _parseFileIdResponse(raw, availableFiles);
+    if (!chosen) {
+      log(`Two-pass file ID: AI response "${raw.substring(0, 80)}" did not match any available file`, 'WARN', 'self-heal');
+      return investigation;
+    }
+
+    // Read the chosen file's content
+    const filePath = path.join(SOURCE_DIR, chosen);
+    if (!fs.existsSync(filePath)) {
+      log(`Two-pass file ID: AI chose ${chosen} but it doesn't exist on disk`, 'WARN', 'self-heal');
+      return investigation;
+    }
+
+    const fileContent = fs.readFileSync(filePath, 'utf8');
+    const importContext = _getImportContext(fileContent);
+
+    log(`Two-pass file ID: AI chose ${chosen} (${fileContent.length} chars, ${importContext ? 'with import context' : 'no imports'}). Proceeding to fix generation.`, 'INFO', 'self-heal');
+
+    // Return a new enriched investigation with the AI-chosen target
+    return {
+      ...investigation,
+      targetFile: chosen,
+      fileContent,
+      importContext: importContext || undefined,
+      // Clear fileListing since we now have a specific target
+      fileListing: undefined,
+      // Preserve screenshot/html/url from original investigation
+      screenshot: investigation.screenshot,
+      html: investigation.html,
+      url: investigation.url,
+      bootTime: investigation.bootTime,
+    };
+  } catch (err: any) {
+    log(`Two-pass file ID failed: ${err.message || err} — falling back to single-pass`, 'WARN', 'self-heal');
+    return investigation;
+  }
 }
 
 /**
@@ -1110,6 +1269,13 @@ async function performSelfHeal(options?: SelfHealOptions) {
     //     We infer the target from the most recent error pattern.
     const enrichedInvestigation = enrichInvestigationWithTargetFile(investigation, errorLogs);
 
+    // 3c. v15: Two-pass file identification.
+    //     If no target file was found (enrichment returned only a file listing),
+    //     ask the AI to pick a file, then read its full content before
+    //     generating fixes. This gives the AI full codebase visibility
+    //     for file selection at the cost of one extra API call.
+    const finalInvestigation = await _aiIdentifyTargetFile(enrichedInvestigation, errorLogs, tribunalSignal);
+
     // 4. Generate fixes via AI tribunal (with abort signal for timeout)
     // On attempt 2+, allow falling back to non-codegen general providers
     // (Groq, z.ai, NVIDIA, etc.) if BazaarLink+Mistral both fail. On the
@@ -1129,7 +1295,7 @@ async function performSelfHeal(options?: SelfHealOptions) {
     const tribunalSignal = AbortSignal.timeout(getCONFIG().SELF_HEAL_TRIBUNAL_TIMEOUT_MS || 120_000);
     try {
       fixes = await getGenerateCodeFixViaTribunal()(
-        enrichedInvestigation,
+        finalInvestigation,
         errorLogs + (patchContext ? '\n\n' + patchContext : ''),
         tribunalSignal,
         { allowNonCodegenFallback: attempts >= 2, feedbackInfo },
