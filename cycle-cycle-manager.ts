@@ -736,6 +736,13 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     // restores consecutiveFailures, error buffer, park state, etc.
     _restoreCycleState(log);
 
+    // v16: Pre-cycle snapshot — write state to DB BEFORE the cycle body
+    // runs. If the process is OOMkilled mid-cycle (e.g., during sign-in),
+    // the finally-block snapshot never fires, but this pre-cycle snapshot
+    // ensures the next boot sees correct state. Critical for first-cycle
+    // OOM loops where no previous snapshot exists.
+    _snapshotCycleState();
+
     // v9: PROACTIVE RUNTIME HEAL on restart-loop detection.
     // If the bot has restarted frequently, something is wrong in runtime state
     // that self-heal's runtime avenues can fix without code patches.
