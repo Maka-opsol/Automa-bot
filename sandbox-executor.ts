@@ -184,17 +184,36 @@ function extractRelativeName(filePath: string): string {
 /**
  * Check whether a patch string contains dangerous patterns.
  * P14: Resets regex lastIndex for safety with stateful patterns.
+ *
+ * Context-aware (P15): patterns that already exist in the ORIGINAL file
+ * are not flagged. This prevents false positives when patching CommonJS files
+ * (module.exports, exports.foo) or files that already use require() internally.
+ * Only NEW introductions of dangerous patterns are blocked.
  */
-function auditPatchContent(patchCode: string): AuditResult {
+function auditPatchContent(patchCode: string, originalContent?: string): AuditResult {
   const violations: string[] = [];
   // Strip comments before pattern matching
   const codeWithoutComments = patchCode
     .replace(/\/\/.*$/gm, '')
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/<!--[\s\S]*?-->/g, '');
+
+  // Build set of patterns already present in the original file
+  const originalStripped = originalContent
+    ? originalContent
+        .replace(/\/\/.*$/gm, '')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/<!--[\s\S]*?-->/g, '')
+    : '';
+
   for (const pattern of BLOCKED_PATTERNS) {
     pattern.lastIndex = 0; // Reset for stateful regexes (defensive)
     if (pattern.test(codeWithoutComments)) {
+      // If the original file already contains this pattern, it's not NEW — skip
+      if (originalStripped) {
+        pattern.lastIndex = 0;
+        if (pattern.test(originalStripped)) continue;
+      }
       violations.push(`Blocked pattern: ${pattern.source}`);
     }
   }
@@ -535,8 +554,17 @@ async function executePatchInSandbox(patchText: string, filePath: string): Promi
     return { safe: false, error: fileCheck.reason, requiresApproval: fileCheck.requiresApproval };
   }
 
-  // Layer 2: Content-level audit
-  const contentAudit = auditPatchContent(patchText);
+  // Layer 2: Content-level audit (context-aware: skips patterns already in original file)
+  let originalContent: string | undefined;
+  try {
+    const resolvedForRead = path.isAbsolute(filePath)
+      ? path.normalize(filePath)
+      : path.resolve(SOURCE_DIR, filePath);
+    if (fs.existsSync(resolvedForRead)) {
+      originalContent = fs.readFileSync(resolvedForRead, 'utf8');
+    }
+  } catch { /* original not available — audit without context */ }
+  const contentAudit = auditPatchContent(patchText, originalContent);
   if (!contentAudit.safe) {
     _log(`Sandbox: Patch blocked for ${filePath} — ${contentAudit.violations.length} violations`, 'ERROR', 'sandbox-executor');
     return { safe: false, error: `Patch contains ${contentAudit.violations.length} blocked patterns`, violations: contentAudit.violations };
