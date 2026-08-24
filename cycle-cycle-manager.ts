@@ -193,6 +193,115 @@ function _restoreCycleState(log: any) {
     // Restore failure is non-fatal — the bot starts clean, which is safe
   }
 }
+
+/* ── OOM-Surviving Action Replay Buffer ──────────────────────────────────
+ * Every 2 successful actions, flush them to the DB. On OOM kill + restart,
+ * the bot replays them instead of burning API calls on the tribunal.
+ * Each action is ~200 bytes; 2 actions = ~400 bytes per flush.
+ */
+const ACTION_REPLAY_DB_KEY = 'action_replay_buffer';
+const ACTION_REPLAY_MAX_AGE_MS = 10 * 60 * 1000; // 10 minutes
+const ACTION_REPLAY_FLUSH_INTERVAL = 2; // flush every N successful actions
+let _actionReplayBuf: any[] = [];
+let _actionsSinceLastFlush = 0;
+
+function _pushActionReplay(action: any) {
+  // Only buffer progress-making actions
+  if (!action || action.actionType === 'wait') return;
+  _actionReplayBuf.push({
+    a: action.actionType,
+    x: action.targetX,
+    y: action.targetY,
+    s: action.submitX,
+    t: action.submitY,
+    v: action.value || '',
+    k: action.keypadSequence || [],
+    cs: action.currentState || '',
+    ts: Date.now(),
+  });
+  _actionsSinceLastFlush++;
+  if (_actionsSinceLastFlush >= ACTION_REPLAY_FLUSH_INTERVAL) {
+    _flushActionReplay();
+    _actionsSinceLastFlush = 0;
+  }
+}
+
+function _flushActionReplay() {
+  if (_actionReplayBuf.length === 0) return;
+  try {
+    const db = getDep('database');
+    if (!db?.upsertCalibration) return;
+    // Keep only last 2 actions in DB (overwrite)
+    const toSave = _actionReplayBuf.slice(-ACTION_REPLAY_FLUSH_INTERVAL);
+    db.upsertCalibration.run(ACTION_REPLAY_DB_KEY, JSON.stringify(toSave), Date.now());
+  } catch { /* non-fatal */ }
+  _actionReplayBuf = []; // clear in-memory after flush
+}
+
+function _clearActionReplay() {
+  _actionReplayBuf = [];
+  _actionsSinceLastFlush = 0;
+  try {
+    const db = getDep('database');
+    if (db?.upsertCalibration) {
+      db.upsertCalibration.run(ACTION_REPLAY_DB_KEY, '', Date.now());
+    }
+  } catch { /* non-fatal */ }
+}
+
+async function _replayActionsFromDB(page: any, executeActionFn: any, log: any): Promise<number> {
+  try {
+    const db = getDep('database');
+    if (!db?.selectCalibration) return 0;
+    const row = db.selectCalibration.get(ACTION_REPLAY_DB_KEY);
+    if (!row?.value || typeof row.value !== 'string' || row.value.length < 10) return 0;
+
+    const actions: any[] = JSON.parse(row.value);
+    if (!Array.isArray(actions) || actions.length === 0) return 0;
+
+    // Check freshness
+    const newest = Math.max(...actions.map((a: any) => a.ts || 0));
+    if (Date.now() - newest > ACTION_REPLAY_MAX_AGE_MS) {
+      log('Action replay buffer stale, clearing', 'DEBUG', 'cycle');
+      _clearActionReplay();
+      return 0;
+    }
+
+    let replayed = 0;
+    for (const saved of actions) {
+      if (!saved?.a) continue;
+      const rebuilt = {
+        actionType: saved.a,
+        targetX: saved.x ?? 0.5,
+        targetY: saved.y ?? 0.5,
+        submitX: saved.s ?? 0.5,
+        submitY: saved.t ?? 0.5,
+        value: saved.v || '',
+        keypadSequence: saved.k || [],
+        currentState: saved.cs || '',
+        reasoning: `OOM replay (saved ${Math.round((Date.now() - (saved.ts || 0)) / 1000)}s ago)`,
+      };
+      try {
+        log(`Replaying action: ${rebuilt.actionType} at (${rebuilt.targetX?.toFixed(2)}, ${rebuilt.targetY?.toFixed(2)}) state=${rebuilt.currentState}`, 'INFO', 'cycle');
+        if (executeActionFn) await executeActionFn(page, rebuilt);
+        replayed++;
+        // Brief pause between replayed actions to let the page react
+        if (replayed < actions.length) await new Promise(r => setTimeout(r, 2000));
+      } catch (err: any) {
+        log(`Replay failed for ${rebuilt.actionType}: ${err.message || err} — falling back to tribunal`, 'WARN', 'cycle');
+        break; // Stop replaying on first failure
+      }
+    }
+
+    // Clear buffer after replay attempt (success or failure)
+    _clearActionReplay();
+    if (replayed > 0) log(`Replayed ${replayed}/${actions.length} actions from DB`, 'INFO', 'cycle');
+    return replayed;
+  } catch {
+    return 0;
+  }
+}
+
 const ZERO_PROGRESS_VOTES_NEEDED = 2;
 
 /**
@@ -555,6 +664,19 @@ let _degradationLadder: any = null;
 function _getDegradationLadder() { if (!_degradationLadder) { try { _degradationLadder = require('./self-heal-degradation-ladder'); } catch { _degradationLadder = null; } } return _degradationLadder; }
 let _actionCache: any = null;
 function _getActionCache() { if (!_actionCache) { try { _actionCache = require('./services-action-cache'); } catch { _actionCache = null; } } return _actionCache; }
+let _localCacheEmpty: boolean | null = null;  // null = not yet checked; true = empty (cold start)
+function _isLocalCacheEmpty(): boolean {
+  if (_localCacheEmpty !== null) return _localCacheEmpty;
+  try {
+    const dbMod = require('./database');
+    const db = dbMod.getDb?.() || dbMod.db;
+    if (db) {
+      const cnt = db.prepare(`SELECT COUNT(*) as cnt FROM action_cache WHERE evicted = 0`).get()?.cnt || 0;
+      _localCacheEmpty = cnt === 0;
+    } else { _localCacheEmpty = true; }
+  } catch { _localCacheEmpty = true; }
+  return _localCacheEmpty;
+}
 let _solutionCache: any = null;
 function _getSolutionCache() { if (!_solutionCache) { try { _solutionCache = require('./math-solution-cache'); } catch { _solutionCache = null; } } return _solutionCache; }
 let _tmpGuardian: any = null;
@@ -843,6 +965,17 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     }
 
     let questionsCompleted = checkpoint?.questionsCompleted || 0;
+
+    // v16: Replay actions from DB if process was OOMkilled.
+    // Skips tribunal calls for the replayed actions, saving API budget.
+    if (executeAction) {
+      const replayed = await _replayActionsFromDB(page, executeAction, log);
+      if (replayed > 0) {
+        // Wait for page to settle after replayed actions
+        await _waitForRenderedPage(page, 10000);
+        if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
+      }
+    }
 
     // v6: Track whether we're mid-quiz (vs. between quizzes on assignments page).
     // When mid-quiz, memory protection uses browser-safe shedding (L0-L2)
@@ -1471,11 +1604,21 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           // Use previous cycle's state as the context key (currentState is set from last cycle)
           _actionCacheSig = actionCache.computeContextSignature(currentState, base64);
           if (_actionCacheSig) {
-            const cachedAction = actionCache.lookup(_actionCacheSig);
+            // Cold start (post-OOM): local action_cache is empty — use async
+            // lookup which AWAITS the Turso read instead of fire-and-forget.
+            // This lets us immediately reuse actions persisted before the kill.
+            const useAsync = _isLocalCacheEmpty();
+            const cachedAction = useAsync
+              ? await actionCache.lookupAsync(_actionCacheSig)
+              : actionCache.lookup(_actionCacheSig);
+            // After a successful async populate, mark local as no longer empty
+            // so subsequent cycles use the fast sync path
+            if (cachedAction && useAsync) { _localCacheEmpty = false; }
             if (cachedAction) {
               action = cachedAction;
               _actionCacheHit = true;
-              log(`Action cache HIT: type=${cachedAction.actionType} at (${cachedAction.targetX.toFixed(2)}, ${cachedAction.targetY.toFixed(2)}) state=${cachedAction.currentState}`, 'INFO', 'cycle');
+              const source = useAsync ? 'turso-cold' : 'local';
+              log(`Action cache HIT (${source}): type=${cachedAction.actionType} at (${cachedAction.targetX.toFixed(2)}, ${cachedAction.targetY.toFixed(2)}) state=${cachedAction.currentState}`, 'INFO', 'cycle');
               updateStats({ actionCacheHits: (getStats().actionCacheHits || 0) + 1 });
             } else {
               updateStats({ actionCacheMisses: (getStats().actionCacheMisses || 0) + 1 });
@@ -1987,6 +2130,10 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         consecutiveFailures = 0;
       }
 
+      // v16: Push successful action to OOM replay buffer.
+      // Flushed to DB every 2 actions. On restart, replayed blindly.
+      if (actionSuccess) _pushActionReplay(action);
+
       // ─── Pixel Calibration Sampling ───
       // After a successful click, sample the button color at click coordinates.
       // This builds a distribution of observed colors per category, so pixel-fallback
@@ -2081,6 +2228,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               currentState: action.currentState || currentState || 'unknown',
               reasoning: action.reasoning,
             });
+            // Local DB now has entries — switch back to fast sync path
+            _localCacheEmpty = false;
           } catch (saveErr: any) {
             log(`Action cache save error: ${saveErr.message || saveErr}`, 'DEBUG', 'cycle');
           }
