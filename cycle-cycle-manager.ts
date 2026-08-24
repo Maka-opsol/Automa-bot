@@ -3005,7 +3005,16 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     const isRetryable = errorType?.retryable ?? err.retryable ?? false;
     const isHealable = errorType?.healable ?? err.healable ?? false;
     const errorCode = errorType?.code || err.code || 'E_UNKNOWN';
-    logError(`Cycle error (${errorCode})`, err);
+    // v17: Include stack trace for unrecognised errors so the source
+    // can be identified. Only log the full stack for errors that lack
+    // a structured code (E_UNKNOWN) — structured errors already carry
+    // enough context in their message.
+    if (errorCode === 'E_UNKNOWN' && err?.stack) {
+      const stackLines = (err.stack as string).split('\n').slice(0, 6).join('\n  ');
+      logError(`Cycle error (${errorCode}) STACK: ${stackLines}`, err);
+    } else {
+      logError(`Cycle error (${errorCode})`, err);
+    }
     // v14: Push error into self-heal's error buffer so the codegen
     // tribunal gets actual error messages (not just a count) when
     // diagnosing what went wrong. This is the #1 improvement:
@@ -3014,7 +3023,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const selfHealMod = getDep('selfHeal') || require('./self-heal');
       if (selfHealMod?.pushSelfHealError) {
         const errMsg = err?.message || String(err);
-        selfHealMod.pushSelfHealError(`${errorCode}: ${errMsg}`, 'cycle-manager');
+        const errStack = err?.stack ? `\n${(err.stack as string).split('\n').slice(1, 4).join('\n')}` : '';
+        selfHealMod.pushSelfHealError(`${errorCode}: ${errMsg}${errStack}`, 'cycle-manager');
       }
     } catch {}
     // Resilience: report failure to cascade breaker
@@ -3025,7 +3035,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     consecutiveFailures++;
     // v4: Record error code for desperation analysis
     _recordErrorForDesperation(errorCode);
-    if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Cycle error: ${err instanceof Error ? err.message : String(err)}`); } catch (e: any) {}
+    if (CONFIG.ALERT_ON_ERROR) try {
+      const alertMsg = err instanceof Error ? err.message : String(err);
+      const alertStack = err?.stack ? `\n${(err.stack as string).split('\n').slice(1, 5).join('\n')}` : '';
+      sendAlert(`Cycle error: ${alertMsg}${alertStack}`);
+    } catch (e: any) {}
 
     // Error routing based on type
     const isErrorTransient = isRetryable && !isHealable;
