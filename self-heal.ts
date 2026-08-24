@@ -1269,6 +1269,10 @@ async function performSelfHeal(options?: SelfHealOptions) {
     //     We infer the target from the most recent error pattern.
     const enrichedInvestigation = enrichInvestigationWithTargetFile(investigation, errorLogs);
 
+    // Tribunal abort signal — created here so both the two-pass file
+    // identification (3c) and the fix generation (4) share the same timeout.
+    const tribunalSignal = AbortSignal.timeout(getCONFIG().SELF_HEAL_TRIBUNAL_TIMEOUT_MS || 120_000);
+
     // 3c. v15: Two-pass file identification.
     //     If no target file was found (enrichment returned only a file listing),
     //     ask the AI to pick a file, then read its full content before
@@ -1292,7 +1296,6 @@ async function performSelfHeal(options?: SelfHealOptions) {
     } : undefined;
     // Reset for THIS attempt — will be set if this attempt fails
     lastTribunalError = null;
-    const tribunalSignal = AbortSignal.timeout(getCONFIG().SELF_HEAL_TRIBUNAL_TIMEOUT_MS || 120_000);
     try {
       fixes = await getGenerateCodeFixViaTribunal()(
         finalInvestigation,
