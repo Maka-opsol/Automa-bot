@@ -63,11 +63,18 @@ Your GOAL: Complete the next available math module. This means:
 - For exercises, you MUST click the open book icon to view the memo before clicking Next.
 - Answer all questions correctly (or if incorrect, review the memo and correct).
 - Move to the next module when finished.
+
+AUTH RULE (HIGHEST PRIORITY — overrides all other instructions):
+- If you see the MathU login page, set currentState to "mathu_login" and click "Sign in with Microsoft".
+- NEVER type in a phone number field. The bot does NOT use phone sign-in.
+- After Microsoft sign-in, if you see email/password fields, set currentState to "microsoft_email_input".
+
 Viewport: ${width}x${height} px.
 All coordinates are fractions of viewport width/height (0.0--1.0).
 Return ONLY a JSON object with:
 {
   "reasoning": "Brief explanation of what you see and why you choose this action.",
+  "currentState": "mathu_login | microsoft_email_input | assignments_page | video_player | exercise_info | exercise_memo | assessment | score_screen | pathway | error | flutter_modal | flutter_bottom_sheet | exploration",
   "actionType": "${ACTION_TYPE_STRING}",
   "targetX": 0.5,
   "targetY": 0.5,
