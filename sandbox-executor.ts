@@ -593,10 +593,8 @@ async function executePatchInSandbox(patchText: string, filePath: string): Promi
 module.exports = {
   vm, path, SOURCE_DIR,
   ALLOWED_MODULES, BLOCKED_PATTERNS, IMMUTABLE_FILES, RESTRICTED_FILES, ALLOWED_PREFIXES,
-  AuditResult, PatchabilityResult, SandboxResult,
   auditPatchContent, isPatchableFile, extractRelativeName,
   createSandboxContext, runPatchInSandbox,
   executePatchInIsolatedProcess, executePatchInSandbox,
   _injectDependencies,
 };
-
