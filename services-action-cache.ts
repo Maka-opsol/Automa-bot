@@ -125,6 +125,121 @@ function computeLayoutFingerprint(
   return parts.join(',');
 }
 
+// ─── Async Lookup (for cold starts — awaits Turso fallback) ───────
+
+/**
+ * Same as lookup() but returns a Promise and AWAITs the Turso fallback
+ * when the local DB misses. Use this on cold starts (post-OOM) so the
+ * bot can immediately reuse actions persisted in Turso instead of wasting
+ * a full tribunal call.
+ *
+ * Flow:
+ *  1. Local DB hit → return immediately (same as sync lookup)
+ *  2. Local DB miss → await Turso read → populate local → return
+ *  3. Turso miss → return null
+ */
+async function lookupAsync(contextSignature: string): Promise<{
+  actionType: string;
+  targetX: number;
+  targetY: number;
+  value: string;
+  keypadSequence: any;
+  currentState: string;
+  reasoning: string;
+  hitCount: number;
+  lastUsed: number;
+} | null> {
+  const log = _getLog();
+
+  // FAST PATH: Check local DB first (sync, zero latency)
+  try {
+    const dbMod = _getDb();
+    if (dbMod) {
+      const row = dbMod.prepare(
+        `SELECT action_type, target_x, target_y, value, keypad_sequence, current_state,
+                reasoning, hit_count, last_used
+         FROM action_cache WHERE context_sig = ? AND evicted = 0`
+      ).get(contextSignature);
+
+      if (row) {
+        // Check TTL
+        const config = _getConfig();
+        const ttlMs = config.ACTION_CACHE_TTL_MS || DEFAULT_TTL_MS;
+        if (Date.now() - row.last_used > ttlMs) {
+          _markEvicted(contextSignature);
+          // Don't return — fall through to Turso below
+        } else {
+          log(`Action cache HIT (local): sig=${contextSignature.substring(0, 8)} type=${row.action_type} hits=${row.hit_count}`, 'INFO', 'action-cache');
+          updateStats('hits');
+          dbMod.prepare(
+            `UPDATE action_cache SET hit_count = hit_count + 1, last_used = ? WHERE context_sig = ?`
+          ).run(Date.now(), contextSignature);
+          const udb = _getUnifiedDb();
+          if (udb) { udb.getActionCache(contextSignature).catch(() => {}); }
+          return {
+            actionType: row.action_type, targetX: row.target_x, targetY: row.target_y,
+            value: row.value || '',
+            keypadSequence: row.keypad_sequence ? JSON.parse(row.keypad_sequence) : [],
+            currentState: row.current_state, reasoning: row.reasoning || '[cached action]',
+            hitCount: row.hit_count, lastUsed: row.last_used,
+          };
+        }
+      }
+    }
+  } catch (e: any) {
+    log(`Action cache local lookup error: ${e.message || e}`, 'DEBUG', 'action-cache');
+  }
+
+  // SLOW PATH: Await Turso (this is the key difference from sync lookup)
+  const udb = _getUnifiedDb();
+  if (udb) {
+    try {
+      const tursoRow = await udb.getActionCache(contextSignature);
+      if (tursoRow) {
+        const config = _getConfig();
+        const ttlMs = config.ACTION_CACHE_TTL_MS || DEFAULT_TTL_MS;
+        if (Date.now() - tursoRow.last_used <= ttlMs) {
+          // Populate local DB for future fast hits
+          try {
+            const dbMod = _getDb();
+            if (dbMod) {
+              const keypadJson = tursoRow.keypad_sequence || null;
+              dbMod.prepare(
+                `INSERT OR REPLACE INTO action_cache (context_sig, action_type, target_x, target_y, value,
+                  keypad_sequence, current_state, reasoning, success_count, failure_count,
+                  hit_count, created_at, last_used, evicted)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+              ).run(
+                contextSignature, tursoRow.action_type, tursoRow.target_x, tursoRow.target_y,
+                tursoRow.value || '', keypadJson, tursoRow.current_state, tursoRow.reasoning || '',
+                tursoRow.success_count || 1, tursoRow.failure_count || 0,
+                tursoRow.hit_count || 0, Date.now(), tursoRow.last_used
+              );
+              try { require('./database-turso').markTableDirty('action_cache'); } catch {}
+            }
+          } catch {}
+
+          log(`Action cache HIT (turso-cold): sig=${contextSignature.substring(0, 8)} type=${tursoRow.action_type} hits=${tursoRow.hit_count}`, 'INFO', 'action-cache');
+          updateStats('hits');
+          updateStats('tursoHits');
+          return {
+            actionType: tursoRow.action_type, targetX: tursoRow.target_x, targetY: tursoRow.target_y,
+            value: tursoRow.value || '',
+            keypadSequence: tursoRow.keypad_sequence ? JSON.parse(tursoRow.keypad_sequence) : [],
+            currentState: tursoRow.current_state, reasoning: tursoRow.reasoning || '[cached action]',
+            hitCount: tursoRow.hit_count || 1, lastUsed: tursoRow.last_used,
+          };
+        }
+      }
+    } catch (e: any) {
+      log(`Action cache Turso lookup error: ${e.message || e}`, 'DEBUG', 'action-cache');
+    }
+  }
+
+  updateStats('misses');
+  return null;
+}
+
 // ─── Cache Operations (sync — local DB fast path) ─────────────────────────
 
 const _stats = { hits: 0, misses: 0, saves: 0, evictions: 0, tursoHits: 0 };
@@ -592,6 +707,7 @@ module.exports = {
   computeContextSignature,
   computeLayoutFingerprint,
   lookup,
+  lookupAsync,
   save,
   recordFailure,
   runMaintenance,
