@@ -215,7 +215,6 @@ async function lookupAsync(contextSignature: string): Promise<{
                 tursoRow.success_count || 1, tursoRow.failure_count || 0,
                 tursoRow.hit_count || 0, Date.now(), tursoRow.last_used
               );
-              try { require('./database-turso').markTableDirty('action_cache'); } catch {}
             }
           } catch {}
 
@@ -352,8 +351,6 @@ function lookup(contextSignature: string): {
                 tursoRow.success_count || 1, tursoRow.failure_count || 0,
                 tursoRow.hit_count || 0, Date.now(), tursoRow.last_used
               );
-              // Mark table dirty so periodic Turso sync picks up the population
-              try { require('./database-turso').markTableDirty('action_cache'); } catch {}
               log(`Action cache: populated local from Turso for sig=${contextSignature.substring(0, 8)}`, 'DEBUG', 'action-cache');
             }
           } catch {}
@@ -368,10 +365,12 @@ function lookup(contextSignature: string): {
 
 /**
  * Save a successful action to the cache.
- * R6: Writes to local DB (sync) + Turso (async via unifiedDb).
- * Local write is immediate; Turso write is fire-and-forget.
+ * Writes to local DB (sync) + Turso (awaited via unifiedDb).
+ * The Turso write is AWAITED so the action is guaranteed persisted
+ * before the bot continues — critical for OOM survival since SIGKILL
+ * allows no shutdown hooks.
  */
-function save(
+async function save(
   contextSignature: string,
   action: {
     actionType: string;
@@ -382,7 +381,7 @@ function save(
     currentState: string;
     reasoning?: string;
   }
-): void {
+): Promise<void> {
   const log = _getLog();
   try {
     const dbMod = _getDb();
@@ -403,13 +402,12 @@ function save(
           ORDER BY last_used ASC LIMIT ?
         )`
       ).run(toEvict);
-      try { require('./database-turso').markTableDirty('action_cache'); } catch {}
     }
 
     const now = Date.now();
     const keypadJson = action.keypadSequence ? JSON.stringify(action.keypadSequence) : null;
 
-    // Upsert to local DB (sync)
+    // Upsert to local DB (sync, instant — survives until next OOM)
     dbMod.prepare(
       `INSERT INTO action_cache (context_sig, action_type, target_x, target_y, value,
         keypad_sequence, current_state, reasoning, success_count, failure_count,
@@ -439,22 +437,26 @@ function save(
       now
     );
 
-    // Mark table dirty so periodic Turso sync picks up the new/updated entry
-    try { require('./database-turso').markTableDirty('action_cache'); } catch {}
-
-    // Async: write to Turso via unifiedDb (fire-and-forget)
+    // AWAIT Turso write — guarantees persistence before next action.
+    // On OOM (SIGKILL) the process dies instantly; only data already
+    // in Turso survives. The ~100-500ms latency is acceptable since
+    // it replaces a full tribunal call on the next boot.
     const udb = _getUnifiedDb();
     if (udb) {
-      udb.saveActionCache({
-        contextSig: contextSignature,
-        actionType: action.actionType,
-        targetX: action.targetX,
-        targetY: action.targetY,
-        value: action.value || '',
-        keypadSequence: keypadJson,
-        currentState: action.currentState,
-        reasoning: action.reasoning || '',
-      }).catch(() => {});
+      try {
+        await udb.saveActionCache({
+          contextSig: contextSignature,
+          actionType: action.actionType,
+          targetX: action.targetX,
+          targetY: action.targetY,
+          value: action.value || '',
+          keypadSequence: keypadJson,
+          currentState: action.currentState,
+          reasoning: action.reasoning || '',
+        });
+      } catch (tursoErr: any) {
+        log(`Action cache Turso write failed (local still saved): ${tursoErr.message || tursoErr}`, 'WARN', 'action-cache');
+      }
     }
 
     log(`Action cache SAVE: sig=${contextSignature.substring(0, 8)} type=${action.actionType} state=${action.currentState}`, 'DEBUG', 'action-cache');
@@ -523,7 +525,6 @@ function _markEvicted(contextSignature: string): void {
     const dbMod = _getDb();
     if (!dbMod) return;
     dbMod.prepare(`UPDATE action_cache SET evicted = 1 WHERE context_sig = ?`).run(contextSignature);
-    try { require('./database-turso').markTableDirty('action_cache'); } catch {}
   } catch { /* non-critical */ }
 }
 
@@ -551,7 +552,6 @@ async function runMaintenanceAsync(): Promise<void> {
     if (result.changes > 0) {
       log(`Action cache maintenance: evicted ${result.changes} expired local entries`, 'INFO', 'action-cache');
       updateStats('evictions');
-      try { require('./database-turso').markTableDirty('action_cache'); } catch {}
     }
 
     dbMod.prepare(
@@ -595,7 +595,6 @@ function runMaintenance(): void {
     if (result.changes > 0) {
       _getLog()(`Action cache maintenance: evicted ${result.changes} expired entries`, 'INFO', 'action-cache');
       updateStats('evictions');
-      try { require('./database-turso').markTableDirty('action_cache'); } catch {}
     }
 
     dbMod.prepare(
@@ -667,7 +666,6 @@ async function clearAsync(): Promise<void> {
     const dbMod = _getDb();
     if (dbMod) {
       dbMod.prepare(`DELETE FROM action_cache`).run();
-      try { require('./database-turso').markTableDirty('action_cache'); } catch {}
     }
   } catch {}
 
@@ -691,7 +689,6 @@ function clear(): void {
     const dbMod = _getDb();
     if (dbMod) {
       dbMod.prepare(`DELETE FROM action_cache`).run();
-      try { require('./database-turso').markTableDirty('action_cache'); } catch {}
     }
   } catch {}
 
