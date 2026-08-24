@@ -1655,6 +1655,34 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             } else {
               action = await determineNextAction(base64, page.url(), explorationMode ? explorationMap : null);
             }
+
+            // ── Eager action cache write (pre-execution) ──────────────────
+            // Persist to Turso IMMEDIATELY after tribunal decides.
+            // If OOM kills before execution, this survives. If the action
+            // later fails, recordFailure (line ~2238) evicts after 3 strikes.
+            if (action?.actionType && actionCache && !_isCacheExcluded
+                && action.actionType !== 'wait' && action.actionType !== 'blank_page') {
+              try {
+                // Compute sig if not already done (cache was excluded or missed)
+                if (!_actionCacheSig) {
+                  _actionCacheSig = actionCache.computeContextSignature(currentState, base64);
+                }
+                if (_actionCacheSig) {
+                  await actionCache.save(_actionCacheSig, {
+                    actionType: action.actionType,
+                    targetX: action.targetX,
+                    targetY: action.targetY,
+                    value: action.value || '',
+                    keypadSequence: action.keypadSequence,
+                    currentState: action.currentState || currentState || 'unknown',
+                    reasoning: action.reasoning,
+                  });
+                  _localCacheEmpty = false;
+                }
+              } catch (eagerErr: any) {
+                log(`Eager cache save failed: ${eagerErr.message || eagerErr}`, 'DEBUG', 'cycle');
+              }
+            }
             // If tribunal internally failed and returned a wait/error fallback, try pixel fallback
             if (action?.actionType === 'wait' && action?.reasoning?.includes('tribunal failure')) {
               logError('Tribunal returned fallback wait, trying pixel fallback', new Error(action.reasoning || ''));
@@ -2208,35 +2236,13 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         }
       }
 
-      // ─── Action Cache Save / Failure Tracking ───
-      // After action execution, update the cache:
-      // - Success: save the action (if not from cache) for future reuse
-      // - Failure: record failure count; evict if too many consecutive failures
-      // GUARD: Never save blank_page actions — they're meaningless (page not
-      // rendered) and caching them creates an infinite wait loop.
+      // ─── Action Cache Failure Tracking ───
+      // Cache write already happened eagerly (right after tribunal returned).
+      // This block only handles failure tracking: if the action we just executed
+      // (whether from cache or tribunal) failed, record it. After 3 consecutive
+      // failures the entry is evicted.
       if (_actionCacheSig && actionCache && !_isCacheExcluded) {
-        if (actionSuccess && !_actionCacheHit) {
-          // Save new successful action to cache (only if it wasn't already from cache)
-          // This builds the cache over time as the bot discovers working actions
-          // AWAIT: save() now awaits the Turso write to guarantee persistence
-          // before OOM can kill the process (SIGKILL allows no shutdown hooks).
-          try {
-            await actionCache.save(_actionCacheSig, {
-              actionType: action.actionType,
-              targetX: action.targetX,
-              targetY: action.targetY,
-              value: action.value || '',
-              keypadSequence: action.keypadSequence,
-              currentState: action.currentState || currentState || 'unknown',
-              reasoning: action.reasoning,
-            });
-            // Local DB now has entries — switch back to fast sync path
-            _localCacheEmpty = false;
-          } catch (saveErr: any) {
-            log(`Action cache save error: ${saveErr.message || saveErr}`, 'DEBUG', 'cycle');
-          }
-        } else if (!actionSuccess && _actionCacheHit) {
-          // Cached action failed — record failure and possibly evict
+        if (!actionSuccess) {
           const evicted = actionCache.recordFailure(_actionCacheSig);
           if (evicted) {
             log('Action cache entry evicted due to repeated failures — will re-query AI next cycle', 'WARN', 'cycle');
