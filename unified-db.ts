@@ -156,8 +156,7 @@ async function deleteCalibration(key: string): Promise<boolean> {
   try {
     const db = _getLocalDb();
     db?.db?.prepare('DELETE FROM calibration WHERE key = ?')?.run(key);
-    // Mark table dirty so periodic Turso sync picks up the deletion
-    try { require('./database-turso').markTableDirty('calibration'); } catch {}
+    // Note: Turso write happens directly below via tursoDeleteCalibration
   } catch {}
 
   const turso = _getTurso();
@@ -403,7 +402,13 @@ async function getActionCache(contextSig: string): Promise<any | null> {
 }
 
 /**
- * Save an action cache entry. Writes to local (sync) + Turso (async).
+ * Save an action cache entry to Turso ONLY.
+ *
+ * IMPORTANT: The caller (services-action-cache.save()) already wrote to
+ * local SQLite before calling this. We ONLY write to Turso here to avoid
+ * a redundant local upsert (wastes CPU on memory-constrained instances).
+ *
+ * If you need local+Turso, call services-action-cache.save() instead.
  */
 async function saveActionCache(data: {
   contextSig: string;
@@ -415,39 +420,12 @@ async function saveActionCache(data: {
   currentState: string;
   reasoning: string;
 }): Promise<boolean> {
-  const now = Date.now();
-  const keypadJson = data.keypadSequence ? JSON.stringify(data.keypadSequence) : null;
+  const keypadJson = typeof data.keypadSequence === 'string'
+    ? data.keypadSequence
+    : data.keypadSequence ? JSON.stringify(data.keypadSequence) : null;
 
-  // Write to local (sync)
-  try {
-    const db = _getLocalDb();
-    if (db?.db) {
-      db.db.prepare(
-        `INSERT INTO action_cache (context_sig, action_type, target_x, target_y, value,
-          keypad_sequence, current_state, reasoning, success_count, failure_count,
-          hit_count, created_at, last_used, evicted)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, ?, ?, 0)
-         ON CONFLICT(context_sig) DO UPDATE SET
-           action_type = excluded.action_type,
-           target_x = excluded.target_x,
-           target_y = excluded.target_y,
-           value = excluded.value,
-           keypad_sequence = excluded.keypad_sequence,
-           current_state = excluded.current_state,
-           reasoning = excluded.reasoning,
-           success_count = success_count + 1,
-           failure_count = 0,
-           last_used = excluded.last_used`
-      ).run(
-        data.contextSig, data.actionType, data.targetX, data.targetY, data.value,
-        keypadJson, data.currentState, data.reasoning, now, now
-      );
-      // Mark table dirty so periodic Turso sync picks up the change
-      try { require('./database-turso').markTableDirty('action_cache'); } catch {}
-    }
-  } catch {}
-
-  // Write to Turso (async)
+  // Write to Turso ONLY — CRITICAL: this is the OOM survival path.
+  // The caller (services-action-cache.save()) already wrote to local SQLite.
   const turso = _getTurso();
   if (turso?.isAvailable?.()) {
     _stats.tursoWrites++;
@@ -462,11 +440,12 @@ async function saveActionCache(data: {
         currentState: data.currentState,
         reasoning: data.reasoning,
       });
-      if (!ok) _stats.tursoWriteErrors++;
-    } catch { _stats.tursoWriteErrors++; }
+      if (!ok) { _stats.tursoWriteErrors++; return false; }
+      return true;
+    } catch { _stats.tursoWriteErrors++; return false; }
   }
 
-  return true;
+  return false; // Turso not available — write did NOT happen
 }
 
 /**
@@ -487,8 +466,6 @@ async function recordActionCacheFailure(contextSig: string): Promise<boolean> {
         if (newFailCount >= 3) {
           db.db.prepare('UPDATE action_cache SET evicted = 1 WHERE context_sig = ?').run(contextSig);
         }
-        // Mark table dirty so periodic Turso sync picks up the change
-        try { require('./database-turso').markTableDirty('action_cache'); } catch {}
       }
     }
   } catch {}
@@ -509,8 +486,6 @@ async function evictActionCache(contextSig: string): Promise<boolean> {
   try {
     const db = _getLocalDb();
     db?.db?.prepare('UPDATE action_cache SET evicted = 1 WHERE context_sig = ?')?.run(contextSig);
-    // Mark table dirty so periodic Turso sync picks up the eviction
-    try { require('./database-turso').markTableDirty('action_cache'); } catch {}
   } catch {}
 
   const turso = _getTurso();
@@ -555,10 +530,7 @@ async function runActionCacheMaintenance(ttlMs: number, maxEntries: number): Pro
           SELECT context_sig FROM action_cache WHERE evicted = 1 ORDER BY last_used DESC LIMIT 50
         )`
       ).run();
-      // Mark table dirty if anything changed
-      if (evicted > 0) {
-        try { require('./database-turso').markTableDirty('action_cache'); } catch {}
-      }
+      // Note: Turso maintenance runs directly below — no dirty flag needed
     }
   } catch {}
 
@@ -620,14 +592,11 @@ async function clearActionCache(): Promise<void> {
   try {
     const db = _getLocalDb();
     db?.db?.prepare('DELETE FROM action_cache')?.run();
-    // Mark table dirty so periodic Turso sync picks up the clear
-    try { require('./database-turso').markTableDirty('action_cache'); } catch {}
   } catch {}
 
   const turso = _getTurso();
   if (turso?.isAvailable?.()) {
     try {
-      // FIX: Use _exec which calls _query internally — DELETE works fine
       // Delete in batches to avoid Turso free-tier row mutation limits
       for (let i = 0; i < 10; i++) {
         const result = await turso.tursoEvictExpiredActionCache(Date.now() + 365 * 24 * 60 * 60 * 1000);
