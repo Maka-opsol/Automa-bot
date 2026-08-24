@@ -275,7 +275,10 @@ function isBlankImage(base64Image: string): boolean {
 // TRIBUNAL EXECUTION
 // ===============================================================================
 
+let _tribunalCallCount = 0;
+
 async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = null, signal: any = null) {
+  const isFirstTribunal = _tribunalCallCount++ === 0;
   const { log } = _getLogger();
 
   // ── Blank image guard ──
@@ -350,7 +353,7 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
         const res = await safeCall(
           (sig: any) => provider.fn(base64Image, fullPrompt, sig || signal, { validate: true }),
           `Tribunal ${provider.name}`,
-          { url: provider.name, maxRetries: 2, baseDelay: 1000, signal: tribunalController.signal }
+          { url: provider.name, maxRetries: isFirstTribunal ? 2 : 0, baseDelay: 1000, signal: tribunalController.signal }
         );
         const latency = Date.now() - start;
         // Note: safeCall already records to providers-health via recordCallResult internally.
