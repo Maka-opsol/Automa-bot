@@ -51,6 +51,35 @@ const DEFAULT_MAX_FAILURES = 3;
  * @param dominantColors - Optional pre-computed color hash from page classifier
  * @returns Context signature string, or null if inputs invalid
  */
+/**
+ * Compute a coarse byte-sample fingerprint directly from a JPEG/PNG buffer.
+ * Does NOT require decoding — samples bytes at fixed percentage positions
+ * through the file body. This is stable across animation frames (which
+ * only change a small fraction of DCT blocks) but changes for genuinely
+ * different pages.
+ *
+ * Cost: ~0.01ms (just array indexing, no decoding).
+ */
+function _coarseBufferFingerprint(buf: Buffer): string {
+  const len = buf.length;
+  // Sample 4 windows of 16 bytes each at 20%, 40%, 60%, 80% of the file.
+  // These positions hit the compressed image data (not headers/footers).
+  const positions = [0.2, 0.4, 0.6, 0.8];
+  const windowSize = 16;
+  let hash = 0;
+  for (const pct of positions) {
+    const start = Math.floor(len * pct);
+    for (let i = 0; i < windowSize && (start + i) < len; i++) {
+      // XOR-fold bytes into a 32-bit hash — fast, no allocations
+      hash = ((hash << 5) - hash + buf[start + i]) | 0;
+    }
+  }
+  // Also bucket the length to absorb ±1KB animation jitter.
+  // Round to nearest 2KB so a 17-byte difference maps to the same bucket.
+  const bucketedLen = Math.floor(len / 2048) * 2048;
+  return `${bucketedLen}:${(hash >>> 0).toString(16)}`;
+}
+
 function computeContextSignature(
   state: string | null,
   base64Screenshot: string | null,
@@ -70,9 +99,10 @@ function computeContextSignature(
 
   if (imageBuffer.length < 100) return null;
 
+  const fp = _coarseBufferFingerprint(imageBuffer);
   const hashSource = [
     `state:${state}`,
-    `imgLen:${imageBuffer.length}`,
+    `fp:${fp}`,
     `domColors:${dominantColors || 'none'}`,
   ].join('|');
 
