@@ -474,7 +474,7 @@ async function save(
     const udb = _getUnifiedDb();
     if (udb) {
       try {
-        await udb.saveActionCache({
+        const tursoOk = await udb.saveActionCache({
           contextSig: contextSignature,
           actionType: action.actionType,
           targetX: action.targetX,
@@ -484,9 +484,12 @@ async function save(
           currentState: action.currentState,
           reasoning: action.reasoning || '',
         });
+        log(`Action cache TURSO WRITE ${tursoOk ? 'OK' : 'FAILED'}: sig=${contextSignature.substring(0, 8)}`, tursoOk ? 'DEBUG' : 'WARN', 'action-cache');
       } catch (tursoErr: any) {
-        log(`Action cache Turso write failed (local still saved): ${tursoErr.message || tursoErr}`, 'WARN', 'action-cache');
+        log(`Action cache Turso write FAILED (local still saved): ${tursoErr.message || tursoErr}`, 'WARN', 'action-cache');
       }
+    } else {
+      log(`Action cache: NO unified-db — Turso write SKIPPED for sig=${contextSignature.substring(0, 8)}`, 'WARN', 'action-cache');
     }
 
     log(`Action cache SAVE: sig=${contextSignature.substring(0, 8)} type=${action.actionType} state=${action.currentState}`, 'DEBUG', 'action-cache');
