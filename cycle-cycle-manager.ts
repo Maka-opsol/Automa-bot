@@ -2218,8 +2218,10 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         if (actionSuccess && !_actionCacheHit) {
           // Save new successful action to cache (only if it wasn't already from cache)
           // This builds the cache over time as the bot discovers working actions
+          // AWAIT: save() now awaits the Turso write to guarantee persistence
+          // before OOM can kill the process (SIGKILL allows no shutdown hooks).
           try {
-            actionCache.save(_actionCacheSig, {
+            await actionCache.save(_actionCacheSig, {
               actionType: action.actionType,
               targetX: action.targetX,
               targetY: action.targetY,
