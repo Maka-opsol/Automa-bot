@@ -673,13 +673,13 @@ function buildCodeGenPrompt(investigationData: any, errorLogs: any, feedbackInfo
   } else {
     prompt += `\nNo specific target file identified. Choose from the file list above.\n`;
     prompt += `INSTRUCTIONS:\n`;
-    prompt += `1. Analyze the error and identify the single most likely source file.\n`;
+    prompt += `1. Analyze the error and identify the single most likely source file. Match the ERROR to the file whose RESPONSIBILITY aligns with what's failing.\n`;
     prompt += `2. Propose ONE fix only.\n`;
     prompt += `3. Return a JSON ARRAY with a SINGLE object:\n`;
     prompt += `- "file": (string) the exact filename from the available files list\n`;
     prompt += `- "change": (string) human-readable description\n`;
     prompt += `- "patch": (string) EITHER a unified diff OR the complete file content\n`;
-    prompt += `DO NOT default to providers-detection-work-detector.ts unless the error specifically mentions work detection.\n`;
+    prompt += `Do NOT pick a file by name recognition alone — pick it because the error describes a bug in that file.\n`;
     prompt += `Only return [] if you truly cannot identify any file to fix.\n`;
     prompt += `Return ONLY the JSON array. No markdown fences, no explanation.\n`;
   }
