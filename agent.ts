@@ -205,6 +205,13 @@ process.once('SIGTERM', shutdown);
 // v5-fix: Shutdown hooks now use { required: false } + null-checks so they don't
 // throw during shutdown if the browser or other modules failed to initialize.
 registerShutdownHook(async () => {
+  log('Flushing action cache to Turso before shutdown...', 'INFO', 'agent');
+  try {
+    const tursoMod = require('./database-turso');
+    if (tursoMod?.syncToTurso) { await tursoMod.syncToTurso(); log('Turso sync complete', 'INFO', 'agent'); }
+  } catch (e: any) { logError('Turso sync on shutdown failed', e as Error); }
+}, 0);
+registerShutdownHook(async () => {
   log('Closing browser...', 'INFO', 'agent');
   try {
     const browserMod = container.get('browser', { required: false });
