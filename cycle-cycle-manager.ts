@@ -1550,55 +1550,15 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // Before calling the tribunal (expensive AI call), check if we have
       // a cached action for this exact visual context. If hit, skip the AI
       // call entirely and use the saved action.
-      // EXCLUSION: Never use cached actions for blank_page or unknown states
-      // when the screenshot is effectively blank. A blank page creates an
-      // infinite wait loop (blank → cached wait → blank → cached wait).
-      // v11: Also detect near-blank screenshots via byte entropy — the
-      // tribunal may return 'unknown' instead of 'blank_page' for screenshots
-      // that barely pass the entropy check but are still blank to the eye.
-      // v11.1: Also check for blank Flutter canvas via DOM (byte entropy
-      // misses these because the <canvas> element adds structural bytes).
+      // EXCLUSION: Only hard blank_page state is excluded (prevents infinite
+      // wait loop). Near-blank byte entropy and Flutter DOM checks removed —
+      // the heightened pixel sampler in the signature makes false matches
+      // unlikely, and the 3-failure eviction self-cleans bad entries.
       let _actionCacheSig: string | null = null;
       let _actionCacheHit = false;
       const actionCache = _getActionCache();
-      const _isBlankPageState = currentState === 'blank_page';
-      // v11: Detect near-blank screenshots — if byte entropy is very low,
-      // treat as blank regardless of what currentState says
-      let _isNearBlankScreenshot = false;
-      try {
-        const buf = Buffer.from(base64, 'base64');
-        if (buf.length > 200) {
-          const sampleStart = Math.min(200, buf.length - 1);
-          const sampleLen = Math.min(4096, buf.length - sampleStart);
-          if (sampleLen > 0) {
-            const seen = new Set<number>();
-            for (let i = sampleStart; i < sampleStart + sampleLen; i++) { seen.add(buf[i]); }
-            // < 50 unique bytes = near-blank (tribunal uses < 40 for hard blank)
-            _isNearBlankScreenshot = seen.size < 50;
-          }
-        }
-      } catch {}
-      // v11.1: DOM-based Flutter blank detection (catches canvases that pass
-      // byte entropy but are visually blank — 0 semantics, minimal text)
-      let _isFlutterBlankDom = false;
-      if (!_isNearBlankScreenshot && !_isBlankPageState) {
-        try {
-          const domSignal = await page.evaluate(() => {
-            const text = (document.body?.innerText || '').trim();
-            if (text.length > 100) return false;
-            // Check for Flutter canvas
-            const canvases = document.querySelectorAll('canvas');
-            for (const c of canvases) {
-              const cls = (c.className || '').toString();
-              if (cls.includes('flt') || cls.includes('flutter')) return true;
-            }
-            return !!document.querySelector('flt-glass-pane');
-          }).catch(() => false);
-          _isFlutterBlankDom = !!domSignal;
-        } catch {}
-      }
-      const _isCacheExcluded = _isBlankPageState || _isNearBlankScreenshot || _isFlutterBlankDom || blankPageCounter > 0;
-      if (!action && actionCache && currentState && !_isCacheExcluded) {
+      const _isCacheExcluded = currentState === 'blank_page';
+      if (!action && actionCache && !_isCacheExcluded) {
         try {
           // Compute context signature from current state + screenshot
           // Use previous cycle's state as the context key (currentState is set from last cycle)
