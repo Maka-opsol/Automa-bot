@@ -58,14 +58,15 @@ const DEFAULT_MAX_FAILURES = 3;
  * only change a small fraction of DCT blocks) but changes for genuinely
  * different pages.
  *
- * Cost: ~0.03ms (12×32 = 384 byte reads, no decoding).
+ * Cost: ~0.01ms (just array indexing, no decoding).
  */
 function _coarseBufferFingerprint(buf: Buffer): string {
   const len = buf.length;
-  // Sample 4 windows of 16 bytes each at 20%, 40%, 60%, 80% of the file.
-  // These positions hit the compressed image data (not headers/footers).
-  const positions = [0.2, 0.4, 0.6, 0.8];
-  const windowSize = 16;
+  // Sample 12 windows of 32 bytes each at evenly-spaced positions
+  // across the compressed image body. Multi-zone coverage makes the
+  // fingerprint resistant to localized DCT changes from animations.
+  const positions = [0.05, 0.12, 0.2, 0.28, 0.36, 0.44, 0.52, 0.6, 0.68, 0.76, 0.84, 0.92];
+  const windowSize = 32;
   let hash = 0;
   for (const pct of positions) {
     const start = Math.floor(len * pct);
@@ -74,9 +75,10 @@ function _coarseBufferFingerprint(buf: Buffer): string {
       hash = ((hash << 5) - hash + buf[start + i]) | 0;
     }
   }
-  // Also bucket the length to absorb ±1KB animation jitter.
-  // Round to nearest 2KB so a 17-byte difference maps to the same bucket.
-  const bucketedLen = Math.floor(len / 2048) * 2048;
+  // Bucket the length to absorb ±1KB animation jitter.
+  // Round to nearest 1KB so small compression differences don't
+  // cause cache misses for visually identical frames.
+  const bucketedLen = Math.floor(len / 1024) * 1024;
   return `${bucketedLen}:${(hash >>> 0).toString(16)}`;
 }
 
