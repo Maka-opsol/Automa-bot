@@ -1448,18 +1448,21 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       let base64 = screenshot.toString('base64');
       // Feed screenshot to dashboard cache (non-blocking)
 
-      // ─── Cloudinary: upload cycle screenshot (fire-and-forget) ───
-      try {
-        const screenshotStorage = require('./screenshot-storage');
-        if (screenshotStorage?.isEnabled?.() && screenshotStorage?.uploadScreenshot) {
-          screenshotStorage.uploadScreenshot(screenshot, 'cycle', {
-            state: currentState || 'unknown',
-            cycle: String(getStats().cycleCount || 0),
-          }).catch(() => {});
-        }
-      } catch (uploadErr: any) {
-        log(`Screenshot Cloudinary upload failed (non-critical): ${uploadErr.message || uploadErr}`, 'DEBUG', 'cycle');
-      }
+      // ─── Cloudinary: DISABLED — burns ~100MB/month bandwidth on Render
+      // free tier (5GB limit). Screenshots are only useful for the dashboard;
+      // they don't contribute to OOM survival. Re-enable by setting env
+      // SCREENSHOT_STORAGE_ENABLED=true if you have bandwidth to spare.
+      // try {
+      //   const screenshotStorage = require('./screenshot-storage');
+      //   if (screenshotStorage?.isEnabled?.() && screenshotStorage?.uploadScreenshot) {
+      //     screenshotStorage.uploadScreenshot(screenshot, 'cycle', {
+      //       state: currentState || 'unknown',
+      //       cycle: String(getStats().cycleCount || 0),
+      //     }).catch(() => {});
+      //   }
+      // } catch (uploadErr: any) {
+      //   log(`Screenshot Cloudinary upload failed (non-critical): ${uploadErr.message || uploadErr}`, 'DEBUG', 'cycle');
+      // }
       try {
         const setShot = (globalThis as any).__setLatestScreenshot;
         if (setShot) {
@@ -1550,10 +1553,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // Before calling the tribunal (expensive AI call), check if we have
       // a cached action for this exact visual context. If hit, skip the AI
       // call entirely and use the saved action.
-      // EXCLUSION: Only hard blank_page state is excluded (prevents infinite
-      // wait loop). Near-blank byte entropy and Flutter DOM checks removed —
-      // the heightened pixel sampler in the signature makes false matches
-      // unlikely, and the 3-failure eviction self-cleans bad entries.
+      // EXCLUSION: Only skip cache for hard blank_page state.
+      // Near-blank screenshots, Flutter DOM checks, and blankPageCounter
+      // were removed in v12 — they over-excluded and starved the cache.
+      // The coarse 12×32 fingerprint now handles animation jitter,
+      // and the 3-failure eviction handles stale entries.
       let _actionCacheSig: string | null = null;
       let _actionCacheHit = false;
       const actionCache = _getActionCache();
