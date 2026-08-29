@@ -88,7 +88,7 @@ function GroqProvider() {
 
     // P7: Pass providerName for health-aware retries
     try {
-      const rawContent = await retryWithBackoff(makeRequest, { providerName: 'Groq', signal });
+      const rawContent = await retryWithBackoff(makeRequest, { providerName: 'Groq', signal, maxRetries: options.maxRetries });
       if (options.validate === false) return rawContent;
       return validateActionResponse(extractJSON(rawContent, 'Groq'), 'Groq');
     } catch (err: any) {
@@ -106,7 +106,7 @@ function GroqProvider() {
             log('Rolled back Groq model config.', 'INFO', 'groq');
             // FIX: Rebuild makeRequest after rollback to pick up new config.
             // buildRequest() reads config fresh, so the new model is used.
-            const retryContent = await retryWithBackoff(makeRequest, { providerName: 'Groq', signal });
+            const retryContent = await retryWithBackoff(makeRequest, { providerName: 'Groq', signal, maxRetries: 0 });
             if (options.validate === false) return retryContent;
             return validateActionResponse(extractJSON(retryContent, 'Groq'), 'Groq');
           }
