@@ -462,9 +462,9 @@ function classifyError(err: any): { category: string; retryable: boolean; retryA
 
   // Rate limited
   if (status === 429 || msg.includes('rate_limit') || msg.includes('rate limit') || msg.includes('rate_limited')) {
-    // Extract retry-after from message or default to 120s (was 60s — too aggressive)
+    // Extract retry-after from message or default to 10s
     const match = msg.match(/retry after (\d+)ms/);
-    const retryAfterMs = match ? parseInt(match[1], 10) : 120000;
+    const retryAfterMs = match ? parseInt(match[1], 10) : 10000; // 10s default (not 120s)
     return { category: 'rate_limited', retryable: true, retryAfterMs };
   }
 
@@ -513,7 +513,7 @@ async function retryWithBackoff(
   } = {}
 ): Promise<any> {
   const { signal } = options;
-  const { maxRetries = 3, baseDelayMs = 1000, providerName } = options;
+  const { maxRetries = 0, baseDelayMs = 1000, providerName } = options;
   const log = _getLog().log;
 
   // FIX: Check if provider is already in cooldown from a previous 429
