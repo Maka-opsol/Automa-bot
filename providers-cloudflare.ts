@@ -252,11 +252,12 @@ async function _callWithModel(
     if (!responseText) {
       throw new Error('CLOUDFLARE_EMPTY_RESPONSE');
     }
-    try { require('./providers-base').storeRawResponse('Cloudflare', responseText, JSON.stringify(data), body.model || currentModel); } catch {}
+    try { require('./providers-base').storeRawResponse('Cloudflare', responseText, JSON.stringify(data), modelId); } catch {}
     return responseText;
   };
 
-  const rawContent = await retryWithBackoff(makeRequest, { providerName: 'Cloudflare', signal });
+  const maxRetries = options.maxRetries ?? 0;
+  const rawContent = await retryWithBackoff(makeRequest, { providerName: 'Cloudflare', signal, maxRetries });
   if (options.validate === false) return rawContent;
   return validateActionResponse(extractJSON(rawContent, 'Cloudflare'), 'Cloudflare');
 }
