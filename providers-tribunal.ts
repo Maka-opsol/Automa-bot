@@ -146,10 +146,16 @@ function findWeightedConsensus(votes: WeightedVote[]): WeightedConsensus | null 
     };
   }
 
-  // Group votes by action key (currentState::actionType)
+  // Group votes by actionType only.
+  // v13: Removed currentState from the cluster key. currentState is a
+  // free-text description that naturally varies between providers
+  // ("loading" vs "signin_page" vs "unknown" for the same visual).
+  // Clustering on it split unanimous "wait" votes into separate clusters,
+  // producing phantom low-agreement warnings. The tribunal cares about
+  // whether providers agree on the ACTION, not the state label.
   const clusters = new Map<string, WeightedVote[]>();
   for (const vote of votes) {
-    const key = `${vote.action.currentState || 'unknown'}::${vote.action.actionType}`;
+    const key = vote.action.actionType;
     if (!clusters.has(key)) clusters.set(key, []);
     clusters.get(key)!.push(vote);
   }
@@ -347,7 +353,10 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
     providers.map(async (provider: any) => {
       const start = Date.now();
       try {
-        const maxRetries = 0;
+        // Allow 1 retry for transient 5xx server errors (503, 502).
+        // maxRetries=0 was too aggressive — it kills providers on temporary
+        // unavailability, wasting the other 5 providers' votes.
+        const maxRetries = 1;
         const res = await safeCall(
           (sig: any) => provider.fn(base64Image, fullPrompt, sig || signal, { validate: true, maxRetries }),
           `Tribunal ${provider.name}`,
@@ -442,11 +451,12 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
       .sort((a, b) => b.weight - a.weight)
       .map(d => `${d.providerName}:${d.weight.toFixed(3)}(${d.actionType})`)
       .join(', ');
-    log(`Tribunal consensus (${consensus.clusterSize}/${consensus.totalVoters} providers, ${consensus.agreementPct}% weight agreement): ${rep.currentState} / ${rep.actionType} | weights: [${weightLog}]`, 'INFO', 'tribunal');
+    const pctDisplay = Math.round(consensus.agreementPct * 100);
+    log(`Tribunal consensus (${consensus.clusterSize}/${consensus.totalVoters} providers, ${pctDisplay}% weight agreement): ${rep.currentState} / ${rep.actionType} | weights: [${weightLog}]`, 'INFO', 'tribunal');
 
-    // Warn on low agreement
+    // Warn on low agreement (threshold: <40% of weight on the winning action)
     if (consensus.agreementPct < 0.4 && consensus.totalVoters >= 3) {
-      log(`Low tribunal agreement (${consensus.agreementPct}%) -- providers disagree on action`, 'WARN', 'tribunal');
+      log(`Low tribunal agreement (${pctDisplay}%) -- providers disagree on action`, 'WARN', 'tribunal');
     }
   }
 
@@ -470,7 +480,7 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
 
   const reasoningPrefix = valid.length === 1
     ? `Tribunal (1 model - ${valid[0]._model}, w=${consensus.winnerWeight.toFixed(2)})`
-    : `Tribunal (${consensus.clusterSize}/${consensus.totalVoters} models, ${consensus.agreementPct}% agreement)`;
+    : `Tribunal (${consensus.clusterSize}/${consensus.totalVoters} models, ${Math.round(consensus.agreementPct * 100)}% agreement)`;
 
   return {
     currentState: cleanRep.currentState,
