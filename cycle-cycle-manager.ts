@@ -2127,15 +2127,16 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       if (actionSuccess) _pushActionReplay(action);
 
       // ─── Pixel Calibration Sampling ───
-      // After a successful click, sample the button color at click coordinates.
-      // This builds a distribution of observed colors per category, so pixel-fallback
-      // can adapt if MathU changes its color scheme.
-      if (actionSuccess && action.actionType === 'click' && (action.targetX > 0 || action.targetY > 0)) {
+      // v17: GATED behind heap check. A PNG screenshot (500KB-2MB) is the
+      // #1 OOM trigger on 512MB Render. Calibration is a nice-to-have that
+      // can wait until the instance has memory headroom.
+      const _postActionHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+      if (actionSuccess && action.actionType === 'click' && (action.targetX > 0 || action.targetY > 0)
+          && _postActionHeapMB < 150) {
         try {
           const pixelCal = require('./pixel-calibration');
           const pngShot = await page.screenshot({ type: 'png', fullPage: false }).catch(() => null);
           if (pngShot && pngShot.length > 100) {
-            // Use DPR-adjusted coordinates (action coords are in viewport pixels)
             const dprMod = require('./browser');
             const dpr = dprMod._dprScale || 1.0;
             pixelCal.sampleAtCoordinates(
@@ -2144,7 +2145,6 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               Math.round(action.targetY * dpr),
               action.actionType
             ).catch(() => {});
-            // Also sample surrounding area (background, adjacent elements)
             pixelCal.sampleSurroundings(
               pngShot,
               Math.round(action.targetX * dpr),
@@ -2155,17 +2155,18 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         } catch (calErr: any) {
           log(`Pixel calibration sampling failed: ${calErr.message || calErr}`, 'DEBUG', 'cycle');
         }
+      } else if (actionSuccess && action.actionType === 'click' && _postActionHeapMB >= 150) {
+        log(`Skipping pixel calibration (heap=${_postActionHeapMB.toFixed(0)}MB > 150MB threshold)`, 'DEBUG', 'cycle');
       }
 
       // ─── Pixel Training: Record successful action for self-training ───
-      // After EVERY successful click (from any source — AI, pixel-fallback,
-      // pixel-explorer, action cache), record the (screenshot, action, result)
-      // triple so pixel-fallback can learn from it.
-      if (actionSuccess && action.actionType === 'click' && (action.targetX > 0 || action.targetY > 0)) {
+      // v17: GATED behind heap check. recordSuccess holds page + screenshot refs
+      // that prevent GC. Skip when memory is tight.
+      if (actionSuccess && action.actionType === 'click' && (action.targetX > 0 || action.targetY > 0)
+          && _postActionHeapMB < 150) {
         try {
           const pixelTraining = require('./pixel-training');
           if (pixelTraining && pixelTraining.recordSuccess) {
-            // Reuse the PNG from calibration if available, otherwise training will capture its own
             const trainingPng = (typeof pngShot !== 'undefined' && pngShot && pngShot.length > 100) ? pngShot : undefined;
             pixelTraining.recordSuccess({
               page,
@@ -2183,11 +2184,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
 
       // ─── Pixel Explorer Outcome Observation ───
-      // If this was a pixel-explorer action, observe the outcome to learn from it.
-      if (actionSuccess && action._pixelExplorer && action._explorationMapKey) {
+      // v17: GATED behind heap check.
+      if (actionSuccess && action._pixelExplorer && action._explorationMapKey
+          && _postActionHeapMB < 150) {
         try {
           const pixelExplorer = require('./pixel-explorer');
-          // screenshotHash was captured before the action as `screenshotHash` variable
           pixelExplorer.observeOutcome(
             page,
             typeof screenshotHash === 'string' ? screenshotHash : '',
@@ -2238,19 +2239,24 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               // Wait additional time for content to fully render
               await dlSleep(2000);
 
-              // Check if module content (topic buttons) is now visible via pixel analysis
-              try {
-                const pngScreenshot = await page.screenshot({ type: 'png', fullPage: false });
-                const pixelMod = require('./pixel-fallback');
-                const decoded = pixelMod._decodePNG?.(pngScreenshot);
-                if (decoded && pixelMod._isModuleContentLoaded?.(decoded.rgba, decoded.width, decoded.height)) {
-                  _moduleDownloadState = 'content_visible';
-                  log('Module download flow: content loaded! Topics visible.', 'INFO', 'cycle');
+              // v17: Skip PNG pixel check on tight heap — use heuristic instead
+              if (process.memoryUsage().heapUsed / 1024 / 1024 < 150) {
+                try {
+                  const pngScreenshot = await page.screenshot({ type: 'png', fullPage: false });
+                  const pixelMod = require('./pixel-fallback');
+                  const decoded = pixelMod._decodePNG?.(pngScreenshot);
+                  if (decoded && pixelMod._isModuleContentLoaded?.(decoded.rgba, decoded.width, decoded.height)) {
+                    _moduleDownloadState = 'content_visible';
+                    log('Module download flow: content loaded! Topics visible.', 'INFO', 'cycle');
+                    contentAppeared = true;
+                  }
+                } catch (pxErr: any) {
+                  log(`Module download flow: pixel check failed (${pxErr.message || pxErr}), assuming content loaded`, 'DEBUG', 'cycle');
                   contentAppeared = true;
+                  _moduleDownloadState = 'content_visible';
                 }
-              } catch (pxErr: any) {
-                log(`Module download flow: pixel check failed (${pxErr.message || pxErr}), assuming content loaded`, 'DEBUG', 'cycle');
-                // If pixel check fails, assume content loaded after screenshot change
+              } else {
+                log('Module download flow: skipping PNG check (heap tight), assuming content loaded', 'DEBUG', 'cycle');
                 contentAppeared = true;
                 _moduleDownloadState = 'content_visible';
               }
@@ -2317,8 +2323,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // Adaptive performance
       if (CONFIG.ENABLE_ADAPTIVE_PERFORMANCE && adaptiveEngine) { adaptiveEngine.recordLatency(latency); }
 
-      // Blackbox recording
-      if (CONFIG.ENABLE_BLACKBOX && blackbox) {
+      // Blackbox recording — v17: skip when heap is tight
+      if (CONFIG.ENABLE_BLACKBOX && blackbox && _postActionHeapMB < 150) {
         const semanticsSnapshot = await _getA11ySnapshot().getA11ySnapshot(page);
         blackbox.record({ state: action.currentState, action: action.actionType, semantics: JSON.stringify(semanticsSnapshot).substring(0, 500), hash: screenshotHash, success: actionSuccess ? 1 : 0, reasoning: action.reasoning || '', latency, provider_used: action.provider || 'unknown' });
         if (insertSemanticsSnapshot) insertSemanticsSnapshot.run(Date.now(), semanticsSnapshot ? Object.keys(semanticsSnapshot).length : 0, JSON.stringify(semanticsSnapshot).substring(0, 1000));
