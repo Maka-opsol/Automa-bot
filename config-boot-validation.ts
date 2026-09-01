@@ -86,7 +86,7 @@ function checkEnvVars(): CheckResult {
   if (!hasProviderKey) missing.push('(at least one provider API key)');
 
   if (missing.length > 0) {
-    return { name: 'env_vars', pass: false, reason: `Missing: ${missing.join(', ')}` };
+    return { name: 'env_vars', pass: false, reason: `${missing.length} required variable(s) not set` };
   }
   return { name: 'env_vars', pass: true, reason: 'All required env vars present' };
 }
@@ -108,17 +108,17 @@ function checkApiKeyFormats(): CheckResult {
     const val = (CONFIG as any)[key] || process.env[key];
     if (val && val.length > 0) {
       if (val.length < 20) {
-        issues.push(`${key}: too short (${val.length} chars, min 20)`);
+        issues.push('a key is too short');
       }
       // Check it's not a placeholder
       if (['your_', 'placeholder', 'xxx', 'changeme', 'default'].some(p => val.toLowerCase().includes(p))) {
-        issues.push(`${key}: appears to be a placeholder`);
+        issues.push('a key appears to be a placeholder');
       }
     }
   }
 
   if (issues.length > 0) {
-    return { name: 'api_key_formats', pass: false, reason: issues.join('; ') };
+    return { name: 'api_key_formats', pass: false, reason: `${issues.length} issue(s) with API key format(s)` };
   }
   return { name: 'api_key_formats', pass: true, reason: 'All API keys look valid' };
 }
@@ -161,7 +161,7 @@ async function checkProviders(): Promise<CheckResult> {
       if (present.length === 0) {
         return { name: 'providers', pass: false, reason: 'No provider API keys found in environment', durationMs: Date.now() - start };
       }
-      return { name: 'providers', pass: true, reason: `API keys present for: ${present.join(', ')} (live test skipped — no registry)`, durationMs: Date.now() - start };
+      return { name: 'providers', pass: true, reason: `${present.length} API key(s) configured (live test skipped — no registry)`, durationMs: Date.now() - start };
     }
 
     // Get available providers (this tests config loading, not live API calls)
@@ -238,7 +238,7 @@ function checkDiskSpace(): CheckResult {
     fs.unlinkSync(testFile);
 
     const sizeKB = stat.size / 1024;
-    return { name: 'disk_space', pass: true, reason: `Data dir writable (${dataDir}, test write ${sizeKB}KB OK)`, durationMs: Date.now() - start };
+    return { name: 'disk_space', pass: true, reason: `Data dir writable (test write ${sizeKB}KB OK)`, durationMs: Date.now() - start };
   } catch (err: any) {
     return { name: 'disk_space', pass: false, reason: `Disk check error: ${err.message || String(err)}`, durationMs: Date.now() - start };
   }
