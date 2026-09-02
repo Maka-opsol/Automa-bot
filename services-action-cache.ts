@@ -288,7 +288,14 @@ function _getDb() {
 }
 
 function _getUnifiedDb() {
-  return _deps.unifiedDb || null;
+  // DI may inject null if unifiedDb's own deps failed (turso is critical:false).
+  // Fall back to direct require so Turso writes are never silently skipped.
+  if (_deps.unifiedDb) return _deps.unifiedDb;
+  try {
+    const mod = require('./unified-db');
+    if (mod && mod.saveActionCache) return mod;
+  } catch { /* first load may fail */ }
+  return null;
 }
 
 /**
