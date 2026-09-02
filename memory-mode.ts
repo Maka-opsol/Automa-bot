@@ -364,6 +364,9 @@ async function _shedMemoryImpl(reason: string = 'unknown', options?: {
         const { container } = require('./container');
         const browserMod = container.get('browser', { required: false });
         if (browserMod?.browserManager?.pageInstance && !browserMod.browserManager.pageInstance.isClosed()) {
+          // Mark as intentional so the disconnect handler doesn't log
+          // "Browser process disconnected unexpectedly" — we chose to close it.
+          browserMod.browserManager._intentionalClose = true;
           await browserMod.browserManager.cleanup().catch((e: any) => {
             _log(`Browser cleanup during shed: ${e.message}`, 'DEBUG');
           });
