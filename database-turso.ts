@@ -38,14 +38,19 @@ let _lastSyncTime = 0;
 let _lastPullTime = 0;
 let _consecutiveErrors = 0;
 const MAX_CONSECUTIVE_ERRORS = 5; // Auto-disable after 5 consecutive failures
-const SYNC_INTERVAL_MS_DEFAULT = 30000; // 30s — push local → Turso
+const SYNC_INTERVAL_MS_DEFAULT = 120000; // 120s — push local → Turso (was 30s; 512MB can't afford frequent syncs during active cycles)
 // v18: Heap guard — skip Turso sync when memory is tight.
-// On 512MB Render, 93 individual HTTP requests to Turso allocates
-// ~5-10MB of temporary objects (Promise chains, response buffers,
-// libsql internal state). Combined with a screenshot buffer, this
-// is enough to trigger the render-free-plan monitor's CRITICAL threshold
-// which kills the browser (L3 shedMemory), crashing the cycle.
-const SYNC_HEAP_GUARD_MB = 120;
+// On 512MB Render, the Node heap is ~256MB max, but RSS includes the
+// browser process (~100-200MB). When heap is 80MB+, RSS is already
+// ~300-400MB, and the sync's HTTP allocations can push past 512MB.
+const SYNC_HEAP_GUARD_MB = 80;
+// v19: RSS hard limit — skip sync if total process RSS is above this.
+// On Render free plan (512MB), the OOM killer fires at ~512MB RSS.
+// Leave 100MB headroom for the browser and GC overhead.
+const SYNC_RSS_GUARD_MB = 400;
+// v19: Mutex — prevent concurrent syncs. If a sync is already running
+// (e.g., it took > interval due to network latency), skip the next one.
+let _syncInProgress = false;
 
 // FIX: Retry transient write failures (1 retry with 1s backoff)
 const WRITE_RETRY_DELAY_MS = 1000;
@@ -621,16 +626,21 @@ async function syncToTurso(): Promise<{ synced: number; errors: number }> {
   const client = _getClient();
   if (!client) return { synced: 0, errors: 0 };
 
-  // v18: Heap guard — skip sync when memory is tight.
-  // The old code did 93+ sequential HTTP requests (one per row), each
-  // allocating response objects, Promise chains, and libsql internal
-  // state. On a 512MB instance (256MB heap), this 5-10MB spike
-  // combined with a screenshot buffer pushes RSS past the render-free-
-  // plan CRITICAL threshold, which kills the browser via L3 shedMemory.
+  // v18/v19: Memory guard — skip sync when memory is tight.
+  // Check BOTH heap and RSS. On 512MB Render:
+  //   - heap 80MB+ means RSS is already ~300-400MB (browser + overhead)
+  //   - RSS 400MB+ means we're ~100MB from OOM killer
+  // Either condition alone is enough to skip the sync.
   try {
-    const heapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+    const mem = process.memoryUsage();
+    const heapMB = mem.heapUsed / 1024 / 1024;
+    const rssMB = mem.rss / 1024 / 1024;
     if (heapMB > SYNC_HEAP_GUARD_MB) {
       _getLog()(`Turso sync skipped — heap ${heapMB.toFixed(0)}MB > ${SYNC_HEAP_GUARD_MB}MB guard`, 'DEBUG');
+      return { synced: 0, errors: 0 };
+    }
+    if (rssMB > SYNC_RSS_GUARD_MB) {
+      _getLog()(`Turso sync skipped — RSS ${rssMB.toFixed(0)}MB > ${SYNC_RSS_GUARD_MB}MB guard`, 'DEBUG');
       return { synced: 0, errors: 0 };
     }
   } catch {}
@@ -874,7 +884,17 @@ async function startTursoSync(): Promise<void> {
   // Start periodic push sync (local → Turso)
   const syncIntervalMs = parseInt(process.env.TURSO_SYNC_INTERVAL_MS || String(SYNC_INTERVAL_MS_DEFAULT), 10);
   _syncInterval = setInterval(async () => {
-    await syncToTurso();
+    // v19: Mutex — skip if previous sync is still running
+    if (_syncInProgress) {
+      _getLog()('Turso sync skipped — previous sync still in progress', 'DEBUG');
+      return;
+    }
+    _syncInProgress = true;
+    try {
+      await syncToTurso();
+    } finally {
+      _syncInProgress = false;
+    }
   }, syncIntervalMs);
   if (_syncInterval?.unref) _syncInterval.unref();
 
