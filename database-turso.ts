@@ -649,9 +649,19 @@ async function syncToTurso(): Promise<{ synced: number; errors: number }> {
   // all values originate from our own local SQLite (not user input).
   function _esc(val: any): string {
     if (val === null || val === undefined) return 'NULL';
-    if (typeof val === 'number') return String(val);
-    // String: escape single quotes
-    return "'" + String(val).replace(/'/g, "''") + "'";
+    if (typeof val === 'number') return isFinite(val) ? String(val) : 'NULL';
+    if (typeof val === 'bigint') return String(val);
+    // String: escape for SQL literal safety
+    let s = String(val);
+    // Remove null bytes (SQLite can't store them in TEXT)
+    s = s.replace(/\0/g, '');
+    // Escape backslashes (some SQLite versions treat \\ as escape)
+    s = s.replace(/\\/g, '\\\\');
+    // Escape single quotes (SQL string delimiter)
+    s = s.replace(/'/g, "''");
+    // Collapse newlines/carriage returns (breaks executeMultiple statement separator)
+    s = s.replace(/[\r\n]+/g, ' ');
+    return "'" + s + "'";
   }
 
   try {
@@ -671,8 +681,8 @@ async function syncToTurso(): Promise<{ synced: number; errors: number }> {
           const stmts = rows.map((r: any) =>
             `INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (${_esc(r.key)}, ${_esc(r.value)}, ${_esc(r.updated_at)})`
           );
-          const result = await client.executeMultiple(stmts.join('; '));
-          if (result) synced += rows.length; else errors += rows.length;
+          await client.executeMultiple(stmts.join('; '));
+          synced += rows.length;
         } else {
           for (const row of rows) {
             const ok = await _exec('INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (?, ?, ?)', [row.key, row.value, row.updated_at]);
