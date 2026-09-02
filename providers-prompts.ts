@@ -34,9 +34,18 @@ function _getRemoteBrain() {
 // ═════════════════════════════════════════════════════════════
 
 const VALID_ACTION_TYPES = [
-  'click', 'input_email', 'input_password', 'keypad_input',
-  'scroll_vertical', 'scroll_horizontal', 'wait',
-  'flutter_swipe', 'flutter_tap',
+  // Coordinate-based
+  'click', 'flutter_tap', 'double_click', 'hover', 'long_press',
+  // Text input
+  'input_email', 'input_password', 'type_text', 'keypad_input',
+  // Gesture
+  'flutter_swipe', 'drag', 'scroll_vertical', 'scroll_horizontal',
+  // Keyboard
+  'press_key',
+  // Navigation
+  'navigate_back', 'select_option',
+  // Timing
+  'wait',
 ];
 
 // BUG FIX (Response 19): Action type string for the prompt is now
@@ -71,6 +80,23 @@ AUTH RULE (HIGHEST PRIORITY — overrides all other instructions):
 
 Viewport: ${width}x${height} px.
 All coordinates are fractions of viewport width/height (0.0--1.0).
+
+AVAILABLE ACTIONS:
+- click/flutter_tap: Single click at (targetX, targetY).
+- double_click: Double-click at (targetX, targetY). Use for elements that need two clicks to activate.
+- hover: Move mouse to (targetX, targetY) WITHOUT clicking. Use to reveal tooltips or hover states before deciding.
+- long_press: Press and hold at (targetX, targetY) for 600ms. Use for context menus.
+- type_text: Click (targetX, targetY) to focus a field, then type the text in "value". Set clearFirst=false to append instead of replace.
+- input_email/input_password: Specialized text input for auth (auto-fills credentials).
+- keypad_input: Tap a sequence of on-screen keys. Each key in keypadSequence has {x, y}. Submit button at (submitX, submitY).
+- press_key: Press a keyboard key. Put the key name in "value" (e.g. "Enter", "Tab", "Escape", "ArrowDown", "Control+a", "Shift+Tab"). No coordinates needed.
+- flutter_swipe: Swipe from (targetX, targetY) to (targetX2, targetY2).
+- drag: Drag from (targetX, targetY) to (targetX2, targetY2). Like swipe but holds down.
+- scroll_vertical/scroll_horizontal: Scroll the page by a fixed amount.
+- navigate_back: Go back in browser history. No coordinates needed.
+- select_option: Click dropdown at (targetX, targetY), then click the option at (targetX2, targetY2).
+- wait: Wait before taking the next action.
+
 Return ONLY a JSON object with:
 {
   "reasoning": "Brief explanation of what you see and why you choose this action.",
@@ -78,10 +104,13 @@ Return ONLY a JSON object with:
   "actionType": "${ACTION_TYPE_STRING}",
   "targetX": 0.5,
   "targetY": 0.5,
+  "targetX2": 0.5,
+  "targetY2": 0.5,
   "keypadSequence": [],
   "submitX": 0.5,
   "submitY": 0.5,
-  "value": ""
+  "value": "",
+  "clearFirst": true
 }
 Do not output extra text, markdown, or code fences.
 `;
@@ -125,7 +154,7 @@ APP ERROR DETECTION (CRITICAL — HIGHEST PRIORITY):
 - If you see ANY error dialog, error message, warning popup, or maintenance notice on screen (e.g. "Something went wrong", "maintenance mode", "error occurred", "try again later", "session expired"), you MUST set currentState to exactly "app_error".
 - Do NOT attempt to click anything on an error dialog. Do NOT try to work around it. The bot will handle recovery automatically.
 - This takes priority over ALL other instructions. If you see an error message, the only correct action is to report it.
-- Example: {"reasoning": "Error dialog visible: Something went wrong with maintenance mode", "actionType": "wait", "currentState": "app_error", "targetX": 0.5, "targetY": 0.5, "keypadSequence": [], "submitX": 0.5, "submitY": 0.5, "value": ""}
+- Example: {"reasoning": "Error dialog visible: Something went wrong with maintenance mode", "actionType": "wait", "currentState": "app_error", "targetX": 0.5, "targetY": 0.5, "targetX2": 0.5, "targetY2": 0.5, "keypadSequence": [], "submitX": 0.5, "submitY": 0.5, "value": "", "clearFirst": true}
 
 Return the JSON as specified.
 `;
