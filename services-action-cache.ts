@@ -281,8 +281,9 @@ function _getDb() {
   if (_db) return _db;
   try {
     const dbMod = require('./database');
-    _db = dbMod.getDb?.() || dbMod.db;
-    return _db;
+    const fresh = dbMod.getDb?.() || dbMod.db;
+    if (fresh) _db = fresh;  // Only cache if we got a real DB
+    return fresh;
   } catch { return null; }
 }
 
@@ -416,8 +417,34 @@ async function save(
 ): Promise<void> {
   const log = _getLog();
   try {
-    const dbMod = _getDb();
-    if (!dbMod) return;
+    let dbMod = _getDb();
+    if (!dbMod) {
+      // Database may not have been ready at first require — retry once
+      _db = null;  // Clear cached null so _getDb retries require
+      dbMod = _getDb();
+    }
+    if (!dbMod) {
+      log(`Action cache save SKIPPED — local DB unavailable for sig=${contextSignature.substring(0, 8)}`, 'ERROR', 'action-cache');
+      // Attempt Turso-only write as last resort
+      const udb = _getUnifiedDb();
+      if (udb) {
+        try {
+          const keypadJson = action.keypadSequence ? JSON.stringify(action.keypadSequence) : null;
+          await udb.saveActionCache({
+            contextSig: contextSignature, actionType: action.actionType,
+            targetX: action.targetX, targetY: action.targetY,
+            value: action.value || '', keypadSequence: keypadJson,
+            currentState: action.currentState, reasoning: action.reasoning || '',
+          });
+          log(`Action cache TURSO-ONLY SAVE OK (no local DB): sig=${contextSignature.substring(0, 8)}`, 'INFO', 'action-cache');
+        } catch (tursoDirectErr: any) {
+          log(`Action cache COMPLETELY FAILED — no local DB and Turso write also failed: ${tursoDirectErr.message || tursoDirectErr}`, 'ERROR', 'action-cache');
+        }
+      } else {
+        log(`Action cache COMPLETELY FAILED — no local DB and no unified-db for sig=${contextSignature.substring(0, 8)}`, 'ERROR', 'action-cache');
+      }
+      return;
+    }
 
     // Check capacity and evict if needed (local)
     const config = _getConfig();
@@ -497,7 +524,7 @@ async function save(
     log(`Action cache SAVE: sig=${contextSignature.substring(0, 8)} type=${action.actionType} state=${action.currentState}`, 'DEBUG', 'action-cache');
     updateStats('saves');
   } catch (e: any) {
-    log(`Action cache save error: ${e.message || e}`, 'DEBUG', 'action-cache');
+    log(`Action cache save CRITICAL ERROR (data LOST): ${e.message || e}`, 'ERROR', 'action-cache');
   }
 }
 
