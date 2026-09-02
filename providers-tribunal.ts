@@ -287,9 +287,19 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   // ── Blank image guard ──
   // If the screenshot is a blank/white page, immediately return 'wait'
   // without calling any providers. This saves ~45s and API quota.
+  //
+  // IMPORTANT: currentState is set to 'unknown', NOT 'blank_page'.
+  // The cycle manager has its own pixel-level blank detection (auth-guard)
+  // that runs BEFORE the tribunal and is far more accurate (actual RGBA
+  // std deviation vs raw JPEG byte entropy). If the cycle manager let
+  // the screenshot through, it already confirmed the page is NOT blank.
+  // The tribunal's byte-entropy heuristic can false-positive on compressed
+  // JPEGs of dark/low-contrast pages. Setting 'blank_page' here would
+  // trigger destructive escalation (navigate away, restart browser, self-heal)
+  // on a page that actually has content.
   if (base64Image && typeof base64Image === 'string' && isBlankImage(base64Image)) {
-    log('Tribunal: screenshot is blank/white — skipping all providers, returning wait', 'WARN', 'tribunal');
-    return { actionType: 'wait', currentState: 'blank_page', reasoning: 'Screenshot is blank/white — page not rendered yet', targetX: 0, targetY: 0 };
+    log('Tribunal: screenshot appears blank (byte-entropy) — skipping providers, returning wait. NOTE: cycle manager already verified page has content — this is likely a compressed-JPEG false positive.', 'WARN', 'tribunal');
+    return { actionType: 'wait', currentState: 'unknown', reasoning: 'Tribunal could not parse screenshot (possible compression artifact) — waiting for next cycle', targetX: 0, targetY: 0 };
   }
 
   const base = _getProvidersBase();
