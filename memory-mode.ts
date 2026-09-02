@@ -46,6 +46,23 @@
 // v3 FIX: Added shedMemory() as a standalone emergency function.
 // ═══════════════════════════════════════════════════════════════════════
 
+// v19: Detect small-memory instances (<=1GB RAM). On these, L3 (browser kill)
+// is counterproductive: the bot NEEDS the browser to function, and relaunching
+// Chrome on a constrained instance causes a second memory spike that often
+// triggers the OOM killer. Instead, cap at L2 (page reload) which frees
+// ~20-50MB without destroying the browser process.
+let _systemTotalMB = 1024; // default assumption
+try {
+  const fs = require('fs');
+  const memInfo = fs.readFileSync('/proc/meminfo', 'utf8');
+  const match = memInfo.match(/MemTotal:\s+(\d+)\s*kB/);
+  if (match) _systemTotalMB = Math.round(parseInt(match[1], 10) / 1024);
+} catch { /* non-Linux or /proc unavailable — keep default */ }
+const _isSmallInstance = _systemTotalMB <= 1024;
+if (_isSmallInstance) {
+  _log(`Small instance detected (${_systemTotalMB}MB RAM) — L3 (browser kill) disabled in shedMemory`, 'INFO');
+}
+
 const persistConfig = require('./persistent-config');
 
 // Calibration keys for DB-backed persistence (survives /tmp wipes via Turso)
@@ -65,7 +82,7 @@ const MODE_THRESHOLDS = {
   full_power: {
     warnHeapMB: 350,
     restartHeapMB: 400,
-    rssHardLimitMB: 470,
+    rssHardLimitMB: 420,  // v19: was 470 — on 512MB, 470 is only 42MB from OOM
     gcIntervalMs: 90 * 1000,
     monitorIntervalMs: 20 * 1000,
     warningStreak: 2,
@@ -254,6 +271,14 @@ async function _shedMemoryImpl(reason: string = 'unknown', options?: {
   let maxLevel = options?.maxLevel ?? 3;
   if (preserveBrowser && maxLevel > 2) {
     maxLevel = 2;
+  }
+  // v19: On small instances (<=1GB), NEVER use L3 (browser kill).
+  // The browser is essential for the bot to function, and relaunching
+  // Chrome on constrained memory causes a second spike → OOM.
+  // Cap at L2 (page reload) which frees ~20-50MB safely.
+  if (_isSmallInstance && maxLevel > 2) {
+    maxLevel = 2;
+    _log(`shedMemory(${reason}): capped to L2 (small instance, ${_systemTotalMB}MB RAM)`, 'DEBUG');
   }
 
   _log(`shedMemory(${reason}): starting at heap=${beforeMB.toFixed(1)}MB, preserveBrowser=${preserveBrowser}, maxLevel=L${maxLevel}${targetMB ? `, target=${targetMB}MB` : ''}`, 'WARN');
