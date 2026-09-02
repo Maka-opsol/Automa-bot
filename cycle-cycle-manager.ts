@@ -943,6 +943,48 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       } catch { return true; }
     }
 
+    // v18: Helper to detect if the browser/page was closed by memory protection
+    // or an OOM event. Memory-mode.shedMemory (L3) closes the browser mid-cycle,
+    // but the `page` variable in the while-loop still holds the old (now dead)
+    // reference. Any page.evaluate / page.screenshot / page.mouse call on it
+    // throws "Target page, context or browser has been closed".
+    // Returns true if page is dead and a fresh browser is needed.
+    function _isPageDead(pg: any): boolean {
+      try {
+        if (!pg) return true;
+        if (pg.isClosed?.()) return true;
+        // Check browser connectivity — context() or browser() may throw on dead proxies
+        const ctx = pg.context;
+        if (typeof ctx === 'function') {
+          const context = ctx();
+          if (context?.pages && !context.pages().includes(pg)) return true;
+          const browser = context?.browser;
+          if (typeof browser === 'function' && !browser()?.isConnected?.()) return true;
+        }
+        return false;
+      } catch {
+        // Any property access failure on a dead proxy means the page is gone
+        return true;
+      }
+    }
+
+    // v18: Re-launch browser after memory protection killed it mid-cycle.
+    // Returns the new page. Throws if re-launch fails.
+    async function _relaunchBrowser(): Promise<any> {
+      log('Browser was closed (likely by memory protection). Re-launching...', 'WARN', 'cycle');
+      _networkSetup = false;
+      const newPage = await safeBrowserRetry(async (p: any) => {
+        if (authenticate) await authenticate(p);
+        const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
+        if (targetUrl) { await p.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}); }
+        return p;
+      });
+      browserLastRestart = Date.now();
+      _trackBrowserRestart();
+      if (typeof resetBrowserLaunchCount === 'function') resetBrowserLaunchCount();
+      return newPage;
+    }
+
     // Navigate to app if browser landed on about:blank (fresh start OR post-self-heal)
     // Even with a checkpoint, self-heal may have killed the browser and re-launched
     // to about:blank. If we're on about:blank, we MUST navigate — the checkpoint
@@ -1425,10 +1467,28 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // v14: NEVER take a screenshot of a blank page. Wait for CanvasKit to render
       // before capturing. This is the universal chokepoint — every cycle path
       // flows through here before the tribunal sees the screenshot.
+      // v18: Check page liveness before screenshot — memory protection may
+      // have killed the browser since the last loop iteration.
+      if (_isPageDead(page)) {
+        log('Page died before screenshot — re-launching browser', 'WARN', 'cycle');
+        try { page = await _relaunchBrowser(); } catch (relaunchErr: any) { throw relaunchErr; }
+        continue;
+      }
       await _waitForRenderedPage(page, 12000);
 
       const beforeUrl = page.url();
-      let screenshot = await page.screenshot({ type: 'jpeg', quality: 20 });
+      let screenshot: any;
+      try {
+        screenshot = await page.screenshot({ type: 'jpeg', quality: 20 });
+      } catch (ssErr: any) {
+        const ssMsg = ssErr?.message || String(ssErr);
+        if (ssMsg.includes('closed') || ssMsg.includes('Closed')) {
+          log('Screenshot failed — page closed. Re-launching browser.', 'WARN', 'cycle');
+          page = await _relaunchBrowser();
+          continue;
+        }
+        throw ssErr;
+      }
 
       // ── Screenshot validity check ──
       // A valid screenshot of a rendered page should be >3KB even at quality:20.
@@ -2072,11 +2132,18 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
       if (action.actionType === 'click') {
         clickAttempts++;
-        const beforeBodyLen = await page.evaluate(() => document.body.innerText.length);
+        // v18: Guard — memory protection may have closed the browser between
+        // the tribunal call (which took a screenshot) and this click execution.
+        if (_isPageDead(page)) {
+          log('Page died before click execution — re-launching browser', 'WARN', 'cycle');
+          try { page = await _relaunchBrowser(); } catch (relaunchErr: any) { throw relaunchErr; }
+          continue; // Re-enter loop with fresh page
+        }
+        const beforeBodyLen = await page.evaluate(() => document.body.innerText.length).catch(() => -1);
         if (executeAction) await executeAction(page, action);
         const afterUrl = page.url();
-        const afterBodyLen = await page.evaluate(() => document.body.innerText.length);
-        if (afterUrl !== beforeUrl || afterBodyLen !== beforeBodyLen) {
+        const afterBodyLen = await page.evaluate(() => document.body.innerText.length).catch(() => -2);
+        if (afterUrl !== beforeUrl || (beforeBodyLen !== -1 && afterBodyLen !== -2 && afterBodyLen !== beforeBodyLen)) {
           clickSuccesses++;
           actionSuccess = true;
           consecutiveFailures = 0;
@@ -2978,7 +3045,20 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       } catch {}
     }
   } catch (err: any) {
-    const errorType = classifyProviderError?.(err);
+    // v18: If the browser was closed by memory protection mid-cycle,
+    // this is NOT a real error — just relaunch and continue. Don't
+    // increment consecutiveFailures (that would trigger self-heal
+    // and circuit breakers for a non-issue).
+    const errMsg = err?.message || String(err);
+    if (errMsg.includes('Target page, context or browser has been closed')
+        || errMsg.includes('Browser closed')
+        || errMsg.includes('browser has been closed')) {
+      log('Cycle caught browser-closed error (likely memory protection). Resetting failure count — not a real error.', 'WARN', 'cycle');
+      consecutiveFailures = 0;
+      // Don't push to self-heal error buffer — this is expected behavior
+      // Don't run self-heal — nothing to heal
+    } else {
+      const errorType = classifyProviderError?.(err);
     // v6: Fall back to properties set directly on the error object.
     // classifyProviderError only recognizes MathUBotError instances and
     // common Node/Playwright patterns. Custom structured errors (like
@@ -3130,7 +3210,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       if (consecutiveFailures % 10 === 0) {
         try { const pr = _getProcessRetrainer(); if (pr?.retrainProcesses) pr.retrainProcesses().catch((e: any) => logError('Retraining failed', e)); } catch (e: any) { /* non-critical */ }
       }
-    }
+    } // end else (non-browser-closed error)
   } finally {
     // v16: Snapshot cycle state to DB (OOM-survival).
     // Runs every cycle. Writes ~1-3 KB to the calibration table.
