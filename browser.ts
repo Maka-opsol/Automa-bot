@@ -264,7 +264,7 @@ class BrowserManager {
     const log = getLog();
     const logError = getLogError();
     if (!this.browserInstance) return;
-    this.browserInstance.on('disconnected', () => { if (!this._intentionalClose) { log('Browser process disconnected unexpectedly', 'ERROR', 'browser'); } this.browserDisconnected = true; this.emit('disconnected'); });
+    this.browserInstance.on('disconnected', () => { if (!this._intentionalClose && !this.launching) { log('Browser process disconnected unexpectedly', 'ERROR', 'browser'); } this.browserDisconnected = true; this.emit('disconnected'); });
     this.browserInstance.on('error', (err: Error) => { logError('Browser process error', err); this.browserDisconnected = true; });
   }
 
