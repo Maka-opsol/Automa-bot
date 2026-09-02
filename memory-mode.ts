@@ -61,6 +61,32 @@ try {
 const _isSmallInstance = _systemTotalMB <= 1024;
 if (_isSmallInstance) {
   _log(`Small instance detected (${_systemTotalMB}MB RAM) — L3 (browser kill) disabled in shedMemory`, 'INFO');
+  // v20: On small instances, RSS hard limits must account for Chrome (~200MB)
+  // and system overhead (~50-100MB). The OOM killer fires at ~_systemTotalMB,
+  // so the RSS hard limit must leave enough headroom for Chrome + system.
+  // Formula: RSS limit = totalRAM - 150MB (Chrome overhead) - 80MB (system/other)
+  const maxSafeRSS = _systemTotalMB - 230;
+  if (maxSafeRSS < MODE_THRESHOLDS.memory_protection.rssHardLimitMB) {
+    MODE_THRESHOLDS.memory_protection.rssHardLimitMB = maxSafeRSS;
+    _log(`Clamped memory_protection RSS hard limit to ${maxSafeRSS}MB (system has ${_systemTotalMB}MB)`, 'INFO');
+  }
+  if (maxSafeRSS < MODE_THRESHOLDS.minimum.rssHardLimitMB) {
+    MODE_THRESHOLDS.minimum.rssHardLimitMB = Math.max(maxSafeRSS - 30, 200);
+    _log(`Clamped minimum RSS hard limit to ${MODE_THRESHOLDS.minimum.rssHardLimitMB}MB`, 'INFO');
+  }
+  // full_power should never run on small instances — clamp if somehow activated
+  if (maxSafeRSS < MODE_THRESHOLDS.full_power.rssHardLimitMB) {
+    MODE_THRESHOLDS.full_power.rssHardLimitMB = maxSafeRSS;
+    _log(`Clamped full_power RSS hard limit to ${maxSafeRSS}MB`, 'WARN');
+  }
+  // Also clamp heap thresholds — on 512MB, heap should never reach 200MB
+  // because Chrome needs ~200MB RSS and Node RSS ≈ heap + 70MB overhead
+  const maxSafeHeap = _systemTotalMB - 300; // leave 300MB for Chrome + system + Node overhead
+  if (maxSafeHeap < MODE_THRESHOLDS.memory_protection.restartHeapMB) {
+    MODE_THRESHOLDS.memory_protection.restartHeapMB = maxSafeHeap;
+    MODE_THRESHOLDS.memory_protection.warnHeapMB = Math.max(maxSafeHeap - 30, 80);
+    _log(`Clamped memory_protection heap thresholds: warn=${MODE_THRESHOLDS.memory_protection.warnHeapMB}MB restart=${MODE_THRESHOLDS.memory_protection.restartHeapMB}MB`, 'INFO');
+  }
 }
 
 const persistConfig = require('./persistent-config');
@@ -687,10 +713,14 @@ function _checkForActiveSelfHealSession(): void {
     }
 
     // Session still valid — grant full power again to continue healing
-    _log(`Resuming self-heal session (elapsed: ${Math.round(elapsed / 60000)}min, timeout: ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min). Granting FULL POWER.`, 'WARN');
+    // v20: On small instances (<=1GB), full_power is unsafe — the thresholds
+    // are designed for 1GB+ and will OOM-kill a 512MB instance. Use
+    // memory_protection instead, which has appropriately clamped thresholds.
+    const targetMode = _isSmallInstance ? 'memory_protection' : 'full_power';
+    _log(`Resuming self-heal session (elapsed: ${Math.round(elapsed / 60000)}min, timeout: ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min). Granting ${targetMode.toUpperCase()}${_isSmallInstance ? ' (small instance — full_power unsafe)' : ''}.`, 'WARN');
     _selfHealSessionActive = true;
     // Fire-and-forget: at startup, no browser to close anyway
-    _applyMode('full_power', `self_heal_resume:elapsed_${Math.round(elapsed / 60000)}min`).catch(() => {});
+    _applyMode(targetMode, `self_heal_resume:elapsed_${Math.round(elapsed / 60000)}min`).catch(() => {});
     _startSelfHealSessionTimeout(SELF_HEAL_SESSION_TIMEOUT_MS - elapsed);
   } catch (e: any) {
     _log(`Self-heal session restore check failed: ${e.message}`, 'DEBUG');
