@@ -2096,22 +2096,27 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             if (page.url() !== afterUrl) actionSuccess = true;
           }
         }
-        // Canvas parsing fallback
-        if (!actionSuccess && canvas && dpr) {
+        // Canvas parsing fallback — v17: GATED.
+        // parseTextAndButtons uses sharp + Tesseract OCR which loads
+        // a full OCR engine (~50-100MB heap). Fatal on 256MB instances.
+        const _clickFallbackHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+        if (!actionSuccess && canvas && dpr && _clickFallbackHeapMB < 150) {
           const canvasData = await canvas.parseTextAndButtons(base64);
           if (canvasData?.watchButton) {
             const coords = dpr.getJitteredClick(canvasData.watchButton.centerX, canvasData.watchButton.centerY);
             await page.mouse.click(coords.x, coords.y);
             actionSuccess = true;
           }
+        } else if (!actionSuccess && canvas && _clickFallbackHeapMB >= 150) {
+          log(`Skipping canvas parser fallback (heap=${_clickFallbackHeapMB.toFixed(0)}MB)`, 'DEBUG', 'cycle');
         }
         // Engine tap fallback
-        if (!actionSuccess && inspector) {
+        if (!actionSuccess && inspector && _clickFallbackHeapMB < 150) {
           const engineTap = await inspector.dispatchTapViaEngine(page, 300, 400);
           if (engineTap) actionSuccess = true;
         }
         // Brute force fallback
-        if (!actionSuccess && bruteForce) {
+        if (!actionSuccess && bruteForce && _clickFallbackHeapMB < 150) {
           const bruteSuccess = await bruteForce.bruteForceNavigate(page);
           if (bruteSuccess) actionSuccess = true;
         }
