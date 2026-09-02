@@ -606,7 +606,7 @@ const env = envalid.cleanEnv(process.env, {
   PIXEL_TRAINING_MAX_CACHE: num({ default: 200 }),
   PIXEL_TRAINING_SIMILARITY_THRESHOLD: num({ default: 0.3 }),
   PIXEL_TRAINING_MAX_RESULTS: num({ default: 5 }),
-}, { strict: false, reporter: (errors: any) => { if (Object.keys(errors).length > 0) { console.warn('Environment validation warnings:', Object.values(errors as any)); } } });
+}, { strict: false, reporter: (_errors: any) => { /* env var details redacted — do not log names or values */ } });
 
 // ─── CONFIG object ───────────────────────────────────────────────────────────
 
