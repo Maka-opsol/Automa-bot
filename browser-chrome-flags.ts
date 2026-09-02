@@ -36,10 +36,15 @@ const DEPRECATED_FLAGS = new Set([
   // They are now in DEPRECATED_FLAGS so they get properly filtered.
   '--disable-web-security',
   '--disable-features=IsolateOrigins,site-per-process',
-  // --disable-gpu kills WebGL, which Flutter CanvasKit requires to render.
-  // Headless Chromium uses SwiftShader (software GL) by default — this flag
-  // is unnecessary AND makes the app permanently blank.
-  '--disable-gpu',
+  // v17: --disable-gpu REMOVED from deprecated flags.
+  // It was added here to fix blank-canvas on Replit, but on Render free plan
+  // (512MB), stripping it lets the GPU subsystem stay active. When CanvasKit
+  // re-renders after a click, Chromium RSS spikes 100MB→400MB and the OS
+  // OOM killer fires. On memory-constrained instances, --disable-gpu must
+  // pass through from CHROMIUM_FLAGS env var.
+  // NOTE: --disable-gpu does kill WebGL/CanvasKit rendering. The bot will
+  // see blank pages and enter the blank_page recovery loop. On 512MB this
+  // is preferable to OOM killing every non-wait action.
 ]);
 
 // Flags that CHROMIUM_FLAGS env var commonly duplicates from FLAG_GROUPS.
