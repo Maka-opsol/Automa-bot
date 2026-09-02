@@ -402,7 +402,7 @@ function createContainer(): DIContainerType {
       return mod;
     },
     deps: ['config', 'logger', 'database', 'unifiedDb'],
-    critical: false,
+    critical: true,
     tags: ['performance'],
   });
 
