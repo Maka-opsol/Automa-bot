@@ -1,11 +1,27 @@
 'use strict';
-// Last modified: 2026-08-05 — Response 20: Dynamic wait timeout (waitTime + 5s buffer instead of 30s cap)
+// Last modified: 2026-09-02 — v19: Major enhancement. Added type_text, press_key,
+// navigate_back, double_click, hover, long_press, drag, select_option.
+// Total action types: 8 → 16.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Cycle Action Executor — Executes validated actions on the Playwright page.
 //
 // Render-aware: All Playwright interactions are timed. Keyboard shortcuts
 // use try/catch per key to avoid a single failure killing the whole action.
+//
+// Architecture:
+//   executeAction() races _executeActionInner() against a timeout.
+//   _executeActionInner() runs the policy check then dispatches to the
+//   appropriate handler by actionType. Every handler is wrapped in
+//   try/catch so one failure doesn't crash the cycle.
+//
+// Action types (16 total):
+//   COORDINATE-BASED: click, flutter_tap, double_click, hover, long_press
+//   TEXT INPUT:       input_email, input_password, type_text, keypad_input
+//   GESTURE:          flutter_swipe, drag, scroll_vertical, scroll_horizontal
+//   KEYBOARD:         press_key
+//   NAVIGATION:       navigate_back, select_option
+//   TIMING:           wait
 // ═══════════════════════════════════════════════════════════════════════════
 
 // v5-fix C9: All project module requires converted to DI deps.
@@ -40,6 +56,19 @@ const PRE_TYPE_DELAY_MS = 500;
 
 /** Delay between keypad taps (ms). */
 const KEYPAD_TAP_DELAY_MS = 200;
+
+/** Delay after hover before taking effect (ms). */
+const HOVER_SETTLE_MS = 300;
+
+/** Default long-press duration (ms). */
+const LONG_PRESS_DURATION_MS = 600;
+
+/** Delay for dropdown option to appear after opening (ms). */
+const DROPDOWN_OPEN_DELAY_MS = 400;
+
+/** Drag gesture step count and step delay (ms). */
+const DRAG_STEPS = 20;
+const DRAG_STEP_DELAY_MS = 15;
 
 /** Maximum time for a single non-wait action execution (ms).
  * Prevents a non-wait action from blocking the cycle indefinitely.
@@ -79,6 +108,407 @@ async function _typeText(page: any, text: string, config: any): Promise<void> {
   }
 }
 
+/** Press a key or key combination. Handles modifier keys correctly. */
+async function _pressKey(page: any, key: string): Promise<void> {
+  // Support compound keys like "Control+a", "Shift+Tab", "Meta+Enter"
+  const parts = key.split('+').map((k: string) => k.trim());
+  if (parts.length > 1) {
+    // Press modifier keys first, then the main key, then release in reverse
+    const modifiers = parts.slice(0, -1);
+    const mainKey = parts[parts.length - 1];
+    for (const mod of modifiers) {
+      try { await page.keyboard.down(mod); } catch { /* best effort */ }
+    }
+    try { await page.keyboard.press(mainKey); } catch { /* best effort */ }
+    for (const mod of modifiers.reverse()) {
+      try { await page.keyboard.up(mod); } catch { /* best effort */ }
+    }
+  } else {
+    try { await page.keyboard.press(key); } catch { /* best effort */ }
+  }
+}
+
+/** Move mouse to coordinates without clicking (hover). */
+async function _hoverAt(page: any, x: number, y: number): Promise<void> {
+  try {
+    await page.mouse.move(x, y);
+  } catch (e: any) {
+    log(`mouse.move failed: ${e.message}`, 'WARN', 'action');
+  }
+}
+
+/** Perform a drag gesture from (x1,y1) to (x2,y2) using CDP touch events.
+ * Falls back to mouse down/move/up if CDP fails. */
+async function _dragGesture(page: any, x1: number, y1: number, x2: number, y2: number): Promise<void> {
+  let cdp: any = null;
+  try {
+    cdp = await page.context().newCDPSession(page);
+    await cdp.send('Input.dispatchTouchEvent', {
+      type: 'touchStart',
+      touchPoints: [{ x: x1, y: y1 }],
+    });
+    for (let i = 1; i <= DRAG_STEPS; i++) {
+      const t = i / DRAG_STEPS;
+      // Ease-in-out for natural feel
+      const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+      const x = x1 + (x2 - x1) * ease;
+      const y = y1 + (y2 - y1) * ease;
+      await cdp.send('Input.dispatchTouchEvent', {
+        type: 'touchMove',
+        touchPoints: [{ x, y }],
+      });
+      await sleep(DRAG_STEP_DELAY_MS);
+    }
+    await cdp.send('Input.dispatchTouchEvent', {
+      type: 'touchEnd',
+      touchPoints: [],
+    });
+  } catch (e: any) {
+    // Fallback to mouse-based drag
+    log(`CDP drag failed, falling back to mouse: ${e.message}`, 'WARN', 'action');
+    try {
+      await page.mouse.move(x1, y1);
+      await page.mouse.down();
+      await page.mouse.move(x2, y2, { steps: DRAG_STEPS });
+      await page.mouse.up();
+    } catch (e2: any) {
+      log(`Mouse drag also failed: ${e2.message}`, 'WARN', 'action');
+    }
+  } finally {
+    if (cdp) { await cdp.detach().catch(() => {}); }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Action handlers
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Each handler is an async function (page, action, ctx) => void.
+// ctx contains pre-computed viewport, scale, config, and dependency refs.
+// Every handler is wrapped in try/catch by the dispatcher — they should
+// throw on fatal errors but log and continue on transient ones.
+
+type ActionCtx = {
+  page: any;
+  action: any;
+  CONFIG: any;
+  wm: number;
+  browser: any;
+  providersBase: any;
+  gestures: any;
+  adaptiveEngine: any;
+  providers: any;
+  progressTracker: any;
+  policyEngine: any;
+  toAbsolute: (xPercent: any, yPercent: any) => { x: number; y: number };
+};
+
+// ── Click / Tap ──
+async function _handleClick(ctx: ActionCtx): Promise<void> {
+  const { page, action, CONFIG, wm, browser, providersBase, toAbsolute } = ctx;
+  if (action.targetX == null || action.targetY == null) {
+    log('Click action missing coordinates.', 'ERROR', 'action');
+    return;
+  }
+  const { x, y } = toAbsolute(action.targetX, action.targetY);
+  const retryWithBackoff = providersBase.retryWithBackoff || ((fn: any) => fn());
+  const success = await retryWithBackoff(
+    () => browser.performClickWithRetry?.(page, x, y, 3),
+    { maxRetries: CLICK_MAX_RETRIES, baseDelay: CLICK_RETRY_BASE_DELAY_MS },
+  );
+  if (!success) {
+    log('Click failed to produce page change, trying flutterTap fallback.', 'WARN', 'action');
+    try { await browser.flutterTap?.(page, x, y); } catch (e: any) { /* best effort */ }
+  }
+  await sleep(CONFIG.POST_CLICK_MS * wm);
+}
+
+// ── Double Click ──
+async function _handleDoubleClick(ctx: ActionCtx): Promise<void> {
+  const { page, action, CONFIG, wm, browser, toAbsolute } = ctx;
+  if (action.targetX == null || action.targetY == null) {
+    log('double_click action missing coordinates.', 'ERROR', 'action');
+    return;
+  }
+  const { x, y } = toAbsolute(action.targetX, action.targetY);
+  try {
+    await page.mouse.dblclick(x, y);
+    log(`Double-clicked at (${x.toFixed(0)}, ${y.toFixed(0)})`, 'DEBUG', 'action');
+  } catch (e: any) {
+    log(`double_click failed: ${e.message}`, 'WARN', 'action');
+    // Fallback: rapid manual double-click
+    try {
+      await page.mouse.click(x, y);
+      await sleep(50);
+      await page.mouse.click(x, y);
+    } catch { /* best effort */ }
+  }
+  await sleep(CONFIG.POST_CLICK_MS * wm);
+}
+
+// ── Hover ──
+async function _handleHover(ctx: ActionCtx): Promise<void> {
+  const { page, action, toAbsolute } = ctx;
+  if (action.targetX == null || action.targetY == null) {
+    log('hover action missing coordinates.', 'ERROR', 'action');
+    return;
+  }
+  const { x, y } = toAbsolute(action.targetX, action.targetY);
+  await _hoverAt(page, x, y);
+  await sleep(HOVER_SETTLE_MS);
+  log(`Hovered at (${x.toFixed(0)}, ${y.toFixed(0)})`, 'DEBUG', 'action');
+}
+
+// ── Long Press ──
+async function _handleLongPress(ctx: ActionCtx): Promise<void> {
+  const { page, action, CONFIG, wm, browser, gestures, toAbsolute } = ctx;
+  if (action.targetX == null || action.targetY == null) {
+    log('long_press action missing coordinates.', 'ERROR', 'action');
+    return;
+  }
+  const { x, y } = toAbsolute(action.targetX, action.targetY);
+  const duration = action.duration || CONFIG.LONG_PRESS_DELAY_MS || LONG_PRESS_DURATION_MS;
+  // Use gesture simulator if available (CDP touch), otherwise mouse fallback
+  if (gestures.performLongPress) {
+    try {
+      await gestures.performLongPress(page, x, y);
+    } catch (e: any) {
+      log(`performLongPress failed: ${e.message}, using mouse fallback`, 'WARN', 'action');
+      try {
+        await page.mouse.move(x, y);
+        await page.mouse.down();
+        await sleep(duration);
+        await page.mouse.up();
+      } catch { /* best effort */ }
+    }
+  } else {
+    try {
+      await page.mouse.move(x, y);
+      await page.mouse.down();
+      await sleep(duration);
+      await page.mouse.up();
+    } catch (e: any) {
+      log(`long_press mouse fallback failed: ${e.message}`, 'WARN', 'action');
+    }
+  }
+  log(`Long-pressed at (${x.toFixed(0)}, ${y.toFixed(0)}) for ${duration}ms`, 'DEBUG', 'action');
+  await sleep(CONFIG.POST_CLICK_MS * wm);
+}
+
+// ── Swipe ──
+async function _handleSwipe(ctx: ActionCtx): Promise<void> {
+  const { page, action, CONFIG, wm, gestures, toAbsolute } = ctx;
+  const { x: startX, y: startY } = toAbsolute(action.targetX || 0.5, action.targetY || 0.5);
+  const { x: endX, y: endY } = toAbsolute(action.targetX2 || 0.5, action.targetY2 || 0.5);
+  if (gestures.performSwipe) {
+    await gestures.performSwipe(page, startX, startY, endX, endY, CONFIG.SWIPE_DURATION_MS);
+  } else {
+    log('flutter_swipe: performSwipe not available', 'WARN', 'action');
+  }
+  await sleep(CONFIG.BETWEEN_STEPS_MS * wm);
+}
+
+// ── Drag and Drop ──
+async function _handleDrag(ctx: ActionCtx): Promise<void> {
+  const { page, action, CONFIG, wm, toAbsolute } = ctx;
+  if (action.targetX == null || action.targetY == null ||
+      action.targetX2 == null || action.targetY2 == null) {
+    log('drag action needs both start (targetX,targetY) and end (targetX2,targetY2) coordinates.', 'ERROR', 'action');
+    return;
+  }
+  const { x: x1, y: y1 } = toAbsolute(action.targetX, action.targetY);
+  const { x: x2, y: y2 } = toAbsolute(action.targetX2, action.targetY2);
+  log(`Dragging from (${x1.toFixed(0)},${y1.toFixed(0)}) to (${x2.toFixed(0)},${y2.toFixed(0)})`, 'DEBUG', 'action');
+  await _dragGesture(page, x1, y1, x2, y2);
+  await sleep(CONFIG.BETWEEN_STEPS_MS * wm);
+}
+
+// ── Email Input ──
+async function _handleInputEmail(ctx: ActionCtx): Promise<void> {
+  const { page, action, CONFIG, wm, browser } = ctx;
+  if (action.targetX == null || action.targetY == null) {
+    log('Input email missing coordinates.', 'ERROR', 'action');
+    return;
+  }
+  const { x, y } = ctx.toAbsolute(action.targetX, action.targetY);
+  await browser.flutterTap?.(page, x, y);
+  await sleep(PRE_TYPE_DELAY_MS);
+  // Try to focus the email field via locator
+  try {
+    const emailLocator = page.locator('input[type="email"], input[name*="email" i], [role="textbox"][aria-label*="email" i]');
+    if (await emailLocator.count() > 0) { await emailLocator.first().click(); }
+  } catch (e: any) { log(`Locator for email field failed: ${e.message}`, 'WARN', 'action'); }
+  await _selectAllText(page);
+  await _typeText(page, CONFIG.getMicrosoftEmail?.() || '', CONFIG);
+  try { await page.keyboard.press('Enter'); } catch { /* best effort */ }
+  await sleep(CONFIG.POST_CLICK_MS * wm);
+}
+
+// ── Password Input ──
+async function _handleInputPassword(ctx: ActionCtx): Promise<void> {
+  const { page, action, CONFIG, wm, browser } = ctx;
+  if (action.targetX == null || action.targetY == null) {
+    log('Input password missing coordinates.', 'ERROR', 'action');
+    return;
+  }
+  const { x, y } = ctx.toAbsolute(action.targetX, action.targetY);
+  await browser.flutterTap?.(page, x, y);
+  await sleep(PRE_TYPE_DELAY_MS);
+  try {
+    const passLocator = page.locator('input[type="password"], input[name*="password" i], [role="textbox"][aria-label*="password" i]');
+    if (await passLocator.count() > 0) { await passLocator.first().click(); }
+  } catch (e: any) { log(`Locator for password field failed: ${e.message}`, 'WARN', 'action'); }
+  await _selectAllText(page);
+  await _typeText(page, CONFIG.getMicrosoftPassword?.() || '', CONFIG);
+  try { await page.keyboard.press('Enter'); } catch { /* best effort */ }
+  await sleep(CONFIG.POST_CLICK_MS * wm);
+}
+
+// ── Generic Text Input ──
+async function _handleTypeText(ctx: ActionCtx): Promise<void> {
+  const { page, action, CONFIG, wm, browser } = ctx;
+  if (action.targetX == null || action.targetY == null) {
+    log('type_text action missing coordinates.', 'ERROR', 'action');
+    return;
+  }
+  const text = action.value || '';
+  if (!text) {
+    log('type_text action missing value (text to type).', 'WARN', 'action');
+    return;
+  }
+  const clearFirst = action.clearFirst !== false; // default true
+  const { x, y } = ctx.toAbsolute(action.targetX, action.targetY);
+  // Tap to focus the field
+  await browser.flutterTap?.(page, x, y);
+  await sleep(PRE_TYPE_DELAY_MS);
+  // Optionally clear existing content
+  if (clearFirst) {
+    await _selectAllText(page);
+  }
+  await _typeText(page, text, CONFIG);
+  log(`Typed ${text.length} chars at (${x.toFixed(0)}, ${y.toFixed(0)})${clearFirst ? ' (cleared first)' : ''}`, 'DEBUG', 'action');
+  await sleep(CONFIG.POST_CLICK_MS * wm);
+}
+
+// ── Keypad Input ──
+async function _handleKeypadInput(ctx: ActionCtx): Promise<void> {
+  const { page, action, CONFIG, wm, browser, toAbsolute } = ctx;
+  if (action.keypadSequence && Array.isArray(action.keypadSequence)) {
+    for (const key of action.keypadSequence) {
+      const { x, y } = toAbsolute(key.x, key.y);
+      await browser.flutterTap?.(page, x, y);
+      await sleep(KEYPAD_TAP_DELAY_MS);
+    }
+    if (action.submitX != null && action.submitY != null) {
+      const { x, y } = toAbsolute(action.submitX, action.submitY);
+      await browser.flutterTap?.(page, x, y);
+    }
+    await sleep(CONFIG.POST_CLICK_MS * wm);
+  } else {
+    log('keypad_input missing keypadSequence.', 'ERROR', 'action');
+  }
+}
+
+// ── Press Key ──
+async function _handlePressKey(ctx: ActionCtx): Promise<void> {
+  const { page, action, CONFIG, wm } = ctx;
+  const key = action.value || '';
+  if (!key) {
+    log('press_key action missing value (key to press, e.g. "Enter", "Tab", "Escape").', 'WARN', 'action');
+    return;
+  }
+  log(`Pressing key: ${key}`, 'DEBUG', 'action');
+  await _pressKey(page, key);
+  await sleep(CONFIG.POST_CLICK_MS * wm);
+}
+
+// ── Scroll Vertical ──
+async function _handleScrollVertical(ctx: ActionCtx): Promise<void> {
+  const { page, CONFIG, wm, browser } = ctx;
+  const scrollFactor = browser.getScaleFactor?.() || 1;
+  await browser.scrollPage?.(page, 0, CONFIG.SCROLL_AMOUNT * scrollFactor);
+  await sleep(CONFIG.SCROLL_PAUSE_MS * wm);
+}
+
+// ── Scroll Horizontal ──
+async function _handleScrollHorizontal(ctx: ActionCtx): Promise<void> {
+  const { page, CONFIG, wm, browser } = ctx;
+  const scrollFactor = browser.getScaleFactor?.() || 1;
+  await browser.scrollPage?.(page, CONFIG.SCROLL_AMOUNT * scrollFactor, 0);
+  await sleep(CONFIG.SCROLL_PAUSE_MS * wm);
+}
+
+// ── Navigate Back ──
+async function _handleNavigateBack(ctx: ActionCtx): Promise<void> {
+  const { page, CONFIG, wm } = ctx;
+  try {
+    await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 });
+    log('Navigated back in browser history.', 'DEBUG', 'action');
+  } catch (e: any) {
+    log(`navigate_back failed: ${e.message}`, 'WARN', 'action');
+  }
+  await sleep(CONFIG.BETWEEN_STEPS_MS * wm);
+}
+
+// ── Select Dropdown Option ──
+async function _handleSelectOption(ctx: ActionCtx): Promise<void> {
+  const { page, action, CONFIG, wm, browser } = ctx;
+  if (action.targetX == null || action.targetY == null ||
+      action.targetX2 == null || action.targetY2 == null) {
+    log('select_option needs dropdown coords (targetX,targetY) and option coords (targetX2,targetY2).', 'ERROR', 'action');
+    return;
+  }
+  // Click the dropdown to open it
+  const { x: dropX, y: dropY } = ctx.toAbsolute(action.targetX, action.targetY);
+  await browser.flutterTap?.(page, dropX, dropY);
+  await sleep(DROPDOWN_OPEN_DELAY_MS);
+  // Click the option
+  const { x: optX, y: optY } = ctx.toAbsolute(action.targetX2, action.targetY2);
+  await browser.flutterTap?.(page, optX, optY);
+  log(`Selected dropdown option at (${optX.toFixed(0)}, ${optY.toFixed(0)})`, 'DEBUG', 'action');
+  await sleep(CONFIG.POST_CLICK_MS * wm);
+}
+
+// ── Wait ──
+async function _handleWait(ctx: ActionCtx): Promise<void> {
+  const { CONFIG, wm, adaptiveEngine } = ctx;
+  const waitTime = (CONFIG.ENABLE_ADAPTIVE_PERFORMANCE && adaptiveEngine?.getAdjustedWait)
+    ? adaptiveEngine.getAdjustedWait(CONFIG.BETWEEN_STEPS_MS)
+    : CONFIG.BETWEEN_STEPS_MS * wm;
+  log(`Waiting ${waitTime}ms...`, 'DEBUG', 'action');
+  await sleep(waitTime);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Action dispatch table
+// ═══════════════════════════════════════════════════════════════════════════
+
+const ACTION_HANDLERS: Record<string, (ctx: ActionCtx) => Promise<void>> = {
+  // Coordinate-based interactions
+  click:          _handleClick,
+  flutter_tap:    _handleClick,        // alias
+  double_click:   _handleDoubleClick,
+  hover:          _handleHover,
+  long_press:     _handleLongPress,
+  // Text input
+  input_email:    _handleInputEmail,
+  input_password: _handleInputPassword,
+  type_text:      _handleTypeText,
+  keypad_input:   _handleKeypadInput,
+  // Gesture
+  flutter_swipe:  _handleSwipe,
+  drag:           _handleDrag,
+  scroll_vertical:   _handleScrollVertical,
+  scroll_horizontal: _handleScrollHorizontal,
+  // Keyboard
+  press_key:      _handlePressKey,
+  // Navigation
+  navigate_back:  _handleNavigateBack,
+  select_option:  _handleSelectOption,
+  // Timing
+  wait:           _handleWait,
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Main action executor
 // ═══════════════════════════════════════════════════════════════════════════
@@ -115,7 +545,7 @@ async function executeAction(page: any, action: any) {
   }
 }
 
-async function _executeActionInner(page: any, action: any) { 
+async function _executeActionInner(page: any, action: any) {
   const CONFIG = getCONFIG();
   const wm = _waitMultiplier(CONFIG);
   const browser = _deps.browser || {};
@@ -153,114 +583,20 @@ async function _executeActionInner(page: any, action: any) {
     return;
   }
 
-  switch (action.actionType) {
-    case 'click':
-    case 'flutter_tap': {
-      if (action.targetX == null || action.targetY == null) {
-        log('Click action missing coordinates.', 'ERROR', 'action');
-        break;
-      }
-      const { x, y } = toAbsolute(action.targetX, action.targetY);
-      const retryWithBackoff = providersBase.retryWithBackoff || ((fn: any) => fn());
- const success = await retryWithBackoff(
-        () => browser.performClickWithRetry?.(page, x, y, 3),
-        { maxRetries: CLICK_MAX_RETRIES, baseDelay: CLICK_RETRY_BASE_DELAY_MS },
-      );
-      if (!success) {
-        log('Click failed to produce page change, trying flutterTap fallback.', 'WARN', 'action');
-        try { await browser.flutterTap?.(page, x, y); } catch (e: any) { /* best effort */ }
-      }
-      await sleep(CONFIG.POST_CLICK_MS * wm);
-      break;
+  // Dispatch to handler
+  const handler = ACTION_HANDLERS[action.actionType];
+  if (handler) {
+    try {
+      await handler({
+        page, action, CONFIG, wm, browser, providersBase, gestures,
+        adaptiveEngine, providers, progressTracker, policyEngine, toAbsolute,
+      });
+    } catch (e: any) {
+      log(`Handler for ${action.actionType} threw: ${e.message}`, 'ERROR', 'action');
     }
-    case 'flutter_swipe': {
-      const { x: startX, y: startY } = toAbsolute(action.targetX || 0.5, action.targetY || 0.5);
-      const { x: endX, y: endY } = toAbsolute(action.targetX2 || 0.5, action.targetY2 || 0.5);
-      if (gestures.performSwipe) {
-        await gestures.performSwipe(page, startX, startY, endX, endY, CONFIG.SWIPE_DURATION_MS);
-      } else {
-        log('flutter_swipe: performSwipe not available', 'WARN', 'action');
-      }
-      await sleep(CONFIG.BETWEEN_STEPS_MS * wm);
-      break;
-    }
-    case 'input_email': {
-      if (action.targetX == null || action.targetY == null) {
-        log('Input email missing coordinates.', 'ERROR', 'action');
-        break;
-      }
-      const { x, y } = toAbsolute(action.targetX, action.targetY);
-      await browser.flutterTap?.(page, x, y);
-      await sleep(PRE_TYPE_DELAY_MS);
-      // Try to focus the email field via locator
-      try {
-        const emailLocator = page.locator('input[type="email"], input[name*="email" i], [role="textbox"][aria-label*="email" i]');
-        if (await emailLocator.count() > 0) { await emailLocator.first().click(); }
-      } catch (e: any) { log(`Locator for email field failed: ${e.message}`, 'WARN', 'action'); }
-      await _selectAllText(page);
-      await _typeText(page, CONFIG.getMicrosoftEmail?.() || '', CONFIG);
-      try { await page.keyboard.press('Enter'); } catch { /* best effort */ }
-      await sleep(CONFIG.POST_CLICK_MS * wm);
-      break;
-    }
-    case 'input_password': {
-      if (action.targetX == null || action.targetY == null) {
-        log('Input password missing coordinates.', 'ERROR', 'action');
-        break;
-      }
-      const { x, y } = toAbsolute(action.targetX, action.targetY);
-      await browser.flutterTap?.(page, x, y);
-      await sleep(PRE_TYPE_DELAY_MS);
-      try {
-        const passLocator = page.locator('input[type="password"], input[name*="password" i], [role="textbox"][aria-label*="password" i]');
-        if (await passLocator.count() > 0) { await passLocator.first().click(); }
-      } catch (e: any) { log(`Locator for password field failed: ${e.message}`, 'WARN', 'action'); }
-      await _selectAllText(page);
-      await _typeText(page, CONFIG.getMicrosoftPassword?.() || '', CONFIG);
-      try { await page.keyboard.press('Enter'); } catch { /* best effort */ }
-      await sleep(CONFIG.POST_CLICK_MS * wm);
-      break;
-    }
-    case 'keypad_input': {
-      if (action.keypadSequence && Array.isArray(action.keypadSequence)) {
-        for (const key of action.keypadSequence) {
-          const { x, y } = toAbsolute(key.x, key.y);
-          await browser.flutterTap?.(page, x, y);
-          await sleep(KEYPAD_TAP_DELAY_MS);
-        }
-        if (action.submitX != null && action.submitY != null) {
-          const { x, y } = toAbsolute(action.submitX, action.submitY);
-          await browser.flutterTap?.(page, x, y);
-        }
-        await sleep(CONFIG.POST_CLICK_MS * wm);
-      } else {
-        log('keypad_input missing keypadSequence.', 'ERROR', 'action');
-      }
-      break;
-    }
-    case 'scroll_vertical': {
-      const scrollFactor = browser.getScaleFactor?.() || 1;
-      await browser.scrollPage?.(page, 0, CONFIG.SCROLL_AMOUNT * scrollFactor);
-      await sleep(CONFIG.SCROLL_PAUSE_MS * wm);
-      break;
-    }
-    case 'scroll_horizontal': {
-      const scrollFactor = browser.getScaleFactor?.() || 1;
-      await browser.scrollPage?.(page, CONFIG.SCROLL_AMOUNT * scrollFactor, 0);
-      await sleep(CONFIG.SCROLL_PAUSE_MS * wm);
-      break;
-    }
-    case 'wait': {
-      const waitTime = (CONFIG.ENABLE_ADAPTIVE_PERFORMANCE && adaptiveEngine?.getAdjustedWait)
-        ? adaptiveEngine.getAdjustedWait(CONFIG.BETWEEN_STEPS_MS)
-        : CONFIG.BETWEEN_STEPS_MS * wm;
-      log(`Waiting ${waitTime}ms...`, 'DEBUG', 'action');
-      await sleep(waitTime);
-      break;
-    }
-    default:
-      log(`Unknown action: ${action.actionType}`, 'WARN', 'action');
-      await sleep(CONFIG.BETWEEN_STEPS_MS * wm);
+  } else {
+    log(`Unknown action: ${action.actionType}`, 'WARN', 'action');
+    await sleep(CONFIG.BETWEEN_STEPS_MS * wm);
   }
 
   // Track progress
