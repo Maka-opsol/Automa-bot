@@ -663,7 +663,20 @@ function _getPix2tex() { if (!_pix2tex) { try { _pix2tex = require('./services-p
 let _degradationLadder: any = null;
 function _getDegradationLadder() { if (!_degradationLadder) { try { _degradationLadder = require('./self-heal-degradation-ladder'); } catch { _degradationLadder = null; } } return _degradationLadder; }
 let _actionCache: any = null;
-function _getActionCache() { if (!_actionCache) { try { _actionCache = require('./services-action-cache'); } catch { _actionCache = null; } } return _actionCache; }
+let _actionCacheLoadAttempted = false;
+function _getActionCache() {
+  if (!_actionCache) {
+    if (_actionCacheLoadAttempted) {
+      // Already tried once and failed — retry once more (DB may have been late)
+      _actionCacheLoadAttempted = false; // allow one more attempt
+      try { _actionCache = require('./services-action-cache'); } catch { _actionCache = null; }
+    } else {
+      try { _actionCache = require('./services-action-cache'); } catch { _actionCache = null; }
+      _actionCacheLoadAttempted = true;
+    }
+  }
+  return _actionCache;
+}
 let _localCacheEmpty: boolean | null = null;  // null = not yet checked; true = empty (cold start)
 function _isLocalCacheEmpty(): boolean {
   if (_localCacheEmpty !== null) return _localCacheEmpty;
@@ -677,6 +690,53 @@ function _isLocalCacheEmpty(): boolean {
   } catch { _localCacheEmpty = true; }
   return _localCacheEmpty;
 }
+
+/**
+ * Save an action to the action cache. Called from EVERY action-producing path
+ * so that no valid action ever skips persistence. This is the single point of
+ * truth for cache writes — do NOT add inline cache saves elsewhere.
+ *
+ * @returns true if save succeeded, false if skipped/failed
+ */
+async function _saveActionToCache(
+  action: any,
+  currentState: string | null,
+  base64: string | null,
+  actionCache: any,
+  existingSig: string | null,
+  isCacheExcluded: boolean,
+  log: Function
+): Promise<boolean> {
+  if (!action?.actionType) return false;
+  if (!actionCache) return false;
+  if (isCacheExcluded) return false;
+  if (action.actionType === 'wait' || action.actionType === 'blank_page') return false;
+
+  try {
+    // Compute sig if not already computed for this cycle
+    let sig = existingSig;
+    if (!sig) {
+      sig = actionCache.computeContextSignature(currentState, base64);
+    }
+    if (!sig) return false;
+
+    await actionCache.save(sig, {
+      actionType: action.actionType,
+      targetX: action.targetX,
+      targetY: action.targetY,
+      value: action.value || '',
+      keypadSequence: action.keypadSequence,
+      currentState: action.currentState || currentState || 'unknown',
+      reasoning: action.reasoning,
+    });
+    _localCacheEmpty = false;
+    return true;
+  } catch (err: any) {
+    log(`Action cache save failed: ${err.message || err}`, 'ERROR', 'cycle');
+    return false;
+  }
+}
+
 let _solutionCache: any = null;
 function _getSolutionCache() { if (!_solutionCache) { try { _solutionCache = require('./math-solution-cache'); } catch { _solutionCache = null; } } return _solutionCache; }
 let _tmpGuardian: any = null;
@@ -1667,6 +1727,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             if (action && action.actionType && action.actionType !== 'wait') {
               log(`Pixel-only fallback: ${action.actionType} at (${action.targetX}, ${action.targetY})`, 'INFO', 'cycle');
             }
+            // v15: Save pixel-only fallback actions to cache too
+            if (action) await _saveActionToCache(action, currentState, base64, actionCache, _actionCacheSig, _isCacheExcluded, log);
           } catch (fbErr: any) {
             log(`Pixel-only fallback failed: ${fbErr.message || fbErr}`, 'WARN', 'cycle');
           }
@@ -1687,36 +1749,18 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             // ── Eager action cache write (pre-execution) ──────────────────
             // Persist to Turso IMMEDIATELY after tribunal decides.
             // If OOM kills before execution, this survives. If the action
-            // later fails, recordFailure (line ~2238) evicts after 3 strikes.
-            if (action?.actionType && actionCache && !_isCacheExcluded
-                && action.actionType !== 'wait' && action.actionType !== 'blank_page') {
-              try {
-                // Compute sig if not already done (cache was excluded or missed)
-                if (!_actionCacheSig) {
-                  _actionCacheSig = actionCache.computeContextSignature(currentState, base64);
-                }
-                if (_actionCacheSig) {
-                  await actionCache.save(_actionCacheSig, {
-                    actionType: action.actionType,
-                    targetX: action.targetX,
-                    targetY: action.targetY,
-                    value: action.value || '',
-                    keypadSequence: action.keypadSequence,
-                    currentState: action.currentState || currentState || 'unknown',
-                    reasoning: action.reasoning,
-                  });
-                  _localCacheEmpty = false;
-                }
-              } catch (eagerErr: any) {
-                log(`Eager cache save failed: ${eagerErr.message || eagerErr}`, 'DEBUG', 'cycle');
-              }
-            }
+            // later fails, recordFailure evicts after 3 strikes.
+            // v15: Uses centralized _saveActionToCache helper.
+            await _saveActionToCache(action, currentState, base64, actionCache, _actionCacheSig, _isCacheExcluded, log);
+
             // If tribunal internally failed and returned a wait/error fallback, try pixel fallback
             if (action?.actionType === 'wait' && action?.reasoning?.includes('tribunal failure')) {
               logError('Tribunal returned fallback wait, trying pixel fallback', new Error(action.reasoning || ''));
             // v14: Feed tribunal failure to self-heal error buffer
             try { (getDep('selfHeal') || require('./self-heal'))?.pushSelfHealError?.(`tribunal fallback wait: ${action.reasoning || 'unknown'}`, 'tribunal'); } catch {}
               action = await getFallbackAction(page, currentState || undefined);
+              // v15: Save tribunal-failure fallback actions to cache too
+              await _saveActionToCache(action, currentState, base64, actionCache, _actionCacheSig, _isCacheExcluded, log);
             }
           } catch (err: any) {
             const errMsg = err?.message || String(err);
@@ -1732,6 +1776,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             // v14: Feed tribunal error to self-heal error buffer
             try { (getDep('selfHeal') || require('./self-heal'))?.pushSelfHealError?.(`tribunal exception: ${err?.message || String(err)}`, 'tribunal'); } catch {}
             action = await getFallbackAction(page, currentState || undefined);
+            // v15: Save catch-path fallback actions to cache too
+            await _saveActionToCache(action, currentState, base64, actionCache, _actionCacheSig, _isCacheExcluded, log);
           }
         }
       }
