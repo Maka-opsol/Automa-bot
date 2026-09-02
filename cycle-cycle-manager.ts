@@ -3211,6 +3211,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         try { const pr = _getProcessRetrainer(); if (pr?.retrainProcesses) pr.retrainProcesses().catch((e: any) => logError('Retraining failed', e)); } catch (e: any) { /* non-critical */ }
       }
     } // end else (non-browser-closed error)
+  } // end catch
   } finally {
     // v16: Snapshot cycle state to DB (OOM-survival).
     // Runs every cycle. Writes ~1-3 KB to the calibration table.
