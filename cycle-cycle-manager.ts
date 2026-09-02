@@ -968,9 +968,26 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
     }
 
-    // v18: Re-launch browser after memory protection killed it mid-cycle.
-    // Returns the new page. Throws if re-launch fails.
+    // v18: Rate-limited browser relaunch. Prevents a death spiral where:
+    //   1. Browser dies (OOM or process crash)
+    //   2. _relaunchBrowser launches a new browser (~100MB RSS spike)
+    //   3. The launch itself triggers another OOM, killing the new browser
+    //   4. Next iteration detects dead page → relaunch again → loop
+    // Without cooldown, the bot burns memory relaunching Chrome every 30s
+    // without ever making progress. Cooldown lets memory settle after a
+    // relaunch so the next iteration can actually take a screenshot and
+    // proceed with the cycle.
+    let _lastRelaunchTime = 0;
+    const RELAUNCH_COOLDOWN_MS = 60000; // 60s between relaunch attempts
+
     async function _relaunchBrowser(): Promise<any> {
+      const now = Date.now();
+      if (now - _lastRelaunchTime < RELAUNCH_COOLDOWN_MS) {
+        const waitMs = RELAUNCH_COOLDOWN_MS - (now - _lastRelaunchTime);
+        log(`Browser relaunch rate-limited — waiting ${Math.round(waitMs / 1000)}s (cooldown)`, 'WARN', 'cycle');
+        await new Promise(r => setTimeout(r, waitMs));
+      }
+      _lastRelaunchTime = Date.now();
       log('Browser was closed (likely by memory protection). Re-launching...', 'WARN', 'cycle');
       _networkSetup = false;
       const newPage = await safeBrowserRetry(async (p: any) => {
