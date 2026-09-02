@@ -39,6 +39,13 @@ let _lastPullTime = 0;
 let _consecutiveErrors = 0;
 const MAX_CONSECUTIVE_ERRORS = 5; // Auto-disable after 5 consecutive failures
 const SYNC_INTERVAL_MS_DEFAULT = 30000; // 30s — push local → Turso
+// v18: Heap guard — skip Turso sync when memory is tight.
+// On 512MB Render, 93 individual HTTP requests to Turso allocates
+// ~5-10MB of temporary objects (Promise chains, response buffers,
+// libsql internal state). Combined with a screenshot buffer, this
+// is enough to trigger the render-free-plan monitor's CRITICAL threshold
+// which kills the browser (L3 shedMemory), crashing the cycle.
+const SYNC_HEAP_GUARD_MB = 120;
 
 // FIX: Retry transient write failures (1 retry with 1s backoff)
 const WRITE_RETRY_DELAY_MS = 1000;
@@ -614,33 +621,83 @@ async function syncToTurso(): Promise<{ synced: number; errors: number }> {
   const client = _getClient();
   if (!client) return { synced: 0, errors: 0 };
 
+  // v18: Heap guard — skip sync when memory is tight.
+  // The old code did 93+ sequential HTTP requests (one per row), each
+  // allocating response objects, Promise chains, and libsql internal
+  // state. On a 512MB instance (256MB heap), this 5-10MB spike
+  // combined with a screenshot buffer pushes RSS past the render-free-
+  // plan CRITICAL threshold, which kills the browser via L3 shedMemory.
+  try {
+    const heapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+    if (heapMB > SYNC_HEAP_GUARD_MB) {
+      _getLog()(`Turso sync skipped — heap ${heapMB.toFixed(0)}MB > ${SYNC_HEAP_GUARD_MB}MB guard`, 'DEBUG');
+      return { synced: 0, errors: 0 };
+    }
+  } catch {}
+
   let synced = 0;
   let errors = 0;
 
+  // v18: Use executeMultiple (single HTTP request per table) instead of
+  // per-row await client.execute(). This reduces 93 HTTP requests to ~7,
+  // cutting memory allocation from ~5-10MB to ~0.5MB per sync cycle.
+  // libsql client.executeMultiple() sends all statements in one HTTP
+  // request, so the response is a single object instead of 93.
+  //
+  // IMPORTANT: executeMultiple does NOT support parameterized queries.
+  // All values must be SQL-literal-escaped inline. This is safe because
+  // all values originate from our own local SQLite (not user input).
+  function _esc(val: any): string {
+    if (val === null || val === undefined) return 'NULL';
+    if (typeof val === 'number') return String(val);
+    // String: escape single quotes
+    return "'" + String(val).replace(/'/g, "''") + "'";
+  }
+
   try {
     const db = require('./database');
+    const useBatch = typeof client.executeMultiple === 'function';
 
-    // Sync calibration (includes solution cache entries — critical!)
+    if (!useBatch) {
+      // Fallback: original per-row sync (shouldn't happen with @libsql/client >= 0.14)
+      _getLog()('executeMultiple not available — using per-row fallback (higher memory)', 'DEBUG');
+    }
+
+    // Sync calibration
     try {
       const rows = db.db?.prepare('SELECT * FROM calibration')?.all() || [];
-      for (const row of rows) {
-        const ok = await _exec(
-          'INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (?, ?, ?)',
-          [row.key, row.value, row.updated_at]
-        );
-        if (ok) synced++; else errors++;
+      if (rows.length > 0) {
+        if (useBatch) {
+          const stmts = rows.map((r: any) =>
+            `INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (${_esc(r.key)}, ${_esc(r.value)}, ${_esc(r.updated_at)})`
+          );
+          const result = await client.executeMultiple(stmts.join('; '));
+          if (result) synced += rows.length; else errors += rows.length;
+        } else {
+          for (const row of rows) {
+            const ok = await _exec('INSERT OR REPLACE INTO calibration (key, value, updated_at) VALUES (?, ?, ?)', [row.key, row.value, row.updated_at]);
+            if (ok) synced++; else errors++;
+          }
+        }
       }
     } catch (e: any) { errors++; }
 
     // Sync completed_modules
     try {
       const modules = db.db?.prepare('SELECT * FROM completed_modules')?.all() || [];
-      for (const row of modules) {
-        const ok = await _exec(
-          'INSERT OR REPLACE INTO completed_modules (name, completed_at, attempts, completion_time_ms, last_attempt) VALUES (?, ?, ?, ?, ?)',
-          [row.name, row.completed_at, row.attempts, row.completion_time_ms, row.last_attempt]
-        );
-        if (ok) synced++; else errors++;
+      if (modules.length > 0) {
+        if (useBatch) {
+          const stmts = modules.map((r: any) =>
+            `INSERT OR REPLACE INTO completed_modules (name, completed_at, attempts, completion_time_ms, last_attempt) VALUES (${_esc(r.name)}, ${_esc(r.completed_at)}, ${_esc(r.attempts)}, ${_esc(r.completion_time_ms)}, ${_esc(r.last_attempt)})`
+          );
+          await client.executeMultiple(stmts.join('; '));
+          synced += modules.length;
+        } else {
+          for (const row of modules) {
+            const ok = await _exec('INSERT OR REPLACE INTO completed_modules (name, completed_at, attempts, completion_time_ms, last_attempt) VALUES (?, ?, ?, ?, ?)', [row.name, row.completed_at, row.attempts, row.completion_time_ms, row.last_attempt]);
+            if (ok) synced++; else errors++;
+          }
+        }
       }
     } catch (e: any) { errors++; }
 
@@ -648,75 +705,118 @@ async function syncToTurso(): Promise<{ synced: number; errors: number }> {
     try {
       const lastState = db.db?.prepare('SELECT * FROM last_state ORDER BY timestamp DESC LIMIT 1')?.get();
       if (lastState) {
-        const ok = await _exec(
-          'INSERT OR REPLACE INTO last_state (url, state, timestamp) VALUES (?, ?, ?)',
-          [lastState.url, lastState.state, lastState.timestamp]
-        );
-        if (ok) synced++; else errors++;
+        if (useBatch) {
+          await client.executeMultiple(`INSERT OR REPLACE INTO last_state (url, state, timestamp) VALUES (${_esc(lastState.url)}, ${_esc(lastState.state)}, ${_esc(lastState.timestamp)})`);
+          synced++;
+        } else {
+          const ok = await _exec('INSERT OR REPLACE INTO last_state (url, state, timestamp) VALUES (?, ?, ?)', [lastState.url, lastState.state, lastState.timestamp]);
+          if (ok) synced++; else errors++;
+        }
       }
     } catch (e: any) { errors++; }
 
     // Sync banned_actions
     try {
       const banned = db.db?.prepare('SELECT * FROM banned_actions')?.all() || [];
-      for (const row of banned) {
-        const ok = await _exec(
-          'INSERT OR REPLACE INTO banned_actions (action_type, banned_by, banned_at, reason) VALUES (?, ?, ?, ?)',
-          [row.action_type, row.banned_by, row.banned_at, row.reason]
-        );
-        if (ok) synced++; else errors++;
+      if (banned.length > 0) {
+        if (useBatch) {
+          const stmts = banned.map((r: any) =>
+            `INSERT OR REPLACE INTO banned_actions (action_type, banned_by, banned_at, reason) VALUES (${_esc(r.action_type)}, ${_esc(r.banned_by)}, ${_esc(r.banned_at)}, ${_esc(r.reason)})`
+          );
+          await client.executeMultiple(stmts.join('; '));
+          synced += banned.length;
+        } else {
+          for (const row of banned) {
+            const ok = await _exec('INSERT OR REPLACE INTO banned_actions (action_type, banned_by, banned_at, reason) VALUES (?, ?, ?, ?)', [row.action_type, row.banned_by, row.banned_at, row.reason]);
+            if (ok) synced++; else errors++;
+          }
+        }
       }
     } catch (e: any) { errors++; }
 
     // Sync provider_registry
     try {
       const providers = db.db?.prepare('SELECT * FROM provider_registry')?.all() || [];
-      for (const row of providers) {
-        const ok = await _exec(
-          'INSERT OR REPLACE INTO provider_registry (provider_name, endpoint, model, last_verified, history, success_count, failure_count, total_latency, last_check) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [row.provider_name, row.endpoint, row.model, row.last_verified, row.history, row.success_count, row.failure_count, row.total_latency, row.last_check]
-        );
-        if (ok) synced++; else errors++;
+      if (providers.length > 0) {
+        if (useBatch) {
+          const stmts = providers.map((r: any) =>
+            `INSERT OR REPLACE INTO provider_registry (provider_name, endpoint, model, last_verified, history, success_count, failure_count, total_latency, last_check) VALUES (${_esc(r.provider_name)}, ${_esc(r.endpoint)}, ${_esc(r.model)}, ${_esc(r.last_verified)}, ${_esc(r.history)}, ${_esc(r.success_count)}, ${_esc(r.failure_count)}, ${_esc(r.total_latency)}, ${_esc(r.last_check)})`
+          );
+          await client.executeMultiple(stmts.join('; '));
+          synced += providers.length;
+        } else {
+          for (const row of providers) {
+            const ok = await _exec('INSERT OR REPLACE INTO provider_registry (provider_name, endpoint, model, last_verified, history, success_count, failure_count, total_latency, last_check) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [row.provider_name, row.endpoint, row.model, row.last_verified, row.history, row.success_count, row.failure_count, row.total_latency, row.last_check]);
+            if (ok) synced++; else errors++;
+          }
+        }
       }
     } catch (e: any) { errors++; }
 
     // Sync model_registry
     try {
       const models = db.db?.prepare('SELECT * FROM model_registry')?.all() || [];
-      for (const row of models) {
-        const ok = await _exec(
-          'INSERT OR REPLACE INTO model_registry (provider, model_id, is_free, is_working, role, last_tested_at, last_success_at, failure_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-          [row.provider, row.model_id, row.is_free, row.is_working, row.role, row.last_tested_at, row.last_success_at, row.failure_count]
-        );
-        if (ok) synced++; else errors++;
+      if (models.length > 0) {
+        if (useBatch) {
+          const stmts = models.map((r: any) =>
+            `INSERT OR REPLACE INTO model_registry (provider, model_id, is_free, is_working, role, last_tested_at, last_success_at, failure_count) VALUES (${_esc(r.provider)}, ${_esc(r.model_id)}, ${_esc(r.is_free)}, ${_esc(r.is_working)}, ${_esc(r.role)}, ${_esc(r.last_tested_at)}, ${_esc(r.last_success_at)}, ${_esc(r.failure_count)})`
+          );
+          await client.executeMultiple(stmts.join('; '));
+          synced += models.length;
+        } else {
+          for (const row of models) {
+            const ok = await _exec('INSERT OR REPLACE INTO model_registry (provider, model_id, is_free, is_working, role, last_tested_at, last_success_at, failure_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [row.provider, row.model_id, row.is_free, row.is_working, row.role, row.last_tested_at, row.last_success_at, row.failure_count]);
+            if (ok) synced++; else errors++;
+          }
+        }
       }
     } catch (e: any) { errors++; }
 
-    // Sync action_cache (R6: critical — avoids redundant AI calls)
+    // Sync action_cache
     try {
       const actions = db.db?.prepare('SELECT * FROM action_cache WHERE evicted = 0')?.all() || [];
-      for (const row of actions) {
-        const ok = await _exec(
-          `INSERT INTO action_cache (context_sig, action_type, target_x, target_y, value,
-            keypad_sequence, current_state, reasoning, success_count, failure_count,
-            hit_count, created_at, last_used, evicted)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(context_sig) DO UPDATE SET
-             action_type = excluded.action_type,
-             target_x = excluded.target_x,
-             target_y = excluded.target_y,
-             hit_count = MAX(action_cache.hit_count, excluded.hit_count)`,
-          [row.context_sig, row.action_type, row.target_x, row.target_y, row.value,
-           row.keypad_sequence, row.current_state, row.reasoning, row.success_count,
-           row.failure_count, row.hit_count, row.created_at, row.last_used, row.evicted]
-        );
-        if (ok) synced++; else errors++;
+      if (actions.length > 0) {
+        if (useBatch) {
+          const stmts = actions.map((r: any) =>
+            `INSERT INTO action_cache (context_sig, action_type, target_x, target_y, value,
+              keypad_sequence, current_state, reasoning, success_count, failure_count,
+              hit_count, created_at, last_used, evicted)
+             VALUES (${_esc(r.context_sig)}, ${_esc(r.action_type)}, ${_esc(r.target_x)}, ${_esc(r.target_y)}, ${_esc(r.value)},
+               ${_esc(r.keypad_sequence)}, ${_esc(r.current_state)}, ${_esc(r.reasoning)}, ${_esc(r.success_count)}, ${_esc(r.failure_count)},
+               ${_esc(r.hit_count)}, ${_esc(r.created_at)}, ${_esc(r.last_used)}, ${_esc(r.evicted)})
+             ON CONFLICT(context_sig) DO UPDATE SET
+               action_type = excluded.action_type,
+               target_x = excluded.target_x,
+               target_y = excluded.target_y,
+               hit_count = MAX(action_cache.hit_count, excluded.hit_count)`
+          );
+          await client.executeMultiple(stmts.join('; '));
+          synced += actions.length;
+        } else {
+          for (const row of actions) {
+            const ok = await _exec(
+              `INSERT INTO action_cache (context_sig, action_type, target_x, target_y, value,
+                keypad_sequence, current_state, reasoning, success_count, failure_count,
+                hit_count, created_at, last_used, evicted)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(context_sig) DO UPDATE SET
+                 action_type = excluded.action_type,
+                 target_x = excluded.target_x,
+                 target_y = excluded.target_y,
+                 hit_count = MAX(action_cache.hit_count, excluded.hit_count)`,
+              [row.context_sig, row.action_type, row.target_x, row.target_y, row.value,
+               row.keypad_sequence, row.current_state, row.reasoning, row.success_count,
+               row.failure_count, row.hit_count, row.created_at, row.last_used, row.evicted]
+            );
+            if (ok) synced++; else errors++;
+          }
+        }
       }
     } catch (e: any) { errors++; }
 
     _lastSyncTime = Date.now();
     if (synced > 0 || errors > 0) {
-      _getLog()(`Pushed ${synced} rows to Turso (${errors} errors)`);
+      _getLog()(`Pushed ${synced} rows to Turso (${errors} errors)${useBatch ? ' [batch]' : ' [per-row]'}`);
     }
 
     if (errors === 0) _consecutiveErrors = 0;
