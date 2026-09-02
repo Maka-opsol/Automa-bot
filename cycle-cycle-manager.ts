@@ -943,30 +943,13 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       } catch { return true; }
     }
 
-    // v18: Helper to detect if the browser/page was closed by memory protection
-    // or an OOM event. Memory-mode.shedMemory (L3) closes the browser mid-cycle,
-    // but the `page` variable in the while-loop still holds the old (now dead)
-    // reference. Any page.evaluate / page.screenshot / page.mouse call on it
-    // throws "Target page, context or browser has been closed".
-    // Returns true if page is dead and a fresh browser is needed.
-    function _isPageDead(pg: any): boolean {
-      try {
-        if (!pg) return true;
-        if (pg.isClosed?.()) return true;
-        // Check browser connectivity — context() or browser() may throw on dead proxies
-        const ctx = pg.context;
-        if (typeof ctx === 'function') {
-          const context = ctx();
-          if (context?.pages && !context.pages().includes(pg)) return true;
-          const browser = context?.browser;
-          if (typeof browser === 'function' && !browser()?.isConnected?.()) return true;
-        }
-        return false;
-      } catch {
-        // Any property access failure on a dead proxy means the page is gone
-        return true;
-      }
-    }
+    // v18 REMOVED: _isPageDead() was causing false positives on live pages.
+    // The catch-all `catch { return true }` treated any transient property
+    // access glitch as a dead page, triggering an unnecessary browser relaunch
+    // that KILLED the working browser on 512MB (two Chrome instances = OOM).
+    // Dead pages are now handled by the existing try/catch blocks around
+    // page.screenshot() (line ~1500) and page.evaluate() (line ~2159), which
+    // catch "closed"/"disconnected" errors and relaunch cleanly.
 
     // v18: Rate-limited browser relaunch. Prevents a death spiral where:
     //   1. Browser dies (OOM or process crash)
@@ -989,6 +972,14 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
       _lastRelaunchTime = Date.now();
       log('Browser was closed (likely by memory protection). Re-launching...', 'WARN', 'cycle');
+      // Mark the old browser close as intentional BEFORE safeBrowserRetry calls
+      // launchBrowser() → cleanup(). Without this, cleanup() fires the
+      // "disconnected" event with _intentionalClose=false, producing a
+      // misleading "Browser process disconnected unexpectedly" error log.
+      try {
+        const bm = _browserDep?.getBrowserManager?.();
+        if (bm) bm._intentionalClose = true;
+      } catch {}
       _networkSetup = false;
       const newPage = await safeBrowserRetry(async (p: any) => {
         if (authenticate) await authenticate(p);
@@ -1484,13 +1475,9 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // v14: NEVER take a screenshot of a blank page. Wait for CanvasKit to render
       // before capturing. This is the universal chokepoint — every cycle path
       // flows through here before the tribunal sees the screenshot.
-      // v18: Check page liveness before screenshot — memory protection may
-      // have killed the browser since the last loop iteration.
-      if (_isPageDead(page)) {
-        log('Page died before screenshot — re-launching browser', 'WARN', 'cycle');
-        try { page = await _relaunchBrowser(); } catch (relaunchErr: any) { throw relaunchErr; }
-        continue;
-      }
+      // Dead-page detection removed — was causing false positives that
+      // killed working browsers on 512MB. The screenshot try/catch below
+      // already handles "Target page, context or browser has been closed".
       await _waitForRenderedPage(page, 12000);
 
       const beforeUrl = page.url();
@@ -2149,13 +2136,10 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
       if (action.actionType === 'click') {
         clickAttempts++;
-        // v18: Guard — memory protection may have closed the browser between
-        // the tribunal call (which took a screenshot) and this click execution.
-        if (_isPageDead(page)) {
-          log('Page died before click execution — re-launching browser', 'WARN', 'cycle');
-          try { page = await _relaunchBrowser(); } catch (relaunchErr: any) { throw relaunchErr; }
-          continue; // Re-enter loop with fresh page
-        }
+        // Dead-page pre-check removed — was causing false positives.
+        // If the browser was killed by memory protection mid-cycle, the
+        // page.evaluate() below will throw and be caught by the outer
+        // catch block which already handles "browser has been closed".
         const beforeBodyLen = await page.evaluate(() => document.body.innerText.length).catch(() => -1);
         if (executeAction) await executeAction(page, action);
         const afterUrl = page.url();
