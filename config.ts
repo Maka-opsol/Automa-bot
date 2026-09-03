@@ -295,8 +295,8 @@ function isValidRemoteOverride(key: string, value: unknown): boolean {
   if (BLOCKED_KEYS.has(key)) return false;
   const schema: Record<string, OverrideSchemaItem> = {
     RETRY_ATTEMPTS: { type: 'number', min: 1, max: 10 },
-    POST_CLICK_MS: { type: 'number', min: 1000, max: 60000 },
-    BETWEEN_STEPS_MS: { type: 'number', min: 5000, max: 120000 },
+    POST_CLICK_MS: { type: 'number', min: 500, max: 60000 },
+    BETWEEN_STEPS_MS: { type: 'number', min: 2000, max: 120000 },
     SCROLL_AMOUNT: { type: 'number', min: 100, max: 2000 },
     VIDEO_SPEED: { type: 'number', min: 1, max: 32 },
     MAX_QUESTIONS: { type: 'number', min: 1, max: 999999 },
@@ -381,9 +381,15 @@ const env = envalid.cleanEnv(process.env, {
   SAVE_SCREENSHOTS: bool({ default: false }),
   SCREENSHOT_DIR: str({ default: path.join(PROJECT_ROOT, 'logs', 'screenshots') }),
   MAX_SCREENSHOTS: num({ default: 10 }),
-  POST_CLICK_MS: num({ default: 20000 }),
-  BETWEEN_STEPS_MS: num({ default: 25000 }),
-  SCROLL_PAUSE_MS: num({ default: 20000 }),
+  // v20: Reduced from 20000/25000/20000. On 512MB Render, the browser
+  // accumulates ~5MB/min of renderer memory during idle waits. The old
+  // 20s+25s=45s per cycle gave Chromium enough time to grow RSS from
+  // ~180MB to 312MB → OOM kill. 3s+5s=8s total keeps browser active
+  // time minimal while still allowing Flutter navigation to settle.
+  // waitForStable() handles the actual readiness detection.
+  POST_CLICK_MS: num({ default: 3000 }),
+  BETWEEN_STEPS_MS: num({ default: 5000 }),
+  SCROLL_PAUSE_MS: num({ default: 3000 }),
   SCROLL_AMOUNT: num({ default: 800 }),
   VIDEO_SPEED: num({ default: 16 }),
   VIDEO_TIMEOUT_MS: num({ default: 90000 }),
