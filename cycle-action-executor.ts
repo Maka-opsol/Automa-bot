@@ -46,10 +46,10 @@ const SELECT_ALL_DELAY_MS = 50;
 const KEYBOARD_TYPE_DELAY_MS = 50;
 
 /** Maximum retry attempts for click actions. */
-const CLICK_MAX_RETRIES = 2;
+const CLICK_MAX_RETRIES = 1;
 
 /** Base delay between click retries (ms). */
-const CLICK_RETRY_BASE_DELAY_MS = 1000;
+const CLICK_RETRY_BASE_DELAY_MS = 500;
 
 /** Delay before typing after tap on input field (ms). */
 const PRE_TYPE_DELAY_MS = 500;
