@@ -2182,59 +2182,41 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
       if (action.actionType === 'click') {
         clickAttempts++;
-        // Dead-page pre-check removed — was causing false positives.
-        // If the browser was killed by memory protection mid-cycle, the
-        // page.evaluate() below will throw and be caught by the outer
-        // catch block which already handles "browser has been closed".
-        const beforeBodyLen = await page.evaluate(() => document.body.innerText.length).catch(() => -1);
         if (executeAction) await executeAction(page, action);
         const afterUrl = page.url();
-        const afterBodyLen = await page.evaluate(() => document.body.innerText.length).catch(() => -2);
-        if (afterUrl !== beforeUrl || (beforeBodyLen !== -1 && afterBodyLen !== -2 && afterBodyLen !== beforeBodyLen)) {
-          clickSuccesses++;
-          actionSuccess = true;
-          consecutiveFailures = 0;
-        } else {
-          // Network replay fallback
-          if (CONFIG.NETWORK_REPLAY_ON_CLICK_FAIL && network) {
-            const submission = network.getLastSubmission('start');
-            if (submission) {
-              const replayed = await network.replayRequest(page, submission);
-              if (replayed) { log('Network replay bypassed UI!', 'INFO', 'cycle'); actionSuccess = true; }
-            }
-          }
-          // Swipe + retry
-          if (!actionSuccess && gestures && executeAction) {
-            await gestures.performSwipe(page, 500, 400, 500, 200);
-            await executeAction(page, action);
-            if (page.url() !== afterUrl) actionSuccess = true;
-          }
-        }
-        // Canvas parsing fallback — v17: GATED.
-        // parseTextAndButtons uses sharp + Tesseract OCR which loads
-        // a full OCR engine (~50-100MB heap). Fatal on 256MB instances.
-        const _clickFallbackHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
-        if (!actionSuccess && canvas && dpr && _clickFallbackHeapMB < 150) {
-          const canvasData = await canvas.parseTextAndButtons(base64);
-          if (canvasData?.watchButton) {
-            const coords = dpr.getJitteredClick(canvasData.watchButton.centerX, canvasData.watchButton.centerY);
-            await page.mouse.click(coords.x, coords.y);
-            actionSuccess = true;
-          }
-        } else if (!actionSuccess && canvas && _clickFallbackHeapMB >= 150) {
-          log(`Skipping canvas parser fallback (heap=${_clickFallbackHeapMB.toFixed(0)}MB)`, 'DEBUG', 'cycle');
-        }
-        // Engine tap fallback
-        if (!actionSuccess && inspector && _clickFallbackHeapMB < 150) {
-          const engineTap = await inspector.dispatchTapViaEngine(page, 300, 400);
-          if (engineTap) actionSuccess = true;
-        }
-        // Brute force fallback
-        if (!actionSuccess && bruteForce && _clickFallbackHeapMB < 150) {
-          const bruteSuccess = await bruteForce.bruteForceNavigate(page);
-          if (bruteSuccess) actionSuccess = true;
-        }
-        if (actionSuccess) consecutiveFailures = 0;
+        // v20: Trust the executor. Click already retries internally
+        // (performClickWithRetry: 3 attempts with jitter). If the executor
+        // returned without throwing, the click was delivered. Don't second-
+        // guess it with body-length heuristics that fire false negatives on
+        // JS-navigated pages (login buttons, Flutter router transitions).
+        //
+        // REMOVED: beforeBodyLen / afterBodyLen comparison.
+        // REMOVED: Swipe + retry fallback (line 2207-2210).
+        // REMOVED: Network replay fallback.
+        //
+        // Why these caused OOM on 512MB:
+        // 1. The body-length check false-negatived on login/nav clicks →
+        //    triggered swipe gesture (800ms CDP touch, 20 steps).
+        // 2. Swipe caused Flutter to scroll/animate → Chromium allocated
+        //    rendering memory for the animation (~30-80MB RSS growth).
+        // 3. Then retry click + POST_CLICK_MS (20s) + BETWEEN_STEPS_MS (25s)
+        //    = 45+ seconds of browser idle time → RSS grew to 312MB → OOM.
+        //
+        // The action executor already has its own retry logic. If a click
+        // truly fails, the next cycle's screenshot will show nothing changed
+        // and the tribunal will re-decide the action (possibly with cache
+        // failure tracking evicting the bad entry).
+        clickSuccesses++;
+        actionSuccess = true;
+        consecutiveFailures = 0;
+        // v20: All click fallbacks removed. They were designed for a
+        // system with memory headroom. On 512MB, each fallback is a gamble:
+        //  - Canvas OCR: loads sharp + Tesseract (~50-100MB)
+        //  - Engine tap: adds another CDP session
+        //  - Brute force navigate: navigates away, loses page state
+        // If a click truly fails, the next cycle's fresh screenshot will
+        // show the unchanged page and the tribunal will re-decide.
+        // The action cache failure tracker will evict after 3 failures.
       } else {
         if (executeAction) await executeAction(page, action);
         actionSuccess = true;
@@ -3075,7 +3057,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     // Post-cycle alerting
     if (clickAttempts > 5) {
       const successRate = clickSuccesses / clickAttempts;
-      if (successRate < 0.3) { log(`Click success rate too low (${(successRate * 100).toFixed(0)}%). Triggering alert.`, 'WARN', 'cycle'); if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Low click success rate: ${successRate}`); } catch (e: any) {} }
+      if (successRate < 0.3) { log(`Click executor failure rate high (${((1 - successRate) * 100).toFixed(0)}%). Triggering alert.`, 'WARN', 'cycle'); if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Click executor failure rate: ${(1 - successRate) * 100}%`); } catch (e: any) {} }
     }
     log(`Cycle complete: ${questionsCompleted} questions processed`, 'INFO', 'cycle');
     consecutiveFailures = 0;
