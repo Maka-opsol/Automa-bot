@@ -9,13 +9,15 @@
 //
 // This raw setInterval runs from the very first line of the process. It has
 // NO dependencies on any project module — just process.memoryUsage() and
-// process.exit(). If heap exceeds 200MB during boot, we exit immediately
+// process.exit(). If heap exceeds 300MB during boot, we exit immediately
 // (exit code 137 = SIGKILL = Render auto-restarts) before V8 can crash.
 //
-// The threshold (200MB) is deliberately below V8's --max-old-space-size
-// (256MB on Docker, 384MB on render.yaml) so we always exit cleanly first.
+// BUG FIX (2026-09-04, v2): Threshold raised from 200 to 300MB now that the
+// Dockerfile --max-old-space-size is 384MB (was 256MB). 300MB gives ~80MB
+// of headroom below V8's 384MB limit — enough to exit cleanly before V8's
+// own OOM killer fires.
 // ═══════════════════════════════════════════════════════════════════════════════
-const EARLY_OOM_THRESHOLD_MB = 200;
+const EARLY_OOM_THRESHOLD_MB = 300;
 const EARLY_OOM_CHECK_INTERVAL_MS = 2000; // every 2s — fast enough to catch boot spikes
 let _earlyOomTriggered = false;
 const _earlyOomInterval = setInterval(() => {
@@ -188,10 +190,12 @@ const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilien
 // The DI container loads 150+ .ts files via tsx — this is the heaviest
 // allocation point during boot. Check heap immediately and exit if critical,
 // before the heap guardian's interval monitor has a chance to run.
+// BUG FIX (2026-09-04, v2): Threshold raised from 200 to 300MB to match the
+// new --max-old-space-size=384 in the Dockerfile.
 {
   const _postContainerHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
-  if (_postContainerHeapMB >= 200) {
-    console.error(`[FATAL] [boot-oom] Heap ${_postContainerHeapMB.toFixed(0)}MB >= 200MB after container init. Exiting immediately.`);
+  if (_postContainerHeapMB >= 300) {
+    console.error(`[FATAL] [boot-oom] Heap ${_postContainerHeapMB.toFixed(0)}MB >= 300MB after container init. Exiting immediately.`);
     clearInterval(_earlyOomInterval);
     process.exit(137);
   }
