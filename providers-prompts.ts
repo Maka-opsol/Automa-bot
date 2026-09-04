@@ -126,9 +126,11 @@ Consider:
 - If you see a "Next" or "Continue" button, click it.
 - If you get stuck, try scrolling.
 
-MODULE DOWNLOAD AND NAVIGATION:
-- If you see assignment cards with a dark blue download arrow button, click the download button first. Wait for the module content to load, then click Watch or Start on the first topic.
-- If you see a progress bar at 0% with no Watch/Start buttons visible, the module may need to be downloaded first — look for a download arrow button on the card.
+MODULE DOWNLOAD AND NAVIGATION (CRITICAL — modules do NOT load automatically):
+- Modules on the assignments page are NOT pre-loaded. You MUST click the dark blue download arrow button on a module card BEFORE you can do anything with that module's content.
+- Do NOT expect module content to appear automatically — the module will sit at 0% with a download button until you explicitly click the download button.
+- After clicking download: WAIT for the progress bar to reach 100% and the download button to be replaced by Watch/Start buttons. Only then click Watch or Start on the first topic.
+- If you see a progress bar at 0% with no Watch/Start buttons visible, the module has NOT been downloaded yet — look for a download arrow button on the card and click it.
 - If you see a list of topics (videos, exercises, assessments) under a module header, work through them in order: watch videos first, then start exercises, then take assessments.
 - After completing a topic, look for a "Next" button or a back button to return to the topic list, then proceed to the next uncompleted topic.
 
@@ -147,7 +149,7 @@ SPA NAVIGATION:
 - This is a Single Page Application (Flutter Web). The browser URL may NOT change between pages — do not rely on URL alone to determine the current state.
 - Rely on the visual content in the screenshot to determine what page you are on and what action to take.
 - The main dashboard has a sidebar with navigation items: "Assignments" (with a book icon) and "Courses" (with a folder icon).
-- When on the assignments page, you will see module cards. Each card may have a download button, a progress bar, and topic buttons (Watch/Start/Redo).
+- When on the assignments page, you will see module cards. Each card may have a download button, a progress bar, and topic buttons (Watch/Start/Redo). Remember: you MUST click the download button on a card before its topic buttons become usable.
 - Scrolling works normally even though the URL does not change.
 
 APP ERROR DETECTION (CRITICAL — HIGHEST PRIORITY):
