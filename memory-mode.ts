@@ -114,8 +114,12 @@ const MODE_THRESHOLDS = {
     warningStreak: 2,
   },
   memory_protection: {
-    warnHeapMB: 200,
-    restartHeapMB: 220,
+    // BUG FIX (2026-09-04): Lowered from 200/220 to 180/200.
+    // The OOM trace showed heap reaching 253.9MB before V8 killed it.
+    // With an 8s check interval, heap can climb 30+MB between checks.
+    // 200MB hard gives ~50MB headroom below V8's ~256MB limit.
+    warnHeapMB: 180,
+    restartHeapMB: 200,
     rssHardLimitMB: 380,
     gcIntervalMs: 15 * 1000,     // v7: was 30s — now 15s for more aggressive GC
     monitorIntervalMs: 8 * 1000,   // v7: was 10s — now 8s for faster detection
