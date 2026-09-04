@@ -538,10 +538,17 @@ async function ensureAuthenticated(page: any) {
   // navigate away from the Microsoft page. The tribunal will see the email
   // input / password input / KMSI / MFA page and handle it visually.
   //
-  // This replaces both:
-  //   - The old login-flow bypass (which only fired when isLoginInProgress())
-  //   - The old re-auth flow's Microsoft branch (which called refreshSession
-  //     and then fell through to browser.closeBrowser() + relaunch)
+  // BUG FIX (2026-09-04, v3): Previously, this branch called
+  // notifyLoginCompleted() — clearing the login-flow flag WHILE STILL ON THE
+  // MICROSOFT PAGE. That was wrong: the login is NOT complete, we're in the
+  // middle of it. Clearing the flag meant that when the bot bounced back to
+  // the app origin (because Microsoft redirected back due to invalid session),
+  // the login-flow protections were gone and the auth-guard called
+  // refreshSession() → tryAllSessions() → page.goto(APP_URL) — a manual URL
+  // change that destroyed state and caused the click loop.
+  //
+  // Now: the flag stays set while we're on Microsoft. It only clears when we
+  // return to the app origin (Rule 2).
   const onMicrosoftLogin = url.includes('login.microsoftonline.com') ||
                            url.includes('login.live.com') ||
                            url.includes('msftauth.net') ||
@@ -549,11 +556,11 @@ async function ensureAuthenticated(page: any) {
   if (onMicrosoftLogin) {
     if (isLoginInProgress()) {
       log(`Login flow in progress — Microsoft login URL is expected destination. Returning page to tribunal. url=${url}`, 'INFO', 'auth-guard');
+      // DO NOT clear the flag here — the login is NOT complete.
+      // The flag will be cleared when we return to the app origin (Rule 2).
     } else {
       log(`On Microsoft login page — returning page to tribunal for visual handling (NOT navigating away, NOT closing browser). url=${url}`, 'INFO', 'auth-guard');
     }
-    // If we got here via the login-flow bypass, clear the flag (we're handling it).
-    if (isLoginInProgress()) notifyLoginCompleted();
     authAttempts = 0;
     // Clear any stale blank-page flag — the Microsoft page has content.
     (page as any)._authBlankPage = false;
@@ -561,11 +568,19 @@ async function ensureAuthenticated(page: any) {
   }
 
   // ── Rule 2: If we were in a login flow and we're now back on the app origin,
-  //    clear the login-flow flag (login completed). ──
+  //    clear the login-flow flag (login completed or bounced back). ──
+  // BUG FIX (2026-09-04, v3): When the bot returns to the app origin after a
+  // login attempt (whether successful or failed), DON'T fall through to Rule 3/4
+  // (which calls refreshSession → page.goto). The session might still be
+  // settling, or the login might have failed and needs to be retried by the
+  // tribunal. Either way, return the page as-is — NO URL changes.
   if (isLoginInProgress() && _isOnKnownAppOrigin(url)) {
-    log('Login flow completed — back on last-known-good origin', 'INFO', 'auth-guard');
+    log('Login flow returned to app origin — clearing flag, returning page to tribunal (NO refreshSession, NO URL change)', 'INFO', 'auth-guard');
     notifyLoginCompleted();
     notifyLastKnownGoodUrl(url);
+    authAttempts = 0;
+    (page as any)._authBlankPage = false;
+    return page;
   }
 
   // ── Rule 3: SPA-aware session validation (read-only, no URL changes) ──
