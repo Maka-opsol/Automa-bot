@@ -21,6 +21,79 @@ function _getRetryWithBackoff() {
 
 let authAttempts = 0;
 
+// ─── Login-Flow Tracking ───────────────────────────────────────────────────
+// BUG FIX (2026-09-04): The auth-guard previously treated every arrival on
+// login.microsoftonline.com as a "session expired" event and aggressively
+// re-authenticated by calling refreshSession → authenticate → strategy loop.
+// When the bot itself had just clicked "Sign in with Microsoft" on the
+// mathu_login page, this caused an infinite loop:
+//
+//   1. Tribunal: click on mathu_login (clicks "Sign in with Microsoft")
+//   2. Page navigates to login.microsoftonline.com (EXPECTED, valid transition)
+//   3. Next cycle's ensureAuthenticated() sees the Microsoft URL, thinks the
+//      session expired, and calls refreshSession()
+//   4. refreshSession runs MicrosoftAuthV2 strategy; if any selector fails
+//      (very common on real Microsoft pages), it returns false
+//   5. ensureAuthenticated sees we're "still on Microsoft login" and calls
+//      browser.closeBrowser() + relaunch — bot is bounced back to MathU app
+//   6. Bot is back at mathu_login state — clicks again → loop forever
+//
+// The fix: cycle-manager calls notifyLoginInitiated() immediately after
+// executing a click on the mathu_login state. While that flag is set,
+// ensureAuthenticated treats the Microsoft login URL as an EXPECTED
+// destination (not session expiry) and returns the page as-is, allowing the
+// tribunal to handle the microsoft_email_input state visually.
+//
+// The flag auto-expires after 5 minutes as a safety net in case
+// notifyLoginCompleted() is never called (e.g., on crash / OOM).
+let _loginFlowInitiatedAt: number | null = null;
+const LOGIN_FLOW_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Notify the auth-guard that the bot has just initiated a Microsoft login
+ * (typically by clicking "Sign in with Microsoft" on the mathu_login page).
+ *
+ * While this flag is set, arriving on login.microsoftonline.com is treated
+ * as the EXPECTED result of that click, NOT as a session-expiry event.
+ *
+ * The flag is auto-cleared:
+ *   - When the bot returns to a SPA (MathU) domain (login completed)
+ *   - After LOGIN_FLOW_TIMEOUT_MS as a safety net
+ */
+function notifyLoginInitiated(): void {
+  _loginFlowInitiatedAt = Date.now();
+  log('Login flow initiated — auth-guard will treat Microsoft login URL as expected destination', 'INFO', 'auth-guard');
+}
+
+/**
+ * Notify the auth-guard that the login flow has completed (the bot is back
+ * on the MathU SPA domain, either via successful auth or by escaping back).
+ * Clears the login-flow flag so future Microsoft redirects are treated as
+ * real session expiries again.
+ */
+function notifyLoginCompleted(): void {
+  if (_loginFlowInitiatedAt !== null) {
+    log('Login flow completed — auth-guard resumes normal session-expiry detection', 'INFO', 'auth-guard');
+  }
+  _loginFlowInitiatedAt = null;
+}
+
+/**
+ * Returns true if the bot has initiated a Microsoft login flow within the
+ * last LOGIN_FLOW_TIMEOUT_MS milliseconds and we have not yet been notified
+ * that the flow completed.
+ */
+function isLoginInProgress(): boolean {
+  if (_loginFlowInitiatedAt === null) return false;
+  const age = Date.now() - _loginFlowInitiatedAt;
+  if (age > LOGIN_FLOW_TIMEOUT_MS) {
+    log(`Login flow flag timed out after ${Math.round(age / 1000)}s — clearing (treating future Microsoft URLs as real session expiry)`, 'WARN', 'auth-guard');
+    _loginFlowInitiatedAt = null;
+    return false;
+  }
+  return true;
+}
+
 // ─── Pixel-based blank page detection ───────────────────────────────────
 // Flutter Web renders everything to <canvas>, so innerText is always empty.
 // Text-length heuristics are fundamentally broken for Flutter SPAs.
@@ -335,6 +408,38 @@ async function ensureAuthenticated(page: any) {
   const browser = _deps.browser || {};
   const url = page.url();
 
+  // ── BUG FIX (2026-09-04): Login-flow bypass ──
+  // If the bot just clicked "Sign in with Microsoft" on the mathu_login page,
+  // we EXPECT to land on login.microsoftonline.com next. Do NOT treat this as
+  // a session-expiry event. Just return the page and let the tribunal decide
+  // how to handle the microsoft_email_input state visually.
+  //
+  // The flag is set by cycle-manager immediately after executing a click on
+  // mathu_login state. It auto-expires after 5 minutes.
+  if (isLoginInProgress()) {
+    const onMicrosoftLogin = url.includes('login.microsoftonline.com') ||
+                             url.includes('login.live.com') ||
+                             url.includes('msftauth.net') ||
+                             url.includes('login.microsoft.com');
+    if (onMicrosoftLogin) {
+      log(`Login flow in progress — Microsoft login URL is expected destination (not session expiry). Returning page to tribunal. url=${url}`, 'INFO', 'auth-guard');
+      authAttempts = 0;
+      // Clear the blank-page flag if it was set by an earlier pre-refresh check;
+      // we're now on the Microsoft page intentionally and shouldn't trigger
+      // blank-page escalation.
+      (page as any)._authBlankPage = false;
+      return page;
+    }
+
+    // If we're back on the MathU SPA domain, the login flow is over (either
+    // it succeeded and we're now authenticated, or it failed and the page
+    // bounced us back). Clear the flag and fall through to normal logic.
+    if (_isSpaDomain(url)) {
+      log('Login flow completed — back on MathU SPA domain', 'INFO', 'auth-guard');
+      notifyLoginCompleted();
+    }
+  }
+
   // ── SPA-aware session validation ──
   if (_isSpaDomain(url)) {
     const valid = await _isSpaSessionValid(page);
@@ -508,4 +613,20 @@ function getCaptchaFailureCount(): number {
   return _consecutiveCaptchaFailures;
 }
 
-module.exports = { ensureAuthenticated, handleCaptcha, resetCaptchaFailureCount, getCaptchaFailureCount, consumeBlankPageFlag, peekBlankPageFlag, _isPageBlank, _injectDependencies };
+module.exports = {
+  ensureAuthenticated,
+  handleCaptcha,
+  resetCaptchaFailureCount,
+  getCaptchaFailureCount,
+  consumeBlankPageFlag,
+  peekBlankPageFlag,
+  _isPageBlank,
+  _injectDependencies,
+  // ── BUG FIX (2026-09-04): Login-flow tracking ──
+  // Cycle-manager calls notifyLoginInitiated() right after executing a click
+  // on mathu_login state, and notifyLoginCompleted() when the bot returns to
+  // the MathU SPA domain. See the long comment block at the top of the file.
+  notifyLoginInitiated,
+  notifyLoginCompleted,
+  isLoginInProgress,
+};
