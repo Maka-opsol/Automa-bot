@@ -38,6 +38,12 @@ function _getLog() {
 const DEFAULT_MAX_ENTRIES = 200;
 const DEFAULT_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const DEFAULT_MAX_FAILURES = 3;
+// BUG FIX (2026-09-04): High-hit-count eviction threshold.
+// If the same cached action is hit more than this many times without success,
+// evict it — the action is clearly wrong for the page (e.g., the bot is stuck
+// on a Microsoft password-reset page that visually resembles the email input
+// page). Override via env var ACTION_CACHE_MAX_HITS_BEFORE_EVICT.
+const DEFAULT_MAX_HITS_BEFORE_EVICT = 10;
 
 // ─── Context Signature Computation ─────────────────────────────────────────
 
@@ -59,29 +65,93 @@ const DEFAULT_MAX_FAILURES = 3;
  * different pages.
  *
  * Cost: ~0.01ms (just array indexing, no decoding).
+ *
+ * BUG FIX (2026-09-04, v2): Returns an ARRAY of per-region hashes instead
+ * of a single XOR-folded hash. The old single-hash design meant that ANY
+ * byte change in ANY sampled window cascaded to a completely different
+ * signature — so a clock ticking in the corner, a spinner animating, or
+ * a video thumbnail changing frame invalidated the entire cache.
+ *
+ * The new design returns 12 independent region hashes. The signature
+ * string encodes all 12 (for exact-match DB storage), but the new
+ * `findSimilarSignature()` function does in-JS similarity matching:
+ * if N out of 12 regions match (default 9 = 75%), the signature is
+ * considered a match. This makes the cache resilient to small background
+ * changes while still rejecting genuinely different pages.
  */
-function _coarseBufferFingerprint(buf: Buffer): string {
+const FINGERPRINT_POSITIONS = [0.05, 0.12, 0.2, 0.28, 0.36, 0.44, 0.52, 0.6, 0.68, 0.76, 0.84, 0.92];
+const FINGERPRINT_WINDOW_SIZE = 32;
+const NUM_REGIONS = FINGERPRINT_POSITIONS.length;
+
+function _coarseBufferFingerprintRegions(buf: Buffer): {
+  lenBucket: number;
+  regions: number[];
+} {
   const len = buf.length;
-  // Sample 12 windows of 32 bytes each at evenly-spaced positions
-  // across the compressed image body. Multi-zone coverage makes the
-  // fingerprint resistant to localized DCT changes from animations.
-  const positions = [0.05, 0.12, 0.2, 0.28, 0.36, 0.44, 0.52, 0.6, 0.68, 0.76, 0.84, 0.92];
-  const windowSize = 32;
-  let hash = 0;
-  for (const pct of positions) {
-    const start = Math.floor(len * pct);
-    for (let i = 0; i < windowSize && (start + i) < len; i++) {
-      // XOR-fold bytes into a 32-bit hash — fast, no allocations
+  const regions: number[] = new Array(NUM_REGIONS).fill(0);
+  for (let r = 0; r < NUM_REGIONS; r++) {
+    const start = Math.floor(len * FINGERPRINT_POSITIONS[r]);
+    let hash = 0;
+    for (let i = 0; i < FINGERPRINT_WINDOW_SIZE && (start + i) < len; i++) {
       hash = ((hash << 5) - hash + buf[start + i]) | 0;
     }
+    regions[r] = hash >>> 0; // unsigned
   }
-  // Bucket the length to absorb ±1KB animation jitter.
-  // Round to nearest 1KB so small compression differences don't
-  // cause cache misses for visually identical frames.
-  const bucketedLen = Math.floor(len / 1024) * 1024;
-  return `${bucketedLen}:${(hash >>> 0).toString(16)}`;
+  const lenBucket = Math.floor(len / 1024) * 1024;
+  return { lenBucket, regions };
 }
 
+/**
+ * @deprecated Use _coarseBufferFingerprintRegions instead. Kept for backward
+ * compatibility with any external callers. Returns the old single-hash format.
+ */
+function _coarseBufferFingerprint(buf: Buffer): string {
+  const { lenBucket, regions } = _coarseBufferFingerprintRegions(buf);
+  // XOR-fold all region hashes into one (lossy — this is what we're moving away from)
+  let combined = 0;
+  for (const r of regions) combined ^= r;
+  return `${lenBucket}:${(combined >>> 0).toString(16)}`;
+}
+
+/**
+ * Compare two region fingerprint arrays and return the fraction of matching regions.
+ * Two regions "match" if their unsigned 32-bit hash values are equal.
+ *
+ * @returns 0.0 - 1.0 fraction of matching regions
+ */
+function _regionSimilarity(a: number[], b: number[]): number {
+  if (!a || !b || a.length !== b.length || a.length === 0) return 0;
+  let matches = 0;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] === b[i]) matches++;
+  }
+  return matches / a.length;
+}
+
+/**
+ * Default similarity threshold for cache matching.
+ * 0.75 means 9 out of 12 regions must match.
+ * Configurable via env var ACTION_CACHE_SIMILARITY_THRESHOLD (0.0 - 1.0).
+ */
+const DEFAULT_SIMILARITY_THRESHOLD = 0.75;
+
+function _getSimilarityThreshold(): number {
+  const config = _getConfig();
+  const v = Number(config.ACTION_CACHE_SIMILARITY_THRESHOLD);
+  if (Number.isFinite(v) && v >= 0.0 && v <= 1.0) return v;
+  return DEFAULT_SIMILARITY_THRESHOLD;
+}
+
+/**
+ * Encode a state + region fingerprint into a signature string for DB storage.
+ *
+ * Format: "state|lenBucket|r0-r1-r2-...-r11"
+ *
+ * The state prefix lets us query the DB by current_state (indexed) and then
+ * do in-JS similarity matching on the region arrays for entries with the same
+ * state. This means: same state + 75% region match = cache hit, even if a
+ * few regions differ due to animations / small layout changes.
+ */
 function computeContextSignature(
   state: string | null,
   base64Screenshot: string | null,
@@ -101,14 +171,187 @@ function computeContextSignature(
 
   if (imageBuffer.length < 100) return null;
 
-  const fp = _coarseBufferFingerprint(imageBuffer);
-  const hashSource = [
-    `state:${state}`,
-    `fp:${fp}`,
-    `domColors:${dominantColors || 'none'}`,
-  ].join('|');
+  const { lenBucket, regions } = _coarseBufferFingerprintRegions(imageBuffer);
+  // Format: state|lenBucket|r0-r1-...-r11|domColors
+  // We keep the dominantColors in the signature for backward compat (older
+  // entries may have used it), but the region array is the primary key.
+  const regionsStr = regions.join('-');
+  return `${state}|${lenBucket}|${regionsStr}|${dominantColors || 'none'}`;
+}
 
-  return crypto.createHash('sha256').update(hashSource).digest('hex').substring(0, 32);
+/**
+ * Parse a stored signature back into its component parts.
+ * Returns null if the signature format is unrecognized (e.g., old-format signatures
+ * that used sha256 — those won't have the region structure and will simply
+ * fail to parse, which is fine; they'll be evicted on next access).
+ */
+function _parseSignature(sig: string): {
+  state: string;
+  lenBucket: number;
+  regions: number[];
+  domColors: string;
+} | null {
+  if (!sig || typeof sig !== 'string') return null;
+  const parts = sig.split('|');
+  if (parts.length < 4) return null;
+  const state = parts[0];
+  const lenBucket = parseInt(parts[1], 10);
+  const regionsStr = parts[2];
+  const domColors = parts.slice(3).join('|'); // in case domColors had | chars
+  if (!state || !regionsStr || !Number.isFinite(lenBucket)) return null;
+  const regions = regionsStr.split('-').map((h: string) => parseInt(h, 10));
+  if (regions.length !== NUM_REGIONS || regions.some((r: number) => !Number.isFinite(r))) {
+    return null;
+  }
+  return { state, lenBucket, regions, domColors };
+}
+
+/**
+ * Check whether a stored signature is similar enough to a target signature
+ * to be considered a cache hit. Two signatures are "similar" if:
+ *   1. They have the same state
+ *   2. They have similar length buckets (within ±2KB)
+ *   3. The fraction of matching regions >= ACTION_CACHE_SIMILARITY_THRESHOLD
+ *
+ * @param storedSig - The signature stored in the DB
+ * @param targetSig - The signature computed from the current screenshot
+ * @returns true if the signatures are similar enough to be a cache hit
+ */
+function _isSignatureSimilar(storedSig: string, targetSig: string): boolean {
+  const stored = _parseSignature(storedSig);
+  const target = _parseSignature(targetSig);
+  if (!stored || !target) return false;
+  if (stored.state !== target.state) return false;
+  // Length bucket must be within ±2KB (absorbs compression jitter)
+  if (Math.abs(stored.lenBucket - target.lenBucket) > 2048) return false;
+  const sim = _regionSimilarity(stored.regions, target.regions);
+  return sim >= _getSimilarityThreshold();
+}
+
+/**
+ * Find a similar cached action in the local DB by scanning entries with the
+ * same `current_state` and doing in-JS similarity matching on their
+ * `context_sig` (which encodes the region fingerprint).
+ *
+ * This is the SLOW PATH after the exact-match fast path misses. It queries
+ * the `action_cache` table by `current_state` (which is indexed) so we only
+ * scan entries with the same state — typically a few dozen at most.
+ *
+ * Returns the cached action if a similar signature is found, null otherwise.
+ * Also updates the matched entry's hit_count and last_used (same as exact match).
+ *
+ * BUG FIX (2026-09-04, v2): This function makes the action cache resilient
+ * to small background changes (clocks ticking, spinners animating, video
+ * thumbnails changing frame). Previously, ANY byte change in the sampled
+ * regions invalidated the entire cache entry — so the bot kept re-querying
+ * the tribunal for pages it had already seen. Now, if 75% of regions match,
+ * the cache entry is reused.
+ */
+function _findSimilarLocalHit(targetSig: string): {
+  actionType: string;
+  targetX: number;
+  targetY: number;
+  value: string;
+  keypadSequence: any;
+  currentState: string;
+  reasoning: string;
+  hitCount: number;
+  lastUsed: number;
+} | null {
+  const log = _getLog();
+  const target = _parseSignature(targetSig);
+  if (!target) return null;
+
+  let dbMod: any = null;
+  try { dbMod = _getDb(); } catch { return null; }
+  if (!dbMod) return null;
+
+  // Query by current_state (uses the idx_action_cache_state index).
+  // Limit to last 50 entries to avoid scanning huge tables.
+  let rows: any[] = [];
+  try {
+    rows = dbMod.prepare(
+      `SELECT context_sig, action_type, target_x, target_y, value, keypad_sequence,
+              current_state, reasoning, hit_count, last_used
+       FROM action_cache
+       WHERE current_state = ? AND evicted = 0
+       ORDER BY last_used DESC
+       LIMIT 50`
+    ).all(target.state);
+  } catch (e: any) {
+    log(`Action cache similarity scan error: ${e.message || e}`, 'DEBUG', 'action-cache');
+    return null;
+  }
+
+  if (!rows || rows.length === 0) return null;
+
+  // Find the most similar entry.
+  let bestRow: any = null;
+  let bestSim = 0;
+  for (const row of rows) {
+    // Skip exact match (already tried in fast path)
+    if (row.context_sig === targetSig) continue;
+    const isSimilar = _isSignatureSimilar(row.context_sig, targetSig);
+    if (isSimilar) {
+      // Compute exact similarity for ranking
+      const stored = _parseSignature(row.context_sig);
+      if (stored) {
+        const sim = _regionSimilarity(stored.regions, target.regions);
+        if (sim > bestSim) {
+          bestSim = sim;
+          bestRow = row;
+        }
+      }
+    }
+  }
+
+  if (!bestRow) return null;
+
+  // Check TTL
+  const config = _getConfig();
+  const ttlMs = config.ACTION_CACHE_TTL_MS || DEFAULT_TTL_MS;
+  if (Date.now() - bestRow.last_used > ttlMs) {
+    _markEvicted(bestRow.context_sig);
+    return null;
+  }
+
+  // Check high-hit-count eviction (same logic as exact match path)
+  const currentHitCount = (bestRow.hit_count || 0) + 1;
+  const maxHitsBeforeEviction = Number(config.ACTION_CACHE_MAX_HITS_BEFORE_EVICT) || DEFAULT_MAX_HITS_BEFORE_EVICT;
+  if (currentHitCount > maxHitsBeforeEviction) {
+    log(`Action cache EVICT (too many hits, similar match): sig=${bestRow.context_sig.substring(0, 8)} type=${bestRow.action_type} hits=${currentHitCount - 1}`, 'WARN', 'action-cache');
+    _markEvicted(bestRow.context_sig);
+    updateStats('evictions');
+    return null;
+  }
+
+  const simPct = Math.round(bestSim * 100);
+  log(`Action cache HIT (SIMILAR ${simPct}%): target_sig=${targetSig.substring(0, 8)} matched_sig=${bestRow.context_sig.substring(0, 8)} type=${bestRow.action_type} hits=${bestRow.hit_count}`, 'INFO', 'action-cache');
+  updateStats('hits');
+  updateStats('similarHits');
+
+  // Update hit count and last_used on the MATCHED entry (not the target sig)
+  try {
+    dbMod.prepare(
+      `UPDATE action_cache SET hit_count = hit_count + 1, last_used = ? WHERE context_sig = ?`
+    ).run(Date.now(), bestRow.context_sig);
+  } catch { /* best effort */ }
+
+  // Async: update hit count in Turso via unifiedDb
+  const udb = _getUnifiedDb();
+  if (udb) { udb.getActionCache(bestRow.context_sig).catch(() => {}); }
+
+  return {
+    actionType: bestRow.action_type,
+    targetX: bestRow.target_x,
+    targetY: bestRow.target_y,
+    value: bestRow.value || '',
+    keypadSequence: bestRow.keypad_sequence ? JSON.parse(bestRow.keypad_sequence) : [],
+    currentState: bestRow.current_state,
+    reasoning: bestRow.reasoning || '[cached action (similar match)]',
+    hitCount: bestRow.hit_count,
+    lastUsed: bestRow.last_used,
+  };
 }
 
 /**
@@ -201,6 +444,25 @@ async function lookupAsync(contextSignature: string): Promise<{
           _markEvicted(contextSignature);
           // Don't return — fall through to Turso below
         } else {
+          // BUG FIX (2026-09-04): High-hit-count eviction.
+          // If the same cached action is being hit >10 times without success,
+          // the action is clearly wrong for the page (e.g., the bot is stuck
+          // on a page that visually resembles the cached state but is actually
+          // different — like a Microsoft password-reset page that visually
+          // resembles the email input page). Evict the entry so the next
+          // cycle re-queries the tribunal instead of serving the same stale
+          // action 30+ times in a loop.
+          const currentHitCount = (row.hit_count || 0) + 1;
+          const maxHitsBeforeEviction = Number(config.ACTION_CACHE_MAX_HITS_BEFORE_EVICT) || DEFAULT_MAX_HITS_BEFORE_EVICT;
+          if (currentHitCount > maxHitsBeforeEviction) {
+            log(`Action cache EVICT (too many hits): sig=${contextSignature.substring(0, 8)} type=${row.action_type} hits=${currentHitCount - 1} — action is clearly not progressing the page, evicting to force tribunal re-query`, 'WARN', 'action-cache');
+            _markEvicted(contextSignature);
+            updateStats('evictions');
+            const udb = _getUnifiedDb();
+            if (udb) { udb.evictActionCache(contextSignature).catch(() => {}); }
+            // Return null so cycle-manager falls through to the tribunal.
+            return null;
+          }
           log(`Action cache HIT (local): sig=${contextSignature.substring(0, 8)} type=${row.action_type} hits=${row.hit_count}`, 'INFO', 'action-cache');
           updateStats('hits');
           dbMod.prepare(
@@ -223,6 +485,16 @@ async function lookupAsync(contextSignature: string): Promise<{
   }
 
   // SLOW PATH: Await Turso (this is the key difference from sync lookup)
+  // BUG FIX (2026-09-04, v2): Before going to Turso (network call), try
+  // similarity matching against local DB entries with the same state. This
+  // catches the common case where a small animation / layout shift changed
+  // a few regions of the screenshot but the page is still fundamentally the
+  // same — the cached action is still valid.
+  const similarLocal = _findSimilarLocalHit(contextSignature);
+  if (similarLocal) {
+    return similarLocal;
+  }
+
   const udb = _getUnifiedDb();
   if (udb) {
     try {
@@ -273,7 +545,7 @@ async function lookupAsync(contextSignature: string): Promise<{
 
 // ─── Cache Operations (sync — local DB fast path) ─────────────────────────
 
-const _stats = { hits: 0, misses: 0, saves: 0, evictions: 0, tursoHits: 0 };
+const _stats = { hits: 0, misses: 0, saves: 0, evictions: 0, tursoHits: 0, similarHits: 0 };
 function updateStats(type: string) { _stats[type] = (_stats as any)[type] + 1 || 1; }
 
 let _db: any = null;
@@ -334,6 +606,20 @@ function lookup(contextSignature: string): {
           _markEvicted(contextSignature);
           // Don't return — fall through to Turso check below
         } else {
+          // BUG FIX (2026-09-04): High-hit-count eviction (sync path).
+          // Same logic as lookupAsync: if the same cached action is being hit
+          // >10 times without success, the action is clearly wrong for the page.
+          // Evict so the next cycle re-queries the tribunal.
+          const currentHitCount = (row.hit_count || 0) + 1;
+          const maxHitsBeforeEviction = Number(_getConfig().ACTION_CACHE_MAX_HITS_BEFORE_EVICT) || DEFAULT_MAX_HITS_BEFORE_EVICT;
+          if (currentHitCount > maxHitsBeforeEviction) {
+            log(`Action cache EVICT (too many hits): sig=${contextSignature.substring(0, 8)} type=${row.action_type} hits=${currentHitCount - 1} — action is clearly not progressing the page, evicting to force tribunal re-query`, 'WARN', 'action-cache');
+            _markEvicted(contextSignature);
+            updateStats('evictions');
+            const udb = _getUnifiedDb();
+            if (udb) { udb.evictActionCache(contextSignature).catch(() => {}); }
+            return null;
+          }
           log(`Action cache HIT (local): sig=${contextSignature.substring(0, 8)} type=${row.action_type} hits=${row.hit_count}`, 'INFO', 'action-cache');
           updateStats('hits');
 
@@ -368,6 +654,13 @@ function lookup(contextSignature: string): {
 
   // SLOW PATH: Try Turso via unifiedDb (async — but we're in sync context,
   // so this is a fire-and-forget population for NEXT cycle)
+  // BUG FIX (2026-09-04, v2): Before falling through to Turso (network),
+  // try similarity matching against local DB entries with the same state.
+  const similarLocal = _findSimilarLocalHit(contextSignature);
+  if (similarLocal) {
+    return similarLocal;
+  }
+
   const udb = _getUnifiedDb();
   if (udb) {
     udb.getActionCache(contextSignature).then((tursoRow: any) => {
@@ -731,6 +1024,7 @@ async function clearAsync(): Promise<void> {
   _stats.saves = 0;
   _stats.evictions = 0;
   _stats.tursoHits = 0;
+  _stats.similarHits = 0;
   try {
     const dbMod = _getDb();
     if (dbMod) {
@@ -754,6 +1048,7 @@ function clear(): void {
   _stats.saves = 0;
   _stats.evictions = 0;
   _stats.tursoHits = 0;
+  _stats.similarHits = 0;
   try {
     const dbMod = _getDb();
     if (dbMod) {
