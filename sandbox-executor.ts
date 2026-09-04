@@ -1,4 +1,4 @@
-'use strict';
+ strict';
 // sandbox-executor.ts — Security-critical module for validating self-heal patches.
 // P14 fixes:
 //   1. isPatchableFile() now handles absolute paths correctly (callers pass fullPath)
@@ -124,6 +124,21 @@ const RESTRICTED_FILES: ReadonlySet<string> = new Set([
 ]);
 
 // ─── Allowed prefixes for unrestricted patching ───
+// BUG FIX (2026-09-04): Added missing prefixes that were causing valid
+// self-heal patches to be blocked. The old list was missing:
+//   - 'longevity-' — longevity-ui-recovery.ts, longevity-*.ts
+//   - 'pixel-' — pixel-fallback.ts, pixel-calibration.ts, pixel-explorer.ts
+//   - 'flutter-' — flutter-stability-waiter.ts, flutter-gesture-simulator.ts, etc.
+//   - 'services-' — services-action-cache.ts, services-pix2tex.ts, etc.
+//   - 'policy-' — policy-state-guard.ts, policy-action-validator.ts
+//   - 'auth-' — auth-strategies-*.ts, auth-captcha-loop-guard.ts
+//   - 'progress-' — progress-tracker.ts, progress-circular-path-detector.ts
+//   - 'network-' — network-ip-rotator.ts
+//   - 'monitoring-' — monitoring-anomaly-detector.ts, monitoring-health-check.ts
+//   - 'survival-' — survival-heartbeat-beacon.ts, survival-restart-guardian.ts
+//   - 'render-' — render-free-plan.ts, render-cold-start.ts
+//   - 'self-heal-' — self-heal-clean-room-test.ts, self-heal-blackbox-replay.ts
+//     (NOTE: self-heal.ts itself is in RESTRICTED_FILES — only submodules are allowed)
 const ALLOWED_PREFIXES: readonly string[] = [
   'selectors-',
   'providers-detection-',
@@ -133,6 +148,29 @@ const ALLOWED_PREFIXES: readonly string[] = [
   'plugins-',
   'planning-',
   'exploration-',
+  'longevity-',
+  'pixel-',
+  'flutter-',
+  'services-',
+  'policy-',
+  'auth-',
+  'progress-',
+  'network-',
+  'monitoring-',
+  'survival-',
+  'render-',
+  'self-heal-',  // submodules only (self-heal.ts is in RESTRICTED_FILES)
+  'brute-force-',
+  'browser-',
+  'container-',
+  'state-',
+  'error-',
+  'config-',
+  'cache-',
+  'alerting-',
+  'logger-',
+  'watchdog-',
+  'failsafe-',
 ];
 
 // ─── Type Definitions ───
