@@ -1,4 +1,4 @@
- strict';
+ 'use strict';
 // sandbox-executor.ts — Security-critical module for validating self-heal patches.
 // P14 fixes:
 //   1. isPatchableFile() now handles absolute paths correctly (callers pass fullPath)
