@@ -2,7 +2,7 @@ FROM node:20-bookworm-slim
 
 LABEL org.opencontainers.image.title="MathU Bot v6 — Render Free Plan"
 LABEL org.opencontainers.image.description="Autonomous MathU bot, all features, 512 MB, ephemeral disk"
-LABEL org.opencontainers.image.authors="U.S.J Sibiya"
+LABEL org.opencontainers.image.authors="Unknown"
 
 # System deps: Chromium shared libs + build tools for better-sqlite3.
 # libxfixes3 was missing — caused "cannot open shared object file" at runtime.
@@ -82,4 +82,9 @@ ENV NODE_ENV=production \
 HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -sf http://localhost:10000/health || exit 1
 
-CMD ["node", "--expose-gc", "--max-old-space-size=256", "--import", "tsx", "render-free-plan.ts"]
+# BUG FIX (2026-09-04): Raised from 256 to 384 to match render.yaml startCommand.
+# The old 256MB limit caused V8 OOM crashes during boot (module loading + DI
+# container init + Turso cold start recovery). The render.yaml startCommand
+# specifies 384MB, but when using a Dockerfile, Render uses the CMD here —
+# so the Dockerfile limit wins. Now both are 384MB.
+CMD ["node", "--expose-gc", "--max-old-space-size=384", "--import", "tsx", "render-free-plan.ts"]
