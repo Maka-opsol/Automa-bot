@@ -78,19 +78,23 @@ let _orParked = false;
 let _orParkedDate = '';   // YYYY-MM-DD UTC of the day we parked
 const OR_PARK_CHECK_INTERVAL_MS = 60000; // Check for midnight every 60s
 
-/* ── 10-Minute Zero-Progress Self-Heal Trigger ───────────────────────────
- * If the bot completes ZERO questions in 10 minutes, full self-heal fires
+/* ── 20-Minute Zero-Progress Self-Heal Trigger ───────────────────────────
+ * If the bot completes ZERO questions in 20 minutes, full self-heal fires
  * DIRECTLY — no _isDesperatelyBroken gate, no consecutive failure threshold,
  * no circuit breaker. Uses MULTIPLE independent time sources:
  *   Avenue 1: Wall clock — Date.now() minus cycleStart
- *   Avenue 2: DB progress log — 0 entries in last 10 minutes
+ *   Avenue 2: DB progress log — 0 entries in last 20 minutes
  *   Avenue 3: Cycle count × estimated iteration time (cycles * ~40s avg)
  *   Avenue 4: Heartbeat file mtime — process alive but no progress
  * 2 of 4 avenues must agree. This is a HARD trigger — it MUST fire.
  */
 let _zeroProgressHealTriggered = false;
-const ZERO_PROGRESS_STUCK_MS = 10 * 60 * 1000;       // 10 minutes
-const ZERO_PROGRESS_MIN_CYCLES = 15;                  // 15 cycles × 40s = 10min
+// BUG FIX (2026-09-04): Changed from 10 minutes to 20 minutes per user request.
+// 10 minutes was too aggressive — the bot often needs >10min to complete a
+// module (video watching alone takes 3min, plus quiz answering, plus navigation).
+// At 10min, self-heal was firing during normal operation, not just actual stalls.
+const ZERO_PROGRESS_STUCK_MS = 20 * 60 * 1000;       // 20 minutes (was 10)
+const ZERO_PROGRESS_MIN_CYCLES = 30;                  // 30 cycles × 40s = 20min (was 15)
 
 /* ── OOM-Surviving Cycle State Snapshot ──────────────────────────────────
  * Writes critical in-memory state to the calibration DB (Turso-synced)
@@ -436,7 +440,7 @@ const TRANSIENT_ERROR_CODES = new Set([
 const PROGRESS_STALL_CODES = new Set([
   'E_PROGRESS_STALL',   // 0 questions in PROGRESS_TIMEOUT_MS
   'E_SLOW_PROGRESS',    // questions completed but then stalled for 2x timeout
-  'E_ZERO_PROGRESS',    // 0 questions in 10min (4-avenue hard trigger)
+  'E_ZERO_PROGRESS',    // 0 questions in 20min (4-avenue hard trigger)
 ]);
 
 // v6: Healable codes — self-heal should fire for these even at lower thresholds.
@@ -2968,8 +2972,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         throw slowErr;
       }
 
-      // ── 10-Minute Zero-Progress Self-Heal Trigger ──
-      // If 0 questions completed in 10 minutes, full self-heal fires DIRECTLY.
+      // ── 20-Minute Zero-Progress Self-Heal Trigger ──
+      // If 0 questions completed in 20 minutes, full self-heal fires DIRECTLY.
       // Uses 4 independent time avenues. 2 of 4 must agree. No gates.
       try {
         if (questionsCompleted === 0 && !_zeroProgressHealTriggered && !selfHealRunning) {
@@ -2983,7 +2987,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             avenues.push(`wall=${Math.round(wallElapsed / 60000)}min`);
           }
 
-          // Avenue 2: DB progress log — any progress entries in last 10 minutes?
+          // Avenue 2: DB progress log — any progress entries in last 20 minutes?
           try {
             const dbMod = require('./database');
             const db = dbMod.db;
@@ -3023,14 +3027,14 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           // TRIGGER: 2+ avenues agree -> full self-heal, no gates
           if (stuckVotes >= ZERO_PROGRESS_VOTES_NEEDED) {
             _zeroProgressHealTriggered = true;
-            const errMsg = `ZERO PROGRESS for 10+ minutes (${avenues.join(', ')}). Triggering full self-heal directly.`;
+            const errMsg = `ZERO PROGRESS for 20+ minutes (${avenues.join(', ')}). Triggering full self-heal directly.`;
             log(errMsg, 'ERROR', 'cycle');
 
             _recordErrorForDesperation('E_ZERO_PROGRESS');
 
             try {
               const sendAlert = require('./alerting').sendAlert;
-              sendAlert?.(`10-min zero progress: ${avenues.join(', ')}`);
+              sendAlert?.(`20-min zero progress: ${avenues.join(', ')}`);
             } catch {}
 
             // DIRECT full self-heal - bypass _isDesperatelyBroken, bypass
@@ -3067,7 +3071,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                   try {
                     const memoryMode = require('./memory-mode');
                     if (memoryMode.isMemoryProtection?.()) {
-                      memoryMode.beginSelfHealSession?.('zero_progress_10min');
+                      memoryMode.beginSelfHealSession?.('zero_progress_20min');
                     }
                   } catch {}
 
