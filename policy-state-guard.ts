@@ -83,6 +83,18 @@ function _getDomain(url: string): string {
 /**
  * Check if a URL belongs to the MathU platform.
  * This is a basic check — can be enhanced with actual MathU domain.
+ *
+ * BUG FIX (2026-09-04): Previously, this function listed 'microsoft.com' as a
+ * "blocked external domain". That meant every legitimate navigation to
+ * login.microsoftonline.com (after clicking "Sign in with Microsoft") got
+ * flagged as a blocked transition. The block was only logged (not enforced),
+ * but the noisy warnings polluted the cycle log and masked the real auth-guard
+ * bug that was actually causing the click loop.
+ *
+ * Microsoft auth domains are now ALLOWED — they are the expected destination
+ * after the bot clicks "Sign in with Microsoft" on the mathu_login page.
+ * See state-machine.ts VALID_TRANSITIONS[MATHU_LOGIN] for the canonical
+ * declaration that mathu_login → microsoft_email_input is a valid transition.
  */
 function _isMathUDomain(url: string): boolean {
   const domain = _getDomain(url);
@@ -98,10 +110,27 @@ function _isMathUDomain(url: string): boolean {
 
   if (allowed.has(domain)) return true;
 
+  // Allow Microsoft auth domains — they are the EXPECTED destination when
+  // the bot clicks "Sign in with Microsoft" on the mathu_login page.
+  // The state machine explicitly allows the transition:
+  //   mathu_login → microsoft_email_input
+  // So blocking these domains here would prevent legitimate auth flow.
+  const microsoftAuthDomains = [
+    'login.microsoftonline.com',
+    'login.live.com',
+    'login.microsoft.com',
+    'msftauth.net',
+    'account.live.com',
+  ];
+  for (const msDomain of microsoftAuthDomains) {
+    if (domain === msDomain || domain.endsWith('.' + msDomain)) return true;
+  }
+
   // Allow any non-external domain (heuristic: if it's not a known external site)
   const blockedDomains = new Set([
     'google.com', 'facebook.com', 'twitter.com', 'github.com',
-    'microsoft.com', 'apple.com', 'amazon.com',
+    'apple.com', 'amazon.com',
+    // NOTE: 'microsoft.com' was REMOVED from this list — see comment above.
   ]);
 
   return !blockedDomains.has(domain);
