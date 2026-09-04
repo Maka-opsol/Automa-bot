@@ -154,17 +154,42 @@ IMPORTANT CODEBASE RULES (violation = rejected fix):\
    Access deps via _deps.logger, _deps.config, _deps.browser, etc.\
    NEVER add top-level require() for other project modules.\
 \
-4. PATCHABLE FILES ONLY: Your fix will be BLOCKED unless the file matches\
-   one of these prefixes: selectors-, providers-detection-, cycle-, providers-base,\
-   providers-config-loader, providers-registry, providers-fallback, providers-prompts,\
-   providers-vision-pipeline, providers-stats, providers-tribunal, providers-serializers,\
-   providers-prompt-evolution, cache, auth-auth-manager, config, browser,\
-   state-machine, longevity-ui-recovery, self-heal-degradation-ladder,\
-   math-problem-classifier, services-pix2tex.\
+4. PATCHABLE FILES: Files matching these PREFIXES can be patched freely\
+   (the sandbox allows them without approval):\
+   selectors-, providers-detection-, cycle-, utils-, test-, plugins-,\
+   planning-, exploration-, longevity-, pixel-, flutter-, services-,\
+   policy-, auth-, progress-, network-, monitoring-, survival-, render-,\
+   self-heal- (submodules only — self-heal.ts itself is restricted),\
+   brute-force-, browser-, container-, state-, error-, config-,\
+   cache-, alerting-, logger-, watchdog-, failsafe-,\
+   providers-base, providers-config-loader, providers-registry,\
+   providers-fallback, providers-prompts, providers-vision-pipeline,\
+   providers-stats, providers-tribunal, providers-serializers,\
+   providers-prompt-evolution, providers-health, providers-fallback,\
+   cache, auth-auth-manager, math-problem-classifier, services-pix2tex,\
+   math-verify, math-solution-cache, memory-mode, jwt, web-search,\
+   openrouter-rate-limiter, bazaarlink-rate-limiter, local-vlm-failover,\
+   cascade-breaker, failsafe-coordinator, screenshot-storage, db-backup,\
+   blackbox-recorder, captcha-human-fallback, captcha-solver-external,\
+   remote-brain-injector, ui-drift-discovery, dependency-manager,\
+   dependency-survivor, puzzle-sandbox, instance-lock, hf-spaces,\
+   provider-quota-bargain, protocol-chameleon, telemetry-gan,\
+   resource-manager, runtime-guardian, runtime-heap-guardian,\
+   runtime-module-quarantine, persistent-config, project-root,\
+   experiment-strategy-variants, economy-quota-rations,\
+   meta-learner-reflection, meta-learner-suggestion-applier,\
+   meta-learner-suggestion-validator.\
 \
-   DO NOT attempt to fix: agent.ts, logger.ts, database.ts, container-*.ts,\
-   providers.ts, providers-codegen-*.ts, memory-mode.ts, self-heal.ts,\
-   auth.ts, get-config.ts, alerting.ts, progress-tracker.ts, etc.\
+   RESTRICTED (require dashboard approval — fixes will be blocked without it):\
+   self-heal.ts, self-heal-gitops.ts, self-heal-auditor.ts,\
+   self-heal-approval-workflow.ts, self-heal-circuit-breaker.ts.\
+\
+   IMMUTABLE (can NEVER be patched — do not attempt):\
+   agent.ts, config.ts, database.ts, container.ts, container-container.ts,\
+   container-modules.ts, providers.ts, providers-codegen-tribunal.ts,\
+   providers-codegen-bazaarlink.ts, providers-codegen-deepseek.ts,\
+   providers-codegen-mistral.ts, providers-codegen-qwen.ts,\
+   providers-codegen-openrouter.ts, get-config.ts.\
 \
 5. PATCH FORMAT: The "patch" field can be EITHER:\
    a) A unified diff (starting with --- a/filename) for surgical edits — PREFERRED for small changes.\
@@ -177,6 +202,15 @@ IMPORTANT CODEBASE RULES (violation = rejected fix):\
 \
 7. FILE NAMING: Use kebab-case with group prefix.\
    Example: cycle-auth-guard.ts, providers-base.ts, self-heal-tmp-overlay.ts.\
+\
+8. MULTI-FILE FIXES: You may fix MULTIPLE files in a single response if the\
+   bug spans multiple modules. Return an array with one object per file.\
+   Each file must independently pass the sandbox audit. Max 3 files per response.\
+\
+9. ROOT-CAUSE ANALYSIS: Before writing a patch, explain your diagnosis in the\
+   "change" field. State: (a) what the bug is, (b) WHY it happens (root cause),\
+   (c) how your fix addresses the root cause. Surface-level fixes that only\
+   suppress symptoms will be rejected.\
 `;
 
 module.exports = { CODEBASE_CONTEXT, _injectDependencies() {} };
