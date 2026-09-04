@@ -1,6 +1,41 @@
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// BUG FIX (2026-09-04): EARLY MEMORY GUARD — runs BEFORE any module loading.
+// ═══════════════════════════════════════════════════════════════════════════════
+// The OOM crash was happening during BOOT (module loading + DI container init
+// + Turso cold start recovery), BEFORE the heap guardian's interval monitor
+// could start. V8's own OOM killer fired at 253.9MB before our exit path ran.
+//
+// This raw setInterval runs from the very first line of the process. It has
+// NO dependencies on any project module — just process.memoryUsage() and
+// process.exit(). If heap exceeds 200MB during boot, we exit immediately
+// (exit code 137 = SIGKILL = Render auto-restarts) before V8 can crash.
+//
+// The threshold (200MB) is deliberately below V8's --max-old-space-size
+// (256MB on Docker, 384MB on render.yaml) so we always exit cleanly first.
+// ═══════════════════════════════════════════════════════════════════════════════
+const EARLY_OOM_THRESHOLD_MB = 200;
+const EARLY_OOM_CHECK_INTERVAL_MS = 2000; // every 2s — fast enough to catch boot spikes
+let _earlyOomTriggered = false;
+const _earlyOomInterval = setInterval(() => {
+  try {
+    const heapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+    if (heapMB >= EARLY_OOM_THRESHOLD_MB && !_earlyOomTriggered) {
+      _earlyOomTriggered = true;
+      // Log to stderr directly — no logger dependency (logger may not be loaded yet)
+      console.error(`[FATAL] [early-oom] Heap ${heapMB.toFixed(0)}MB >= ${EARLY_OOM_THRESHOLD_MB}MB threshold during boot. Exiting immediately to avoid V8 OOM crash.`);
+      clearInterval(_earlyOomInterval);
+      // Exit with 137 (SIGKILL) so Render auto-restarts
+      process.exit(137);
+    }
+  } catch { /* never let the guard crash the process */ }
+}, EARLY_OOM_CHECK_INTERVAL_MS);
+// Don't let this interval keep the process alive if nothing else is running
+const _earlyOomIntervalHandle: any = _earlyOomInterval;
+if (_earlyOomIntervalHandle.unref) _earlyOomIntervalHandle.unref();
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MathU Bot v6 — Render Free Plan Entry Point (FULL FEATURES)
 // ═══════════════════════════════════════════════════════════════════════════════
 // Designed for Render free tier: 512 MB RAM, ephemeral disk,
@@ -148,6 +183,19 @@ for (const dir of [
 // ═══════════════════════════════════════════════════════════════════════
 
 const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilienceSubsystems, getContainerHealth, runStartupSmokeTests } = require('./container');
+
+// BUG FIX (2026-09-04): Synchronous memory check right after container init.
+// The DI container loads 150+ .ts files via tsx — this is the heaviest
+// allocation point during boot. Check heap immediately and exit if critical,
+// before the heap guardian's interval monitor has a chance to run.
+{
+  const _postContainerHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+  if (_postContainerHeapMB >= 200) {
+    console.error(`[FATAL] [boot-oom] Heap ${_postContainerHeapMB.toFixed(0)}MB >= 200MB after container init. Exiting immediately.`);
+    clearInterval(_earlyOomInterval);
+    process.exit(137);
+  }
+}
 
 let CONFIG: any, log: any, logError: any;
 let closeDatabase: any, upsertCalibration: any, selectCalibration: any, pruneTemplateCache: any;
