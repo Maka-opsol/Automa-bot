@@ -1774,8 +1774,37 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             await _saveActionToCache(action, currentState, base64, actionCache, _actionCacheSig, _isCacheExcluded, log);
 
             // If tribunal internally failed and returned a wait/error fallback, try pixel fallback
-            if (action?.actionType === 'wait' && action?.reasoning?.includes('tribunal failure')) {
-              logError('Tribunal returned fallback wait, trying pixel fallback', new Error(action.reasoning || ''));
+            // BUG FIX (2026-09-04): The old check only matched the literal string
+            // "tribunal failure" — which is the text produced when runTribunal()
+            // THROWS an exception (caught by determineNextAction's safeCall).
+            // But when the vision pipeline exhausts its own fallback chain
+            // (Pix2Tex → Local VLM → error-wait), the error-wait reasoning is
+            // "All vision providers and fallbacks failed" — NOT "tribunal failure".
+            // That error-wait flows through the tribunal as a normal provider
+            // response, reaches consensus, and gets its reasoning prefixed with
+            // "Tribunal (3/3 models, 100% agreement): ..." — which still doesn't
+            // include "tribunal failure". So pixel-fallback was NEVER called.
+            //
+            // Fix: detect ANY wait-on-error action from the tribunal, regardless
+            // of the exact reasoning text. This is safe because pixel-fallback
+            // either returns a real action or returns its own wait — so there's
+            // no downside to always trying it when the tribunal returns an error.
+            const isTribunalErrorWait = action?.actionType === 'wait' &&
+              (action?.currentState === 'error' || action?.currentState === 'unknown') &&
+              (
+                // Old check: literal "tribunal failure" text (thrown by determineNextAction's catch)
+                action?.reasoning?.includes('tribunal failure') ||
+                // Vision pipeline exhausted all fallbacks
+                action?.reasoning?.includes('All vision providers and fallbacks failed') ||
+                action?.reasoning?.includes('All vision fallbacks exhausted') ||
+                // Tribunal found no valid model responses
+                action?.reasoning?.includes('No valid responses from any provider') ||
+                action?.reasoning?.includes('No providers') ||
+                // Generic fallback-error from vision pipeline (provider: 'fallback-error')
+                action?.provider === 'fallback-error'
+              );
+            if (isTribunalErrorWait) {
+              logError(`Tribunal/vision returned error-wait, trying pixel fallback. reasoning=${action?.reasoning || 'unknown'}`, new Error(action?.reasoning || ''));
             // v14: Feed tribunal failure to self-heal error buffer
             try { (getDep('selfHeal') || require('./self-heal'))?.pushSelfHealError?.(`tribunal fallback wait: ${action.reasoning || 'unknown'}`, 'tribunal'); } catch {}
               action = await getFallbackAction(page, currentState || undefined);
