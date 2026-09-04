@@ -2,8 +2,18 @@
 
 let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
-// @ts-expect-error
-const getCONFIG: any = new Proxy({}, { get: (_, prop) => _deps.config?.[prop] ?? process.env[prop] });
+// BUG FIX (2026-09-04): The Proxy's get trap must handle Symbol props.
+// JavaScript engines internally access Symbol properties (Symbol.toPrimitive,
+// Symbol.toStringTag, 'then', etc.) on objects. When the Proxy forwarded
+// these to `process.env[Symbol]`, it threw "TypeError: Cannot convert a
+// Symbol value to a string" because process.env only accepts string keys.
+// Now: return undefined for non-string props (standard object behavior).
+const getCONFIG: any = new Proxy({}, {
+  get: (_, prop) => {
+    if (typeof prop !== 'string') return undefined;
+    return _deps.config?.[prop] ?? process.env[prop];
+  },
+});
 const log = (...args: any[]) => _deps.logger?.log?.(...args) ?? console.log(...args);
 const logError = (...args: any[]) => _deps.logger?.logError?.(...args) ?? console.error(...args);
 
@@ -64,7 +74,11 @@ async function sendNtfyAlert(message: any, title = 'MathU Bot Alert', priority =
     });
     log(`Sent ntfy alert to topic "${ntfyTopic}"`, 'DEBUG', 'alerting');
   } catch (e: any) {
-    log(`ntfy alert skipped: ${e.code || e.name || e.message}`.substring(0, 120), 'DEBUG', 'alerting');
+    // BUG FIX (2026-09-04): Was `e.code || e.name || e.message` — for TypeErrors,
+    // e.name='TypeError' is truthy so it stopped there and never showed e.message.
+    // Now: message first (most useful), then code, then name as last resort.
+    const errDetail = e.message || e.code || e.name || String(e);
+    log(`ntfy alert skipped: ${errDetail}`.substring(0, 200), 'DEBUG', 'alerting');
   }
 }
 
@@ -102,7 +116,8 @@ async function sendSlackAlert(message: any) {
       body: JSON.stringify({ text: `MathU Bot Alert: ${message}` }),
     });
   } catch (e: any) {
-    log(`Slack alert skipped: ${e.code || e.name || e.message}`.substring(0, 120), 'DEBUG', 'alerting');
+    const errDetail = e.message || e.code || e.name || String(e);
+    log(`Slack alert skipped: ${errDetail}`.substring(0, 200), 'DEBUG', 'alerting');
   }
 }
 
@@ -122,7 +137,8 @@ async function sendTelegramAlert(message: any) {
       }),
     });
   } catch (e: any) {
-    log(`Telegram alert skipped: ${e.code || e.name || e.message}`.substring(0, 120), 'DEBUG', 'alerting');
+    const errDetail = e.message || e.code || e.name || String(e);
+    log(`Telegram alert skipped: ${errDetail}`.substring(0, 200), 'DEBUG', 'alerting');
   }
 }
 
