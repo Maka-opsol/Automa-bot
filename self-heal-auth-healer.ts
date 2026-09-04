@@ -76,8 +76,15 @@ class AuthHealer {
       const { launchBrowser, closeBrowser } = require('./browser');
       page = await launchBrowser();
 
-      log('Navigating to Microsoft login page for investigation...', 'DEBUG', 'auth-healer');
-      await page.goto('https://login.microsoftonline.com/', {
+      log('Navigating to app URL for auth investigation (NOT login.microsoftonline.com — that causes AADSTS900561 GET-vs-POST error)...', 'DEBUG', 'auth-healer');
+      // BUG FIX (2026-09-04): Navigating directly to https://login.microsoftonline.com/
+      // produces "AADSTS900561: The endpoint only accepts POST requests. Received a GET
+      // request." because the root URL is an API endpoint, not a login page. The proper
+      // way to reach the Microsoft login is via the MathU app, which redirects to the
+      // OAuth /authorize endpoint (which IS GET-able and shows the login form).
+      const CONFIG = require('./get-config');
+      const investigateUrl = CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za';
+      await page.goto(investigateUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 30000,
       });
