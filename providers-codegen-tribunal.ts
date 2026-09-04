@@ -205,7 +205,7 @@ async function generateCodeFixViaTribunal(
   const ctl = withTimeout(signal, DEFAULT_TRIBUNAL_TIMEOUT_MS);
 
   try {
-    const result = await _runFixConsensus(prompt, models, totalModels, ctl.signal);
+    const result = await _runFixConsensus(prompt, models, totalModels, ctl.signal, screenshot);
     // If dedicated codegen providers all failed AND caller allows fallback,
     // try non-codegen providers from the general registry.
     if (!result && options?.allowNonCodegenFallback) {
@@ -221,8 +221,14 @@ async function generateCodeFixViaTribunal(
 /**
  * Run the fix-specific consensus algorithm.
  * Separate function so the signal setup/teardown is clean.
+ *
+ * BUG FIX (2026-09-04): Added `screenshot` parameter. Previously, this function
+ * referenced `screenshot` at line 244 (callBazaarLinkCodeGenWithModel) but it
+ * was NOT in the function's parameter list — causing "screenshot is not defined"
+ * ReferenceError on every BazaarLink codegen call. The variable was declared
+ * in the parent function generateCodeFixViaTribunal() but never passed down.
  */
-async function _runFixConsensus(prompt: string, models: any, totalModels: number, signal: any) {
+async function _runFixConsensus(prompt: string, models: any, totalModels: number, signal: any, screenshot?: string | null) {
   let blSkipped = false;
   const BL_STAGGER_MS = 3000;
   const collected: Array<{ provider: string; fixes: any[]; error?: string }> = [];
