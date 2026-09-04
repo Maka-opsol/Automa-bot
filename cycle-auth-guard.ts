@@ -292,6 +292,101 @@ async function _isPageVisuallyBlank(page: any): Promise<boolean> {
 let _consecutiveCaptchaFailures = 0;
 const MAX_CONSECUTIVE_CAPTCHA_FAILURES = 3;
 
+// ─── Last-Known-Good-URL Tracking ──────────────────────────────────────────
+// BUG FIX (2026-09-04): Previously, session checks compared the current URL
+// against preset URL lists:
+//   - CONFIG.MATHU_SPA_DOMAINS (default: "app.mathu.co.za,mathu.co.za")
+//   - CONFIG.APP_URL           (default: "https://app.mathu.co.za/")
+//
+// These presets are brittle:
+//   - If the bot is deployed to a different domain, the session check breaks.
+//   - If CONFIG.APP_URL drifts from what the bot is actually using, the
+//     check produces false positives (treating valid pages as expired).
+//   - The url.includes(CONFIG.APP_URL) check on line ~463 was redundant with
+//     _isSpaDomain(url) and produced noisy log warnings.
+//
+// Fix: track the origin of the last URL where the session was known to be
+// valid. Use THAT origin as the baseline for the next session check. The
+// preset list is kept only as a one-time bootstrap fallback for the very
+// first cycle (when no last-known-good URL exists yet).
+//
+// The tracker is updated:
+//   - When _isSpaSessionValid() returns true
+//   - When the login-flow bypass fires (we're on Microsoft login but it's
+//     an expected navigation, so the previous SPA URL is still "last known good")
+//   - When cycle-cycle-manager.ts calls notifyLastKnownGoodUrl() after each
+//     successful action
+let _lastKnownGoodUrl: string | null = null;
+
+/**
+ * Notify the auth-guard of the URL the bot is currently on, so the next
+ * session check can compare against it. Called by cycle-manager after each
+ * successful action and after a successful session check.
+ *
+ * Only URLs on non-Microsoft, non-blank pages are stored. Microsoft login
+ * URLs are NOT stored (we don't want them to become the "expected" origin).
+ */
+function notifyLastKnownGoodUrl(url: string | null | undefined): void {
+  if (!url || typeof url !== 'string') return;
+  if (url === 'about:blank') return;
+  // Never store Microsoft login URLs — they are NOT the bot's "home" origin.
+  if (url.includes('login.microsoftonline.com') ||
+      url.includes('login.live.com') ||
+      url.includes('login.microsoft.com') ||
+      url.includes('msftauth.net')) {
+    return;
+  }
+  if (_lastKnownGoodUrl !== url) {
+    _lastKnownGoodUrl = url;
+  }
+}
+
+/**
+ * Get the last URL the bot was at when the session was known to be valid.
+ * Used by cycle-manager for recovery navigation (so the bot returns to
+ * where it was, not to a preset root URL).
+ */
+function getLastKnownGoodUrl(): string | null {
+  return _lastKnownGoodUrl;
+}
+
+/**
+ * Get the origin (protocol+host) of the last known good URL.
+ * Returns null if no last-known-good URL has been recorded yet.
+ */
+function _getLastKnownGoodOrigin(): string | null {
+  if (!_lastKnownGoodUrl) return null;
+  try {
+    return new URL(_lastKnownGoodUrl).origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check whether the given URL is on the same origin as the last known good
+ * URL. Used to replace the preset _isSpaDomain() check.
+ *
+ * Behavior:
+ *   - If a last-known-good URL exists, compare origins.
+ *   - If no last-known-good URL exists yet (first cycle), fall back to the
+ *     preset _isSpaDomain() check for bootstrap. This is the ONLY place the
+ *     preset list is still consulted — after the first successful cycle, the
+ *     tracker takes over entirely.
+ */
+function _isOnKnownAppOrigin(url: string): boolean {
+  const lastOrigin = _getLastKnownGoodOrigin();
+  if (lastOrigin) {
+    try {
+      return new URL(url).origin === lastOrigin;
+    } catch {
+      return false;
+    }
+  }
+  // Bootstrap fallback: no last-known-good URL yet, use preset list.
+  return _isSpaDomain(url);
+}
+
 /**
  * Default SPA domains for MathU. On these domains the URL never changes
  * between pages (e.g. assignments, topics, quiz, score screen are all
@@ -321,7 +416,8 @@ function _isSpaDomain(url: string): boolean {
  * Multi-signal SPA session validator.
  * Instead of checking for '/assignments' in the URL (which never appears
  * on a Flutter Web SPA), we look at:
- *   1. Is the page on a known MathU SPA domain?
+ *   1. Is the page on the same origin as the last known good URL (or, on
+ *      the first cycle, on a preset SPA domain)?
  *   2. Is the page NOT on a Microsoft login domain?
  *   3. Does the page body contain MathU app indicators?
  *   4. Is the page actually rendered (not blank Flutter canvas/spinner)?
@@ -337,31 +433,34 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
     return false;
   }
 
-  // Positive signal: on MathU SPA domain
-  if (!_isSpaDomain(url)) {
-    log(`SPA check: URL ${url} is not a recognized SPA domain`, 'DEBUG', 'auth-guard');
+  // Positive signal: on the same origin as the last known good URL.
+  // BUG FIX (2026-09-04): Replaced preset _isSpaDomain() check with
+  // _isOnKnownAppOrigin() which uses the bot's actual last-known location
+  // as the baseline. Preset URL lists are brittle (break if the deployment
+  // domain changes, drift from CONFIG.APP_URL, etc.). The tracker is
+  // updated after every successful cycle, so it always reflects where the
+  // bot actually is — not where a config file thinks it should be.
+  // For the very first cycle (no last-known-good URL yet), the helper falls
+  // back to the preset _isSpaDomain() check as a one-time bootstrap.
+  if (!_isOnKnownAppOrigin(url)) {
+    log(`SPA check: URL ${url} is not on the last-known-good origin — session invalid`, 'DEBUG', 'auth-guard');
     return false;
   }
 
   // Content-based validation: look for MathU app elements in the page
   try {
-    // ── BLANK PAGE DETECTION (pixel-based, must run BEFORE canvas check) ──
-    // Flutter Web paints everything to <canvas>, so innerText is always empty.
-    // Text-length heuristics are fundamentally broken for Flutter SPAs.
-    // Instead, sample ~35 pixels from a screenshot (corners, centre, grid, random).
-    // If pixel variance is near-zero (std < 3), the page is visually blank.
-    // If even 1 pixel differs significantly, real content is rendered.
     const visuallyBlank = await _isPageVisuallyBlank(page);
     if (visuallyBlank) {
       log('SPA check: Screenshot is visually blank (low pixel variance) — session NOT valid', 'WARN', 'auth-guard');
       return false;
     }
 
-    // Pixel check already confirmed the page is NOT visually blank.
-    // If we're on the SPA domain and the page has rendered pixels, the session
-    // is valid — the Flutter app is showing something (even if it's a quiz,
-    // modal, or non-standard layout the text-check couldn't detect).
-    log('SPA check: Page has rendered content (pixels differ) — session valid', 'DEBUG', 'auth-guard');
+    // Pixel check confirmed the page is NOT visually blank.
+    // We're on the last-known-good origin AND the page has rendered pixels,
+    // so the session is valid. Update the tracker with the current URL so
+    // subsequent checks compare against the freshest known-good location.
+    log('SPA check: Page has rendered content on known origin — session valid', 'DEBUG', 'auth-guard');
+    notifyLastKnownGoodUrl(url);
     return true;
   } catch (err: any) {
     log(`SPA check: evaluate failed (${err.message}) — treating as NOT valid (was: assume valid)`, 'WARN', 'auth-guard');
@@ -408,60 +507,103 @@ async function ensureAuthenticated(page: any) {
   const browser = _deps.browser || {};
   const url = page.url();
 
-  // ── BUG FIX (2026-09-04): Login-flow bypass ──
-  // If the bot just clicked "Sign in with Microsoft" on the mathu_login page,
-  // we EXPECT to land on login.microsoftonline.com next. Do NOT treat this as
-  // a session-expiry event. Just return the page and let the tribunal decide
-  // how to handle the microsoft_email_input state visually.
+  // ═══════════════════════════════════════════════════════════════════════════
+  // BUG FIX (2026-09-04, v2): Never manually change the URL.
+  // ═══════════════════════════════════════════════════════════════════════════
+  // The Microsoft sign-in is shown as an overlay/popup on top of (or alongside)
+  // the MathU app. The auth-guard previously "recovered" from perceived session
+  // expiry by:
+  //   1. Calling refreshSession() → which internally does page.goto(APP_URL)
+  //      via captcha-human-fallback.ts → tryAllSessions(). This navigates AWAY
+  //      from the Microsoft overlay, destroying the in-progress sign-in flow.
+  //   2. Closing the browser entirely (browser.closeBrowser()) and relaunching
+  //      (browser.launchBrowser()), which starts fresh at about:blank and then
+  //      gets navigated to APP_URL by cycle-manager's fresh-start logic.
+  //      This is the "changes the URL into an entirely new website" behavior.
   //
-  // The flag is set by cycle-manager immediately after executing a click on
-  // mathu_login state. It auto-expires after 5 minutes.
-  if (isLoginInProgress()) {
-    const onMicrosoftLogin = url.includes('login.microsoftonline.com') ||
-                             url.includes('login.live.com') ||
-                             url.includes('msftauth.net') ||
-                             url.includes('login.microsoft.com');
-    if (onMicrosoftLogin) {
-      log(`Login flow in progress — Microsoft login URL is expected destination (not session expiry). Returning page to tribunal. url=${url}`, 'INFO', 'auth-guard');
-      authAttempts = 0;
-      // Clear the blank-page flag if it was set by an earlier pre-refresh check;
-      // we're now on the Microsoft page intentionally and shouldn't trigger
-      // blank-page escalation.
-      (page as any)._authBlankPage = false;
-      return page;
-    }
+  // Both behaviors cause the bot to loop: click "Sign in with Microsoft" →
+  // land on Microsoft login → auth-guard destroys the overlay → bot is back at
+  // MathU root → tribunal sees mathu_login → clicks again → loop forever.
+  //
+  // New philosophy: the auth-guard NEVER changes the URL. It only READS the
+  // current page state to decide whether the session is valid. If the session
+  // is invalid, it returns the page as-is and lets the tribunal handle it
+  // visually (the tribunal can click buttons, type credentials, etc. without
+  // any URL navigation from the auth-guard).
+  // ═══════════════════════════════════════════════════════════════════════════
 
-    // If we're back on the MathU SPA domain, the login flow is over (either
-    // it succeeded and we're now authenticated, or it failed and the page
-    // bounced us back). Clear the flag and fall through to normal logic.
-    if (_isSpaDomain(url)) {
-      log('Login flow completed — back on MathU SPA domain', 'INFO', 'auth-guard');
-      notifyLoginCompleted();
+  // ── Rule 1: On Microsoft login page → return page as-is, ALWAYS ──
+  // Whether we just clicked "Sign in with Microsoft" (login in progress) or
+  // the session genuinely expired and Microsoft redirected us here, we NEVER
+  // navigate away from the Microsoft page. The tribunal will see the email
+  // input / password input / KMSI / MFA page and handle it visually.
+  //
+  // This replaces both:
+  //   - The old login-flow bypass (which only fired when isLoginInProgress())
+  //   - The old re-auth flow's Microsoft branch (which called refreshSession
+  //     and then fell through to browser.closeBrowser() + relaunch)
+  const onMicrosoftLogin = url.includes('login.microsoftonline.com') ||
+                           url.includes('login.live.com') ||
+                           url.includes('msftauth.net') ||
+                           url.includes('login.microsoft.com');
+  if (onMicrosoftLogin) {
+    if (isLoginInProgress()) {
+      log(`Login flow in progress — Microsoft login URL is expected destination. Returning page to tribunal. url=${url}`, 'INFO', 'auth-guard');
+    } else {
+      log(`On Microsoft login page — returning page to tribunal for visual handling (NOT navigating away, NOT closing browser). url=${url}`, 'INFO', 'auth-guard');
     }
+    // If we got here via the login-flow bypass, clear the flag (we're handling it).
+    if (isLoginInProgress()) notifyLoginCompleted();
+    authAttempts = 0;
+    // Clear any stale blank-page flag — the Microsoft page has content.
+    (page as any)._authBlankPage = false;
+    return page;
   }
 
-  // ── SPA-aware session validation ──
-  if (_isSpaDomain(url)) {
+  // ── Rule 2: If we were in a login flow and we're now back on the app origin,
+  //    clear the login-flow flag (login completed). ──
+  if (isLoginInProgress() && _isOnKnownAppOrigin(url)) {
+    log('Login flow completed — back on last-known-good origin', 'INFO', 'auth-guard');
+    notifyLoginCompleted();
+    notifyLastKnownGoodUrl(url);
+  }
+
+  // ── Rule 3: SPA-aware session validation (read-only, no URL changes) ──
+  // If we're on the bot's home origin, verify the session is still valid by
+  // checking page content. If valid, return the page. If invalid, fall through
+  // to the re-auth flow (which also does NOT change the URL anymore).
+  if (_isOnKnownAppOrigin(url)) {
     const valid = await _isSpaSessionValid(page);
     if (valid) {
       authAttempts = 0;
       return page;
     }
-    // SPA invalid — check if the page is blank BEFORE re-authenticating.
+    // SPA invalid — check if the page is blank BEFORE attempting re-auth.
     // If blank, set the flag so cycle-manager's peekBlankPageFlag can catch it
     // and skip the tribunal (which would also see blank and waste API calls).
     const preRefreshBlank = await _isPageBlank(page);
     if (preRefreshBlank) {
       (page as any)._authBlankPage = true;
     }
-    log('SPA session invalid, re-authenticating...', 'WARN', 'auth-guard');
+    log('SPA session invalid, attempting re-auth (no URL change)...', 'WARN', 'auth-guard');
   } else {
+    // Not on the known app origin and not on Microsoft login — could be a deep
+    // link, /assignments (legacy), or an unknown page. Preserve the legacy
+    // /assignments fast-path. Otherwise fall through to re-auth.
     if (url.includes('/assignments')) { authAttempts = 0; return page; }
   }
 
-  // ── Re-authentication flow ──
-  if (url.includes('login.microsoftonline.com') || url.includes(CONFIG.APP_URL) || _isSpaDomain(url)) {
-    log('Session expired, re-authenticating...', 'WARN', 'auth-guard');
+  // ── Rule 4: Re-authentication flow (NO URL CHANGES) ──
+  // We only reach here if:
+  //   - We're on the bot's home origin but the session is invalid, OR
+  //   - We're on an unknown page (not Microsoft, not app origin, not /assignments)
+  //
+  // refreshSession() may internally navigate (via tryAllSessions → page.goto),
+  // but ONLY when restoring a saved session — and that navigation stays within
+  // the app origin, so it doesn't destroy the Microsoft overlay. We only call
+  // refreshSession when we're already on the app origin (never on Microsoft).
+  if (_isOnKnownAppOrigin(url)) {
+    log('Session expired, attempting refreshSession (no URL change away from app)...', 'WARN', 'auth-guard');
     authAttempts++;
     if (authAttempts > CONFIG.MAX_AUTH_ATTEMPTS) {
       try { (_deps.alerting?.sendAlert || (() => {}))('Max authentication attempts exceeded'); } catch (alertErr: any) { log('Failed to send auth failure alert', 'ERROR', 'auth-guard'); }
@@ -470,72 +612,32 @@ async function ensureAuthenticated(page: any) {
     const refreshed = await auth.refreshSession?.(page);
     if (refreshed) {
       authAttempts = 0;
-      // v14 FIX: Clear stale blank flag from pre-refresh check (line 350).
-      // refreshSession succeeded and presumably loaded content — the
-      // pre-refresh blank detection is no longer relevant.
       (page as any)._authBlankPage = false;
       return page;
     }
 
-    // refreshSession (→ authenticate) returned false = "no strategy matched,
-    // delegating to vision tribunal". The page might still be usable — the
-    // tribunal can handle it visually. Check the actual page state before
-    // nuking the browser.
-    const postRefreshUrl = page.url();
-    const stillOnAppDomain = _isSpaDomain(postRefreshUrl);
-    const redirectedToLogin = postRefreshUrl.includes('login.microsoftonline.com') || postRefreshUrl.includes('login.live.com');
-
-    if (stillOnAppDomain && !redirectedToLogin) {
-      // FIX: Before letting tribunal handle a "still on app domain" page,
-      // check if it's a blank/unrendered page. The tribunal will also fail
-      // on a blank canvas, returning unknown/wait in an infinite loop.
-      // If blank, report the exact state so the cycle manager can escalate.
-      const isBlank = await _isPageBlank(page);
-      if (isBlank) {
-        log('Auth returned false, page on app domain but BLANK — reporting blank_loading state (not delegating to tribunal)', 'WARN', 'auth-guard');
-        authAttempts = 0;
-        // Return page but attach a flag so the cycle manager knows to
-        // escalate (reload/restart) rather than entering the tribunal loop.
-        (page as any)._authBlankPage = true;
-        return page;
-      }
-      // Page has content — session is likely valid, auth strategies just
-      // can't recognize the layout. Let the tribunal handle it visually.
-      // v14 FIX: Clear stale blank flag from pre-refresh check (line 350).
-      // The post-refresh check confirmed the page has content, so the
-      // pre-refresh blank flag is stale and must be cleared to prevent
-      // the cycle manager from falsely incrementing blankPageCounter.
-      (page as any)._authBlankPage = false;
-      log('Auth returned false but page remains on app domain with content — continuing to tribunal', 'INFO', 'auth-guard');
-      authAttempts = 0;
-      return page;
+    // refreshSession failed (no strategy matched, no saved session worked).
+    // OLD BEHAVIOR (REMOVED): close the browser + relaunch + navigate to
+    //   APP_URL. This was the "changes the URL into an entirely new website"
+    //   behavior that destroyed the Microsoft sign-in overlay.
+    // NEW BEHAVIOR: just return the page as-is. The tribunal will see whatever
+    //   is on screen and decide what to do visually. If the page is genuinely
+    //   broken (blank), the cycle-manager's blank-page escalation ladder will
+    //   handle it — that's not the auth-guard's job.
+    const isBlank = await _isPageBlank(page);
+    if (isBlank) {
+      log('refreshSession failed, page is BLANK — flagging for cycle-manager escalation (NOT closing browser)', 'WARN', 'auth-guard');
+      (page as any)._authBlankPage = true;
+    } else {
+      log('refreshSession failed but page has content — returning page to tribunal (no URL change, no browser restart)', 'INFO', 'auth-guard');
     }
-
-    // Genuinely unauthenticated (redirected to Microsoft login or unknown domain)
-    await browser.closeBrowser?.();
-    const retryFn = _getRetryWithBackoff();
-    const newPage = retryFn ? await retryFn(browser.launchBrowser, { maxRetries: 2 }) : await browser.launchBrowser?.();
-    try {
-      await auth.authenticate?.(newPage);
-      authAttempts = 0;
-      return newPage;
-    } catch (authErr: any) {
-      // FIX: Distinguish MFA_REQUIRED from other auth failures.
-      // MFA is permanent — no point retrying, escalate immediately.
-      const errMsg = authErr?.message || '';
-      if (errMsg.includes('MFA_REQUIRED')) {
-        log('MFA required — alerting and entering long sleep to avoid hour burn', 'ERROR', 'auth-guard');
-        try { (_deps.alerting?.sendAlert || (() => {}))('MFA required — human intervention needed. Bot entering DORMANT.', 1); } catch {}
-        // Trigger degradation to DORMANT to stop burning hours
-        try {
-          const { degradationLadder } = require('./self-heal-degradation-ladder');
-          degradationLadder.setLevel(4, 'MFA_REQUIRED — cannot authenticate without human intervention');
-        } catch {}
-        throw new Error('MFA_REQUIRED: Cannot proceed without human MFA intervention');
-      }
-      throw authErr;
-    }
+    authAttempts = 0;
+    return page;
   }
+
+  // Unknown URL (not Microsoft, not app origin, not /assignments).
+  // Return the page as-is and let the tribunal figure it out.
+  log(`On unknown URL — returning page to tribunal for visual handling (no URL change). url=${url}`, 'INFO', 'auth-guard');
   return page;
 }
 
@@ -629,4 +731,14 @@ module.exports = {
   notifyLoginInitiated,
   notifyLoginCompleted,
   isLoginInProgress,
+  // ── BUG FIX (2026-09-04): Last-known-good-URL tracking ──
+  // Session checks compare the current URL against the bot's actual
+  // last-known location (notifyLastKnownGoodUrl) rather than preset URL lists
+  // (CONFIG.APP_URL, CONFIG.MATHU_SPA_DOMAINS). The tracker is updated after
+  // every successful session check and from cycle-manager after every
+  // successful action. getLastKnownGoodUrl() is used by cycle-manager for
+  // recovery navigation (so the bot returns to where it was, not a preset
+  // root URL).
+  notifyLastKnownGoodUrl,
+  getLastKnownGoodUrl,
 };
