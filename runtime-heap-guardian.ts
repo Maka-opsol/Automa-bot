@@ -53,9 +53,15 @@ function logError(msg: string, err: Error) {
 }
 
 // ─── Fallback thresholds (used only if memory-mode unavailable) ───
-const FALLBACK_SOFT_THRESHOLD_MB = 200;
-const FALLBACK_HARD_THRESHOLD_MB = 220;
-const CHECK_INTERVAL_MS = 10000;
+// BUG FIX (2026-09-04): Lowered from 200/220 to 180/200.
+// The old 220MB hard threshold was too high — the OOM trace showed heap
+// reaching 253.9MB before V8 killed it. With an 8-10s check interval,
+// heap can climb 30+ MB between checks. 200MB hard gives us ~50MB of
+// headroom below V8's ~256MB limit (Render's --max-old-space-size=256
+// in the Dockerfile, even though render.yaml says 384).
+const FALLBACK_SOFT_THRESHOLD_MB = 180;
+const FALLBACK_HARD_THRESHOLD_MB = 200;
+const CHECK_INTERVAL_MS = 5000; // was 10000 — check every 5s for faster OOM detection
 
 // ─── State ───
 let _monitorInterval: ReturnType<typeof setInterval> | null = null;
@@ -221,69 +227,44 @@ async function checkMemory(options?: { preserveBrowser?: boolean }): Promise<boo
   }
 
   // Hard threshold — euthanasia
+  // BUG FIX (2026-09-04): The old code attempted memory recovery (which takes
+  // 1+ seconds due to the await setTimeout in attemptMemoryRecovery) before
+  // exiting. V8's own OOM killer fires in milliseconds when heap is exhausted,
+  // so it beat us to it — the process crashed with "FATAL ERROR: Reached heap
+  // limit" before our exit path could run. Now we exit IMMEDIATELY on hard
+  // threshold, with only the OOM recording (sync, fast) before the exit.
   if (heapMB >= hardThreshold) {
     _hardTriggerCount++;
     log(`HARD OOM THRESHOLD HIT: ${getMemorySnapshot()} (trigger #${_hardTriggerCount}, mode=${_getModeName()})`, 'FATAL');
 
-    // v3 FIX: Record OOM BEFORE attempting recovery.
-    // Previously, if recovery succeeded, the OOM event was never recorded,
-    // so the next restart wouldn't know it was in danger.
+    // v3 FIX: Record OOM BEFORE attempting recovery (sync, fast — no await).
     try {
       const memoryMode = require('./memory-mode');
       const mem = process.memoryUsage();
       memoryMode.recordOOMExit(mem.heapUsed / 1024 / 1024, mem.rss / 1024 / 1024);
     } catch { /* best-effort */ }
 
-    if (_hardTriggerCount >= MAX_HARD_TRIGGERS) {
-      log(`Hard threshold hit ${MAX_HARD_TRIGGERS} times. Permanent shutdown.`, 'FATAL');
-      // v4: Run full preservation before exiting (tombstone, checkpoint, Turso sync, caches)
-      try {
-        const guardian = require('./survival-restart-guardian');
-        if (guardian?.preserveBeforeExit) {
-          guardian.preserveBeforeExit('OOM_HARD_THRESHOLD_3x').finally(() => {
-            const origExit = (process as any)._originalExit || process.exit.bind(process);
-            origExit(137);
-          });
-          return true; // Don't fall through to recovery
-        }
-      } catch { /* guardian not available */ }
+    // BUG FIX (2026-09-04): Exit IMMEDIATELY. Do NOT attempt recovery.
+    // The old code's attemptMemoryRecovery() had a 1-second setTimeout delay
+    // for the "second GC pass". V8's OOM killer doesn't wait 1 second — it
+    // fires as soon as allocation fails. We were losing the race every time.
+    // Now: record OOM (sync), fire tombstone (fire-and-forget), exit immediately.
+    log(`Hard threshold hit. Exiting IMMEDIATELY to avoid V8 OOM kill race (heap=${heapMB.toFixed(0)}MB, hard=${hardThreshold}MB).`, 'FATAL');
+    try {
+      const guardian = require('./survival-restart-guardian');
+      if (guardian?.preserveBeforeExit) {
+        // Fire-and-forget — don't await. Exit happens immediately.
+        guardian.preserveBeforeExit('OOM_HARD_THRESHOLD_IMMEDIATE').catch(() => {});
+      }
+    } catch { /* guardian not available */ }
+    // Push tombstone fire-and-forget, then exit immediately.
+    try { pushTombstoneBeforeDeath().catch(() => {}); } catch {}
+    // Small delay (50ms) to let fire-and-forget writes start, then exit.
+    setTimeout(() => {
       const origExit = (process as any)._originalExit || process.exit.bind(process);
       origExit(137);
-    }
-
-    // v5 FIX: await the recovery so browser actually closes BEFORE we check
-    // if memory is still critical. Old code fire-and-forget'd this, so heap
-    // was still at 300MB+ when the "still critical" check ran.
-    // v6 FIX: pass preserveBrowser — on hard threshold, still try to save the page
-    // unless the caller explicitly said not to. But if we're on the 3rd
-    // hard trigger, preserveBrowser is overridden (bot is dying anyway).
-    const hardPreserve = _hardTriggerCount >= MAX_HARD_TRIGGERS - 1 ? false : preserveBrowser;
-    await attemptMemoryRecovery({ preserveBrowser: hardPreserve });
-
-    const afterRecoveryMB = getHeapUsedMB();
-    if (afterRecoveryMB >= hardThreshold) {
-      log(`Memory still critical after recovery: ${afterRecoveryMB.toFixed(1)}MB. Exiting for Render restart.`, 'FATAL');
-      // v4: Use restart guardian's comprehensive preservation (includes tombstone + more)
-      try {
-        const guardian = require('./survival-restart-guardian');
-        if (guardian?.preserveBeforeExit) {
-          guardian.preserveBeforeExit('OOM_RECOVERY_FAILED').finally(() => {
-            const origExit = (process as any)._originalExit || process.exit.bind(process);
-            origExit(1);
-          });
-          return true;
-        }
-      } catch { /* guardian not available, fall through to original logic */ }
-      pushTombstoneBeforeDeath().finally(() => {
-        const origExit = (process as any)._originalExit || process.exit.bind(process);
-        origExit(1);
-      });
-      return true;
-    } else {
-      log(`Memory recovered below hard threshold: ${afterRecoveryMB.toFixed(1)}MB`, 'INFO');
-      _softTriggered = true;
-    }
-    return false;
+    }, 50);
+    return true;
   }
 
   // Soft threshold — recovery attempt
