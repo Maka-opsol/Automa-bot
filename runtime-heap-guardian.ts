@@ -53,15 +53,13 @@ function logError(msg: string, err: Error) {
 }
 
 // ─── Fallback thresholds (used only if memory-mode unavailable) ───
-// BUG FIX (2026-09-04): Lowered from 200/220 to 180/200.
-// The old 220MB hard threshold was too high — the OOM trace showed heap
-// reaching 253.9MB before V8 killed it. With an 8-10s check interval,
-// heap can climb 30+ MB between checks. 200MB hard gives us ~50MB of
-// headroom below V8's ~256MB limit (Render's --max-old-space-size=256
-// in the Dockerfile, even though render.yaml says 384).
-const FALLBACK_SOFT_THRESHOLD_MB = 180;
-const FALLBACK_HARD_THRESHOLD_MB = 200;
-const CHECK_INTERVAL_MS = 5000; // was 10000 — check every 5s for faster OOM detection
+// BUG FIX (2026-09-04, v2): Raised from 180/200 to 280/320.
+// The old thresholds (180/200) were designed for the old --max-old-space-size=256.
+// Now that the Dockerfile uses 384MB (matching render.yaml), we can afford
+// higher thresholds. 320MB hard gives ~64MB of headroom below V8's 384MB limit.
+const FALLBACK_SOFT_THRESHOLD_MB = 280;
+const FALLBACK_HARD_THRESHOLD_MB = 320;
+const CHECK_INTERVAL_MS = 5000; // every 5s for fast OOM detection
 
 // ─── State ───
 let _monitorInterval: ReturnType<typeof setInterval> | null = null;
