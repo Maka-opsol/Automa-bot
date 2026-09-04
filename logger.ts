@@ -241,13 +241,52 @@ const dedupStreams = streams.map((s: any) => {
   return s;
 });
 
+// BUG FIX (2026-09-04): Timezone-aware timestamp for pino logs.
+// The old code used `new Date().toISOString()` which always returns UTC (the
+// "Z" suffix). On Render/HF Spaces the server is UTC, so all log timestamps
+// appeared in UTC instead of SAST (UTC+2). This made it hard for the user to
+// correlate logs with their local time and the configured allowed-hours window.
+//
+// This function returns an ISO 8601 string in the configured timezone
+// (TIMEZONE env var, default 'Africa/Johannesburg'). It still ends with the
+// proper UTC offset (e.g. "+02:00") so the timestamp is unambiguous.
+function _timestampInTimezone(): string {
+  const tz = process.env.TIMEZONE || process.env.TZ || 'Africa/Johannesburg';
+  try {
+    const when = new Date();
+    const formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false,
+    });
+    const parts = formatter.formatToParts(when);
+    const get = (type: string) => parts.find((p: any) => p.type === type)?.value || '00';
+    const yyyy = get('year'); const mm = get('month'); const dd = get('day');
+    const hhRaw = get('hour'); const hh = hhRaw === '24' ? '00' : hhRaw; // 24-hour edge case
+    const mi = get('minute'); const ss = get('second');
+    // Compute UTC offset for the timezone
+    const nowUtc = when.getTime();
+    const offsetMs = nowUtc - new Date(when.toLocaleString('en-US', { timeZone: tz })).getTime();
+    const offsetMin = Math.round(offsetMs / 60000);
+    const sign = offsetMin >= 0 ? '+' : '-';
+    const absMin = Math.abs(offsetMin);
+    const offsetStr = `${sign}${String(Math.floor(absMin / 60)).padStart(2, '0')}:${String(absMin % 60).padStart(2, '0')}`;
+    return `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}.000${offsetStr}`;
+  } catch {
+    // Fallback to UTC if timezone string is invalid
+    return new Date().toISOString();
+  }
+}
+
 const logger = pino({
   level: parseLogLevel(process.env.LOG_LEVEL),
   formatters: {
     level: (label: any) => ({ level: label.toUpperCase() }),
     bindings: (bindings: any) => bindings ? { pid: bindings.pid, host: bindings.hostname?.substring(0, 50) || 'unknown' } : {}
   },
-  timestamp: () => `,"timestamp":"${new Date().toISOString()}"`,
+  // BUG FIX (2026-09-04): Use timezone-aware timestamp instead of UTC ISO string.
+  timestamp: () => `,"timestamp":"${_timestampInTimezone()}"`,
   base: undefined,
   serializers: { err: pino.stdSerializers.err, error: pino.stdSerializers.err },
   redact: { paths: ['req.headers.authorization', 'req.headers.cookie'], censor: '[REDACTED]' }
@@ -331,8 +370,8 @@ function logMetric(name: any, value: any, unit = '') {
   safeLog({ metric: name, value, unit }, 'INFO', 'metrics');
 }
 
-function logAudit(action: any, details = {}) { 
-  safeLog({ action, ...details, timestamp: new Date().toISOString() }, 'INFO', 'audit');
+function logAudit(action: any, details = {}) {
+  safeLog({ action, ...details, timestamp: _timestampInTimezone() }, 'INFO', 'audit');
 }
 
 module.exports = {
