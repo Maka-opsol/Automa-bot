@@ -2209,6 +2209,32 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         clickSuccesses++;
         actionSuccess = true;
         consecutiveFailures = 0;
+
+        // ── BUG FIX (2026-09-04): Login-flow tracking ──
+        // When the bot clicks on the mathu_login state, it is virtually
+        // always clicking the "Sign in with Microsoft" button (per the
+        // tribunal's AUTH RULE in providers-prompts.ts). The EXPECTED next
+        // step is a navigation to login.microsoftonline.com.
+        //
+        // The auth-guard's ensureAuthenticated() at the START of the next
+        // cycle would otherwise see that URL, misinterpret it as "session
+        // expired", and call refreshSession() — which often fails and ends
+        // up bouncing the bot back to MathU via browser.closeBrowser()+relaunch,
+        // causing the click loop documented in the worklog.
+        //
+        // We proactively notify the auth-guard that a login flow has been
+        // initiated, so its next ensureAuthenticated() call treats the
+        // Microsoft login URL as an EXPECTED destination rather than a
+        // session-expiry event. The flag auto-clears when the bot returns
+        // to the MathU SPA domain (notifyLoginCompleted) or after 5 minutes.
+        if (action.currentState === 'mathu_login' || preActionState === 'mathu_login') {
+          try {
+            const authGuardForLogin = getDep('authGuard');
+            if (typeof authGuardForLogin?.notifyLoginInitiated === 'function') {
+              authGuardForLogin.notifyLoginInitiated();
+            }
+          } catch (e: any) { /* non-critical — auth-guard not available */ }
+        }
         // v20: All click fallbacks removed. They were designed for a
         // system with memory headroom. On 512MB, each fallback is a gamble:
         //  - Canvas OCR: loads sharp + Tesseract (~50-100MB)
