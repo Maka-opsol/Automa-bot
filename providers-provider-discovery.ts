@@ -167,7 +167,9 @@ async function refreshAllProviderModels(options: { force?: boolean; providerName
 
       const current = loader.getProviderConfig(providerName);
       if (current && current.model !== result.model) {
-        loader.updateProviderConfig(providerName, { ...current, model }, false);
+        // BUG FIX (2026-09-04): Was `model` (undefined variable — ReferenceError).
+        // The discovered model is `result.model`, not a bare `model`.
+        loader.updateProviderConfig(providerName, { ...current, model: result.model }, false);
         updatedCount++;
         _log(`Updated ${providerName} model to ${result.model}`, 'INFO', 'provider-discovery');
       }
