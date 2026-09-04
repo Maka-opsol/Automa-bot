@@ -443,6 +443,30 @@ async function investigatePage() {
     });
     page = await context.newPage();
 
+    // BUG FIX (2026-09-04): Capture browser console logs during investigation.
+    // The AI can use console errors/warnings to diagnose JS exceptions, failed
+    // network requests, etc. — information that's NOT visible in the screenshot
+    // or HTML. We collect them into an array and attach to the investigation.
+    const consoleMessages: Array<{ type: string; text: string; url?: string }> = [];
+    const pageErrors: string[] = [];
+    try {
+      page.on('console', (msg: any) => {
+        const type = msg.type();
+        if (type === 'error' || type === 'warning') {
+          const text = msg.text();
+          if (text && text.length > 0 && text.length < 500) {
+            consoleMessages.push({ type, text, url: msg.location()?.url });
+          }
+        }
+      });
+      page.on('pageerror', (err: Error) => {
+        const text = err?.message || String(err);
+        if (text && text.length > 0 && text.length < 500) {
+          pageErrors.push(text);
+        }
+      });
+    } catch { /* best effort — listener setup shouldn't fail investigation */ }
+
     // If auth module is available, try to authenticate
     try { await (_deps.auth?.authenticate || (() => {}))(page); } catch {}
     await page.goto(config.APP_URL + '/assignments', { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -450,7 +474,48 @@ async function investigatePage() {
     const screenshot = await page.screenshot({ type: 'jpeg', quality: 30 });
     const base64 = screenshot.toString('base64');
     const html = await page.content();
-    return { screenshot: base64, html, url: page.url() };
+
+    // BUG FIX (2026-09-04): Capture additional page context for the AI.
+    // The AI needs more than just screenshot + HTML to diagnose issues:
+    //   - pageText: visible text on the page (error dialogs, button labels, etc.)
+    //   - title: page <title> (often contains error indicators)
+    //   - consoleErrors: browser console errors/warnings captured above
+    //   - pageErrors: uncaught JS exceptions captured above
+    //   - domStats: counts of key DOM elements (inputs, buttons, iframes, etc.)
+    let pageText = '';
+    let pageTitle = '';
+    let domStats = '';
+    try {
+      pageText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+      pageText = pageText.substring(0, 2000); // cap at 2KB
+      pageTitle = await page.title().catch(() => '');
+    } catch { /* best effort */ }
+    try {
+      domStats = await page.evaluate(() => {
+        const stats: Record<string, number> = {
+          inputs: document.querySelectorAll('input').length,
+          buttons: document.querySelectorAll('button').length,
+          links: document.querySelectorAll('a').length,
+          iframes: document.querySelectorAll('iframe').length,
+          canvas: document.querySelectorAll('canvas').length,
+          imgs: document.querySelectorAll('img').length,
+          divs: document.querySelectorAll('div').length,
+          errorDialogs: document.querySelectorAll('[role="alert"], .error, .alert-error').length,
+        };
+        return Object.entries(stats).map(([k, v]) => `${k}=${v}`).join(', ');
+      }).catch(() => '');
+    } catch { /* best effort */ }
+
+    return {
+      screenshot: base64,
+      html,
+      url: page.url(),
+      pageText,
+      pageTitle,
+      consoleErrors: consoleMessages.slice(-15),  // last 15 console errors/warnings
+      pageErrors: pageErrors.slice(-10),         // last 10 uncaught JS exceptions
+      domStats,
+    };
   } catch (err: any) {
     logError('Investigation failed', err);
     return null;
@@ -466,9 +531,13 @@ async function investigatePage() {
 // v14: Error message buffer — stores actual error messages for rich diagnosis.
 // The cycle-manager pushes errors here via pushSelfHealError().
 // getRecentErrors() includes these in the tribunal prompt.
+// BUG FIX (2026-09-04): Expanded from 15 errors / 30 min to 50 errors / 2 hours.
+// The AI needs more error history to diagnose intermittent issues and pattern-match
+// recurring failures. A 15-error / 30-min window was too small — the AI often
+// couldn't see the full picture of what was going wrong.
 const _errorBuffer: Array<{ msg: string; ts: number; source?: string }> = [];
-const ERROR_BUFFER_MAX = 15;
-const ERROR_BUFFER_WINDOW_MS = 30 * 60 * 1000; // 30 min
+const ERROR_BUFFER_MAX = 50;
+const ERROR_BUFFER_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 /**
  * Push an error message into the self-heal error buffer.
@@ -491,19 +560,64 @@ function pushSelfHealError(msg: string, source?: string) {
   } catch { /* non-critical */ }
 }
 
-function getRecentErrors() { 
+function getRecentErrors() {
   try {
     const stats = getProvidersStats().getStats();
     let result = `Last error count: ${stats.errors || 0}, consecutive failures: ${stats.consecutiveFailures || 0}`;
     // v14: Include actual error messages from the buffer
+    // BUG FIX (2026-09-04): Return last 20 errors (was 8) so the AI has more
+    // context to diagnose recurring patterns.
     if (_errorBuffer.length > 0) {
-      const recent = _errorBuffer.slice(-8); // last 8 errors
+      const recent = _errorBuffer.slice(-20); // last 20 errors
       result += '\n\nRecent error messages:\n';
       for (const e of recent) {
         const ageMin = Math.round((Date.now() - e.ts) / 60000);
         result += `  [${ageMin}min ago${e.source ? ` | ${e.source}` : ''}] ${e.msg}\n`;
       }
     }
+    // BUG FIX (2026-09-04): Add state-machine and cycle diagnostics so the AI
+    // can see what the bot was doing right before the failure.
+    try {
+      const sm = require('./state-machine');
+      const diag = sm.getStateDiagnostics?.();
+      if (diag) {
+        result += `\nState machine: currentState=${diag.currentState || 'null'}, `;
+        result += `stateAge=${Math.round(diag.stateAge / 1000)}s, `;
+        result += `historyLength=${diag.historyLength}, `;
+        result += `deadlockDetected=${diag.deadlockDetected}`;
+        const history = sm.stateMachine?.getHistory?.() || [];
+        if (history.length > 0) {
+          const recentHistory = history.slice(-8);
+          result += '\nRecent state transitions:\n';
+          for (const h of recentHistory) {
+            const ageMin = Math.round((Date.now() - h.timestamp) / 60000);
+            result += `  [${ageMin}min ago] state=${h.state}\n`;
+          }
+        }
+      }
+    } catch { /* state-machine not available */ }
+
+    // BUG FIX (2026-09-04): Add the LOGGER RING BUFFER — the actual log lines.
+    // This is the PRIMARY source of diagnostic context. The AI needs to see the
+    // FLOW of what the bot did (INFO-level lines like "Executing: click on
+    // state X") to diagnose logic errors and death loops — WARN/ERROR alone
+    // only show symptoms, not behavioral patterns.
+    //
+    // Provider-retry noise (429s, circuit breaker, "Retry 1/3", exhausted,
+    // blacklist, etc.) is filtered out by default — these flood the logs with
+    // unimportant chatter and push out actually-useful lines. The AI doesn't
+    // need to see "Retry 2/3 for OpenRouter after 2253ms: rate_limited" 50
+    // times to diagnose a click loop.
+    try {
+      const loggerMod = require('./logger');
+      if (typeof loggerMod.getRecentLogLines === 'function') {
+        // Get the last 60 meaningful log lines (all levels, noise filtered out)
+        const logLines = loggerMod.getRecentLogLines(60, { includeNoise: false });
+        if (logLines && logLines.length > 0) {
+          result += logLines;
+        }
+      }
+    } catch { /* logger not available */ }
     return result;
   } catch (e: any) {
     return 'No error details available';
