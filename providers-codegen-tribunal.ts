@@ -626,17 +626,42 @@ function _getCodebaseContext(): string {
 
 function buildCodeGenPrompt(investigationData: any, errorLogs: any, feedbackInfo?: { lastError?: string; lastFixPreview?: string }) {
   const url = investigationData?.url || null;
-  const html = investigationData?.html ? String(investigationData.html).substring(0, 1500) : null;
+  // BUG FIX (2026-09-04): Increased HTML snippet from 1500 to 4000 chars.
+  // 1500 chars was too short — the AI couldn't see enough of the page structure
+  // to diagnose issues. 4000 chars covers most Flutter Web error dialogs and
+  // login page forms while staying within token budget.
+  const html = investigationData?.html ? String(investigationData.html).substring(0, 4000) : null;
   const targetFile = investigationData?.targetFile || null;
   const fileContent = investigationData?.fileContent ? String(investigationData.fileContent).substring(0, 12000) : null;
   const isBootTime = !!investigationData?.bootTime;
   const fileListing = investigationData?.fileListing || null;
   const importContext = investigationData?.importContext || null;
+  // BUG FIX (2026-09-04): New context fields from enriched investigation.
+  const pageText = investigationData?.pageText || null;
+  const pageTitle = investigationData?.pageTitle || null;
+  const consoleErrors = investigationData?.consoleErrors || null;
+  const pageErrors = investigationData?.pageErrors || null;
+  const domStats = investigationData?.domStats || null;
 
   let contextLines: string[] = [];
   contextLines.push(`- Error/reason: ${errorLogs || 'Unknown recurring failure'}`);
   if (url) contextLines.push(`- Current URL: ${url}`);
-  if (html) contextLines.push(`- HTML snippet: ${html}`);
+  if (pageTitle) contextLines.push(`- Page title: ${pageTitle}`);
+  if (html) contextLines.push(`- HTML snippet (first 4000 chars):\n${html}`);
+  if (pageText) contextLines.push(`- Visible page text: ${pageText}`);
+  if (domStats) contextLines.push(`- DOM element counts: ${domStats}`);
+  if (consoleErrors && Array.isArray(consoleErrors) && consoleErrors.length > 0) {
+    contextLines.push(`- Browser console errors/warnings (last ${consoleErrors.length}):`);
+    for (const e of consoleErrors) {
+      contextLines.push(`    [${e.type}] ${e.text}${e.url ? ` (url: ${String(e.url).substring(0, 80)})` : ''}`);
+    }
+  }
+  if (pageErrors && Array.isArray(pageErrors) && pageErrors.length > 0) {
+    contextLines.push(`- Uncaught JS exceptions (last ${pageErrors.length}):`);
+    for (const e of pageErrors) {
+      contextLines.push(`    ${e}`);
+    }
+  }
   if (isBootTime) contextLines.push(`- NOTE: This is a boot-time heal (no browser available). Diagnose from error patterns only.`);
 
   // v14: Iterative feedback — tell AI what went wrong last time
@@ -654,7 +679,7 @@ function buildCodeGenPrompt(investigationData: any, errorLogs: any, feedbackInfo
 
   // v14: File listing when no target identified
   if (!targetFile && fileListing) {
-    prompt += `\nAvailable files (choose ONE to fix):\n${fileListing}\n`;
+    prompt += `\nAvailable files (choose the most relevant ones — you may pick up to 3 if the bug spans multiple modules):\n${fileListing}\n`;
   }
 
   if (targetFile && fileContent) {
@@ -665,27 +690,28 @@ function buildCodeGenPrompt(investigationData: any, errorLogs: any, feedbackInfo
       prompt += `\n${importContext}\n`;
     }
     prompt += `INSTRUCTIONS:\n`;
-    prompt += `1. Identify the exact bug in the file above.\n`;
-    prompt += `2. Propose a fix.\n`;
-    prompt += `3. Return a JSON ARRAY with a SINGLE object. The object must have:\n`;
+    prompt += `1. Diagnose the ROOT CAUSE of the bug — not just the symptom. Use all available context (error logs, console errors, page text, DOM stats, state transitions) to understand WHY the failure happens.\n`;
+    prompt += `2. Propose a fix that addresses the root cause, not just suppresses the symptom.\n`;
+    prompt += `3. Return a JSON ARRAY with a SINGLE object (or up to 3 objects if the bug genuinely spans multiple files). Each object must have:\n`;
     prompt += `- "file": "${targetFile}" (exact filename — do NOT invent other filenames)\n`;
-    prompt += `- "change": (string) human-readable description of the fix\n`;
+    prompt += `- "change": (string) Describe: (a) what the bug is, (b) WHY it happens, (c) how your fix addresses it. Root-cause analysis is required.\n`;
     prompt += `- "patch": (string) EITHER a unified diff OR the complete file content\n`;
     prompt += `PATCH FORMAT: You may return a unified diff (starting with --- a/${targetFile}) for surgical edits,\n`;
     prompt += `OR the complete file content for full replacement. Prefer unified diffs for small changes.\n`;
-    prompt += `CRITICAL: Only fix ${targetFile}. Do NOT return patches for other files.\n`;
+    prompt += `CRITICAL: Only fix ${targetFile} (and other clearly-related files if the bug spans modules). Do NOT return patches for unrelated files.\n`;
     prompt += `If no fix is possible, return exactly: []\n`;
     prompt += `Return ONLY the JSON array. No markdown fences, no explanation.\n`;
   } else {
     prompt += `\nNo specific target file identified. Choose from the file list above.\n`;
     prompt += `INSTRUCTIONS:\n`;
-    prompt += `1. Analyze the error and identify the single most likely source file. Match the ERROR to the file whose RESPONSIBILITY aligns with what's failing.\n`;
-    prompt += `2. Propose ONE fix only.\n`;
-    prompt += `3. Return a JSON ARRAY with a SINGLE object:\n`;
+    prompt += `1. Diagnose the ROOT CAUSE — use all available context (error logs, console errors, page text, DOM stats, state transitions, URL, page title) to understand WHY the failure happens. Do not just pattern-match the error to a filename — trace the causal chain.\n`;
+    prompt += `2. Identify the file(s) whose responsibility aligns with the root cause. You may pick up to 3 files if the bug spans multiple modules.\n`;
+    prompt += `3. For EACH file you pick, propose a fix that addresses the root cause.\n`;
+    prompt += `4. Return a JSON ARRAY with one object per file (max 3):\n`;
     prompt += `- "file": (string) the exact filename from the available files list\n`;
-    prompt += `- "change": (string) human-readable description\n`;
+    prompt += `- "change": (string) Describe: (a) what the bug is, (b) WHY it happens, (c) how your fix addresses it. Root-cause analysis is required.\n`;
     prompt += `- "patch": (string) EITHER a unified diff OR the complete file content\n`;
-    prompt += `Do NOT pick a file by name recognition alone — pick it because the error describes a bug in that file.\n`;
+    prompt += `Do NOT pick a file by name recognition alone — pick it because the error describes a bug in that file's area of responsibility.\n`;
     prompt += `Only return [] if you truly cannot identify any file to fix.\n`;
     prompt += `Return ONLY the JSON array. No markdown fences, no explanation.\n`;
   }
