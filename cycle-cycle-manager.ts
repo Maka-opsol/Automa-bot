@@ -28,6 +28,26 @@ function getDep(name: any) {
 // Fallback is safe: cycle-manager runs mid-cycle, long after container init.
 function getCONFIG(): Record<string, any> { return (_deps as any).config || require('./get-config'); }
 
+// ── BUG FIX (2026-09-04): Recovery-URL resolver ──
+// When the bot needs to recover (blank page, browser restart, etc.), prefer
+// the URL it was last successfully at — falling back to CONFIG.APP_URL only
+// if no last-known-good URL has been recorded yet (first cycle / cold start).
+// This replaces the old behavior of always navigating to a preset root URL,
+// which lost deep-link context and was brittle to deployment domain changes.
+function _getRecoveryUrl(): string {
+  try {
+    const authGuard = getDep('authGuard');
+    const lastGoodUrl = typeof authGuard?.getLastKnownGoodUrl === 'function'
+      ? authGuard.getLastKnownGoodUrl()
+      : null;
+    if (lastGoodUrl && typeof lastGoodUrl === 'string' && lastGoodUrl.length > 0) {
+      return lastGoodUrl;
+    }
+  } catch { /* non-critical */ }
+  const CONFIG = getCONFIG();
+  return CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za';
+}
+
 // ─── Module state ───
 let stopRequested = false;
 let cycleStartTime: number | null = null;
@@ -1043,7 +1063,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       _networkSetup = false;
       const newPage = await safeBrowserRetry(async (p: any) => {
         if (authenticate) await authenticate(p);
-        const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
+        const targetUrl = _getRecoveryUrl();
         if (targetUrl) { await p.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}); }
         return p;
       });
@@ -1058,20 +1078,20 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     // to about:blank. If we're on about:blank, we MUST navigate — the checkpoint
     // URL is stale (the browser was killed).
     if (page.url() === 'about:blank') {
-      const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
-      if (targetUrl) {
-        log(`Fresh start: navigating to ${targetUrl}`, 'INFO', 'cycle');
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
-          log(`Initial navigation failed: ${e.message || e}`, 'WARN', 'cycle');
-        });
-        // v14: Use pixel-based render check instead of height heuristic.
-        // The old scrollHeight check returned true for blank canvases that
-        // had nonzero body height from the <canvas> element itself.
-        log('Fresh start: waiting for Flutter canvas to render...', 'INFO', 'cycle');
-        await _waitForRenderedPage(page, 20000);
-      } else {
-        log('Fresh start at about:blank — no BASE_URL or APP_URL configured', 'WARN', 'cycle');
-      }
+      // BUG FIX (2026-09-04): Prefer the last-known-good URL the bot was at
+      // (from the auth-guard tracker) over a preset CONFIG.BASE_URL / APP_URL.
+      // On a fresh start the tracker is empty, so this naturally falls back
+      // to CONFIG.APP_URL via _getRecoveryUrl().
+      const targetUrl = _getRecoveryUrl();
+      log(`Fresh start: navigating to ${targetUrl}`, 'INFO', 'cycle');
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
+        log(`Initial navigation failed: ${e.message || e}`, 'WARN', 'cycle');
+      });
+      // v14: Use pixel-based render check instead of height heuristic.
+      // The old scrollHeight check returned true for blank canvases that
+      // had nonzero body height from the <canvas> element itself.
+      log('Fresh start: waiting for Flutter canvas to render...', 'INFO', 'cycle');
+      await _waitForRenderedPage(page, 20000);
     }
 
     let questionsCompleted = checkpoint?.questionsCompleted || 0;
@@ -1358,7 +1378,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 await network.setupInterception(page);
                 _networkSetup = true;
               }
-              await page.goto(CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za', { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await page.goto(_getRecoveryUrl(), { waitUntil: 'domcontentloaded', timeout: 30000 });
               await new Promise(r => setTimeout(r, 8000));
               if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
             } catch (restartErr: any) {
@@ -1392,7 +1412,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 await network.setupInterception(page);
                 _networkSetup = true;
               }
-              await page.goto(CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za', { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await page.goto(_getRecoveryUrl(), { waitUntil: 'domcontentloaded', timeout: 30000 });
               await new Promise(r => setTimeout(r, 8000));
               if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
             } catch (restartErr: any) {
@@ -1416,7 +1436,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           } else if (blankPageCounter >= BLANK_RELOAD_THRESHOLD) {
             // Step 1: Reload MathU
             log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — reloading MathU`, 'WARN', 'cycle');
-            const targetUrl = CONFIG.APP_URL || CONFIG.BASE_URL;
+            const targetUrl = _getRecoveryUrl();
             if (targetUrl) {
               await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
               await new Promise(r => setTimeout(r, 8000));
@@ -1457,7 +1477,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           return null;
         });
         if (errorText) {
-          const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
+          const targetUrl = _getRecoveryUrl();
           log(`Fast DOM check: detected app error text "${errorText}" — reloading to recover`, 'WARN', 'cycle');
           if (targetUrl) {
             try {
@@ -2064,7 +2084,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       if (action.actionType === 'wait' && action.currentState === 'blank_page') {
         currentState = 'blank_page';
         blankPageCounter++;
-        const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
+        const targetUrl = _getRecoveryUrl();
 
         if (blankPageCounter >= BLANK_SELF_HEAL_THRESHOLD) {
           // Step 3: Full self-heal
@@ -2105,7 +2125,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               await network.setupInterception(page);
               _networkSetup = true;
             }
-            await page.goto(targetUrl || 'https://app.mathu.co.za', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.goto(_getRecoveryUrl(), { waitUntil: 'domcontentloaded', timeout: 30000 });
             await new Promise(r => setTimeout(r, 8000));
             if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
           } catch (restartErr: any) {
@@ -2152,7 +2172,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // reload — not clicks or self-heal. The app itself typically says
       // "close the app and open it again", which means reload.
       if (action.currentState === 'app_error') {
-        const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
+        const targetUrl = _getRecoveryUrl();
         log(`App error detected by tribunal: ${action.reasoning || 'error dialog visible'}. Reloading to recover.`, 'WARN', 'cycle');
         if (targetUrl) {
           try {
@@ -2252,6 +2272,21 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // v16: Push successful action to OOM replay buffer.
       // Flushed to DB every 2 actions. On restart, replayed blindly.
       if (actionSuccess) _pushActionReplay(action);
+
+      // ── BUG FIX (2026-09-04): Update last-known-good-URL tracker ──
+      // After a successful action, notify the auth-guard of the current URL.
+      // This becomes the baseline for the next session check — replacing the
+      // old preset-URL checks (CONFIG.APP_URL, CONFIG.MATHU_SPA_DOMAINS) with
+      // the bot's actual current location. The auth-guard's notifyLastKnownGoodUrl
+      // filters out Microsoft login URLs and about:blank, so we can pass any URL.
+      if (actionSuccess) {
+        try {
+          const authGuardForUrl = getDep('authGuard');
+          if (typeof authGuardForUrl?.notifyLastKnownGoodUrl === 'function') {
+            authGuardForUrl.notifyLastKnownGoodUrl(page.url());
+          }
+        } catch (e: any) { /* non-critical — auth-guard not available */ }
+      }
 
       // ─── Pixel Calibration Sampling ───
       // v17: GATED behind heap check. A PNG screenshot (500KB-2MB) is the
@@ -2652,7 +2687,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               await network.setupInterception(page);
               _networkSetup = true;
             }
-            await page.goto(CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.goto(_getRecoveryUrl(), { waitUntil: 'domcontentloaded', timeout: 30000 });
             await new Promise(r => setTimeout(r, 8000));
             if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
           } catch (restartErr: any) {
@@ -2681,7 +2716,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               await network.setupInterception(page);
               _networkSetup = true;
             }
-            await page.goto(CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.goto(_getRecoveryUrl(), { waitUntil: 'domcontentloaded', timeout: 30000 });
             await new Promise(r => setTimeout(r, 8000));
             if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
           } catch (restartErr: any) {
@@ -2700,7 +2735,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         } else if (blankPageCounter >= BLANK_RELOAD_THRESHOLD) {
           // Step 1: Reload MathU
           log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — reloading MathU`, 'WARN', 'cycle');
-          const targetUrl = CONFIG.APP_URL || CONFIG.BASE_URL;
+          const targetUrl = _getRecoveryUrl();
           if (targetUrl) {
             try {
               await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
@@ -2716,7 +2751,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           continue;
         }
         // First blank page: navigate to APP_URL (original behavior)
-        const targetUrl = CONFIG.BASE_URL || CONFIG.APP_URL;
+        const targetUrl = _getRecoveryUrl();
         if (targetUrl) {
           try {
             log(`blank_page escape (step ${blankPageCounter}): navigating to ${targetUrl}`, 'INFO', 'cycle');
