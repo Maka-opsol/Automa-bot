@@ -308,6 +308,7 @@ function isValidRemoteOverride(key: string, value: unknown): boolean {
     LOG_LEVEL: { type: 'string', maxLength: 10, allowed: ['debug', 'info', 'warn', 'error', 'fatal'] },
     EXPECTED_IP_CITY: { type: 'string', maxLength: 100, regex: /^[a-zA-Z\s\-']+$/ },
     EXPECTED_IP_COUNTRY: { type: 'string', maxLength: 100, regex: /^[a-zA-Z\s\-']+$/ },
+    TIMEZONE: { type: 'string', maxLength: 100, regex: /^[a-zA-Z_\/]+$/ },
     AUTO_INSTALL_DEPENDENCIES: { type: 'boolean' },
     // SANDBOX_MODE intentionally omitted from schema — it is in BLOCKED_KEYS
     WEB_SEARCH_ENABLED: { type: 'boolean' },
@@ -456,6 +457,11 @@ const env = envalid.cleanEnv(process.env, {
   ENABLE_IP_CHECK: bool({ default: true }),
   EXPECTED_IP_CITY: str({ default: 'Johannesburg' }),
   EXPECTED_IP_COUNTRY: str({ default: 'South Africa' }),
+  // BUG FIX (2026-09-04): TIMEZONE config added so allowed-hours checks and
+  // log timestamps use the bot's local timezone instead of server-local
+  // (UTC on Render/HF Spaces). Default 'Africa/Johannesburg' = SAST (UTC+2).
+  // Override via env var TIMEZONE=... (e.g. 'Europe/London').
+  TIMEZONE: str({ default: 'Africa/Johannesburg' }),
   DB_PATH: str({ default: path.join(PROJECT_ROOT, 'mathu-bot.db') }),
   TEMPLATE_CACHE_ENABLED: bool({ default: true }),
   TEMPLATE_MATCH_THRESHOLD: num({ default: 0.85 }),
@@ -715,6 +721,7 @@ const _configStore: Record<string, any> = {
   ENABLE_IP_CHECK: env.ENABLE_IP_CHECK,
   EXPECTED_IP_CITY: env.EXPECTED_IP_CITY,
   EXPECTED_IP_COUNTRY: env.EXPECTED_IP_COUNTRY,
+  TIMEZONE: env.TIMEZONE,
   DB_PATH: env.DB_PATH,
   TEMPLATE_CACHE_ENABLED: env.TEMPLATE_CACHE_ENABLED,
   TEMPLATE_MATCH_THRESHOLD: env.TEMPLATE_MATCH_THRESHOLD,
