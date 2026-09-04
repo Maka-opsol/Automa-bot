@@ -549,10 +549,91 @@ async function ensureAuthenticated(page: any) {
   //
   // Now: the flag stays set while we're on Microsoft. It only clears when we
   // return to the app origin (Rule 2).
-  const onMicrosoftLogin = url.includes('login.microsoftonline.com') ||
-                           url.includes('login.live.com') ||
-                           url.includes('msftauth.net') ||
-                           url.includes('login.microsoft.com');
+  //
+  // BUG FIX (2026-09-04, v4): The old check used `url.includes(...)` which
+  // matched SUBSTRINGS anywhere in the URL — including inside query parameters.
+  // The bot ended up on `passwordreset.microsoftonline.com/?ru=https://login.microsoftonline.com/...`
+  // and the `url.includes('login.microsoftonline.com')` matched the `ru=` query
+  // param, causing the auth-guard to treat the password-reset page as a normal
+  // Microsoft login page. The tribunal's action cache then kept serving
+  // `input_email` (31+ hits!) on a page that has NO email input field.
+  //
+  // Fix: parse the URL hostname and check it directly. Also explicitly detect
+  // password-reset / recovery / proofup pages — those require human intervention
+  // (the account credentials are bad / require MFA setup / require password
+  // change). No amount of bot clicking will succeed. The bot must alert and
+  // degrade instead of looping.
+  const hostname = (() => {
+    try { return new URL(url).hostname.toLowerCase(); }
+    catch { return ''; }
+  })();
+
+  const onMicrosoftLogin =
+    hostname === 'login.microsoftonline.com' ||
+    hostname === 'login.live.com' ||
+    hostname === 'login.microsoft.com' ||
+    hostname === 'msftauth.net' ||
+    hostname.endsWith('.login.microsoftonline.com') ||
+    hostname.endsWith('.login.live.com') ||
+    hostname.endsWith('.msftauth.net');
+
+  // Password-reset / recovery / proofup / MFA-enrollment pages.
+  // These are Microsoft pages but NOT login pages — the bot CANNOT proceed
+  // automatically. Detect and escalate (alert + degrade) instead of looping.
+  const onPasswordResetPage =
+    hostname === 'passwordreset.microsoftonline.com' ||
+    hostname.endsWith('.passwordreset.microsoftonline.com') ||
+    hostname === 'account.live.com' && url.includes('/resetpassword') ||
+    url.includes('/proofup') ||
+    url.includes('/strongauth') ||
+    url.includes('/recovery') ||
+    url.includes('/resetpassword') ||
+    url.includes('/forgotpassword');
+
+  // BUG FIX (2026-09-04): Detect AADSTS error pages.
+  // When the bot (or self-heal code) navigates directly to
+  // https://login.microsoftonline.com/ (the root URL), Microsoft returns
+  // "AADSTS900561: The endpoint only accepts POST requests. Received a GET
+  // request." This is because the root URL is an API endpoint, not a login
+  // page. The bot gets stuck on this error page in a loop.
+  // Detection: the URL or page content contains "AADSTS" (Azure AD Sign-in
+  // error code prefix). Since we can't check page content here (would need
+  // a screenshot), we detect via URL — Microsoft error pages have the error
+  // code in the URL query params (e.g. ?error=AADSTS900561).
+  const onAadstsErrorPage = url.includes('AADSTS') || url.includes('error=AADSTS');
+
+  if (onPasswordResetPage || onAadstsErrorPage) {
+    // Microsoft redirected us to a password-reset / recovery / AADSTS error page.
+    // This means the account requires human intervention:
+    //   - Password expired and must be changed
+    //   - MFA enrollment required
+    //   - Account locked / suspicious activity
+    //   - Conditional access policy denied the sign-in
+    //   - AADSTS error (e.g. AADSTS900561 GET-vs-POST) — the bot navigated to
+    //     a POST-only endpoint with a GET request, or Microsoft rejected the
+    //     auth flow.
+    // The bot CANNOT proceed automatically. Alert once and degrade to DORMANT
+    // so we stop burning cycles on a page that needs human action.
+    const pageType = onAadstsErrorPage ? 'AADSTS error' : 'password-reset/recovery';
+    const msg = `Microsoft ${pageType} page detected (hostname=${hostname}). ${onAadstsErrorPage ? 'Auth flow error (AADSTS) — the bot likely navigated to a POST-only endpoint with GET, or Microsoft rejected the auth.' : 'Account requires human intervention (expired password / MFA enrollment / locked / conditional access).'} Bot will degrade to DORMANT to stop burning cycles. URL=${url.substring(0, 200)}`;
+    log(msg, 'ERROR', 'auth-guard');
+    try {
+      const alerting = _deps.alerting;
+      if (alerting?.sendAlert) alerting.sendAlert(msg, 1);
+    } catch { /* best effort */ }
+    try {
+      const { degradationLadder } = require('./self-heal-degradation-ladder');
+      degradationLadder.setLevel(4, `MICROSOFT_${onAadstsErrorPage ? 'AADSTS_ERROR' : 'RECOVERY_PAGE'}: ${hostname} — ${onAadstsErrorPage ? 'auth flow error' : 'account requires human intervention'}`);
+    } catch { /* non-critical */ }
+    // Throw so cycle-manager catches and the daemon sleeps via backoff
+    // (degradation to DORMANT means the daemon won't try again soon).
+    const err: any = new Error(`MICROSOFT_${onAadstsErrorPage ? 'AADSTS_ERROR' : 'RECOVERY_PAGE'}: ${onAadstsErrorPage ? 'auth flow error' : 'account requires human intervention'}`);
+    err.code = onAadstsErrorPage ? 'MICROSOFT_AADSTS_ERROR' : 'MICROSOFT_RECOVERY_PAGE';
+    err.retryable = false;
+    err.healable = false;
+    throw err;
+  }
+
   if (onMicrosoftLogin) {
     if (isLoginInProgress()) {
       log(`Login flow in progress — Microsoft login URL is expected destination. Returning page to tribunal. url=${url}`, 'INFO', 'auth-guard');
