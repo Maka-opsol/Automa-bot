@@ -2997,13 +2997,19 @@ function _microsoftLoginAction(
 
   // v4: Handle password reset / expired password pages
   if (url.includes('resetpassword') || url.includes('expired') || url.includes('reauth')) {
-    log(`Pixel fallback: password reset/reauth page detected — reloading to main login`, 'WARN', 'pixel-fallback');
+    log(`Pixel fallback: password reset/reauth page detected — navigating back to app (NOT login.microsoftonline.com — that causes AADSTS900561)`, 'WARN', 'pixel-fallback');
+    // BUG FIX (2026-09-04): Navigate to the MathU APP_URL, NOT https://login.microsoftonline.com/
+    // The Microsoft root URL is a POST-only API endpoint. GET-ing it in a browser produces
+    // "AADSTS900561: The endpoint only accepts POST requests. Received a GET request."
+    // The APP_URL will redirect to the proper OAuth /authorize endpoint which IS GET-able.
+    const CONFIG = require('./get-config');
+    const recoveryUrl = CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za';
     return {
       actionType: 'goto_url',
       targetX: 0, targetY: 0,
       currentState: 'microsoft_email_input',
-      reasoning: 'Pixel fallback: password reset/reauth page — navigating back to login',
-      _gotoUrl: 'https://login.microsoftonline.com/',
+      reasoning: 'Pixel fallback: password reset/reauth page — navigating back to app to restart OAuth flow',
+      _gotoUrl: recoveryUrl,
     };
   }
 
