@@ -305,7 +305,7 @@ function createChildLogger(moduleName: any) {
 
 const _childLoggerCache = new Map();
 
-function log(message: any, level = 'INFO', module = 'main') { 
+function log(message: any, level = 'INFO', module = 'main') {
   try {
     // Auto-initialize file logging on first call
     if (!_logInitDone) _initLogStream();
@@ -329,12 +329,152 @@ function log(message: any, level = 'INFO', module = 'main') {
     if (typeof Array.isArray !== 'function' || typeof Array.from !== 'function' || typeof Array.of !== 'function') {
       try { (globalThis as any).Array = _realArray; } catch { /* best effort */ }
     }
+
+    // ── BUG FIX (2026-09-04): Log ring buffer for self-heal AI ──
+    // Capture ALL log levels (DEBUG excluded for volume) so the AI can see the
+    // actual FLOW of what the bot did — not just the alarms. Logic errors and
+    // death loops manifest as repeated action patterns and state stagnation,
+    // which only show up at INFO level (e.g. "Executing: click on state X"
+    // repeated 30 times). WARN/ERROR alone can't reveal these.
+    //
+    // At read time, getRecentLogLines() filters out provider-retry noise
+    // (429s, circuit breaker, cooldown, "Retry 1/3", exhausted, blacklist, etc.)
+    // so the AI sees meaningful recent activity, not 50 lines of "Retry 2/3
+    // for OpenRouter after 2253ms: rate_limited".
+    //
+    // The buffer is capped at 300 entries and 1 hour. Each entry is tagged
+    // with `noisy: true/false` at capture time so filtering is O(1) at read.
+    if (lvl === 'debug' || lvl === 'info' || lvl === 'warn' || lvl === 'error' || lvl === 'fatal') {
+      try {
+        // Tag provider-retry noise at capture time. This is the list of
+        // patterns that flood the logs with unimportant retry/rate-limit
+        // chatter. They're tagged (not dropped) so getRecentLogLines() can
+        // exclude them by default but include them if explicitly requested.
+        const isNoisy = (
+          safeModule === 'base' && (
+            /Retry \d+\/\d+/.test(safeMessage) ||
+            /retrying without response_format/.test(safeMessage) ||
+            /config rolled back, retrying/.test(safeMessage) ||
+            /rollback failed/.test(safeMessage) ||
+            /PROVIDER_COOLDOWN/.test(safeMessage) ||
+            /failed: /.test(safeMessage) && /(timeout|ECONNREFUSED|HTTP_ERROR_4\d\d|HTTP_ERROR_5\d\d|rate_limit|429)/.test(safeMessage)
+          )
+        ) || (
+          safeModule === 'health' && (
+            /circuit → (open|half-open|re-opened)/.test(safeMessage) ||
+            /DISABLED:/.test(safeMessage) ||
+            /half-open after/.test(safeMessage) ||
+            /cooldown/.test(safeMessage)
+          )
+        ) || (
+          safeModule === 'registry' && (
+            /Blacklisting/.test(safeMessage) ||
+            /retired:/.test(safeMessage) ||
+            /No replacement found/.test(safeMessage) ||
+            /Auto-replacement failed/.test(safeMessage)
+          )
+        ) || (
+          safeModule === 'gemini' && /not found\/deprecated|All models exhausted|hit 429/.test(safeMessage)
+        ) || (
+          safeModule === 'openrouter-tribunal' && /budget exhausted|HTTP_ERROR_429|HTTP_ERROR_5|timeout|ECONNREFUSED/.test(safeMessage)
+        ) || (
+          safeModule === 'bazaarlink' && /429|rate.?limit|exhausted|budget/i.test(safeMessage)
+        ) || (
+          safeModule === 'cloudflare' && /circuit|cooldown|exhausted|429|rate.?limit/i.test(safeMessage)
+        ) || (
+          /OPENROUTER_DAILY_LIMIT|free-models-per-day/.test(safeMessage)
+        );
+
+        _logRingBuffer.push({
+          msg: safeMessage.substring(0, 500), // cap individual entries at 500 chars
+          level: lvl,
+          module: safeModule,
+          ts: Date.now(),
+          noisy: isNoisy,
+        });
+        // Trim to max size
+        while (_logRingBuffer.length > LOG_RING_BUFFER_MAX) _logRingBuffer.shift();
+        // Age-prune (remove entries older than the window)
+        const cutoff = Date.now() - LOG_RING_BUFFER_WINDOW_MS;
+        while (_logRingBuffer.length > 0 && _logRingBuffer[0].ts < cutoff) _logRingBuffer.shift();
+      } catch { /* ring buffer failure must never affect logging */ }
+    }
+
     let child = _childLoggerCache.get(safeModule);
     if (!child) { child = logger.child({ module: safeModule }); _childLoggerCache.set(safeModule, child); }
     child[lvl](safeMessage);
   } catch (err: any) {
     console.error(`Log failure: ${err.message}`, { originalMessage: String(message)?.substring(0, 100) });
   }
+}
+
+// ── BUG FIX (2026-09-04): Log ring buffer ──────────────────────────────────
+// Stores the last N log lines (ALL levels except DEBUG) for the self-heal AI.
+// This is the PRIMARY source of diagnostic context — it captures the actual
+// FLOW of what the bot did, not just the alarms.
+//
+// The AI needs to see INFO-level flow to diagnose logic errors and death
+// loops (e.g. "Executing: click on state mathu_login" repeated 30 times).
+// WARN/ERROR alone only show symptoms, not the behavioral pattern.
+//
+// Provider-retry noise (429s, circuit breaker, cooldown, "Retry 1/3",
+// exhausted, blacklist) is tagged at capture time via `noisy: true` so it
+// can be filtered out at read time — these flood the logs and push out
+// actually-useful lines.
+const LOG_RING_BUFFER_MAX = 300;
+const LOG_RING_BUFFER_WINDOW_MS = 60 * 60 * 1000; // 1 hour (was 2h — 1h is enough for diagnosis)
+const _logRingBuffer: Array<{ msg: string; level: string; module: string; ts: number; noisy: boolean }> = [];
+
+/**
+ * Get recent log lines from the ring buffer, excluding provider-retry noise
+ * by default.
+ *
+ * @param maxEntries - Maximum number of entries to return (default 50)
+ * @param opts - { includeNoise: false = filter out provider retries (default),
+ *                 maxAgeMs: only return entries newer than this (default 1 hour) }
+ * @returns Formatted string of recent log lines, or empty string if none.
+ */
+function getRecentLogLines(maxEntries = 50, opts?: { includeNoise?: boolean; maxAgeMs?: number }): string {
+  try {
+    if (_logRingBuffer.length === 0) return '';
+    const includeNoise = opts?.includeNoise ?? false;
+    const maxAgeMs = opts?.maxAgeMs ?? LOG_RING_BUFFER_WINDOW_MS;
+    const cutoff = Date.now() - maxAgeMs;
+    // Filter: age + noise (unless includeNoise=true)
+    const filtered = _logRingBuffer.filter((e) => {
+      if (e.ts < cutoff) return false;
+      if (!includeNoise && e.noisy) return false;
+      return true;
+    });
+    if (filtered.length === 0) return '';
+    // Take the most recent N entries, then reverse to oldest-first for readability
+    const recent = filtered.slice(-maxEntries);
+    const noiseNote = includeNoise ? '' : ' (provider retries filtered out)';
+    let result = `\nRecent logs (last ${recent.length} entries${noiseNote}, oldest first):\n`;
+    for (const e of recent) {
+      const ageMin = Math.round((Date.now() - e.ts) / 60000);
+      const ageStr = ageMin < 1 ? `${Math.round((Date.now() - e.ts) / 1000)}s` : `${ageMin}min`;
+      const lvlTag = e.level.toUpperCase().substring(0, 5);
+      result += `  [${ageStr} ago | ${lvlTag} | ${e.module}] ${e.msg}\n`;
+    }
+    return result;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Get the raw log ring buffer entries (for dashboard / debugging).
+ */
+function getLogRingBuffer(): Array<{ msg: string; level: string; module: string; ts: number; noisy: boolean }> {
+  return [..._logRingBuffer];
+}
+
+/**
+ * Clear the log ring buffer (for testing).
+ */
+function clearLogRingBuffer(): void {
+  _logRingBuffer.length = 0;
 }
 
 function safeLog(message: any, level = 'INFO', module = 'main') { 
@@ -388,4 +528,8 @@ module.exports = {
   initFileLogging: _initLogStream,
   // logtail removed: replaced by logging-betterstack.ts (no stdout side-effects)
   _betterstackAvailable,
+  // BUG FIX (2026-09-04): Log ring buffer for self-heal AI
+  getRecentLogLines,
+  getLogRingBuffer,
+  clearLogRingBuffer,
 };
