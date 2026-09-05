@@ -1,0 +1,99 @@
+services:
+  - type: web
+    name: MathU-Bot-Flat
+    runtime: node
+    plan: free
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Render Free Plan Build Strategy (512 MB RAM, ~10 min build timeout)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. NODE_OPTIONS limits V8 heap for the build process itself
+    # 2. npm_config_jobs=1 prevents parallel native compilations (each g++
+    #    can use 100-200 MB; two in parallel would OOM on 512 MB)
+    # 3. npm_config_build_from_source=false prefers prebuilt binaries
+    #    (better-sqlite3 ships prebuilds for common glibc/Linux)
+    # 4. PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 skips Chromium during npm install
+    #    — postinstall.js installs it separately after npm install frees memory
+    # 5. --no-optional skips onnxruntime-node, sharp, @xenova/transformers,
+    #    tesseract.js (all are disabled at runtime or used by optional features
+    #    that aren't critical; compiling them would OOM the 512 MB build)
+    # ═══════════════════════════════════════════════════════════════════════════
+    buildCommand: |-
+      NODE_OPTIONS=--max-old-space-size=256 \
+      npm_config_jobs=1 \
+      npm_config_build_from_source=false \
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+      npm install --no-optional && \
+      node build.js
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Start Command
+    # ═══════════════════════════════════════════════════════════════════════════
+    # BUG FIX (2026-09-04): Pre-compiled JS instead of tsx on-the-fly transpilation.
+    # tsx keeps source maps, ASTs, and compiled module cache in memory (~50-80MB).
+    # Pre-compiling at build time removes all that overhead from the runtime.
+    # The bot now runs plain compiled .js files from dist/ — no tsx import needed.
+    # Expected baseline heap: ~180-200MB (down from ~260MB with tsx).
+    # ═══════════════════════════════════════════════════════════════════════════
+    startCommand: node --expose-gc --max-old-space-size=384 dist/render-free-plan.js
+
+    envVars:
+      - key: NODE_VERSION
+        value: "20.x"
+      - key: NODE_ENV
+        value: production
+      # Chromium — single-process + 128 MB V8 heap for 512 MB total
+      - key: CHROMIUM_FLAGS
+        value: "--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion --js-flags=--max-old-space-size=128 --optimize-for-size --single-process"
+      # ── Credentials (set real values in Render dashboard) ──
+      - key: MICROSOFT_EMAIL
+        sync: false
+      - key: MICROSOFT_PASSWORD
+        sync: false
+      - key: ENCRYPTION_PASSPHRASE
+        sync: false
+      # ── AI Provider API Keys ──
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: MISTRAL_CODE_API_KEY
+        sync: false
+      - key: QWEN_CODE_API_KEY
+        sync: false
+      - key: DEEPSEEK_CODE_API_KEY
+        sync: false
+      - key: GITHUB_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: AGNES_API_KEY
+        sync: false
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: CEREBRAS_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      # ── Telegram (optional) ──
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      # ── SMTP / Email alerts (optional) ──
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      # ── Render-specific ──
+      - key: DB_PATH
+        sync: false
+      - key: ADMIN_SECRET
+        sync: false
+      # ── Optional: external keepalive ping (UptimeRobot / cron-job.org URL) ──
+      # Set this to your monitoring ping URL as a backup to the self-ping
+      - key: KEEPALIVE_PING_URL
+        sync: false
