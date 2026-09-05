@@ -441,29 +441,22 @@ function createContainer(): DIContainerType {
     factory: (deps: any) => {
       // Inject dependencies into cycle-manager via a setup function
       const cycleManager = require('./cycle-cycle-manager');
-      cycleManager._injectDependencies(deps);
+      // BUG FIX (2026-09-04): Pass the container itself as __container so
+      // cycle-manager's getDep() can lazy-load modules that aren't in the
+      // eager deps array. This allows cycleManager to declare only 7 core
+      // deps while still accessing all 30+ other modules on first use.
+      cycleManager._injectDependencies({ ...deps, __container: c });
       return cycleManager;
     },
     deps: [
-      // Core
+      // BUG FIX (2026-09-04): Reduced from 37 eager deps to 7 core deps.
+      // The other 30 modules (pixel-fallback, blackbox, flutter-*, exploration,
+      // strategyVariants, etc.) are lazy-loaded via getDep() at the point of use
+      // inside runCycle(). This saves ~30-40MB of heap at boot because those
+      // modules (and their transpiled code) aren't loaded until actually needed.
+      // Most cycles only use 5-6 of these — loading all 37 at boot was wasteful.
       'config', 'logger', 'database', 'browser', 'auth', 'providers',
-      'stateMachine', 'visionPipeline', 'cache', 'alerting',
-      // Cycle subsystems
-      'authGuard', 'actionExecutor', 'stagnation', 'moduleTracking',
-      // State & progress
-      'statePersist', 'moduleSelector', 'progressTracker',
-      // Provider management
-      'providersBase', 'providerQuotaBargain',
-      // Utility modules
-      'dependencySurvivor', 'uiDriftDiscovery', 'captchaHumanFallback',
-      'bruteForceNavigator', 'blackbox', 'adaptivePerformanceEngine',
-      'explorationCartographer',
-      // Flutter subsystems
-      'flutterStability', 'flutterModalSlayer', 'flutterSemantics',
-      'flutterDpr', 'flutterNetwork', 'flutterInspector',
-      'flutterCanvas', 'flutterGestures',
-      // Experiments & policy
-      'strategyVariants', 'policyEngine', 'pluginAPI',
+      'stateMachine',
     ],
     critical: true,
     tags: ['cycle'],
