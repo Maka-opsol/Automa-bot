@@ -37,12 +37,22 @@ class AuthManager {
   loadStrategies() { 
     const fs = require('fs');
     const path = require('path');
-const { PROJECT_ROOT } = require('./project-root');
-    const strategyFiles = fs.readdirSync(PROJECT_ROOT)
-      .filter((f: any) => f.startsWith('auth-strategies-') && f !== 'auth-strategies-base.ts' && f !== 'auth-strategies-base.js' && (f.endsWith('.ts') || f.endsWith('.js')));
+    // BUG FIX (2026-09-05): Use __dirname instead of PROJECT_ROOT.
+    // In tsx mode: __dirname is the project root (/app/) — finds .ts files,
+    //   tsx transpiles them on require.
+    // In compiled mode: __dirname is /app/dist/ — finds .js files (compiled output).
+    //   Node can require .js files directly.
+    // The old code used PROJECT_ROOT (= process.cwd() = /app/) which in compiled
+    // mode found .ts source files — Node can't parse TypeScript syntax.
+    const searchDir = __dirname;
+    const strategyFiles = fs.readdirSync(searchDir)
+      .filter((f: any) => f.startsWith('auth-strategies-') &&
+                          f !== 'auth-strategies-base.ts' &&
+                          f !== 'auth-strategies-base.js' &&
+                          (f.endsWith('.ts') || f.endsWith('.js')));
     for (const file of strategyFiles) {
       try {
-        const StrategyClass = require(path.join(PROJECT_ROOT, file));
+        const StrategyClass = require(path.join(searchDir, file));
         const instance = new StrategyClass();
         if (instance.id) {
           this.strategies.push(instance);
