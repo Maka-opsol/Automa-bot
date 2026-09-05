@@ -25,7 +25,13 @@ const OPTIONAL_DEPS = new Set([
 const isTypesOnly = (dep: string) => dep.startsWith('@types/');
 
 function checkDependencies() { 
-  const pkg = require('./package.json');
+  // BUG FIX (2026-09-05): Use PROJECT_ROOT for package.json path.
+  // When running from dist/, `require('./package.json')` resolves to
+  // dist/package.json which doesn't exist. The real package.json is at
+  // PROJECT_ROOT/package.json (= process.cwd()/package.json).
+  const path = require('path');
+  const { PROJECT_ROOT } = require('./project-root');
+  const pkg = require(path.join(PROJECT_ROOT, 'package.json'));
   const deps = { ...pkg.dependencies, ...(pkg.devDependencies || {}), ...(pkg.optionalDependencies || {}) };
   const missing = [];
   const missingOptional = [];
