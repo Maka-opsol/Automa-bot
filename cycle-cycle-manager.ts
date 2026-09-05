@@ -12,17 +12,49 @@ let _deps = {};
  * Inject dependencies from the DI container.
  * Called once during container initialization.
  *
+ * BUG FIX (2026-09-04): Also stores the container reference so getDep() can
+ * lazy-load modules that aren't in the eager deps array. This allows the
+ * cycleManager to declare only 7 core deps (down from 37) while still
+ * being able to access all 30+ other modules via getDep('moduleName').
+ *
  * @param {Object} deps - Object mapping dependency names to modules
+ * @param {Object} container - The DI container itself (for lazy loading)
  */
-function _injectDependencies(deps: any) { 
+function _injectDependencies(deps: any) {
   _deps = deps;
+  // The container passes itself as deps.__container (see container-modules.ts factory)
+  _container = deps.__container || null;
 }
+
+// BUG FIX (2026-09-04): Reference to the DI container for lazy module loading.
+// When getDep('moduleName') is called for a module NOT in the eager deps array,
+// we fall back to container.get('moduleName') which lazy-loads it on first access.
+let _container: any = null;
 
 // ─── Lazy accessors with fallback to container.get() ───
 // This allows cycle-manager to work even if some non-critical deps are null.
 
-function getDep(name: any) { 
-  return (_deps as any)[name] || null;
+function getDep(name: any) {
+  // First check if the dep was eagerly injected
+  const eager = (_deps as any)[name];
+  if (eager) return eager;
+  // BUG FIX (2026-09-04): Lazy-load from the DI container if not in eager deps.
+  // This allows cycleManager to declare only 7 core deps while still accessing
+  // all 30+ other modules (authGuard, actionExecutor, blackbox, flutter-*, etc.)
+  // on first use. The container.get() call triggers the module's factory, which
+  // requires + initializes the module — this happens ONCE, then is cached by
+  // the container as a singleton.
+  if (_container) {
+    try {
+      const lazy = _container.get(name, { required: false });
+      if (lazy) {
+        // Cache it in _deps so subsequent getDep() calls don't hit the container
+        (_deps as any)[name] = lazy;
+        return lazy;
+      }
+    } catch { /* module failed to load — return null, caller handles it */ }
+  }
+  return null;
 }
 
 // Fallback is safe: cycle-manager runs mid-cycle, long after container init.
@@ -1567,7 +1599,10 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const beforeUrl = page.url();
       let screenshot: any;
       try {
-        screenshot = await page.screenshot({ type: 'jpeg', quality: 20 });
+        // BUG FIX (2026-09-04): Lowered quality from 20 to 15 to reduce heap pressure.
+        // Each screenshot is a base64 string in memory (~50KB at quality 20, ~30KB at 15).
+        // Over 60+ cycles, the accumulated transient allocations push heap past the limit.
+        screenshot = await page.screenshot({ type: 'jpeg', quality: 15 });
       } catch (ssErr: any) {
         const ssMsg = ssErr?.message || String(ssErr);
         if (ssMsg.includes('closed') || ssMsg.includes('Closed')) {
@@ -1585,7 +1620,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         log(`Screenshot suspiciously small (${screenshot.length} bytes) — page may be blank. Waiting 3s and retaking...`, 'WARN', 'cycle');
         await new Promise(r => setTimeout(r, 3000));
         try {
-          const retryShot = await page.screenshot({ type: 'jpeg', quality: 20 });
+          const retryShot = await page.screenshot({ type: 'jpeg', quality: 15 });
           if (retryShot.length > screenshot.length) {
             log(`Retry screenshot is ${retryShot.length} bytes (was ${screenshot.length}) — using retry`, 'INFO', 'cycle');
             screenshot = retryShot;
@@ -2306,6 +2341,23 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // Flushed to DB every 2 actions. On restart, replayed blindly.
       if (actionSuccess) _pushActionReplay(action);
 
+      // ── BUG FIX (2026-09-04): Post-action memory cleanup ──
+      // Clear the dashboard screenshot global immediately after the action
+      // executes (it was only needed for the tribunal decision, which is done).
+      // Then force a GC to reclaim the screenshot base64 string, provider
+      // response objects, and any other transient allocations from this cycle.
+      // This prevents per-cycle allocations from accumulating and pushing
+      // heap past the limit mid-session.
+      try {
+        const setShot = (globalThis as any).__setLatestScreenshot;
+        if (setShot) setShot('', null); // clear the screenshot global
+      } catch { /* non-critical */ }
+      try {
+        if (global.gc) {
+          global.gc(); // force garbage collection after each action
+        }
+      } catch { /* non-critical */ }
+
       // ── BUG FIX (2026-09-04): Update last-known-good-URL tracker ──
       // After a successful action, notify the auth-guard of the current URL.
       // This becomes the baseline for the next session check — replacing the
@@ -2423,7 +2475,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         while (Date.now() - downloadStartTime < MODULE_DOWNLOAD_TIMEOUT_MS) {
           await dlSleep(MODULE_DOWNLOAD_POLL_INTERVAL_MS);
           try {
-            const pollScreenshot = await page.screenshot({ type: 'jpeg', quality: 30 });
+            const pollScreenshot = await page.screenshot({ type: 'jpeg', quality: 15 });
             const pollHash = crypto.createHash('md5').update(pollScreenshot).digest('hex');
 
             if (pollHash !== _preDownloadScreenshotHash) {
