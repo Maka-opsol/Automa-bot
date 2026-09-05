@@ -2,7 +2,7 @@ FROM node:20-bookworm-slim
 
 LABEL org.opencontainers.image.title="MathU Bot v6 — Render Free Plan"
 LABEL org.opencontainers.image.description="Autonomous MathU bot, all features, 512 MB, ephemeral disk"
-LABEL org.opencontainers.image.authors="Unknown"
+LABEL org.opencontainers.image.authors="U.S.J Sibiya"
 
 # System deps: Chromium shared libs + build tools for better-sqlite3.
 # libxfixes3 was missing — caused "cannot open shared object file" at runtime.
@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY package.json tsconfig.json ./
+COPY package.json tsconfig.json tsconfig.prod.json ./
 
 # Main npm install — --ignore-scripts defers postinstall, --no-optional skips
 # ~140MB of native deps (onnxruntime-node, sharp, tesseract.js, @xenova/transformers)
@@ -47,6 +47,13 @@ RUN npx playwright install chromium
 
 # App code last — layers above are cached when only .ts files change
 COPY . .
+
+# BUG FIX (2026-09-04): Pre-compile TypeScript to JavaScript at BUILD time.
+# This removes tsx from the runtime entirely — saves ~50-80MB of heap at
+# runtime (tsx keeps source maps, ASTs, and compiled module cache in memory).
+# The bot now runs plain compiled .js files from dist/ — no tsx import needed.
+# Expected baseline heap: ~180-200MB (down from ~260MB with tsx).
+RUN npx tsc -p tsconfig.prod.json
 
 # Runtime directories under /tmp (ephemeral disk)
 RUN mkdir -p /tmp/mathu-logs/screenshots \
@@ -82,9 +89,6 @@ ENV NODE_ENV=production \
 HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -sf http://localhost:10000/health || exit 1
 
-# BUG FIX (2026-09-04): Raised from 256 to 384 to match render.yaml startCommand.
-# The old 256MB limit caused V8 OOM crashes during boot (module loading + DI
-# container init + Turso cold start recovery). The render.yaml startCommand
-# specifies 384MB, but when using a Dockerfile, Render uses the CMD here —
-# so the Dockerfile limit wins. Now both are 384MB.
-CMD ["node", "--expose-gc", "--max-old-space-size=384", "--import", "tsx", "render-free-plan.ts"]
+# BUG FIX (2026-09-04): Run pre-compiled JS instead of tsx on-the-fly transpilation.
+# No --import tsx flag needed — the dist/*.js files are plain CommonJS.
+CMD ["node", "--expose-gc", "--max-old-space-size=384", "dist/render-free-plan.js"]
