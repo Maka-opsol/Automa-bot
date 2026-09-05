@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY package.json tsconfig.json tsconfig.prod.json ./
+COPY package.json tsconfig.json ./
 
 # Main npm install — --ignore-scripts defers postinstall, --no-optional skips
 # ~140MB of native deps (onnxruntime-node, sharp, tesseract.js, @xenova/transformers)
@@ -48,12 +48,13 @@ RUN npx playwright install chromium
 # App code last — layers above are cached when only .ts files change
 COPY . .
 
-# BUG FIX (2026-09-04): Pre-compile TypeScript to JavaScript at BUILD time.
-# This removes tsx from the runtime entirely — saves ~50-80MB of heap at
-# runtime (tsx keeps source maps, ASTs, and compiled module cache in memory).
-# The bot now runs plain compiled .js files from dist/ — no tsx import needed.
+# BUG FIX (2026-09-04): Compile TypeScript to JavaScript at BUILD time using esbuild.
+# tsc fails with hundreds of "Cannot redeclare block-scoped variable" errors because
+# the codebase was written for tsx (each file transpiled independently). esbuild
+# transpiles each file independently like tsx does — no cross-file type checking.
+# This removes tsx from the runtime entirely — saves ~50-80MB of heap at runtime.
 # Expected baseline heap: ~180-200MB (down from ~260MB with tsx).
-RUN npx tsc -p tsconfig.prod.json
+RUN node build.js
 
 # Runtime directories under /tmp (ephemeral disk)
 RUN mkdir -p /tmp/mathu-logs/screenshots \
