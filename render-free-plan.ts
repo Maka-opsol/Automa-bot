@@ -17,10 +17,10 @@
 // of headroom below V8's 384MB limit — enough to exit cleanly before V8's
 // own OOM killer fires.
 // ═══════════════════════════════════════════════════════════════════════════════
-// BUG FIX (2026-09-06): Reduced from 300 to 200MB now that --max-old-space-size
-// is 256MB (was 384MB). The old 300MB threshold was above the new V8 limit.
-// 200MB gives ~50MB headroom below V8's 256MB limit.
-const EARLY_OOM_THRESHOLD_MB = 200;
+// BUG FIX (2026-09-06): Set to 300MB for 384MB V8 limit. With esbuild (no tsx),
+// baseline is 66MB. Flutter Web loading allocates ~150MB. 66+150 = 216MB.
+// 300MB threshold gives 84MB headroom below V8's 384MB limit.
+const EARLY_OOM_THRESHOLD_MB = 300;
 const EARLY_OOM_CHECK_INTERVAL_MS = 2000; // every 2s — fast enough to catch boot spikes
 let _earlyOomTriggered = false;
 const _earlyOomInterval = setInterval(() => {
@@ -211,7 +211,7 @@ const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilien
     clearInterval(_earlyOomInterval);
     process.exit(137);
   }
-  if (_postContainerHeapMB >= 200) {
+  if (_postContainerHeapMB >= 300) {
     console.error(`[FATAL] [boot-oom] Heap ${_postContainerHeapMB.toFixed(0)}MB >= 300MB after container init. Exiting immediately.`);
     clearInterval(_earlyOomInterval);
     process.exit(137);
