@@ -147,9 +147,12 @@ function getTimeSignal(): ShiftName {
     : ((productiveStart + Math.floor(totalProductiveHours * 0.6)) % 24);
 
   const isWrap = productiveStart > productiveEnd;
+  // BUG FIX (2026-09-05): Changed endH check from < to <= so the end hour is
+  // INCLUSIVE. With ALLOWED_ACTIVITY_END_HOUR=23, the bot should be active
+  // DURING hour 23 (11pm), not stop at 23:00.
   const inWindow = isWrap
-    ? (currentHour >= productiveStart || currentHour < productiveEnd)
-    : (currentHour >= productiveStart && currentHour < productiveEnd);
+    ? (currentHour >= productiveStart || currentHour <= productiveEnd)
+    : (currentHour >= productiveStart && currentHour <= productiveEnd);
 
   if (!inWindow) return 'REST';
 
