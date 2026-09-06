@@ -1,4 +1,4 @@
-// Resilience R1: Pre-OOM Euthanasia — mathu-bot-resilience-worklog.md
+
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════
@@ -53,12 +53,10 @@ function logError(msg: string, err: Error) {
 }
 
 // ─── Fallback thresholds (used only if memory-mode unavailable) ───
-// BUG FIX (2026-09-04, v2): Raised from 180/200 to 280/320.
-// The old thresholds (180/200) were designed for the old --max-old-space-size=256.
-// Now that the Dockerfile uses 384MB (matching render.yaml), we can afford
-// higher thresholds. 320MB hard gives ~64MB of headroom below V8's 384MB limit.
-const FALLBACK_SOFT_THRESHOLD_MB = 280;
-const FALLBACK_HARD_THRESHOLD_MB = 320;
+// BUG FIX (2026-09-06): Reduced from 280/320 to 180/200 to match the new
+// --max-old-space-size=256 (was 384). 200MB hard gives ~50MB headroom.
+const FALLBACK_SOFT_THRESHOLD_MB = 180;
+const FALLBACK_HARD_THRESHOLD_MB = 200;
 const CHECK_INTERVAL_MS = 5000; // every 5s for fast OOM detection
 
 // ─── State ───
