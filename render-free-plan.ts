@@ -1,4 +1,4 @@
- strict';
+'use strict';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BUG FIX (2026-09-04): EARLY MEMORY GUARD — runs BEFORE any module loading.
