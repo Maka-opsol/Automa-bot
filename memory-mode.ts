@@ -108,7 +108,7 @@ const MODE_THRESHOLDS = {
   full_power: {
     warnHeapMB: 350,
     restartHeapMB: 400,
-    rssHardLimitMB: 420,  // v19: was 470 — on 512MB, 470 is only 42MB from OOM
+    rssHardLimitMB: 420,
     gcIntervalMs: 90 * 1000,
     monitorIntervalMs: 20 * 1000,
     warningStreak: 2,
@@ -118,16 +118,21 @@ const MODE_THRESHOLDS = {
     warnHeapMB: 280,
     restartHeapMB: 320,
     rssHardLimitMB: 380,
-    gcIntervalMs: 15 * 1000,     // v7: was 30s — now 15s for more aggressive GC
-    monitorIntervalMs: 8 * 1000,   // v7: was 10s — now 8s for faster detection
-    warningStreak: 1,              // v3: was 2 — now react on FIRST warning
+    gcIntervalMs: 15 * 1000,
+    monitorIntervalMs: 8 * 1000,
+    warningStreak: 1,
   },
   minimum: {
-    warnHeapMB: 150,
-    restartHeapMB: 170,
-    rssHardLimitMB: 300,
-    gcIntervalMs: 8 * 1000,       // very aggressive GC
-    monitorIntervalMs: 5 * 1000,   // very fast detection
+    // BUG FIX (2026-09-06): Match memory_protection thresholds.
+    // The old minimum thresholds (150/170) were so low that the bot couldn't
+    // function — it just looped "Memory CRITICAL" and closed the browser.
+    // Minimum mode now has the same thresholds as memory_protection — it just
+    // disables more modules. The thresholds should never cause a death loop.
+    warnHeapMB: 280,
+    restartHeapMB: 320,
+    rssHardLimitMB: 380,
+    gcIntervalMs: 15 * 1000,
+    monitorIntervalMs: 8 * 1000,
     warningStreak: 1,
   },
 };
@@ -1018,25 +1023,23 @@ async function checkAfterTursoSync(selectCalibration: any, upsertCalibration: an
   if (!selectCalibration || !upsertCalibration) return;
 
   try {
-    // Check 0: Is MINIMUM mode persisted in the DB? (highest priority)
+    // BUG FIX (2026-09-06): Do NOT restore MINIMUM mode from the DB.
+    // Minimum mode has thresholds so low (150/170MB) that the bot can't
+    // function — it just loops "Memory CRITICAL" and closes the browser.
+    // Clear any persisted minimum mode and boot in memory_protection.
     const minRow = selectCalibration.get(CALIBRATION_KEY_MINIMUM_MODE);
     if (minRow) {
       try {
         const parsed = JSON.parse(minRow.value);
         if (parsed.active) {
-          // v7: TTL check — expired minimum mode should not be restored
-          const setAt = parsed.setAt || parsed.ts || 0;
-          const age = Date.now() - setAt;
-          if (age > MINIMUM_MODE_DB_TTL_MS) {
-            _log(`DB MINIMUM mode expired (${Math.round(age / 60000)}min). Clearing.`, 'WARN');
-            try { upsertCalibration.run(CALIBRATION_KEY_MINIMUM_MODE, '', Date.now()); } catch {}
-          } else if (_currentMode !== 'minimum') {
-            // Pass the ORIGINAL reason through — don't prepend a restore prefix.
-            await _applyMode('minimum', sanitizeReason(parsed.reason || 'db_restore'));
+          _log(`DB MINIMUM mode found but IGNORED (was causing death loop). Clearing.`, 'WARN');
+          try { upsertCalibration.run(CALIBRATION_KEY_MINIMUM_MODE, '', Date.now()); } catch {}
+          // Force switch to memory_protection if not already
+          if (_currentMode === 'minimum') {
+            await _applyMode('memory_protection', 'stale_minimum_cleared_after_turso');
             _restartTimers();
-            _log(`Restored MINIMUM mode from database (Turso recovery, ${Math.round(age / 60000)}min old)`, 'ERROR');
-            return;
           }
+          // Fall through to check for memory_protection mode below
         }
       } catch { /* parse error */ }
     }
@@ -1046,10 +1049,14 @@ async function checkAfterTursoSync(selectCalibration: any, upsertCalibration: an
     if (modeRow) {
       try {
         const parsed = JSON.parse(modeRow.value);
-        if (parsed.mode === 'minimum' && _currentMode !== 'minimum') {
-          await _applyMode('minimum', sanitizeReason(parsed.reason || 'db_restore'));
-          _restartTimers();
-          _log('Restored MINIMUM mode from database (mode field)', 'ERROR');
+        // BUG FIX (2026-09-06): Don't restore 'minimum' from DB mode field either.
+        if (parsed.mode === 'minimum') {
+          _log(`DB mode field says 'minimum' but IGNORED (death loop). Clearing to memory_protection.`, 'WARN');
+          try { upsertCalibration.run(CALIBRATION_KEY_MODE, JSON.stringify({ mode: 'memory_protection', reason: 'cleared_from_minimum', setAt: Date.now() }), Date.now()); } catch {}
+          if (_currentMode !== 'memory_protection') {
+            await _applyMode('memory_protection', 'cleared_from_minimum');
+            _restartTimers();
+          }
           return;
         }
         if (parsed.mode === 'memory_protection' && _currentMode !== 'memory_protection') {
