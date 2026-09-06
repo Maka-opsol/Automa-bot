@@ -1725,8 +1725,14 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         } else {
           loopCheck = progressCircularPathDetector.checkUrlLoop(beforeUrl);
           if (loopCheck?.isLooping) {
-            log(`Circular path detected! URL ${beforeUrl} seen ${loopCheck.loopCount} times. Navigating away.`, 'WARN', 'cycle');
-            await page.goto(CONFIG.BASE_URL || 'about:blank', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+            log(`Circular path detected! URL ${beforeUrl} seen ${loopCheck.loopCount} times. Navigating to app URL.`, 'WARN', 'cycle');
+            // BUG FIX (2026-09-06): Navigate to APP_URL, not 'about:blank'.
+            // The old code used CONFIG.BASE_URL || 'about:blank' — when BASE_URL
+            // was empty, it navigated to about:blank, which caused a death loop:
+            // about:blank → tribunal sees blank → error/wait → circular path
+            // detected on about:blank → navigate to about:blank → repeat.
+            const recoveryUrl = _getRecoveryUrl();
+            await page.goto(recoveryUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
           }
         }
       }
