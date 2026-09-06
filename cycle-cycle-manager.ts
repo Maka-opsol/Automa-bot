@@ -1515,15 +1515,14 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           // First blank: fall through to normal blank-page guard below
         }
       } // end if (isBlank) — v14: now wraps verification + escalation ladder
-      // BUG FIX (2026-09-06): Removed handleCaptcha call. The old code called
-      // auth.detectCaptcha(page) on EVERY cycle, which matched on any Microsoft
-      // login URL (via canHandle) and logged "CAPTCHA detected" every ~5 seconds
-      // even when there was no actual captcha. The tribunal (AI) can see the
-      // screenshot and decide whether there's a captcha — no need for selector-based
-      // detection that fires on every cycle.
+      // BUG FIX (2026-09-06): Removed handleCaptcha AND recordCaptcha calls.
+      // The old code called auth.detectCaptcha(page) AND recordCaptcha() on
+      // EVERY cycle — recordCaptcha logged "CAPTCHA detected" every ~5 seconds
+      // even when there was no captcha. The tribunal (AI) now decides if there's
+      // a captcha by looking at the screenshot and setting currentState to "captcha".
+      // The captcha loop guard should only fire when the AI actually reports a captcha.
       // if (handleCaptcha) await handleCaptcha(page);
-      // Resilience: CAPTCHA loop detection
-      authCaptchaLoopGuard?.recordCaptcha?.();
+      // authCaptchaLoopGuard?.recordCaptcha?.();
       if (authCaptchaLoopGuard?.isCaptchaLooping?.()) {
         const cooldownMs = authCaptchaLoopGuard.getCaptchaCooldownRemaining?.() || 1800000;
         log(`CAPTCHA loop detected! Cooling off for ${Math.round(cooldownMs / 1000)}s`, 'WARN', 'cycle');
@@ -3011,6 +3010,13 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
 
       currentState = action.currentState;
+
+      // BUG FIX (2026-09-06): Record CAPTCHA only when the AI (tribunal) actually
+      // reports seeing a captcha — not on every cycle. The AI sets currentState
+      // to "captcha" when it sees an actual captcha challenge in the screenshot.
+      if (action.currentState === 'captcha') {
+        authCaptchaLoopGuard?.recordCaptcha?.();
+      }
       // v6: Track mid-quiz state for browser-preserving memory shedding.
       // We're "mid-quiz" when the state indicates we're on a question page
       // (not assignments, not score screen, not module downloading).
