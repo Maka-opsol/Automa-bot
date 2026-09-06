@@ -449,14 +449,13 @@ function createContainer(): DIContainerType {
       return cycleManager;
     },
     deps: [
-      // BUG FIX (2026-09-04): Reduced from 37 eager deps to 7 core deps.
-      // The other 30 modules (pixel-fallback, blackbox, flutter-*, exploration,
-      // strategyVariants, etc.) are lazy-loaded via getDep() at the point of use
-      // inside runCycle(). This saves ~30-40MB of heap at boot because those
-      // modules (and their transpiled code) aren't loaded until actually needed.
-      // Most cycles only use 5-6 of these — loading all 37 at boot was wasteful.
+      // BUG FIX (2026-09-06): Added 'providerRegistry', 'providersBase', and
+      // 'cache' back to eager deps. The vision pipeline (runVisionPipeline)
+      // requires these at runtime — without them it logs "Vision pipeline
+      // missing required deps (providerRegistry or providersBase), aborting"
+      // and returns null, meaning the tribunal never gets called.
       'config', 'logger', 'database', 'browser', 'auth', 'providers',
-      'stateMachine',
+      'stateMachine', 'providerRegistry', 'providersBase', 'cache',
     ],
     critical: true,
     tags: ['cycle'],
