@@ -300,8 +300,8 @@ function isValidRemoteOverride(key: string, value: unknown): boolean {
     SCROLL_AMOUNT: { type: 'number', min: 100, max: 2000 },
     VIDEO_SPEED: { type: 'number', min: 1, max: 32 },
     MAX_QUESTIONS: { type: 'number', min: 1, max: 999999 },
-    SLEEP_MIN_HOURS: { type: 'number', min: 0.5, max: 48 },
-    SLEEP_MAX_HOURS: { type: 'number', min: 0.5, max: 48 },
+    SLEEP_MIN_HOURS: { type: 'number', min: 0.01, max: 48 },
+    SLEEP_MAX_HOURS: { type: 'number', min: 0.01, max: 48 },
     HEADLESS: { type: 'boolean' },
     SAVE_SCREENSHOTS: { type: 'boolean' },
     ENABLE_IP_CHECK: { type: 'boolean' },
@@ -408,8 +408,8 @@ const env = envalid.cleanEnv(process.env, {
   AUTH_TIMEOUT_MS: num({ default: 450000 }),
   MAX_AUTH_ATTEMPTS: num({ default: 30 }),
   CAPTCHA_MAX_ATTEMPTS: num({ default: 3 }),
-  PROGRESS_TIMEOUT_MS: num({ default: 30 * 60 * 1000 }),
-  PROGRESS_SLOW_TIMEOUT_MS: num({ default: 60 * 60 * 1000 }),
+  PROGRESS_TIMEOUT_MS: num({ default: 60 * 60 * 1000 }),
+  PROGRESS_SLOW_TIMEOUT_MS: num({ default: 120 * 60 * 1000 }),
   MAX_RUNTIME_PER_CYCLE_MS: num({ default: 2 * 60 * 60 * 1000 }),
   CHECK_INTERVAL_HOURS: num({ default: 12 }),
   MAX_BACKOFF_MULTIPLIER: num({ default: 16 }),
@@ -447,8 +447,12 @@ const env = envalid.cleanEnv(process.env, {
   LOG_MAX_FILES: num({ default: 5 }),
   RAW_RESPONSE_TTL_MS: num({ default: 30000 }),
   LOG_ROTATE_INTERVAL: str({ default: '1d' }),
-  SLEEP_MIN_HOURS: num({ default: 10 }),
-  SLEEP_MAX_HOURS: num({ default: 16 }),
+  // BUG FIX (2026-09-06): Reduced from 10/16 hours to 0.1/0.3 hours (6-18 min).
+  // The old defaults meant the bot slept 10-16 HOURS between cycles — most of
+  // the day wasted. Now it sleeps 6-18 minutes, giving enough time for GC +
+  // browser cleanup without wasting the entire Render free tier budget.
+  SLEEP_MIN_HOURS: num({ default: 0.1 }),
+  SLEEP_MAX_HOURS: num({ default: 0.3 }),
   STARTUP_DELAY_MIN_MINUTES: num({ default: 15 }),
   STARTUP_DELAY_MAX_MINUTES: num({ default: 45 }),
   WARMUP_PROBABILITY: num({ default: 0.3 }),
