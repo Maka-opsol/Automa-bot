@@ -605,8 +605,17 @@ function _startMemoryMonitor(): void {
     // (we can't await inside setInterval). The browser cleanup will complete
     // within ~2-3s. A follow-up GC is scheduled.
     // v6 FIX: Read isMidQuiz() to preserve browser if mid-quiz
-    if (used > activeRestart || rss > activeRssHard) {
-      log(`Memory CRITICAL (${memoryMode.getMode()}): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'ERROR', 'render-free-plan');
+    // BUG FIX (2026-09-06): Use HARD-CODED thresholds, not mode-dependent ones.
+    // The mode-dependent thresholds (minimum=150/170, memory_protection=280/320)
+    // were causing death loops: in minimum mode, 101MB heap triggered "CRITICAL"
+    // every 8 seconds, calling shedMemory L2 (reload page) which navigated to
+    // about:blank, which caused "circular path detected" and "page still blank".
+    // With hard-coded thresholds, the memory monitor only fires when there's
+    // a REAL memory problem, not just because the mode threshold is set too low.
+    const HARD_RESTART_HEAP_MB = 300; // only fire if heap > 300MB (out of 384MB V8 limit)
+    const HARD_RSS_LIMIT_MB = 440;   // only fire if RSS > 440MB (out of 512MB container)
+    if (used > HARD_RESTART_HEAP_MB || rss > HARD_RSS_LIMIT_MB) {
+      log(`Memory CRITICAL (hard threshold): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'ERROR', 'render-free-plan');
       // BUG FIX (2026-09-06): Cap maxLevel at L2 to prevent closing the browser.
       // L3 closes the browser, which kills the page state and forces a re-launch
       // + re-navigate cycle. This was causing a death loop: shed L3 → browser
