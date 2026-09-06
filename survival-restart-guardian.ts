@@ -585,10 +585,16 @@ function init(deps?: Record<string, any>): { wasUnexpected: boolean; emergencyMo
     _log(`Startup: ${updatedRestarts.length} unexpected restarts in DB — emergency mode activating`, 'ERROR');
     _activateEmergencyMode(updatedRestarts);
   } else if (updatedRestarts.length >= 1) {
-    _log(`Startup: ${updatedRestarts.length} unexpected restart(s) in DB — memory_protection as precaution`, 'WARN');
-    // Even 1 unexpected restart is suspicious on Render — switch to memory_protection
-    // to prevent a second OOM while we wait for the threshold.
-    _switchToMemoryProtection(`precautionary:${updatedRestarts.length}_unexpected_restart(s)`);
+    // BUG FIX (2026-09-05): Do NOT switch to memory_protection on 1 restart.
+    // The old code did `switchToMemoryProtection` as a "precaution" after just 1
+    // unexpected restart. But this caused a death loop:
+    //   1. Bot crashes (OOM or Render kernel kill)
+    //   2. Restart guardian detects 1 unexpected restart → memory_protection
+    //   3. memory_protection disables 20 modules but doesn't prevent the crash
+    //   4. Bot crashes again (same root cause) → now 2 restarts → emergency mode
+    //   5. Emergency mode makes things worse (more disabled modules, different code paths)
+    // Now: only warn on 1 restart. Wait for 2+ before taking action.
+    _log(`Startup: ${updatedRestarts.length} unexpected restart(s) in DB — monitoring (threshold: ${RESTART_THRESHOLD}). NOT switching to memory_protection yet — waiting for ${RESTART_THRESHOLD}+ restarts.`, 'WARN');
   }
 
   // Try to restore from last-resort dump if emergency mode is active
@@ -741,8 +747,9 @@ function recheckAfterTursoSync(): { activated: boolean; recentCount: number } {
     _activateEmergencyMode(recent);
     return { activated: true, recentCount: recent.length };
   } else if (recent.length >= 1) {
-    _log(`Post-Turso recheck: ${recent.length} unexpected restart(s) found — memory_protection as precaution`, 'WARN');
-    _switchToMemoryProtection(`post_turso_recheck:${recent.length}_restart(s)`);
+    // BUG FIX (2026-09-05): Do NOT switch to memory_protection on 1 restart.
+    // See init() for the full explanation.
+    _log(`Post-Turso recheck: ${recent.length} unexpected restart(s) found — monitoring (NOT switching to memory_protection yet)`, 'WARN');
     return { activated: false, recentCount: recent.length };
   }
 
