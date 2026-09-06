@@ -607,8 +607,15 @@ function _startMemoryMonitor(): void {
     // v6 FIX: Read isMidQuiz() to preserve browser if mid-quiz
     if (used > activeRestart || rss > activeRssHard) {
       log(`Memory CRITICAL (${memoryMode.getMode()}): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'ERROR', 'render-free-plan');
+      // BUG FIX (2026-09-06): Cap maxLevel at L2 to prevent closing the browser.
+      // L3 closes the browser, which kills the page state and forces a re-launch
+      // + re-navigate cycle. This was causing a death loop: shed L3 → browser
+      // closed → re-launch → navigate → memory spike → shed L3 again.
+      // L2 (reload page + clear caches) is enough — it frees ~10-20MB without
+      // losing the browser session.
       memoryMode.shedMemory('render-monitor-critical', {
         preserveBrowser: memoryMode.isMidQuiz?.() ?? false,
+        maxLevel: 2,  // BUG FIX: never L3 — don't close the browser
       }).then(() => {
         // v5 FIX: Second GC AFTER browser cleanup actually completes
         if (global.gc) { try { global.gc(); } catch {} }
