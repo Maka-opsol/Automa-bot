@@ -286,21 +286,21 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
 
   // ── Blank image guard ──
   // If the screenshot is a blank/white page, immediately return 'wait'
-  // without calling any providers. This saves ~45s and API quota.
+  // IMPORTANT: BUG FIX (2026-09-06) — DISABLED the byte-entropy blank check.
+  // The old code used isBlankImage(base64Image) to skip providers if the
+  // screenshot "appeared blank" by checking JPEG byte entropy. But this is
+  // a LOSSY heuristic that false-positives on compressed JPEGs of dark or
+  // low-contrast pages. The cycle manager's pixel-level blank detection
+  // (auth-guard._isPageBlank) is FAR more accurate — it decodes the PNG,
+  // samples 35 pixels, and computes actual RGBA standard deviation. If the
+  // cycle manager let the screenshot through, it already confirmed the page
+  // has content. The tribunal's byte-entropy check was blocking ALL provider
+  // calls on pages with dark backgrounds, causing the bot to waste 25 seconds
+  // waiting instead of asking the AI what to do.
   //
-  // IMPORTANT: currentState is set to 'unknown', NOT 'blank_page'.
-  // The cycle manager has its own pixel-level blank detection (auth-guard)
-  // that runs BEFORE the tribunal and is far more accurate (actual RGBA
-  // std deviation vs raw JPEG byte entropy). If the cycle manager let
-  // the screenshot through, it already confirmed the page is NOT blank.
-  // The tribunal's byte-entropy heuristic can false-positive on compressed
-  // JPEGs of dark/low-contrast pages. Setting 'blank_page' here would
-  // trigger destructive escalation (navigate away, restart browser, self-heal)
-  // on a page that actually has content.
-  if (base64Image && typeof base64Image === 'string' && isBlankImage(base64Image)) {
-    log('Tribunal: screenshot appears blank (byte-entropy) — skipping providers, returning wait. NOTE: cycle manager already verified page has content — this is likely a compressed-JPEG false positive.', 'WARN', 'tribunal');
-    return { actionType: 'wait', currentState: 'unknown', reasoning: 'Tribunal could not parse screenshot (possible compression artifact) — waiting for next cycle', targetX: 0, targetY: 0 };
-  }
+  // The pixel check (auth-guard) takes priority over byte entropy. If the
+  // pixel check says NOT blank, we trust it and proceed to providers.
+  // (isBlankImage code is kept above for reference but no longer called.)
 
   const base = _getProvidersBase();
   const { getSystemPrompt, getUserInstruction } = _getPrompts();
