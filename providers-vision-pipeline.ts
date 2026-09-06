@@ -29,12 +29,17 @@ function _injectDependencies(deps: Record<string, any>) {
   _deps = deps;
 }
 
-function getCONFIG(): any { return _deps.config || {}; }
+function getCONFIG(): any {
+  if (_deps.config) return _deps.config;
+  try { return require('./get-config'); } catch { return {}; }
+}
 function getLog(): (msg: string, level?: string, _module?: string) => void {
-  return _deps.logger?.log || console.log;
+  if (_deps.logger?.log) return _deps.logger.log;
+  try { return require('./logger').log; } catch { return console.log; }
 }
 function getLogError(): (msg: string, err: Error, ctx?: any) => void {
-  return _deps.logger?.logError || ((msg: string, err: Error) => console.error(msg, err));
+  if (_deps.logger?.logError) return _deps.logger.logError;
+  try { return require('./logger').logError; } catch { return (msg: string, err: Error) => console.error(msg, err); }
 }
 
 let localVLM: any = null;
