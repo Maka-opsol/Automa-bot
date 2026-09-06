@@ -114,10 +114,9 @@ const MODE_THRESHOLDS = {
     warningStreak: 2,
   },
   memory_protection: {
-    // BUG FIX (2026-09-06): Reduced from 280/320 to 180/200 to match the new
-    // --max-old-space-size=256 (was 384). 200MB hard gives ~50MB headroom.
-    warnHeapMB: 180,
-    restartHeapMB: 200,
+    // BUG FIX (2026-09-06): Set to 280/320 for 384MB V8 limit.
+    warnHeapMB: 280,
+    restartHeapMB: 320,
     rssHardLimitMB: 380,
     gcIntervalMs: 15 * 1000,     // v7: was 30s — now 15s for more aggressive GC
     monitorIntervalMs: 8 * 1000,   // v7: was 10s — now 8s for faster detection
