@@ -99,6 +99,7 @@ const STATE_ACTION_WHITELIST: Record<string, string[]> = {
     'input_password',  // Type password
     'wait',
     'navigate',
+    'reload_browser',  // Reload if stuck
   ],
   'microsoft_email_input': [
     'click',
@@ -106,6 +107,7 @@ const STATE_ACTION_WHITELIST: Record<string, string[]> = {
     'input_password',
     'wait',
     'navigate',
+    'reload_browser',
   ],
   'advlearn_login': [
     'click',
@@ -113,6 +115,12 @@ const STATE_ACTION_WHITELIST: Record<string, string[]> = {
     'input_password',
     'wait',
     'navigate',
+    'reload_browser',
+  ],
+  'captcha': [
+    'wait',            // Wait for the captcha solver to handle it
+    'reload_browser',  // Reload to get a fresh captcha if stuck
+    'click',           // Click on captcha elements if needed
   ],
   'error_screen': [
     'navigate',        // Navigate away from error
