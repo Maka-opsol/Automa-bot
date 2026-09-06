@@ -641,12 +641,8 @@ const _configStore: Record<string, any> = {
   HTTP_PROXY: env.HTTP_PROXY || null,
   HTTPS_PROXY: env.HTTPS_PROXY || null,
   NO_PROXY: env.NO_PROXY || null,
-  // BUG FIX (2026-09-06): Reduced from 1280x800 to 800x600 to halve canvas memory.
-  // Flutter Web renders to a <canvas> element — each pixel uses 4 bytes (RGBA).
-  // 1280×800 = 4MB canvas, 800×600 = 1.9MB canvas. On 256MB V8 heap, this
-  // saves ~2MB per render cycle and reduces the overall Flutter memory footprint.
-  DISPLAY_WIDTH: 800,
-  DISPLAY_HEIGHT: 600,
+  DISPLAY_WIDTH: 1280,
+  DISPLAY_HEIGHT: 800,
   COORDINATE_TOLERANCE_PX: 50,
   MAX_TOKENS: 256,
   TEMPERATURE: 0.0,
