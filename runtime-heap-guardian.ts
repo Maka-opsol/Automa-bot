@@ -1,4 +1,4 @@
-
+// Resilience R1: Pre-OOM Euthanasia — mathu-bot-resilience-worklog.md
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════
@@ -53,10 +53,11 @@ function logError(msg: string, err: Error) {
 }
 
 // ─── Fallback thresholds (used only if memory-mode unavailable) ───
-// BUG FIX (2026-09-06): Reduced from 280/320 to 180/200 to match the new
-// --max-old-space-size=256 (was 384). 200MB hard gives ~50MB headroom.
-const FALLBACK_SOFT_THRESHOLD_MB = 180;
-const FALLBACK_HARD_THRESHOLD_MB = 200;
+// BUG FIX (2026-09-06): Set to 280/320 for 384MB V8 limit. With esbuild,
+// baseline is 66MB. Flutter Web needs ~150MB. 66+150+30 = 246MB.
+// 320MB hard gives ~64MB headroom below V8's 384MB limit.
+const FALLBACK_SOFT_THRESHOLD_MB = 280;
+const FALLBACK_HARD_THRESHOLD_MB = 320;
 const CHECK_INTERVAL_MS = 5000; // every 5s for fast OOM detection
 
 // ─── State ───
