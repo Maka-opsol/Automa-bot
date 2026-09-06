@@ -1,4 +1,4 @@
-'use strict';
+ strict';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BUG FIX (2026-09-04): EARLY MEMORY GUARD — runs BEFORE any module loading.
@@ -22,13 +22,24 @@ const EARLY_OOM_CHECK_INTERVAL_MS = 2000; // every 2s — fast enough to catch b
 let _earlyOomTriggered = false;
 const _earlyOomInterval = setInterval(() => {
   try {
-    const heapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+    const mem = process.memoryUsage();
+    const heapMB = mem.heapUsed / 1024 / 1024;
+    const rssMB = mem.rss / 1024 / 1024;
+    // BUG FIX (2026-09-05): Check BOTH heap AND RSS. On Render free plan (512MB),
+    // the kernel OOM killer fires on RSS, not V8 heap. Chromium single-process
+    // uses ~100-150MB RSS on top of Node's heap. If RSS > 450MB, the kernel
+    // will SIGKILL the process before our heap guardian can react.
+    // RSS limit: 450MB (leaves 62MB for OS + other processes)
+    if (rssMB >= 450 && !_earlyOomTriggered) {
+      _earlyOomTriggered = true;
+      console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 450MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
+      clearInterval(_earlyOomInterval);
+      process.exit(137);
+    }
     if (heapMB >= EARLY_OOM_THRESHOLD_MB && !_earlyOomTriggered) {
       _earlyOomTriggered = true;
-      // Log to stderr directly — no logger dependency (logger may not be loaded yet)
       console.error(`[FATAL] [early-oom] Heap ${heapMB.toFixed(0)}MB >= ${EARLY_OOM_THRESHOLD_MB}MB threshold during boot. Exiting immediately to avoid V8 OOM crash.`);
       clearInterval(_earlyOomInterval);
-      // Exit with 137 (SIGKILL) so Render auto-restarts
       process.exit(137);
     }
   } catch { /* never let the guard crash the process */ }
@@ -186,14 +197,17 @@ for (const dir of [
 
 const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilienceSubsystems, getContainerHealth, runStartupSmokeTests } = require('./container');
 
-// BUG FIX (2026-09-04): Synchronous memory check right after container init.
-// The DI container loads 150+ .ts files via tsx — this is the heaviest
-// allocation point during boot. Check heap immediately and exit if critical,
-// before the heap guardian's interval monitor has a chance to run.
-// BUG FIX (2026-09-04, v2): Threshold raised from 200 to 300MB to match the
-// new --max-old-space-size=384 in the Dockerfile.
+// BUG FIX (2026-09-05): Synchronous memory check right after container init.
+// Checks BOTH heap AND RSS — the kernel OOM killer fires on RSS, not heap.
 {
-  const _postContainerHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+  const _mem = process.memoryUsage();
+  const _postContainerHeapMB = _mem.heapUsed / 1024 / 1024;
+  const _postContainerRSSMB = _mem.rss / 1024 / 1024;
+  if (_postContainerRSSMB >= 450) {
+    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 450MB after container init. Kernel OOM imminent. Exiting immediately.`);
+    clearInterval(_earlyOomInterval);
+    process.exit(137);
+  }
   if (_postContainerHeapMB >= 300) {
     console.error(`[FATAL] [boot-oom] Heap ${_postContainerHeapMB.toFixed(0)}MB >= 300MB after container init. Exiting immediately.`);
     clearInterval(_earlyOomInterval);
