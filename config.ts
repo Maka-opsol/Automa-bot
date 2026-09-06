@@ -447,12 +447,8 @@ const env = envalid.cleanEnv(process.env, {
   LOG_MAX_FILES: num({ default: 5 }),
   RAW_RESPONSE_TTL_MS: num({ default: 30000 }),
   LOG_ROTATE_INTERVAL: str({ default: '1d' }),
-  // BUG FIX (2026-09-06): Reduced from 10/16 hours to 0.1/0.3 hours (6-18 min).
-  // The old defaults meant the bot slept 10-16 HOURS between cycles — most of
-  // the day wasted. Now it sleeps 6-18 minutes, giving enough time for GC +
-  // browser cleanup without wasting the entire Render free tier budget.
-  SLEEP_MIN_HOURS: num({ default: 0.1 }),
-  SLEEP_MAX_HOURS: num({ default: 0.3 }),
+  SLEEP_MIN_HOURS: num({ default: 0.5 }),
+  SLEEP_MAX_HOURS: num({ default: 3 }),
   STARTUP_DELAY_MIN_MINUTES: num({ default: 15 }),
   STARTUP_DELAY_MAX_MINUTES: num({ default: 45 }),
   WARMUP_PROBABILITY: num({ default: 0.3 }),
