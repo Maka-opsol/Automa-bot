@@ -31,9 +31,20 @@ const { sleep } = require('./utils-sleep');
 let _deps: Record<string, any> = {};
 
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
-function getCONFIG(): any { return _deps.config || {}; }
-function log(msg: string, level?: string, mod?: string) { _deps.logger?.log?.(msg, level, mod) ?? console.log(msg); }
-function logError(msg: string, err: Error, ctx?: any) { _deps.logger?.logError?.(msg, err, ctx) ?? console.error(msg, err); }
+function getCONFIG(): any {
+  if (_deps.config) return _deps.config;
+  try { return require('./get-config'); } catch { return {}; }
+}
+function log(msg: string, level?: string, mod?: string) {
+  if (_deps.logger?.log) { _deps.logger.log(msg, level, mod); return; }
+  try { require('./logger').log(msg, level, mod); return; } catch {}
+  console.log(msg);
+}
+function logError(msg: string, err: Error, ctx?: any) {
+  if (_deps.logger?.logError) { _deps.logger.logError(msg, err, ctx); return; }
+  try { require('./logger').logError(msg, err, ctx); return; } catch {}
+  console.error(msg, err);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -564,12 +575,15 @@ async function executeAction(page: any, action: any) {
 async function _executeActionInner(page: any, action: any) {
   const CONFIG = getCONFIG();
   const wm = _waitMultiplier(CONFIG);
-  const browser = _deps.browser || {};
-  const providersBase = _deps.providersBase || {};
-  const gestures = _deps.flutterGestures || {};
+  // BUG FIX (2026-09-06): Fall back to require() if DI didn't inject these deps.
+  // The action executor is loaded via require('./cycle-action-executor') and
+  // _injectDependencies may not have been called with all deps.
+  const browser = _deps.browser || (() => { try { return require('./browser'); } catch { return {}; } })();
+  const providersBase = _deps.providersBase || (() => { try { return require('./providers-base'); } catch { return {}; } })();
+  const gestures = _deps.flutterGestures || (() => { try { return require('./flutter-gesture-simulator'); } catch { return {}; } })();
   const adaptiveEngine = _deps.adaptivePerformanceEngine || null;
-  const providers = _deps.providers || {};
-  const progressTracker = _deps.progressTracker || {};
+  const providers = _deps.providers || (() => { try { return require('./providers'); } catch { return {}; } })();
+  const progressTracker = _deps.progressTracker || (() => { try { return require('./progress-tracker'); } catch { return {}; } })();
   const policyEngine = _deps.policyEngine?.policyEngine || _deps.policyEngine || {};
 
   log(`Executing: ${action.actionType} on state ${action.currentState}`, 'INFO', 'action');
