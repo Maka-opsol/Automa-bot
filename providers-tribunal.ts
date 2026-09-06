@@ -336,7 +336,7 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   // base64 strings and JSON responses. If we're already at 70%+ heap,
   // the provider call itself will push us past the hard threshold
   // and into OOM kill territory.
-  const NODE_HEAP_LIMIT_MB = 384; // BUG FIX (2026-09-04): was 256 — raised to match Dockerfile/render.yaml --max-old-space-size=384
+  const NODE_HEAP_LIMIT_MB = 256; // BUG FIX (2026-09-06): was 384 — reduced to match --max-old-space-size=256
   const PRE_CALL_SHED_THRESHOLD = NODE_HEAP_LIMIT_MB * 0.7; // 179MB
   const preCallHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
   if (preCallHeapMB > PRE_CALL_SHED_THRESHOLD) {
