@@ -450,6 +450,21 @@ async function _handleNavigateBack(ctx: ActionCtx): Promise<void> {
   await sleep(CONFIG.BETWEEN_STEPS_MS * wm);
 }
 
+// ── Reload Browser ──
+// BUG FIX (2026-09-06): New action type — lets the AI reload the current page
+// when it's stuck, shows an error, or has an unsolvable CAPTCHA.
+async function _handleReloadBrowser(ctx: ActionCtx): Promise<void> {
+  const { page, CONFIG, wm } = ctx;
+  try {
+    log('Reloading current page (AI requested reload_browser)...', 'INFO', 'action');
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+    log('Page reloaded successfully.', 'INFO', 'action');
+  } catch (e: any) {
+    log(`reload_browser failed: ${e.message}`, 'WARN', 'action');
+  }
+  await sleep(CONFIG.BETWEEN_STEPS_MS * wm);
+}
+
 // ── Select Dropdown Option ──
 async function _handleSelectOption(ctx: ActionCtx): Promise<void> {
   const { page, action, CONFIG, wm, browser } = ctx;
@@ -504,6 +519,7 @@ const ACTION_HANDLERS: Record<string, (ctx: ActionCtx) => Promise<void>> = {
   press_key:      _handlePressKey,
   // Navigation
   navigate_back:  _handleNavigateBack,
+  reload_browser: _handleReloadBrowser,
   select_option:  _handleSelectOption,
   // Timing
   wait:           _handleWait,
