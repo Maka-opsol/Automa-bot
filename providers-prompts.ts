@@ -95,12 +95,18 @@ AVAILABLE ACTIONS:
 - scroll_vertical/scroll_horizontal: Scroll the page by a fixed amount.
 - navigate_back: Go back in browser history. No coordinates needed.
 - select_option: Click dropdown at (targetX, targetY), then click the option at (targetX2, targetY2).
+- reload_browser: Reload the current page (like pressing F5). Use this when the page is stuck, shows an error, or a CAPTCHA that can't be solved. No coordinates needed.
 - wait: Wait before taking the next action.
+
+CAPTCHA DETECTION (YOU decide — do NOT assume):
+- Look at the screenshot carefully. If you see a CAPTCHA challenge (image puzzle, "Prove you're human", distorted text, checkbox "I'm not a robot", FunCaptcha, hCaptcha, etc.), set currentState to "captcha" and use the "wait" action. Do NOT try to solve the CAPTCHA yourself — the bot has a separate CAPTCHA solver. Just report it and wait.
+- If you do NOT see a CAPTCHA, do NOT report one. Many Microsoft login pages have security elements that are NOT captchas (e.g. "Stay signed in?" prompts, MFA prompts). Only report a CAPTCHA if you see an actual puzzle/challenge image.
+- If the page shows a CAPTCHA that has been there for multiple cycles (stuck), use "reload_browser" to reload the page and get a fresh CAPTCHA.
 
 Return ONLY a JSON object with:
 {
   "reasoning": "Brief explanation of what you see and why you choose this action.",
-  "currentState": "mathu_login | microsoft_email_input | assignments_page | video_player | exercise_info | exercise_memo | assessment | score_screen | pathway | error | flutter_modal | flutter_bottom_sheet | exploration",
+  "currentState": "mathu_login | microsoft_email_input | assignments_page | video_player | exercise_info | exercise_memo | assessment | score_screen | pathway | error | captcha | flutter_modal | flutter_bottom_sheet | exploration",
   "actionType": "${ACTION_TYPE_STRING}",
   "targetX": 0.5,
   "targetY": 0.5,
