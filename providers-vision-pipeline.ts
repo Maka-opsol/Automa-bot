@@ -139,8 +139,19 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
 
   const cache = _deps.cache || {};
   const browser = _deps.browser || {};
-  const providersRegistry = _deps.providerRegistry;
-  const providersBase = _deps.providersBase;
+  // BUG FIX (2026-09-06): Fall back to require() if DI didn't inject these deps.
+  // The vision pipeline is often loaded via require('./providers-vision-pipeline')
+  // directly from providers-tribunal.ts, bypassing the DI container. In that case
+  // _deps.providerRegistry and _deps.providersBase are null. Fall back to
+  // require() just like providers-tribunal.ts does with _getProvidersBase().
+  let providersRegistry = _deps.providerRegistry;
+  if (!providersRegistry) {
+    try { providersRegistry = require('./providers-registry'); } catch { providersRegistry = null; }
+  }
+  let providersBase = _deps.providersBase;
+  if (!providersBase) {
+    try { providersBase = require('./providers-base'); } catch { providersBase = null; }
+  }
   if (!providersRegistry || !providersBase) {
     log('Vision pipeline missing required deps (providerRegistry or providersBase), aborting', 'ERROR', 'vision');
     return null;
