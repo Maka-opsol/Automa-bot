@@ -48,14 +48,6 @@ RUN npx playwright install chromium
 # App code last — layers above are cached when only .ts files change
 COPY . .
 
-# BUG FIX (2026-09-04): Compile TypeScript to JavaScript at BUILD time using esbuild.
-# tsc fails with hundreds of "Cannot redeclare block-scoped variable" errors because
-# the codebase was written for tsx (each file transpiled independently). esbuild
-# transpiles each file independently like tsx does — no cross-file type checking.
-# This removes tsx from the runtime entirely — saves ~50-80MB of heap at runtime.
-# Expected baseline heap: ~180-200MB (down from ~260MB with tsx).
-RUN node build.js
-
 # Runtime directories under /tmp (ephemeral disk)
 RUN mkdir -p /tmp/mathu-logs/screenshots \
     /tmp/.browser-data \
@@ -90,9 +82,4 @@ ENV NODE_ENV=production \
 HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -sf http://localhost:10000/health || exit 1
 
-# BUG FIX (2026-09-06): Raised back from 256 to 384MB. With esbuild pre-compilation
-# (no tsx), baseline is 66MB (was ~120MB with tsx). Flutter Web loading inside
-# Chromium --single-process allocates ~150MB of V8 heap (CanvasKit WASM + Dart
-# runtime). 66MB + 150MB + 30MB Turso = 246MB → fits in 384MB with 138MB headroom.
-# The old 256MB limit was too tight — 66+150+30 = 246 > 256 → OOM every time.
-CMD ["node", "--expose-gc", "--max-old-space-size=384", "dist/render-free-plan.js"]
+CMD ["node", "--expose-gc", "--max-old-space-size=384", "--import", "tsx", "render-free-plan.ts"]
