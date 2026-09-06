@@ -1114,20 +1114,50 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     // to about:blank. If we're on about:blank, we MUST navigate — the checkpoint
     // URL is stale (the browser was killed).
     if (page.url() === 'about:blank') {
-      // BUG FIX (2026-09-04): Prefer the last-known-good URL the bot was at
-      // (from the auth-guard tracker) over a preset CONFIG.BASE_URL / APP_URL.
-      // On a fresh start the tracker is empty, so this naturally falls back
-      // to CONFIG.APP_URL via _getRecoveryUrl().
       const targetUrl = _getRecoveryUrl();
+
+      // BUG FIX (2026-09-06): Force GC + check heap BEFORE page.goto().
+      // The navigation to app.mathu.co.za + Turso cold start + Flutter canvas
+      // render all happen in a ~2 second burst, pushing heap from ~48MB to
+      // 253MB — past the 256MB V8 limit. V8's OOM killer fires faster than
+      // our 2-second early-oom interval. By forcing GC and checking heap
+      // synchronously RIGHT BEFORE navigation, we ensure there's headroom.
+      try { if (global.gc) global.gc(); } catch {}
+      const _preNavHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+      const _preNavRSSMB = process.memoryUsage().rss / 1024 / 1024;
+      log(`Pre-navigation memory check: heap=${_preNavHeapMB.toFixed(0)}MB, rss=${_preNavRSSMB.toFixed(0)}MB`, 'INFO', 'cycle');
+      if (_preNavHeapMB >= 200 || _preNavRSSMB >= 420) {
+        log(`FATAL: Memory too high before navigation (heap=${_preNavHeapMB.toFixed(0)}MB, rss=${_preNavRSSMB.toFixed(0)}MB). Exiting for clean restart.`, 'FATAL', 'cycle');
+        try { require('./survival-restart-guardian').preserveBeforeExit?.('pre_nav_oom').catch(() => {}); } catch {}
+        const origExit = (process as any)._originalExit || process.exit.bind(process);
+        origExit(137);
+      }
+
       log(`Fresh start: navigating to ${targetUrl}`, 'INFO', 'cycle');
       await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
         log(`Initial navigation failed: ${e.message || e}`, 'WARN', 'cycle');
       });
-      // v14: Use pixel-based render check instead of height heuristic.
-      // The old scrollHeight check returned true for blank canvases that
-      // had nonzero body height from the <canvas> element itself.
+
+      // BUG FIX (2026-09-06): Force GC + check heap AFTER page.goto() too.
+      // The navigation itself may have allocated a lot (DOM, JS, network
+      // responses). Force GC to reclaim what we can before the tribunal
+      // adds more allocations (screenshot, provider calls, JSON parse).
+      try { if (global.gc) global.gc(); } catch {}
+      const _postNavHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+      const _postNavRSSMB = process.memoryUsage().rss / 1024 / 1024;
+      log(`Post-navigation memory: heap=${_postNavHeapMB.toFixed(0)}MB, rss=${_postNavRSSMB.toFixed(0)}MB`, 'INFO', 'cycle');
+      if (_postNavHeapMB >= 220 || _postNavRSSMB >= 440) {
+        log(`FATAL: Memory too high after navigation (heap=${_postNavHeapMB.toFixed(0)}MB, rss=${_postNavRSSMB.toFixed(0)}MB). Exiting for clean restart.`, 'FATAL', 'cycle');
+        try { require('./survival-restart-guardian').preserveBeforeExit?.('post_nav_oom').catch(() => {}); } catch {}
+        const origExit = (process as any)._originalExit || process.exit.bind(process);
+        origExit(137);
+      }
+
       log('Fresh start: waiting for Flutter canvas to render...', 'INFO', 'cycle');
       await _waitForRenderedPage(page, 20000);
+
+      // BUG FIX (2026-09-06): Force GC after Flutter render wait too.
+      try { if (global.gc) global.gc(); } catch {}
     }
 
     let questionsCompleted = checkpoint?.questionsCompleted || 0;
