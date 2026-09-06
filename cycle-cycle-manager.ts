@@ -2378,16 +2378,12 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       if (actionSuccess) _pushActionReplay(action);
 
       // ── BUG FIX (2026-09-04): Post-action memory cleanup ──
-      // Clear the dashboard screenshot global immediately after the action
-      // executes (it was only needed for the tribunal decision, which is done).
-      // Then force a GC to reclaim the screenshot base64 string, provider
-      // response objects, and any other transient allocations from this cycle.
-      // This prevents per-cycle allocations from accumulating and pushing
-      // heap past the limit mid-session.
-      try {
-        const setShot = (globalThis as any).__setLatestScreenshot;
-        if (setShot) setShot('', null); // clear the screenshot global
-      } catch { /* non-critical */ }
+      // NOTE: Do NOT clear the screenshot global — it's needed for the dashboard.
+      // The old cleanup code did setShot('', null) which wiped the screenshot
+      // from the dashboard before it could be displayed. The screenshot is
+      // already small (~30KB at quality 15) and gets overwritten on the next
+      // cycle — no need to explicitly clear it.
+      // Force GC to reclaim transient allocations from this cycle.
       try {
         if (global.gc) {
           global.gc(); // force garbage collection after each action
