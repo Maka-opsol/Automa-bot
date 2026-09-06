@@ -1199,12 +1199,22 @@ function init(): void {
     } catch {}
 
     const persisted = persistConfig.getMode();
-    if (persisted.current === 'minimum') {
-      _applyMode('minimum', sanitizeReason(persisted.reason || 'persist_restore')).catch(() => {});
-      _log('Starting in MINIMUM mode (restored from persistent storage)', 'ERROR');
-    } else if (persisted.current === 'memory_protection') {
+    // BUG FIX (2026-09-06): Do NOT restore minimum mode from persistent storage.
+    // The old code restored 'minimum' mode if persistConfig had it — but minimum
+    // mode was being stuck because the persistent config never got cleared.
+    // Minimum mode has thresholds so low (150/170MB) that the bot can't
+    // function — it just loops "Memory CRITICAL" and closes the browser.
+    // Now: only restore 'memory_protection' from persistent storage. If the
+    // persisted mode is 'minimum', ignore it and boot in memory_protection
+    // (which has reasonable thresholds of 280/320MB).
+    if (persisted.current === 'memory_protection') {
       _applyMode('memory_protection', sanitizeReason(persisted.reason || 'persist_restore')).catch(() => {});
       _log('Restored MEMORY PROTECTION mode from persistent storage', 'INFO');
+    } else if (persisted.current === 'minimum') {
+      // Clear the stale minimum mode and boot in memory_protection instead
+      _log('Persisted MINIMUM mode detected but IGNORED (was stuck in death loop). Booting in MEMORY PROTECTION mode instead.', 'WARN');
+      try { persistConfig.setMode('memory_protection', 'stale_minimum_cleared'); } catch {}
+      _applyMode('memory_protection', 'stale_minimum_cleared').catch(() => {});
     } else if (persistConfig.wasRecentlyOOMKilled()) {
       // Check OOM kill count — if very high, go straight to minimum
       const oomCount = _getStoredOOMCount();
