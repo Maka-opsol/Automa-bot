@@ -125,8 +125,8 @@ let _zeroProgressHealTriggered = false;
 // 10 minutes was too aggressive — the bot often needs >10min to complete a
 // module (video watching alone takes 3min, plus quiz answering, plus navigation).
 // At 10min, self-heal was firing during normal operation, not just actual stalls.
-const ZERO_PROGRESS_STUCK_MS = 20 * 60 * 1000;       // 20 minutes (was 10)
-const ZERO_PROGRESS_MIN_CYCLES = 30;                  // 30 cycles × 40s = 20min (was 15)
+const ZERO_PROGRESS_STUCK_MS = 60 * 60 * 1000;       // 60 minutes (was 20)
+const ZERO_PROGRESS_MIN_CYCLES = 90;                  // 90 cycles × 40s = 60min (was 30)
 
 /* ── OOM-Surviving Cycle State Snapshot ──────────────────────────────────
  * Writes critical in-memory state to the calibration DB (Turso-synced)
