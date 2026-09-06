@@ -73,37 +73,35 @@ function _getNextAllowedStartInTimezone(): number {
     return Date.now(); // no window configured — always active
   }
 
-  // Get current SAST hour, minute, and date parts.
-  const nowParts = new Date().toLocaleString('en-US', {
-    timeZone: tz,
-    year: 'numeric', month: 'numeric', day: 'numeric',
-    hour: 'numeric', minute: 'numeric', hour12: false,
-  }).split(/[/,\s:]+/).map((s: string) => parseInt(s, 10));
-  // nowParts = [month, day, year, hour, minute] (en-US format: M/D/YYYY, h:mm)
-  // We only need hour for the window check.
   const currentHour = _getCurrentHourInTimezone();
 
   const isWrap = startH > endH;
+  // BUG FIX (2026-09-05): Changed endH check from < to <= so the end hour is
+  // INCLUSIVE. With ALLOWED_ACTIVITY_END_HOUR=23, the bot should be active
+  // DURING hour 23 (11pm), not stop at 23:00. The old < comparison meant
+  // hour 23 was excluded — the bot stopped at 23:00 and waited until 01:00.
   const inWindow = isWrap
-    ? (currentHour >= startH || currentHour < endH)
-    : (currentHour >= startH && currentHour < endH);
+    ? (currentHour >= startH || currentHour <= endH)
+    : (currentHour >= startH && currentHour <= endH);
   if (inWindow) return Date.now();
 
   // Compute how many hours until the next startH in SAST.
   let hoursUntilStart: number;
   if (isWrap) {
-    // Window is e.g. 23-5. We're currently in 5-23 (outside). Next start is at 23.
+    // Window is e.g. 23-5. We're currently in 6-22 (outside). Next start is at 23.
     hoursUntilStart = (startH - currentHour + 24) % 24;
   } else {
-    // Window is e.g. 1-23. We're currently in 23-1 (outside). Next start is at 1.
-    if (currentHour >= endH) {
+    // Window is e.g. 1-23. We're currently in 0 (midnight) or 24 (after 23).
+    // Next start is at 1am.
+    if (currentHour > endH) {
+      // After end hour (e.g. hour 0 with end=23 → wait 1 hour)
       hoursUntilStart = (startH - currentHour + 24) % 24;
     } else {
-      // currentHour < startH (shouldn't happen since we're outside window, but just in case)
+      // Before start hour (e.g. hour 0 with start=1 → wait 1 hour)
       hoursUntilStart = startH - currentHour;
     }
   }
-  if (hoursUntilStart < 0) hoursUntilStart += 24;
+  if (hoursUntilStart <= 0) hoursUntilStart += 24;
   return Date.now() + hoursUntilStart * 60 * 60 * 1000;
 }
 
@@ -172,7 +170,10 @@ async function startDaemon() {
       // BUG FIX (2026-09-04): Log the current SAST hour so the user can verify
       // the bot is correctly outside its allowed window (not just using UTC).
       const currentTzHour = _getCurrentHourInTimezone();
-      log(`Outside allowed hours (current ${tz} hour: ${currentTzHour}, window: ${CONFIG.ALLOWED_ACTIVITY_START_HOUR}-${CONFIG.ALLOWED_ACTIVITY_END_HOUR}). Waiting ${waitMin} mins until ${_nowIsoInTimezone()}...`, 'INFO', 'orchestrator');
+      // BUG FIX (2026-09-05): Pass nextStart to _nowIsoInTimezone so the log
+      // shows the FUTURE wake time, not the current time. The old code showed
+      // "Waiting 30 mins until [current time]" which was confusing.
+      log(`Outside allowed hours (current ${tz} hour: ${currentTzHour}, window: ${CONFIG.ALLOWED_ACTIVITY_START_HOUR}-${CONFIG.ALLOWED_ACTIVITY_END_HOUR}). Waiting ${waitMin} mins until ${_nowIsoInTimezone(nextStart)}...`, 'INFO', 'orchestrator');
       await sleep(waitMs);
       continue;
     }
