@@ -1153,11 +1153,29 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         origExit(137);
       }
 
-      log('Fresh start: waiting for Flutter canvas to render...', 'INFO', 'cycle');
-      await _waitForRenderedPage(page, 20000);
+      log('Fresh start: navigating (skipping Flutter render wait to save ~150MB heap)', 'INFO', 'cycle');
 
-      // BUG FIX (2026-09-06): Force GC after Flutter render wait too.
+      // BUG FIX (2026-09-06): Skip _waitForRenderedPage — it takes PNG screenshots
+      // (500KB-2MB each) in a loop AND waits for Flutter to fully render, which
+      // allocates ~150MB of V8 heap (CanvasKit WASM + Dart runtime + UI tree).
+      // On 256MB V8 heap, this pushes heap past the limit → V8 OOM crash.
+      // Instead: just wait 3 seconds for the DOM to settle, then proceed.
+      // If the page is still blank, the tribunal will see it and return a "wait"
+      // action. On the next cycle, Flutter will have rendered.
+      await new Promise(r => setTimeout(r, 3000));
+
+      // BUG FIX (2026-09-06): Force GC after the wait to reclaim any
+      // Flutter/DOM allocations before proceeding to the tribunal.
       try { if (global.gc) global.gc(); } catch {}
+      const _postRenderHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+      const _postRenderRSSMB = process.memoryUsage().rss / 1024 / 1024;
+      log(`Post-render memory: heap=${_postRenderHeapMB.toFixed(0)}MB, rss=${_postRenderRSSMB.toFixed(0)}MB`, 'INFO', 'cycle');
+      if (_postRenderHeapMB >= 220 || _postRenderRSSMB >= 440) {
+        log(`FATAL: Memory too high after render wait (heap=${_postRenderHeapMB.toFixed(0)}MB, rss=${_postRenderRSSMB.toFixed(0)}MB). Exiting for clean restart.`, 'FATAL', 'cycle');
+        try { require('./survival-restart-guardian').preserveBeforeExit?.('post_render_oom').catch(() => {}); } catch {}
+        const origExit = (process as any)._originalExit || process.exit.bind(process);
+        origExit(137);
+      }
     }
 
     let questionsCompleted = checkpoint?.questionsCompleted || 0;
