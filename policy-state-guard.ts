@@ -48,15 +48,33 @@ interface TransitionValidationResult {
 
 // ─── Allowed State Transitions ───
 // Format: fromState → Set<toState>
+// BUG FIX (2026-09-06): Updated to use the ACTUAL state names from state-machine.ts.
+// The old list used generic names (auth_page, question_page, answering) that the
+// tribunal never produces — every transition was blocked.
 const ALLOWED_TRANSITIONS: Record<string, Set<string>> = {
-  'assignments_page': new Set(['question_page', 'auth_page', 'error_screen']),
-  'question_page': new Set(['answering', 'score_screen', 'assignments_page', 'error_screen', 'auth_page']),
-  'answering': new Set(['score_screen', 'question_page', 'error_screen', 'assignments_page']),
-  'score_screen': new Set(['assignments_page', 'question_page', 'completion_screen', 'error_screen']),
-  'completion_screen': new Set(['assignments_page', 'question_page']),
-  'auth_page': new Set(['assignments_page', 'error_screen']),
-  'error_screen': new Set(['assignments_page', 'auth_page', 'question_page']),
-  'unknown': new Set(['assignments_page', 'question_page', 'auth_page', 'error_screen', 'score_screen']),
+  'mathu_login': new Set(['microsoft_email_input', 'advlearn_login', 'assignments_page', 'anywhere_click_recovery', 'error', 'unknown']),
+  'microsoft_email_input': new Set(['advlearn_login', 'assignments_page', 'anywhere_click_recovery', 'error', 'unknown']),
+  'advlearn_login': new Set(['assignments_page', 'anywhere_click_recovery', 'error', 'unknown']),
+  'assignments_page': new Set(['video_player', 'exercise_info', 'assessment', 'assignments_page', 'anywhere_click_recovery', 'error', 'ui_discovered', 'exploration', 'unknown']),
+  'video_player': new Set(['exercise_info', 'assessment', 'score_screen', 'assignments_page', 'anywhere_click_recovery', 'error', 'unknown']),
+  'exercise_info': new Set(['exercise_memo', 'assignments_page', 'anywhere_click_recovery', 'error', 'unknown']),
+  'exercise_memo': new Set(['assessment', 'assignments_page', 'score_screen', 'anywhere_click_recovery', 'error', 'unknown']),
+  'assessment': new Set(['score_screen', 'pathway', 'assessment_correction', 'assessment', 'anywhere_click_recovery', 'error', 'unknown']),
+  'score_screen': new Set(['pathway', 'assignments_page', 'anywhere_click_recovery', 'error', 'unknown']),
+  'pathway': new Set(['pathway_feedback', 'assignments_page', 'score_screen', 'anywhere_click_recovery', 'error', 'unknown']),
+  'pathway_feedback': new Set(['pathway', 'assignments_page', 'anywhere_click_recovery', 'error', 'unknown']),
+  'assessment_correction': new Set(['score_screen', 'pathway', 'assessment_correction', 'anywhere_click_recovery', 'error', 'unknown']),
+  'anywhere_click_recovery': new Set(['mathu_login', 'assignments_page', 'video_player', 'exercise_info', 'assessment', 'score_screen', 'pathway', 'error', 'unknown']),
+  'error': new Set(['mathu_login', 'assignments_page', 'error', 'anywhere_click_recovery', 'unknown']),
+  'ui_discovered': new Set(['assignments_page', 'video_player', 'error', 'unknown']),
+  'exploration': new Set(['assignments_page', 'error', 'unknown']),
+  // Legacy/generic state names (kept for backward compat — some providers may use them)
+  'auth_page': new Set(['assignments_page', 'mathu_login', 'microsoft_email_input', 'error', 'unknown']),
+  'question_page': new Set(['assessment', 'score_screen', 'assignments_page', 'error', 'unknown']),
+  'answering': new Set(['score_screen', 'question_page', 'error', 'assignments_page', 'unknown']),
+  'completion_screen': new Set(['assignments_page', 'question_page', 'unknown']),
+  // Unknown is the catch-all — allow transition to anything
+  'unknown': new Set(['mathu_login', 'microsoft_email_input', 'advlearn_login', 'assignments_page', 'video_player', 'exercise_info', 'exercise_memo', 'assessment', 'score_screen', 'pathway', 'pathway_feedback', 'assessment_correction', 'anywhere_click_recovery', 'error', 'ui_discovered', 'exploration', 'auth_page', 'question_page', 'unknown']),
 };
 
 // ─── State ───
