@@ -173,6 +173,23 @@ function validateTransition(
 ): TransitionValidationResult {
   _totalTransitions++;
 
+  // BUG FIX (2026-09-06): If toState is a URL (starts with http), skip validation.
+  // The cycle-manager sometimes passes the current URL as the "state" to
+  // validateTransition(). URLs are not state names — validate them via the
+  // URL domain check below instead.
+  if (toState && (toState.startsWith('http://') || toState.startsWith('https://'))) {
+    // It's a URL, not a state name. Check the domain instead.
+    if (url && !_isMathUDomain(url)) {
+      _totalBlocked++;
+      _lastBlockedTransition = { from: fromState, to: toState, reason: `External domain: ${_getDomain(url)}` };
+      log(`[STATE-GUARD] Transition blocked: navigating to external domain "${_getDomain(url)}"`, 'WARN');
+      return { allowed: false, reason: _lastBlockedTransition.reason };
+    }
+    // URL is on a known domain — allow it
+    _currentState = fromState; // don't update state for URL transitions
+    return { allowed: true, reason: null };
+  }
+
   // Update current state tracking
   _currentState = toState;
 
