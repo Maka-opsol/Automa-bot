@@ -93,6 +93,27 @@ const STATE_ACTION_WHITELIST: Record<string, string[]> = {
     'wait',
     'navigate',
   ],
+  'mathu_login': [
+    'click',           // Click "Sign in with Microsoft"
+    'input_email',     // Type email
+    'input_password',  // Type password
+    'wait',
+    'navigate',
+  ],
+  'microsoft_email_input': [
+    'click',
+    'input_email',
+    'input_password',
+    'wait',
+    'navigate',
+  ],
+  'advlearn_login': [
+    'click',
+    'input_email',
+    'input_password',
+    'wait',
+    'navigate',
+  ],
   'error_screen': [
     'navigate',        // Navigate away from error
     'wait',
