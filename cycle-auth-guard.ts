@@ -732,7 +732,19 @@ async function ensureAuthenticated(page: any) {
   }
 
   // Unknown URL (not Microsoft, not app origin, not /assignments).
-  // Return the page as-is and let the tribunal figure it out.
+  // BUG FIX (2026-09-06): If on about:blank, navigate to APP_URL instead of
+  // returning a blank page to the tribunal. The tribunal can't do anything
+  // with a blank page — it just returns error/wait, which loops forever.
+  if (url === 'about:blank') {
+    const recoveryUrl = CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za';
+    log(`On about:blank — navigating to ${recoveryUrl} (instead of returning blank page to tribunal)`, 'INFO', 'auth-guard');
+    try {
+      await page.goto(recoveryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (e: any) {
+      log(`Navigation to ${recoveryUrl} failed: ${e.message}`, 'WARN', 'auth-guard');
+    }
+    return page;
+  }
   log(`On unknown URL — returning page to tribunal for visual handling (no URL change). url=${url}`, 'INFO', 'auth-guard');
   return page;
 }
