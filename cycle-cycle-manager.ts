@@ -1515,7 +1515,13 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           // First blank: fall through to normal blank-page guard below
         }
       } // end if (isBlank) — v14: now wraps verification + escalation ladder
-      if (handleCaptcha) await handleCaptcha(page);
+      // BUG FIX (2026-09-06): Removed handleCaptcha call. The old code called
+      // auth.detectCaptcha(page) on EVERY cycle, which matched on any Microsoft
+      // login URL (via canHandle) and logged "CAPTCHA detected" every ~5 seconds
+      // even when there was no actual captcha. The tribunal (AI) can see the
+      // screenshot and decide whether there's a captcha — no need for selector-based
+      // detection that fires on every cycle.
+      // if (handleCaptcha) await handleCaptcha(page);
       // Resilience: CAPTCHA loop detection
       authCaptchaLoopGuard?.recordCaptcha?.();
       if (authCaptchaLoopGuard?.isCaptchaLooping?.()) {
