@@ -1126,7 +1126,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const _preNavHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
       const _preNavRSSMB = process.memoryUsage().rss / 1024 / 1024;
       log(`Pre-navigation memory check: heap=${_preNavHeapMB.toFixed(0)}MB, rss=${_preNavRSSMB.toFixed(0)}MB`, 'INFO', 'cycle');
-      if (_preNavHeapMB >= 200 || _preNavRSSMB >= 420) {
+      // BUG FIX (2026-09-06): Higher thresholds for 384MB V8 limit.
+      // Flutter Web loads ~150MB into the shared V8 heap (Chromium --single-process).
+      // 66MB baseline + 150MB Flutter = 216MB. Allow up to 300MB heap / 430MB RSS
+      // before bailing — gives 84MB headroom below V8's 384MB limit.
+      if (_preNavHeapMB >= 300 || _preNavRSSMB >= 430) {
         log(`FATAL: Memory too high before navigation (heap=${_preNavHeapMB.toFixed(0)}MB, rss=${_preNavRSSMB.toFixed(0)}MB). Exiting for clean restart.`, 'FATAL', 'cycle');
         try { require('./survival-restart-guardian').preserveBeforeExit?.('pre_nav_oom').catch(() => {}); } catch {}
         const origExit = (process as any)._originalExit || process.exit.bind(process);
@@ -1146,7 +1150,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const _postNavHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
       const _postNavRSSMB = process.memoryUsage().rss / 1024 / 1024;
       log(`Post-navigation memory: heap=${_postNavHeapMB.toFixed(0)}MB, rss=${_postNavRSSMB.toFixed(0)}MB`, 'INFO', 'cycle');
-      if (_postNavHeapMB >= 220 || _postNavRSSMB >= 440) {
+      if (_postNavHeapMB >= 320 || _postNavRSSMB >= 440) {
         log(`FATAL: Memory too high after navigation (heap=${_postNavHeapMB.toFixed(0)}MB, rss=${_postNavRSSMB.toFixed(0)}MB). Exiting for clean restart.`, 'FATAL', 'cycle');
         try { require('./survival-restart-guardian').preserveBeforeExit?.('post_nav_oom').catch(() => {}); } catch {}
         const origExit = (process as any)._originalExit || process.exit.bind(process);
@@ -1170,7 +1174,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const _postRenderHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
       const _postRenderRSSMB = process.memoryUsage().rss / 1024 / 1024;
       log(`Post-render memory: heap=${_postRenderHeapMB.toFixed(0)}MB, rss=${_postRenderRSSMB.toFixed(0)}MB`, 'INFO', 'cycle');
-      if (_postRenderHeapMB >= 220 || _postRenderRSSMB >= 440) {
+      if (_postRenderHeapMB >= 330 || _postRenderRSSMB >= 450) {
         log(`FATAL: Memory too high after render wait (heap=${_postRenderHeapMB.toFixed(0)}MB, rss=${_postRenderRSSMB.toFixed(0)}MB). Exiting for clean restart.`, 'FATAL', 'cycle');
         try { require('./survival-restart-guardian').preserveBeforeExit?.('post_render_oom').catch(() => {}); } catch {}
         const origExit = (process as any)._originalExit || process.exit.bind(process);
