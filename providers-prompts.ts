@@ -103,6 +103,13 @@ CAPTCHA DETECTION (YOU decide — do NOT assume):
 - If you do NOT see a CAPTCHA, do NOT report one. Many Microsoft login pages have security elements that are NOT captchas (e.g. "Stay signed in?" prompts, MFA prompts). Only report a CAPTCHA if you see an actual puzzle/challenge image.
 - If the page shows a CAPTCHA that has been there for multiple cycles (stuck), use "reload_browser" to reload the page and get a fresh CAPTCHA.
 
+FLUTTER WEB PREFERENCES (when logged into MathU — NOT on login/Microsoft pages):
+- The MathU app is built with Flutter Web. Flutter UI elements respond better to "flutter_tap" than "click".
+- When you are on the assignments_page, video_player, exercise_info, exercise_memo, assessment, score_screen, or pathway states (i.e. logged in and using the app), prefer using "flutter_tap" instead of "click" for all button presses, card taps, and element interactions.
+- On the login page (mathu_login, microsoft_email_input) and Microsoft pages, use "click" — flutter_tap may not work correctly on non-Flutter pages.
+- For scrolling on Flutter pages, prefer "flutter_swipe" over "scroll_vertical" — Flutter gesture recognition is more reliable with swipe.
+- For the download button double-tap mentioned above, use "double_click" (not flutter_tap) since the download button is an HTML element overlaid on the Flutter canvas.
+
 Return ONLY a JSON object with:
 {
   "reasoning": "Brief explanation of what you see and why you choose this action.",
@@ -135,6 +142,7 @@ Consider:
 MODULE DOWNLOAD AND NAVIGATION (CRITICAL — modules do NOT load automatically):
 - Modules on the assignments page are NOT pre-loaded. You MUST click the dark blue download arrow button on a module card BEFORE you can do anything with that module's content.
 - Do NOT expect module content to appear automatically — the module will sit at 0% with a download button until you explicitly click the download button.
+- IMPORTANT: When clicking the download button, use "double_click" (not "click"). The download button sometimes does not register a single click — a double tap ensures it registers.
 - After clicking download: WAIT for the progress bar to reach 100% and the download button to be replaced by Watch/Start buttons. Only then click Watch or Start on the first topic.
 - If you see a progress bar at 0% with no Watch/Start buttons visible, the module has NOT been downloaded yet — look for a download arrow button on the card and click it.
 - If you see a list of topics (videos, exercises, assessments) under a module header, work through them in order: watch videos first, then start exercises, then take assessments.
