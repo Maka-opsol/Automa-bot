@@ -77,15 +77,33 @@ async function _fetchProxyScrapeProxies(): Promise<string[]> {
       return [];
     }
 
-    // Extract proxy URLs, filter to alive ones only
-    const proxies: string[] = [];
+    // Extract alive proxies with their city for sorting
+    const aliveProxies: Array<{ url: string; city: string }> = [];
     for (const p of data.proxies) {
       if (p.alive && p.proxy) {
-        proxies.push(p.proxy);
+        const city = (p.ip_data?.city || '').toLowerCase();
+        aliveProxies.push({ url: p.proxy, city });
       }
     }
 
-    log(`[IP] ProxyScrape returned ${data.proxies.length} proxies, ${proxies.length} alive`, 'INFO');
+    // Sort: Johannesburg first, then other Gauteng cities, then everything else
+    const gautengCities = ['johannesburg', 'pretoria', 'centurion', 'midrand', 'sandton', 'randburg', 'roodepoort', 'germiston', 'kempton park', 'boksburg', 'springs', 'benoni', 'brakpan', 'vanderbijlpark', 'vereeniging', 'krugersdorp', 'soweto'];
+    aliveProxies.sort((a, b) => {
+      const aJoburg = a.city === 'johannesburg';
+      const bJoburg = b.city === 'johannesburg';
+      if (aJoburg && !bJoburg) return -1;
+      if (!aJoburg && bJoburg) return 1;
+      const aGauteng = gautengCities.includes(a.city);
+      const bGauteng = gautengCities.includes(b.city);
+      if (aGauteng && !bGauteng) return -1;
+      if (!aGauteng && bGauteng) return 1;
+      return 0;
+    });
+
+    const proxies = aliveProxies.map(p => p.url);
+    const joburgCount = aliveProxies.filter(p => p.city === 'johannesburg').length;
+    const gautengCount = aliveProxies.filter(p => gautengCities.includes(p.city)).length;
+    log(`[IP] ProxyScrape returned ${data.proxies.length} proxies, ${proxies.length} alive (${joburgCount} Johannesburg, ${gautengCount} Gauteng, ${proxies.length - gautengCount} other)`, 'INFO');
     return proxies;
   } catch (err) {
     log(`[IP] ProxyScrape API fetch failed: ${(err as Error).message}`, 'WARN');
@@ -284,10 +302,24 @@ async function start(): Promise<void> {
   if (_started) return;
   _started = true;
 
+  // Load proxies FIRST (before checking IP)
   await _loadProxyUrls();
+
+  // If we have proxies, activate the first one immediately (before IP check)
+  // so the IP check goes through the proxy
+  if (_proxyUrls.length > 0) {
+    _currentProxyIndex = 0;
+    const firstProxy = _proxyUrls[0];
+    process.env.HTTP_PROXY = firstProxy;
+    process.env.HTTPS_PROXY = firstProxy;
+    log(`[IP] Activated proxy before IP check: ${firstProxy}`, 'INFO');
+  } else {
+    log('[IP] No proxies available — using direct connection', 'WARN');
+  }
+
   log('[IP] IP rotator started', 'INFO');
 
-  // Check IP on startup
+  // Check IP (will go through the proxy if one is active)
   await checkIp();
 
   // Set up periodic proxy list refresh (every 10 min)
