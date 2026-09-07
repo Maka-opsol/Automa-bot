@@ -731,6 +731,27 @@ async function ensureAuthenticated(page: any) {
     return page;
   }
 
+  // BUG FIX (2026-09-07): Handle Chrome error pages (chrome-error://chromewebdata/).
+  // These appear when page.goto() fails (network timeout, DNS error, proxy failure).
+  // The page shows a blank Chrome error page — navigating to APP_URL recovers.
+  if (url.includes('chrome-error://') || url.includes('chromewebdata')) {
+    const recoveryUrl = CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za';
+    log(`On Chrome error page (${url}) — navigating to ${recoveryUrl} (network/proxy error recovery)`, 'WARN', 'auth-guard');
+    try {
+      await page.goto(recoveryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (e: any) {
+      log(`Recovery navigation to ${recoveryUrl} also failed: ${e.message}`, 'ERROR', 'auth-guard');
+      // If we can't navigate, close and relaunch the browser
+      try {
+        const browser = _deps.browser || {};
+        await browser.closeBrowser?.();
+        await new Promise(r => setTimeout(r, 2000));
+        await browser.launchBrowser?.();
+      } catch {}
+    }
+    return page;
+  }
+
   // Unknown URL (not Microsoft, not app origin, not /assignments).
   // BUG FIX (2026-09-06): If on about:blank, navigate to APP_URL instead of
   // returning a blank page to the tribunal. The tribunal can't do anything
