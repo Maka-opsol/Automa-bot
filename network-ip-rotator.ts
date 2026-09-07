@@ -2,29 +2,20 @@
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════
-// network-ip-rotator.ts — P3 IP Rotation Awareness
+// network-ip-rotator.ts — ProxyScrape Integration + IP Rotation
 // ═══════════════════════════════════════════════════════════════
-// On Render free plan, the server IP is fixed but may be blocked
-// by provider APIs. This module checks the current IP on startup,
-// tracks changes across restarts, and supports proxy rotation
-// when available.
+// Fetches South African proxies from ProxyScrape API on startup,
+// rotates through them when the current IP is blocked or when
+// manual rotation is requested.
 //
-// Features:
-//   1. Check current IP on startup via ipify.org
-//   2. Store IP in DB for comparison across restarts
-//   3. If 403 from 3+ providers simultaneously → assume IP blocked
-//   4. Configurable proxy list (PROXY_URLS env var)
-//   5. Rotate to next proxy on IP block detection
+// ProxyScrape API:
+//   https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies
+//   &proxy_format=protocolipport&format=json&protocol=http,socks4,socks5&country=za
 //
 // Integration:
 //   - container-subsystem-runner.ts calls checkIp() at startup
 //   - providers-base.ts reports 403s for IP block detection
-//   - providers-base.ts uses getCurrentProxy() for fetch wrapper
-//
-// Config:
-//   PROXY_URLS — comma-separated list of proxy URLs (optional)
-//   IP_CHECK_URL — IP check endpoint (default https://api.ipify.org)
-//   IP_BLOCK_THRESHOLD — 403s before IP block declared (default 3)
+//   - browser.ts uses getCurrentProxy() for Chrome --proxy-server flag
 // ═══════════════════════════════════════════════════════════════
 
 let _deps: Record<string, any> = {};
@@ -48,6 +39,8 @@ function log(msg: string, level: string = 'INFO', mod: string = 'ip-rotator') {
 // ─── Constants ───
 const DEFAULT_IP_CHECK_URL = 'https://api.ipify.org?format=json';
 const DEFAULT_IP_BLOCK_THRESHOLD = 3;
+const PROXYSCRAPE_API_URL = 'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&protocol=http%2Csocks4%2Csocks5&country=za';
+const PROXY_REFRESH_INTERVAL_MS = 10 * 60 * 1000; // refresh proxy list every 10 min
 
 // ─── State ───
 let _currentIp: string | null = null;
@@ -58,26 +51,69 @@ let _consecutive403s = 0;
 let _isIpBlocked = false;
 let _ipChecked = false;
 let _started = false;
+let _proxyRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
-// ─── Helpers ───
+// ─── ProxyScrape Integration ───
 
-function _getIpCheckUrl(): string {
-  const CONFIG = getCONFIG();
-  return String(CONFIG.IP_CHECK_URL || DEFAULT_IP_CHECK_URL);
+/**
+ * Fetch South African proxies from ProxyScrape API.
+ * Returns an array of proxy URLs like ["socks4://105.214.0.91:5678", "http://102.68.98.94:3128"].
+ */
+async function _fetchProxyScrapeProxies(): Promise<string[]> {
+  try {
+    log('[IP] Fetching ZA proxies from ProxyScrape API...', 'INFO');
+    const response = await fetch(PROXYSCRAPE_API_URL, {
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!response.ok) {
+      log(`[IP] ProxyScrape API returned HTTP ${response.status}`, 'WARN');
+      return [];
+    }
+
+    const data = await response.json();
+    if (!data?.proxies || !Array.isArray(data.proxies)) {
+      log('[IP] ProxyScrape API returned no proxies array', 'WARN');
+      return [];
+    }
+
+    // Extract proxy URLs, filter to alive ones only
+    const proxies: string[] = [];
+    for (const p of data.proxies) {
+      if (p.alive && p.proxy) {
+        proxies.push(p.proxy);
+      }
+    }
+
+    log(`[IP] ProxyScrape returned ${data.proxies.length} proxies, ${proxies.length} alive`, 'INFO');
+    return proxies;
+  } catch (err) {
+    log(`[IP] ProxyScrape API fetch failed: ${(err as Error).message}`, 'WARN');
+    return [];
+  }
 }
 
-function _getIpBlockThreshold(): number {
-  const CONFIG = getCONFIG();
-  const val = Number(CONFIG.IP_BLOCK_THRESHOLD);
-  return (val > 0 && Number.isFinite(val)) ? val : DEFAULT_IP_BLOCK_THRESHOLD;
-}
-
-function _loadProxyUrls(): void {
+/**
+ * Load proxies from ProxyScrape API + PROXY_URLS env var.
+ */
+async function _loadProxyUrls(): Promise<void> {
+  // First, check for manual PROXY_URLS env var (static list)
   const CONFIG = getCONFIG();
   const proxyEnv = String(CONFIG.PROXY_URLS || process.env.PROXY_URLS || '');
   if (proxyEnv.trim()) {
     _proxyUrls = proxyEnv.split(',').map(u => u.trim()).filter(u => u.length > 0);
-    log(`[IP] Loaded ${_proxyUrls.length} proxy URLs`, 'INFO');
+    log(`[IP] Loaded ${_proxyUrls.length} proxy URLs from PROXY_URLS env var`, 'INFO');
+    return;
+  }
+
+  // Otherwise, fetch from ProxyScrape API
+  const scrapeProxies = await _fetchProxyScrapeProxies();
+  if (scrapeProxies.length > 0) {
+    _proxyUrls = scrapeProxies;
+    log(`[IP] Loaded ${_proxyUrls.length} ZA proxies from ProxyScrape`, 'INFO');
+  } else {
+    _proxyUrls = [];
+    log('[IP] No proxies available (ProxyScrape returned empty)', 'WARN');
   }
 }
 
@@ -89,9 +125,11 @@ function _loadProxyUrls(): void {
  */
 async function checkIp(): Promise<string | null> {
   try {
-    const response = await fetch(_getIpCheckUrl(), {
-      signal: AbortSignal.timeout(10000),
-    });
+    // If we have a proxy active, check IP through the proxy
+    const proxy = getCurrentProxy();
+    const fetchOptions: any = { signal: AbortSignal.timeout(10000) };
+
+    const response = await fetch(_getIpCheckUrl(), fetchOptions);
 
     if (!response.ok) {
       log(`[IP] IP check failed: HTTP ${response.status}`, 'WARN');
@@ -114,30 +152,10 @@ async function checkIp(): Promise<string | null> {
       }
     } catch { /* non-critical */ }
 
-    // Check for IP change
     if (_previousIp && _previousIp !== ip) {
-      log(
-        `[IP] IP changed: ${_previousIp} → ${ip}. Verifying provider API keys...`,
-        'WARN'
-      );
-      // IP change doesn't require action on Render (fixed IP),
-      // but log it for debugging
+      log(`[IP] IP changed: ${_previousIp} → ${ip}`, 'WARN');
     } else {
-      log(`[IP] Current IP: ${ip}`, 'INFO');
-    }
-
-    // Load previous IP from DB for comparison
-    if (!_previousIp) {
-      try {
-        const db = (_deps as any).database;
-        if (db?.selectCalibration) {
-          const savedIp = db.selectCalibration('server_ip');
-          if (savedIp && savedIp !== ip) {
-            _previousIp = savedIp;
-            log(`[IP] Previous IP from DB: ${savedIp}`, 'INFO');
-          }
-        }
-      } catch { /* non-critical */ }
+      log(`[IP] Current IP: ${ip}${proxy ? ' (via proxy ' + proxy + ')' : ''}`, 'INFO');
     }
 
     return ip;
@@ -145,6 +163,17 @@ async function checkIp(): Promise<string | null> {
     log(`[IP] IP check failed: ${(err as Error).message}`, 'WARN');
     return _currentIp;
   }
+}
+
+function _getIpCheckUrl(): string {
+  const CONFIG = getCONFIG();
+  return String(CONFIG.IP_CHECK_URL || DEFAULT_IP_CHECK_URL);
+}
+
+function _getIpBlockThreshold(): number {
+  const CONFIG = getCONFIG();
+  const val = Number(CONFIG.IP_BLOCK_THRESHOLD);
+  return (val > 0 && Number.isFinite(val)) ? val : DEFAULT_IP_BLOCK_THRESHOLD;
 }
 
 /**
@@ -163,16 +192,10 @@ function report403(providerName: string): void {
   }
 }
 
-/**
- * Reset 403 counter (called on any successful provider call).
- */
 function reset403Count(): void {
   _consecutive403s = 0;
 }
 
-/**
- * Declare IP blocked and attempt proxy rotation.
- */
 function _declareIpBlocked(): void {
   _isIpBlocked = true;
 
@@ -199,42 +222,29 @@ function _declareIpBlocked(): void {
       alerting.sendAlert(
         'IP Blocked',
         `Server IP ${_currentIp || 'unknown'} has been blocked by ${_consecutive403s} providers. ` +
-        `No proxy URLs available. Consider: ` +
-        `1. Adding PROXY_URLS env var ` +
-        `2. Waiting for IP block to expire ` +
-        `3. Restarting service`
+        `No proxies available. ProxyScrape may be down or returned empty list.`
       );
     }
   } catch { /* non-critical */ }
 }
 
-/**
- * Rotate to the next proxy in the list.
- */
 function _rotateProxy(): string | null {
   if (_proxyUrls.length === 0) return null;
 
   _currentProxyIndex = (_currentProxyIndex + 1) % _proxyUrls.length;
-  return _proxyUrls[_currentProxyIndex];
+  const proxy = _proxyUrls[_currentProxyIndex];
+  log(`[IP] Rotated to proxy ${_currentProxyIndex + 1}/${_proxyUrls.length}: ${proxy}`, 'INFO');
+  return proxy;
 }
 
-/**
- * Get the current proxy URL (or null if using direct connection).
- */
 function getCurrentProxy(): string | null {
   return _currentProxyIndex >= 0 ? _proxyUrls[_currentProxyIndex] : null;
 }
 
-/**
- * Check if IP is currently blocked.
- */
 function isIpBlocked(): boolean {
   return _isIpBlocked;
 }
 
-/**
- * Manually unblock IP (e.g., after adding new proxy).
- */
 function unblockIp(): void {
   _isIpBlocked = false;
   _consecutive403s = 0;
@@ -242,20 +252,16 @@ function unblockIp(): void {
 }
 
 /**
+ * Manually rotate to the next proxy.
+ */
+function rotateProxy(): string | null {
+  return _rotateProxy();
+}
+
+/**
  * Get diagnostic status.
  */
-function getStatus(): {
-  currentIp: string | null;
-  previousIp: string | null;
-  ipChanged: boolean;
-  proxyCount: number;
-  currentProxyIndex: number;
-  currentProxy: string | null;
-  consecutive403s: number;
-  ipBlockThreshold: number;
-  isIpBlocked: boolean;
-  ipChecked: boolean;
-} {
+function getStatus(): Record<string, any> {
   return {
     currentIp: _currentIp,
     previousIp: _previousIp,
@@ -267,6 +273,7 @@ function getStatus(): {
     ipBlockThreshold: _getIpBlockThreshold(),
     isIpBlocked: _isIpBlocked,
     ipChecked: _ipChecked,
+    proxySource: _proxyUrls.length > 0 ? 'proxyscrape' : 'none',
   };
 }
 
@@ -277,11 +284,26 @@ async function start(): Promise<void> {
   if (_started) return;
   _started = true;
 
-  _loadProxyUrls();
+  await _loadProxyUrls();
   log('[IP] IP rotator started', 'INFO');
 
   // Check IP on startup
   await checkIp();
+
+  // Set up periodic proxy list refresh (every 10 min)
+  _proxyRefreshTimer = setInterval(async () => {
+    try {
+      log('[IP] Refreshing proxy list from ProxyScrape...', 'DEBUG');
+      const oldCount = _proxyUrls.length;
+      await _loadProxyUrls();
+      if (_proxyUrls.length !== oldCount) {
+        log(`[IP] Proxy list refreshed: ${oldCount} → ${_proxyUrls.length} proxies`, 'INFO');
+      }
+    } catch { /* non-critical */ }
+  }, PROXY_REFRESH_INTERVAL_MS);
+  if (_proxyRefreshTimer && typeof (_proxyRefreshTimer as any).unref === 'function') {
+    (_proxyRefreshTimer as any).unref();
+  }
 }
 
 module.exports = {
@@ -292,6 +314,7 @@ module.exports = {
   getCurrentProxy,
   isIpBlocked,
   unblockIp,
+  rotateProxy,
   getStatus,
   start,
 };
