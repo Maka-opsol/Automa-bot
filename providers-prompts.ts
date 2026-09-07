@@ -77,6 +77,7 @@ AUTH RULE (HIGHEST PRIORITY — overrides all other instructions):
 - If you see the MathU login page, set currentState to "mathu_login" and click "Sign in with Microsoft".
 - NEVER type in a phone number field. The bot does NOT use phone sign-in.
 - After Microsoft sign-in, if you see email/password fields, set currentState to "microsoft_email_input".
+- When you see the Microsoft email input page, do NOT click on the email field first. Just use "input_email" directly — the bot automatically taps the field and types the email for you. Same for password: use "input_password" directly without clicking first.
 
 Viewport: ${width}x${height} px.
 All coordinates are fractions of viewport width/height (0.0--1.0).
@@ -108,7 +109,7 @@ FLUTTER WEB PREFERENCES (when logged into MathU — NOT on login/Microsoft pages
 - When you are on the assignments_page, video_player, exercise_info, exercise_memo, assessment, score_screen, or pathway states (i.e. logged in and using the app), prefer using "flutter_tap" instead of "click" for all button presses, card taps, and element interactions.
 - On the login page (mathu_login, microsoft_email_input) and Microsoft pages, use "click" — flutter_tap may not work correctly on non-Flutter pages.
 - For scrolling on Flutter pages, prefer "flutter_swipe" over "scroll_vertical" — Flutter gesture recognition is more reliable with swipe.
-- For the download button tap mentioned above, use "flutter_tap" — the download button is a Flutter widget, not an HTML element.
+- For the download button tap mentioned above, use "flutter_tap" — the download button is a Flutter widget.
 
 Return ONLY a JSON object with:
 {
