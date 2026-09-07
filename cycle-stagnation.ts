@@ -45,6 +45,20 @@ async function recoverIfStuck(page: any, screenshotBuffer: any, action: any) {
     if (allSame && lastActions[0] !== 'wait') {
       log(`⚠️ Repeated action ${lastActions[0]} ${CONFIG.MAX_CONSECUTIVE_SAME_ACTION} times -- attempting recovery.`, 'WARN', 'stagnation');
       if (CONFIG.ALERT_ON_STAGNATION) try { getSendAlert()(`Repeated action ${lastActions[0]} ${CONFIG.MAX_CONSECUTIVE_SAME_ACTION} times`); } catch (e: any) {}
+
+      // BUG FIX (2026-09-07): If a proxy is active and actions are repeating,
+      // the proxy may be silently dropping the bot's actions (clicks, taps not
+      // registering). Disable the proxy so the browser uses a direct connection.
+      try {
+        const ipRotator = require('./network-ip-rotator');
+        const currentProxy = ipRotator.getCurrentProxy?.();
+        if (currentProxy && !(globalThis as any).__proxyDisabled) {
+          (globalThis as any).__proxyDisabled = true;
+          log(`Proxy was active (${currentProxy}) when actions stopped working — DISABLING PROXY (actions may not be registering through proxy). Browser will relaunch with direct connection.`, 'ERROR', 'stagnation');
+          try { getSendAlert()('Proxy disabled: repeated actions not working. Switching to direct connection.'); } catch {}
+        }
+      } catch {}
+
       const vp = getPageViewport(page);
       const x = Math.floor(Math.random() * (vp ? vp.width : CONFIG.DISPLAY_WIDTH));
       const y = Math.floor(Math.random() * (vp ? vp.height : CONFIG.DISPLAY_HEIGHT));
