@@ -232,10 +232,16 @@ class BrowserManager {
   getFullLaunchOptions() { 
     const CONFIG = getCONFIG();
     let flags = getChromeFlags({ isReplit: CONFIG.REPLIT_VM, verbose: true });
-    if (CONFIG.HTTP_PROXY || CONFIG.HTTPS_PROXY) { addProxyFlags(flags, { http: CONFIG.HTTP_PROXY, https: CONFIG.HTTPS_PROXY }); }
+    // BUG FIX (2026-09-07): Don't add --proxy-server flag at launch level.
+    // Instead, use Playwright's per-context proxy via newContext({ proxy: ... }).
+    // The old approach (--proxy-server in Chrome flags) caused chrome-error://chromewebdata/ loops
+    // when the proxy was slow or required authentication.
+    // We DO still set proxy at launch level as 'per-context' so the browser
+    // knows to expect per-context proxy config.
     addWindowSizeFlags(flags, CONFIG.DISPLAY_WIDTH, CONFIG.DISPLAY_HEIGHT);
-    const options = { headless: !!getCONFIG().HEADLESS, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 60000 };
-// @ts-expect-error
+    const options: any = { headless: !!getCONFIG().HEADLESS, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 60000 };
+    // Tell Chromium to expect per-context proxies (avoids chromewebdata loop)
+    options.proxy = { server: 'per-context' };
     if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
     return options;
   }
@@ -244,9 +250,8 @@ class BrowserManager {
     const CONFIG = getCONFIG();
     // NOTE: --disable-gpu removed — breaks Flutter CanvasKit WebGL rendering
     const flags = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-extensions', '--disable-background-networking', `--window-size=${CONFIG.DISPLAY_WIDTH},${CONFIG.DISPLAY_HEIGHT}`];
-    if (CONFIG.HTTPS_PROXY) { flags.push(`--proxy-server=${CONFIG.HTTPS_PROXY}`); }
-    const options = { headless: true, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000 };
-// @ts-expect-error
+    // BUG FIX (2026-09-07): Use per-context proxy instead of --proxy-server flag.
+    const options: any = { headless: true, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000, proxy: { server: 'per-context' } };
     if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
     return options;
   }
@@ -274,8 +279,31 @@ class BrowserManager {
     if (!this.browserInstance) throw new Error('Browser instance not available');
     const loadSession = getLoadSession();
     const sessionData = loadSession();
-    const contextOptions = await getRealisticBrowserContext();
+    const contextOptions: any = await getRealisticBrowserContext();
     if (sessionData) { contextOptions.storageState = sessionData; }
+    // BUG FIX (2026-09-07): Pass proxy at the context level, not the launch level.
+    // The browser was launched with proxy: { server: 'per-context' } which tells
+    // Chromium to expect per-context proxy config. Now we pass the actual proxy
+    // to the context. This prevents chrome-error://chromewebdata/ loops that
+    // occurred when --proxy-server was set at launch level but the proxy was
+    // slow or required authentication.
+    try {
+      const ipRotator = require('./network-ip-rotator');
+      const currentProxy = ipRotator.getCurrentProxy?.();
+      if (currentProxy) {
+        // Parse the proxy URL. Playwright accepts:
+        //   { server: 'http://host:port' } for HTTP proxies
+        //   { server: 'socks5://host:port' } for SOCKS proxies
+        //   { server, username, password } for authenticated proxies
+        // The proxy URL from ProxyScrape is like 'socks4://105.214.0.91:5678' or 'http://102.68.98.94:3128'
+        contextOptions.proxy = { server: currentProxy };
+        log(`Context proxy set to: ${currentProxy}`, 'INFO', 'browser');
+      } else {
+        log('No proxy available — using direct connection', 'DEBUG', 'browser');
+      }
+    } catch (e: any) {
+      log(`Failed to get proxy for context: ${e.message}`, 'WARN', 'browser');
+    }
     this.contextInstance = await Promise.race([
       this.browserInstance.newContext(contextOptions),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Context creation timeout')), getCONFIG().BROWSER_CONTEXT_TIMEOUT_MS || 30000))
