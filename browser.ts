@@ -232,12 +232,9 @@ class BrowserManager {
   getFullLaunchOptions() { 
     const CONFIG = getCONFIG();
     let flags = getChromeFlags({ isReplit: CONFIG.REPLIT_VM, verbose: true });
-    // BUG FIX (2026-09-07): Don't add --proxy-server flag at launch level.
-    // Instead, use Playwright's per-context proxy via newContext({ proxy: ... }).
-    // The old approach (--proxy-server in Chrome flags) caused chrome-error://chromewebdata/ loops
-    // when the proxy was slow or required authentication.
-    // We DO still set proxy at launch level as 'per-context' so the browser
-    // knows to expect per-context proxy config.
+    // BUG FIX (2026-09-07): Force HTTP/1.1 to avoid proxy HTTP/2 incompatibility.
+    // Some proxies can't handle multiplexed HTTP/2 traffic, causing silent drops.
+    flags.push('--disable-http2');
     addWindowSizeFlags(flags, CONFIG.DISPLAY_WIDTH, CONFIG.DISPLAY_HEIGHT);
     const options: any = { headless: !!getCONFIG().HEADLESS, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 60000 };
     // Tell Chromium to expect per-context proxies (avoids chromewebdata loop)
@@ -248,9 +245,7 @@ class BrowserManager {
 
   getReducedLaunchOptions() { 
     const CONFIG = getCONFIG();
-    // NOTE: --disable-gpu removed — breaks Flutter CanvasKit WebGL rendering
-    const flags = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-extensions', '--disable-background-networking', `--window-size=${CONFIG.DISPLAY_WIDTH},${CONFIG.DISPLAY_HEIGHT}`];
-    // BUG FIX (2026-09-07): Use per-context proxy instead of --proxy-server flag.
+    const flags = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-extensions', '--disable-background-networking', '--disable-http2', `--window-size=${CONFIG.DISPLAY_WIDTH},${CONFIG.DISPLAY_HEIGHT}`];
     const options: any = { headless: true, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000, proxy: { server: 'per-context' } };
     if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
     return options;
@@ -258,9 +253,7 @@ class BrowserManager {
 
   getMinimalLaunchOptions() { 
     const CONFIG = getCONFIG();
-    // NOTE: --disable-gpu removed — breaks Flutter CanvasKit WebGL rendering
-    const options = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-zygote', '--single-process'], timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 30000 };
-// @ts-expect-error
+    const options: any = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-zygote', '--single-process', '--disable-http2'], timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 30000, proxy: { server: 'per-context' } };
     if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
     return options;
   }
@@ -282,22 +275,38 @@ class BrowserManager {
     const contextOptions: any = await getRealisticBrowserContext();
     if (sessionData) { contextOptions.storageState = sessionData; }
     // BUG FIX (2026-09-07): Pass proxy at the context level, not the launch level.
-    // The browser was launched with proxy: { server: 'per-context' } which tells
-    // Chromium to expect per-context proxy config. Now we pass the actual proxy
-    // to the context. This prevents chrome-error://chromewebdata/ loops that
-    // occurred when --proxy-server was set at launch level but the proxy was
-    // slow or required authentication.
+    // Also implement auto-disable: if the browser has had proxy issues (chrome-error,
+    // repeated blank pages, navigation timeouts), disable the proxy for this context
+    // to allow the bot to continue working without the proxy.
     try {
       const ipRotator = require('./network-ip-rotator');
       const currentProxy = ipRotator.getCurrentProxy?.();
-      if (currentProxy) {
-        // Parse the proxy URL. Playwright accepts:
-        //   { server: 'http://host:port' } for HTTP proxies
-        //   { server: 'socks5://host:port' } for SOCKS proxies
-        //   { server, username, password } for authenticated proxies
-        // The proxy URL from ProxyScrape is like 'socks4://105.214.0.91:5678' or 'http://102.68.98.94:3128'
-        contextOptions.proxy = { server: currentProxy };
-        log(`Context proxy set to: ${currentProxy}`, 'INFO', 'browser');
+
+      // Check if proxies have been disabled due to errors
+      const _proxyDisabled = (globalThis as any).__proxyDisabled || false;
+
+      if (currentProxy && !_proxyDisabled) {
+        // Parse the proxy URL to separate credentials (if any) from the server URL.
+        // Playwright requires credentials as separate username/password properties,
+        // not inline in the URL string.
+        try {
+          const proxyUrl = new URL(currentProxy);
+          const proxyConfig: any = { server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyUrl.port}` };
+          if (proxyUrl.username) {
+            proxyConfig.username = decodeURIComponent(proxyUrl.username);
+          }
+          if (proxyUrl.password) {
+            proxyConfig.password = decodeURIComponent(proxyUrl.password);
+          }
+          contextOptions.proxy = proxyConfig;
+          log(`Context proxy set to: ${proxyConfig.server}${proxyConfig.username ? ' (with auth)' : ''}`, 'INFO', 'browser');
+        } catch {
+          // If URL parsing fails, pass the raw proxy string
+          contextOptions.proxy = { server: currentProxy };
+          log(`Context proxy set to (raw): ${currentProxy}`, 'INFO', 'browser');
+        }
+      } else if (_proxyDisabled) {
+        log('Proxy DISABLED (auto-recovery from proxy errors) — using direct connection', 'WARN', 'browser');
       } else {
         log('No proxy available — using direct connection', 'DEBUG', 'browser');
       }
