@@ -1183,6 +1183,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     let currentState = checkpoint?.state || null;
     let stuckCounter = 0;
     const MAX_STUCK = 10;
+    let _appErrorCount = 0; // BUG FIX (2026-09-07): Track consecutive app_error states for browser relaunch
     let consecutiveTribunalFailures = 0;
     let unknownStateCounter = 0; // Counts consecutive 'unknown' currentState results
     const MAX_UNKNOWN_STATE = 3; // After this many unknowns, force recovery
@@ -2281,9 +2282,35 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // messages on screen. These are app-level errors that require a page
       // reload — not clicks or self-heal. The app itself typically says
       // "close the app and open it again", which means reload.
+      // BUG FIX (2026-09-07): If app_error appears 3+ times, relaunch the
+      // entire browser — the page is stuck in a broken state that reload
+      // can't fix.
       if (action.currentState === 'app_error') {
+        _appErrorCount++;
+        log(`App error detected by tribunal (#${_appErrorCount}): ${action.reasoning || 'error dialog visible'}.`, 'WARN', 'cycle');
+
+        if (_appErrorCount >= 3) {
+          log(`App error appeared ${_appErrorCount} times — relaunching entire browser.`, 'ERROR', 'cycle');
+          _appErrorCount = 0;
+          try {
+            if (typeof closeBrowser === 'function') await closeBrowser();
+            _networkSetup = false;
+            page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+            if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
+              await network.setupInterception(page);
+              _networkSetup = true;
+            }
+            if (CONFIG.FLUTTER_DPR_AUTO_CALIBRATE && dpr) { await dpr.calibrate(page); }
+          } catch (relaunchErr: any) {
+            log(`Browser relaunch failed: ${relaunchErr.message}`, 'ERROR', 'cycle');
+          }
+          lastScreenshotChangeTime = Date.now();
+          lastProgressTime = Date.now();
+          continue;
+        }
+
         const targetUrl = _getRecoveryUrl();
-        log(`App error detected by tribunal: ${action.reasoning || 'error dialog visible'}. Reloading to recover.`, 'WARN', 'cycle');
+        log(`Reloading to recover from app error.`, 'WARN', 'cycle');
         if (targetUrl) {
           try {
             await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
@@ -2295,7 +2322,6 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             log(`App error recovery failed: ${navErr.message || navErr}`, 'WARN', 'cycle');
           }
         } else {
-          // No URL configured — try a simple reload
           try {
             await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
             await new Promise(r => setTimeout(r, 8000));
@@ -2303,7 +2329,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           } catch {}
         }
         lastScreenshotChangeTime = Date.now();
-        lastProgressTime = Date.now(); // Reset progress timer — error recovery is progress
+        lastProgressTime = Date.now();
         continue;
       }
 
@@ -3012,6 +3038,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
 
       currentState = action.currentState;
+
+      // BUG FIX (2026-09-07): Reset app_error counter when a non-error state is detected
+      if (action.currentState !== 'app_error' && action.currentState !== 'error') {
+        _appErrorCount = 0;
+      }
 
       // BUG FIX (2026-09-06): Record CAPTCHA only when the AI (tribunal) actually
       // reports seeing a captcha — not on every cycle. The AI sets currentState
