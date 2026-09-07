@@ -635,6 +635,9 @@ async function ensureAuthenticated(page: any) {
   }
 
   if (onMicrosoftLogin) {
+    // BUG FIX (2026-09-07): Reset chrome-error counter when we successfully
+    // reach a Microsoft login page — the proxy is working.
+    (globalThis as any).__chromeErrorCount = 0;
     if (isLoginInProgress()) {
       log(`Login flow in progress — Microsoft login URL is expected destination. Returning page to tribunal. url=${url}`, 'INFO', 'auth-guard');
       // DO NOT clear the flag here — the login is NOT complete.
@@ -669,6 +672,9 @@ async function ensureAuthenticated(page: any) {
   // checking page content. If valid, return the page. If invalid, fall through
   // to the re-auth flow (which also does NOT change the URL anymore).
   if (_isOnKnownAppOrigin(url)) {
+    // BUG FIX (2026-09-07): Reset chrome-error counter when we successfully
+    // reach the app — the proxy (or direct connection) is working.
+    (globalThis as any).__chromeErrorCount = 0;
     const valid = await _isSpaSessionValid(page);
     if (valid) {
       authAttempts = 0;
@@ -734,9 +740,22 @@ async function ensureAuthenticated(page: any) {
   // BUG FIX (2026-09-07): Handle Chrome error pages (chrome-error://chromewebdata/).
   // These appear when page.goto() fails (network timeout, DNS error, proxy failure).
   // The page shows a blank Chrome error page — navigating to APP_URL recovers.
+  // If this happens repeatedly, disable the proxy entirely (it's causing more
+  // harm than good).
   if (url.includes('chrome-error://') || url.includes('chromewebdata')) {
+    // Track consecutive chrome-error occurrences
+    const errorCount = ((globalThis as any).__chromeErrorCount || 0) + 1;
+    (globalThis as any).__chromeErrorCount = errorCount;
+
+    if (errorCount >= 3) {
+      // 3+ chrome-error pages = proxy is broken. Disable it.
+      (globalThis as any).__proxyDisabled = true;
+      log(`Chrome error page detected ${errorCount} times — DISABLING PROXY (auto-recovery). Browser will use direct connection.`, 'ERROR', 'auth-guard');
+      try { (_deps.alerting?.sendAlert || (() => {}))('Proxy disabled due to repeated chrome-error pages. Using direct connection.'); } catch {}
+    }
+
     const recoveryUrl = CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za';
-    log(`On Chrome error page (${url}) — navigating to ${recoveryUrl} (network/proxy error recovery)`, 'WARN', 'auth-guard');
+    log(`On Chrome error page (${url}, occurrence #${errorCount}) — navigating to ${recoveryUrl} (network/proxy error recovery)`, 'WARN', 'auth-guard');
     try {
       await page.goto(recoveryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (e: any) {
