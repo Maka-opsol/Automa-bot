@@ -108,7 +108,7 @@ FLUTTER WEB PREFERENCES (when logged into MathU — NOT on login/Microsoft pages
 - When you are on the assignments_page, video_player, exercise_info, exercise_memo, assessment, score_screen, or pathway states (i.e. logged in and using the app), prefer using "flutter_tap" instead of "click" for all button presses, card taps, and element interactions.
 - On the login page (mathu_login, microsoft_email_input) and Microsoft pages, use "click" — flutter_tap may not work correctly on non-Flutter pages.
 - For scrolling on Flutter pages, prefer "flutter_swipe" over "scroll_vertical" — Flutter gesture recognition is more reliable with swipe.
-- For the download button double-tap mentioned above, use "double_click" (not flutter_tap) since the download button is an HTML element overlaid on the Flutter canvas.
+- For the download button tap mentioned above, use "flutter_tap" — the download button is a Flutter widget, not an HTML element.
 
 Return ONLY a JSON object with:
 {
@@ -142,7 +142,7 @@ Consider:
 MODULE DOWNLOAD AND NAVIGATION (CRITICAL — modules do NOT load automatically):
 - Modules on the assignments page are NOT pre-loaded. You MUST click the dark blue download arrow button on a module card BEFORE you can do anything with that module's content.
 - Do NOT expect module content to appear automatically — the module will sit at 0% with a download button until you explicitly click the download button.
-- IMPORTANT: When clicking the download button, use "double_click" (not "click"). The download button sometimes does not register a single click — a double tap ensures it registers.
+- IMPORTANT: When clicking the download button, use "flutter_tap" (not "click"). The download button is a Flutter widget and responds better to flutter_tap than a regular click.
 - After clicking download: WAIT for the progress bar to reach 100% and the download button to be replaced by Watch/Start buttons. Only then click Watch or Start on the first topic.
 - If you see a progress bar at 0% with no Watch/Start buttons visible, the module has NOT been downloaded yet — look for a download arrow button on the card and click it.
 - If you see a list of topics (videos, exercises, assessments) under a module header, work through them in order: watch videos first, then start exercises, then take assessments.
