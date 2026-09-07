@@ -52,86 +52,65 @@ interface Action {
 }
 
 // ─── State Action Whitelist ───
+// BUG FIX (2026-09-06): Added flutter_tap, flutter_swipe, and double_click to
+// ALL states so the AI can use Flutter actions on any page without being blocked.
 const STATE_ACTION_WHITELIST: Record<string, string[]> = {
   'assignments_page': [
-    'click',           // Click on assignment/module
-    'scroll_vertical', // Scroll through assignments
-    'scroll_horizontal',
-    'wait',            // Wait for page load
-    'navigate',        // Navigate to specific assignment
+    'click', 'flutter_tap', 'double_click',
+    'scroll_vertical', 'scroll_horizontal', 'flutter_swipe',
+    'wait', 'navigate', 'reload_browser',
   ],
   'question_page': [
-    'click',           // Click on answer option
-    'input_keypad',    // Type answer via keypad
-    'flutter_swipe',   // Swipe on mobile Flutter UI
-    'wait',            // Wait for rendering
-    'scroll_vertical',
-    'scroll_horizontal',
-    'screenshot',      // Take screenshot for analysis
+    'click', 'flutter_tap', 'double_click',
+    'input_keypad', 'flutter_swipe',
+    'wait', 'scroll_vertical', 'scroll_horizontal',
+    'screenshot',
   ],
   'answering': [
-    'click',
-    'input_keypad',
-    'flutter_swipe',
-    'wait',
-    'screenshot',
+    'click', 'flutter_tap', 'double_click',
+    'input_keypad', 'flutter_swipe',
+    'wait', 'screenshot',
   ],
   'score_screen': [
-    'click',           // Click "Next" or "Continue"
-    'scroll_vertical',
-    'wait',
-    'navigate',        // Navigate back to assignments
+    'click', 'flutter_tap', 'double_click',
+    'scroll_vertical', 'flutter_swipe',
+    'wait', 'navigate', 'reload_browser',
   ],
   'completion_screen': [
-    'click',
-    'navigate',
-    'wait',
+    'click', 'flutter_tap', 'double_click',
+    'navigate', 'wait',
   ],
   'auth_page': [
-    'input_keypad',
-    'click',
-    'wait',
-    'navigate',
+    'click', 'flutter_tap', 'double_click',
+    'input_keypad', 'wait', 'navigate', 'reload_browser',
   ],
   'mathu_login': [
-    'click',           // Click "Sign in with Microsoft"
-    'input_email',     // Type email
-    'input_password',  // Type password
-    'wait',
-    'navigate',
-    'reload_browser',  // Reload if stuck
+    'click', 'flutter_tap', 'double_click',
+    'input_email', 'input_password',
+    'wait', 'navigate', 'reload_browser',
   ],
   'microsoft_email_input': [
-    'click',
-    'input_email',
-    'input_password',
-    'wait',
-    'navigate',
-    'reload_browser',
+    'click', 'flutter_tap', 'double_click',
+    'input_email', 'input_password',
+    'wait', 'navigate', 'reload_browser',
   ],
   'advlearn_login': [
-    'click',
-    'input_email',
-    'input_password',
-    'wait',
-    'navigate',
-    'reload_browser',
+    'click', 'flutter_tap', 'double_click',
+    'input_email', 'input_password',
+    'wait', 'navigate', 'reload_browser',
   ],
   'captcha': [
-    'wait',            // Wait for the captcha solver to handle it
-    'reload_browser',  // Reload to get a fresh captcha if stuck
-    'click',           // Click on captcha elements if needed
+    'wait', 'reload_browser',
+    'click', 'flutter_tap',
   ],
   'error_screen': [
-    'navigate',        // Navigate away from error
-    'wait',
-    'click',           // Dismiss error dialogs
+    'navigate', 'wait', 'reload_browser',
+    'click', 'flutter_tap',
   ],
   'unknown': [
-    // Minimal actions for unknown states
-    'screenshot',
-    'wait',
-    'navigate',
+    'click', 'flutter_tap', 'double_click',
+    'flutter_swipe', 'scroll_vertical', 'scroll_horizontal',
+    'screenshot', 'wait', 'navigate', 'reload_browser',
   ],
 };
 
@@ -239,4 +218,3 @@ module.exports = {
   getAllowedActions,
   setAllowedActions,
   getStatus,
-};
