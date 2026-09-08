@@ -630,6 +630,16 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     authWrap(() => {
       const mem = process.memoryUsage();
       const stats = getProviderStats();
+      // Task 29 (2026-09-08): Surface proxy outcome + network errors in dashboard.
+      // The cycle manager records these via globals set by render-free-plan.ts.
+      const latestProxyOutcome = (() => { const g = (globalThis as any).__getLatestProxyOutcome; return typeof g === 'function' ? g() : null; })();
+      const latestNetworkError = (() => { const g = (globalThis as any).__getLatestNetworkError; return typeof g === 'function' ? g() : null; })();
+      const ipRotatorStatus = (() => {
+        try {
+          const ip = require('./network-ip-rotator');
+          return ip.getStatus ? ip.getStatus() : {};
+        } catch { return {}; }
+      })();
       const health = {
         status: 'healthy',
         timestamp: new Date().toISOString(),
@@ -648,6 +658,17 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
         database: (() => { const s = getDatabaseStats(); return s ? s() : {}; })(),
         cache: (() => { const s = getCacheStats(); return s ? s() : {}; })(),
         failsafe: (() => { const d = getFailsafeDiagnostics(); return d ? d() : {}; })(),
+        // New: proxy + network diagnostics
+        proxy: {
+          disabled: !!(globalThis as any).__proxyDisabled,
+          currentProxy: ipRotatorStatus?.currentProxy || null,
+          proxyCount: ipRotatorStatus?.proxyCount || 0,
+          consecutive403s: ipRotatorStatus?.consecutive403s || 0,
+          isIpBlocked: ipRotatorStatus?.isIpBlocked || false,
+          latestOutcome: latestProxyOutcome,
+          networkError: latestNetworkError,
+          networkErrorCount: ipRotatorStatus?.networkErrorCount || 0,
+        },
       };
       jsonRes(res, health);
     });
