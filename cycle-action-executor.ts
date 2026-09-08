@@ -119,6 +119,83 @@ async function _typeText(page: any, text: string, config: any): Promise<void> {
   }
 }
 
+/**
+ * Focus a form field robustly, handling Microsoft login's `lightbox-cover`
+ * overlay that intercepts pointer events during page transitions.
+ *
+ * Microsoft's login page periodically shows `<div class="lightbox-cover">`
+ * (used for gray-out progress) on top of the email/password input. Playwright's
+ * default `.click()` waits for visible+enabled+stable AND checks for intercepting
+ * elements — so it hangs for 30s and times out, instead of just clicking through.
+ *
+ * Strategy (in order, fail fast at each step):
+ *   1. `fill(value)` — Playwright's native method, sets value directly without
+ *      needing a real click. Bypasses interception entirely. If this succeeds,
+ *      the value is already set — caller should NOT call keyboard.type again.
+ *   2. `click({ force: true })` — bypass the interception check. Use after
+ *      `fill()` fails (e.g. field is a custom Flutter web component).
+ *      Caller should still call keyboard.type to enter the value.
+ *   3. JS `focus()` via evaluate — directly set focus on the element.
+ *      Caller should still call keyboard.type to enter the value.
+ *
+ * Returns:
+ *   'filled'  — fill() succeeded, value is set, do NOT type again.
+ *   'focused' — focus succeeded via click or JS, caller should type the value.
+ *   'failed'  — all strategies failed, but caller can still attempt keyboard.type
+ *               on whatever element has focus (e.g. after flutterTap).
+ */
+async function _focusFieldRobust(
+  page: any,
+  selector: string,
+  value: string,
+  logPrefix = 'field'
+): Promise<'filled' | 'focused' | 'failed'> {
+  // Strategy 1: page.fill() — most reliable, bypasses interception
+  try {
+    await page.fill(selector, value, { timeout: 5000 });
+    log(`${logPrefix}: fill() succeeded`, 'DEBUG', 'action');
+    return 'filled';
+  } catch (fillErr: any) {
+    log(`${logPrefix}: fill() failed: ${fillErr?.message || fillErr}`, 'DEBUG', 'action');
+  }
+
+  // Strategy 2: locator click with force=true (bypass interception)
+  try {
+    const loc = page.locator(selector).first();
+    if (await loc.count() > 0) {
+      await loc.click({ force: true, timeout: 5000 });
+      log(`${logPrefix}: click({force}) succeeded`, 'DEBUG', 'action');
+      return 'focused';
+    }
+  } catch (clickErr: any) {
+    log(`${logPrefix}: click({force}) failed: ${clickErr?.message || clickErr}`, 'DEBUG', 'action');
+  }
+
+  // Strategy 3: JS focus via evaluate
+  try {
+    const focused = await page.evaluate((sel: string) => {
+      const el = document.querySelector(sel) as HTMLInputElement | null;
+      if (el) {
+        el.focus();
+        el.click?.();
+        return true;
+      }
+      return false;
+    }, selector);
+    if (focused) {
+      log(`${logPrefix}: JS focus() fallback used`, 'DEBUG', 'action');
+      return 'focused';
+    }
+  } catch (evalErr: any) {
+    log(`${logPrefix}: JS focus() failed: ${evalErr?.message || evalErr}`, 'WARN', 'action');
+  }
+
+  // All strategies failed — but we should still attempt keyboard typing,
+  // because the prior flutterTap may have already focused the field.
+  log(`${logPrefix}: all focus strategies failed, will attempt keyboard.type on whatever has focus`, 'WARN', 'action');
+  return 'failed';
+}
+
 /** Press a key or key combination. Handles modifier keys correctly. */
 async function _pressKey(page: any, key: string): Promise<void> {
   // Support compound keys like "Control+a", "Shift+Tab", "Meta+Enter"
@@ -342,15 +419,36 @@ async function _handleInputEmail(ctx: ActionCtx): Promise<void> {
     return;
   }
   const { x, y } = ctx.toAbsolute(action.targetX, action.targetY);
+  // Keep the flutterTap — the user explicitly asked AI to use flutter_tap on
+  // all pages, including Microsoft login. The tap may also dismiss the
+  // `lightbox-cover` overlay if it's currently intercepting clicks.
   await browser.flutterTap?.(page, x, y);
   await sleep(PRE_TYPE_DELAY_MS);
-  // Try to focus the email field via locator
-  try {
-    const emailLocator = page.locator('input[type="email"], input[name*="email" i], [role="textbox"][aria-label*="email" i]');
-    if (await emailLocator.count() > 0) { await emailLocator.first().click(); }
-  } catch (e: any) { log(`Locator for email field failed: ${e.message}`, 'WARN', 'action'); }
-  await _selectAllText(page);
-  await _typeText(page, CONFIG.getMicrosoftEmail?.() || '', CONFIG);
+
+  const emailVal = CONFIG.getMicrosoftEmail?.() || '';
+  if (!emailVal) {
+    log('input_email: no email configured — skipping', 'WARN', 'action');
+    return;
+  }
+
+  // BUG FIX (2026-09-08): Use robust focus that bypasses `lightbox-cover`
+  // interception. The old `locator.click()` waited 30s for visible+enabled+stable
+  // AND checked for intercepting elements — Microsoft login's lightbox-cover
+  // overlay caused every click to time out.
+  const EMAIL_SELECTOR = 'input[type="email"], input[name*="email" i], [role="textbox"][aria-label*="email" i]';
+  const focusResult = await _focusFieldRobust(page, EMAIL_SELECTOR, emailVal, 'input_email');
+
+  // If fill() already set the value, skip keyboard typing.
+  // Otherwise (focused or failed), use keyboard.type to enter the value.
+  if (focusResult !== 'filled') {
+    if (focusResult === 'focused') {
+      // Field is focused but empty — select all (in case there's a placeholder
+      // or stale value) then type.
+      await _selectAllText(page);
+    }
+    await _typeText(page, emailVal, CONFIG);
+  }
+
   try { await page.keyboard.press('Enter'); } catch { /* best effort */ }
   await sleep(CONFIG.POST_CLICK_MS * wm);
 }
@@ -365,12 +463,24 @@ async function _handleInputPassword(ctx: ActionCtx): Promise<void> {
   const { x, y } = ctx.toAbsolute(action.targetX, action.targetY);
   await browser.flutterTap?.(page, x, y);
   await sleep(PRE_TYPE_DELAY_MS);
-  try {
-    const passLocator = page.locator('input[type="password"], input[name*="password" i], [role="textbox"][aria-label*="password" i]');
-    if (await passLocator.count() > 0) { await passLocator.first().click(); }
-  } catch (e: any) { log(`Locator for password field failed: ${e.message}`, 'WARN', 'action'); }
-  await _selectAllText(page);
-  await _typeText(page, CONFIG.getMicrosoftPassword?.() || '', CONFIG);
+
+  const passVal = CONFIG.getMicrosoftPassword?.() || '';
+  if (!passVal) {
+    log('input_password: no password configured — skipping', 'WARN', 'action');
+    return;
+  }
+
+  // BUG FIX (2026-09-08): Same lightbox-cover interception issue as email.
+  const PASS_SELECTOR = 'input[type="password"], input[name*="password" i], [role="textbox"][aria-label*="password" i]';
+  const focusResult = await _focusFieldRobust(page, PASS_SELECTOR, passVal, 'input_password');
+
+  if (focusResult !== 'filled') {
+    if (focusResult === 'focused') {
+      await _selectAllText(page);
+    }
+    await _typeText(page, passVal, CONFIG);
+  }
+
   try { await page.keyboard.press('Enter'); } catch { /* best effort */ }
   await sleep(CONFIG.POST_CLICK_MS * wm);
 }
