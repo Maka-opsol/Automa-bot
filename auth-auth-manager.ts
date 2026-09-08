@@ -220,7 +220,7 @@ class AuthManager {
       const hasCaptchaService = (CONFIG.ENABLE_PUZZLE_SANDBOX && this.puzzleSolver) || CONFIG.CAPTCHA_SERVICE !== 'none';
       if (!hasCaptchaService) return false;
       try {
-        const screenshot = await page.screenshot({ type: 'jpeg' });
+        const screenshot = await page.screenshot({ type: 'jpeg', timeout: 15000, animations: 'disabled' });
         const base64 = screenshot.toString('base64');
         if (CONFIG.ENABLE_PUZZLE_SANDBOX && this.puzzleSolver) {
           log('Using puzzle sandbox for interactive CAPTCHA', 'INFO', 'auth');
