@@ -471,7 +471,7 @@ async function investigatePage() {
     try { await (_deps.auth?.authenticate || (() => {}))(page); } catch {}
     await page.goto(config.APP_URL + '/assignments', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(5000);
-    const screenshot = await page.screenshot({ type: 'jpeg', quality: 30 });
+    const screenshot = await page.screenshot({ type: 'jpeg', quality: 30, timeout: 15000, animations: 'disabled' });
     const base64 = screenshot.toString('base64');
     const html = await page.content();
 
