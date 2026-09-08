@@ -235,8 +235,21 @@ class BrowserManager {
     // BUG FIX (2026-09-07): Force HTTP/1.1 to avoid proxy HTTP/2 incompatibility.
     // Some proxies can't handle multiplexed HTTP/2 traffic, causing silent drops.
     flags.push('--disable-http2');
-    addWindowSizeFlags(flags, CONFIG.DISPLAY_WIDTH, CONFIG.DISPLAY_HEIGHT);
-    const options: any = { headless: !!getCONFIG().HEADLESS, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 60000 };
+    // BUG FIX (2026-09-08): Provide explicit fallbacks for DISPLAY_WIDTH/HEIGHT
+    // at the call site (defense-in-depth — addWindowSizeFlags also validates,
+    // but if browser-chrome-flags.ts is an older version, this protects us).
+    const _w = Number(CONFIG.DISPLAY_WIDTH) || 1280;
+    const _h = Number(CONFIG.DISPLAY_HEIGHT) || 800;
+    addWindowSizeFlags(flags, _w, _h);
+    // BUG FIX (2026-09-08): headless MUST default to true.
+    // The old code `!!getCONFIG().HEADLESS` evaluates to `false` when CONFIG is
+    // empty (during cold start or after self-heal rollback), which causes
+    // Playwright to launch a HEADED browser. On a headless server (no X server),
+    // this fails with "Missing X server or $DISPLAY" + "The platform failed to
+    // initialize. Exiting." — the bot then cascades to reduced/minimal strategies
+    // unnecessarily. Default to headless: true unless explicitly disabled.
+    const _headless = getCONFIG().HEADLESS === false ? false : true;
+    const options: any = { headless: _headless, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 60000 };
     // Tell Chromium to expect per-context proxies (avoids chromewebdata loop)
     options.proxy = { server: 'per-context' };
     if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
