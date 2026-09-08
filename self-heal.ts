@@ -469,7 +469,29 @@ async function investigatePage() {
 
     // If auth module is available, try to authenticate
     try { await (_deps.auth?.authenticate || (() => {}))(page); } catch {}
-    await page.goto(config.APP_URL + '/assignments', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    // BUG FIX (2026-09-08): Normalize APP_URL to avoid double-slash.
+    // `config.APP_URL` defaults to `https://app.mathu.co.za/` (with trailing slash),
+    // so `APP_URL + '/assignments'` produces `https://app.mathu.co.za//assignments`
+    // (double slash) — some servers / CDNs return ERR_EMPTY_RESPONSE on this.
+    const _appUrl = String(config.APP_URL || 'https://app.mathu.co.za').replace(/\/+$/, '');
+    const _investigateUrl = `${_appUrl}/assignments`;
+    try {
+      await page.goto(_investigateUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (navErr: any) {
+      const _msg = String(navErr?.message || navErr);
+      log(`Investigation navigation to ${_investigateUrl} failed: ${_msg.substring(0, 200)}`, 'WARN', 'self-heal');
+      // Record the network error for dashboard
+      try {
+        const ipRotator = require('./network-ip-rotator');
+        if (typeof ipRotator.recordNetworkError === 'function') {
+          ipRotator.recordNetworkError(navErr, { url: _investigateUrl });
+        }
+      } catch { /* ip-rotator not loaded */ }
+      // ERR_EMPTY_RESPONSE / ERR_CONNECTION_CLOSED / chrome-error = the page is unreachable.
+      // This is a NETWORK failure, not a code bug — rethrow so the self-heal
+      // caller can decide whether to retry (it has its own backoff + max attempts).
+      throw navErr;
+    }
     await sleep(5000);
     const screenshot = await page.screenshot({ type: 'jpeg', quality: 30, timeout: 15000, animations: 'disabled' });
     const base64 = screenshot.toString('base64');
