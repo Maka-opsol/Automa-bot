@@ -126,9 +126,12 @@ let _initialized = false;
 
 function getTimeSignal(): ShiftName {
   const CONFIG = getCONFIG();
-  const tz = process.env.TZ || 'Africa/Johannesburg';
-  const productiveStart = Number(CONFIG.ALLOWED_ACTIVITY_START_HOUR ?? 7);
-  const productiveEnd = Number(CONFIG.ALLOWED_ACTIVITY_END_HOUR ?? 22);
+  // BUG FIX (2026-09-08): Use CONFIG.TIMEZONE (not process.env.TZ) to match
+  // the orchestrator's timezone. The old code used process.env.TZ which may
+  // not be set, causing the hour check to use UTC instead of SAST.
+  const tz = CONFIG.TIMEZONE || process.env.TZ || 'Africa/Johannesburg';
+  const productiveStart = Number(CONFIG.ALLOWED_ACTIVITY_START_HOUR ?? 1);
+  const productiveEnd = Number(CONFIG.ALLOWED_ACTIVITY_END_HOUR ?? 23);
 
   const now = new Date();
   const currentHour = parseInt(
