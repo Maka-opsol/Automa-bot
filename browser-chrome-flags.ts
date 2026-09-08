@@ -178,7 +178,17 @@ function addProxyFlags(flags: string[], proxyConfig: any): string[] {
 }
 
 function addWindowSizeFlags(flags: string[], width: any, height: any): string[] { 
-  flags.push(`--window-size=${width},${height}`);
+  // BUG FIX (2026-09-08): Validate width/height — if either is undefined,
+  // null, NaN, or <= 0, fall back to safe defaults (1280×800).
+  // Without this, when `_deps.config` is momentarily empty (during cold start
+  // or after a self-heal rollback), Chromium receives `--window-size=undefined,undefined`
+  // which causes "Malformed window size" error and the browser launch fails
+  // with "Target page, context or browser has been closed".
+  const _w = Number(width);
+  const _h = Number(height);
+  const safeW = (Number.isFinite(_w) && _w > 0) ? _w : 1280;
+  const safeH = (Number.isFinite(_h) && _h > 0) ? _h : 800;
+  flags.push(`--window-size=${safeW},${safeH}`);
   return flags;
 }
 
