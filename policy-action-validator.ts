@@ -58,7 +58,7 @@ const STATE_ACTION_WHITELIST: Record<string, string[]> = {
   'assignments_page': [
     'click', 'flutter_tap', 'double_click',
     'scroll_vertical', 'scroll_horizontal', 'flutter_swipe',
-    'wait', 'navigate', 'reload_browser',
+    'wait', 'navigate', 'reload_browser', 'reload_page',
   ],
   'question_page': [
     'click', 'flutter_tap', 'double_click',
@@ -74,7 +74,7 @@ const STATE_ACTION_WHITELIST: Record<string, string[]> = {
   'score_screen': [
     'click', 'flutter_tap', 'double_click',
     'scroll_vertical', 'flutter_swipe',
-    'wait', 'navigate', 'reload_browser',
+    'wait', 'navigate', 'reload_browser', 'reload_page',
   ],
   'completion_screen': [
     'click', 'flutter_tap', 'double_click',
@@ -82,35 +82,35 @@ const STATE_ACTION_WHITELIST: Record<string, string[]> = {
   ],
   'auth_page': [
     'click', 'flutter_tap', 'double_click',
-    'input_keypad', 'wait', 'navigate', 'reload_browser',
+    'input_keypad', 'wait', 'navigate', 'reload_browser', 'reload_page',
   ],
   'mathu_login': [
     'click', 'flutter_tap', 'double_click',
     'input_email', 'input_password',
-    'wait', 'navigate', 'reload_browser',
+    'wait', 'navigate', 'reload_browser', 'reload_page',
   ],
   'microsoft_email_input': [
     'click', 'flutter_tap', 'double_click',
     'input_email', 'input_password',
-    'wait', 'navigate', 'reload_browser',
+    'wait', 'navigate', 'reload_browser', 'reload_page',
   ],
   'advlearn_login': [
     'click', 'flutter_tap', 'double_click',
     'input_email', 'input_password',
-    'wait', 'navigate', 'reload_browser',
+    'wait', 'navigate', 'reload_browser', 'reload_page',
   ],
   'captcha': [
-    'wait', 'reload_browser',
+    'wait', 'reload_browser', 'reload_page',
     'click', 'flutter_tap',
   ],
   'error_screen': [
-    'navigate', 'wait', 'reload_browser',
+    'navigate', 'wait', 'reload_browser', 'reload_page',
     'click', 'flutter_tap',
   ],
   'unknown': [
     'click', 'flutter_tap', 'double_click',
     'flutter_swipe', 'scroll_vertical', 'scroll_horizontal',
-    'screenshot', 'wait', 'navigate', 'reload_browser',
+    'screenshot', 'wait', 'navigate', 'reload_browser', 'reload_page',
   ],
 };
 
@@ -218,3 +218,4 @@ module.exports = {
   getAllowedActions,
   setAllowedActions,
   getStatus,
+};
