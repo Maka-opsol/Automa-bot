@@ -53,6 +53,64 @@ let _ipChecked = false;
 let _started = false;
 let _proxyRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
+// ─── Proxy outcome / network error tracking (for dashboard) ───
+// These are surfaced to the dashboard via `__setLatestProxyOutcome` and
+// `__setLatestNetworkError` globals (set by render-free-plan.ts).
+interface ProxyOutcome {
+  timestamp: number;
+  action: 'validated' | 'rotated' | 'bypassed' | 'failed' | 'disabled';
+  proxy?: string | null;
+  reason?: string;
+  testUrl?: string;
+  latencyMs?: number;
+}
+
+interface NetworkErrorRecord {
+  timestamp: number;
+  errorType: string;        // e.g. 'ERR_CONNECTION_CLOSED', 'NAV_TIMEOUT'
+  url?: string;
+  proxy?: string | null;
+  message: string;
+  cycleCount?: number;
+}
+
+let _latestProxyOutcome: ProxyOutcome | null = null;
+let _latestNetworkError: NetworkErrorRecord | null = null;
+let _networkErrorHistory: NetworkErrorRecord[] = [];   // bounded ring buffer
+const MAX_NETWORK_ERROR_HISTORY = 20;
+
+function _recordProxyOutcome(outcome: ProxyOutcome): void {
+  _latestProxyOutcome = outcome;
+  try {
+    const setter = (globalThis as any).__setLatestProxyOutcome;
+    if (typeof setter === 'function') setter(outcome);
+  } catch { /* dashboard not loaded yet */ }
+}
+
+function _recordNetworkError(rec: NetworkErrorRecord): void {
+  _latestNetworkError = rec;
+  _networkErrorHistory.push(rec);
+  if (_networkErrorHistory.length > MAX_NETWORK_ERROR_HISTORY) {
+    _networkErrorHistory.shift();
+  }
+  try {
+    const setter = (globalThis as any).__setLatestNetworkError;
+    if (typeof setter === 'function') setter(rec);
+  } catch { /* dashboard not loaded yet */ }
+}
+
+function getLatestProxyOutcome(): ProxyOutcome | null {
+  return _latestProxyOutcome;
+}
+
+function getLatestNetworkError(): NetworkErrorRecord | null {
+  return _latestNetworkError;
+}
+
+function getNetworkErrorHistory(): NetworkErrorRecord[] {
+  return _networkErrorHistory.slice();
+}
+
 // ─── ProxyScrape Integration ───
 
 /**
@@ -136,6 +194,248 @@ async function _loadProxyUrls(): Promise<void> {
 }
 
 // ─── Core API ───
+
+/**
+ * Validate a proxy by attempting a TCP socket connection to the proxy's
+ * host:port. This is the fastest and most reliable way to verify a proxy
+ * is alive — it works for HTTP, SOCKS4, and SOCKS5 proxies alike, and
+ * doesn't depend on undici or proxy-agent packages.
+ *
+ * We don't try to route an actual HTTP request through the proxy here
+ * because:
+ *   1. SOCKS proxies require the `socks-proxy-agent` package which may not
+ *      be installed.
+ *   2. The Playwright browser will do the actual routing test when it
+ *      tries to navigate. If the proxy is alive (TCP connects) but can't
+ *      route, the navigation retry logic in cycle-cycle-manager will
+ *      rotate to a different proxy.
+ *
+ * So `validateProxy` is a fast pre-filter: "is this proxy's port open?"
+ * The full routing validation happens during `page.goto`.
+ */
+async function validateProxy(
+  proxyUrl: string,
+  testUrl?: string,
+  timeoutMs: number = 5000
+): Promise<{ ok: boolean; latencyMs?: number; reason?: string; statusCode?: number }> {
+  const start = Date.now();
+  let host: string | null = null;
+  let port: number | null = null;
+
+  // Parse the proxy URL to extract host and port
+  try {
+    const parsed = new URL(proxyUrl);
+    host = parsed.hostname;
+    port = parseInt(parsed.port, 10);
+    if (!host || !port || port <= 0 || port > 65535) {
+      return { ok: false, latencyMs: 0, reason: `invalid host/port: ${host}:${port}` };
+    }
+  } catch (e: any) {
+    return { ok: false, latencyMs: 0, reason: `URL parse failed: ${e.message}` };
+  }
+
+  // Use Node's built-in `net` module to open a TCP socket
+  const net = require('net');
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      try { socket.destroy(); } catch { /* best effort */ }
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      const latencyMs = Date.now() - start;
+      resolve({ ok: false, latencyMs, reason: `connect timeout after ${timeoutMs}ms` });
+    }, timeoutMs);
+
+    socket.once('connect', () => {
+      clearTimeout(timer);
+      const latencyMs = Date.now() - start;
+      cleanup();
+      // Connection succeeded — proxy port is open and accepting connections.
+      // We return ok=true with statusCode=0 (no HTTP status — we only verified
+      // TCP connectivity). The caller treats this as "proxy is alive".
+      resolve({ ok: true, latencyMs, statusCode: 0 });
+    });
+
+    socket.once('error', (err: any) => {
+      clearTimeout(timer);
+      const latencyMs = Date.now() - start;
+      cleanup();
+      const code = err?.code || err?.errno || 'UNKNOWN';
+      const msg = String(err?.message || err);
+      // Common errors: ECONNREFUSED, ECONNRESET, ETIMEDOUT, EHOSTUNREACH, ENETUNREACH
+      resolve({ ok: false, latencyMs, reason: `${code}: ${msg.substring(0, 100)}` });
+    });
+
+    try {
+      socket.connect(port, host);
+    } catch (e: any) {
+      clearTimeout(timer);
+      cleanup();
+      const latencyMs = Date.now() - start;
+      resolve({ ok: false, latencyMs, reason: `socket.connect failed: ${e.message}` });
+    }
+  });
+}
+
+/**
+ * Rotate to the next validated proxy. Tries each proxy in the list with
+ * `validateProxy` until one passes, then activates it. If all proxies fail
+ * validation, returns null (caller should fall back to direct connection).
+ *
+ * `maxToTry` bounds the number of proxies we test (default: 5) so we don't
+ * spend 30s+ testing a long proxy list.
+ */
+async function rotateToValidatedProxy(maxToTry: number = 5): Promise<string | null> {
+  if (_proxyUrls.length === 0) {
+    log('[IP] rotateToValidatedProxy: no proxies available', 'WARN');
+    return null;
+  }
+  // Start from the next proxy in the list
+  const tried: string[] = [];
+  const triedReasons: Array<{ proxy: string; reason: string; latencyMs?: number }> = [];
+  for (let i = 0; i < Math.min(maxToTry, _proxyUrls.length); i++) {
+    const candidate = _rotateProxy();
+    if (!candidate || tried.includes(candidate)) continue;
+    tried.push(candidate);
+    const result = await validateProxy(candidate);
+    if (result.ok) {
+      _recordProxyOutcome({
+        timestamp: Date.now(),
+        action: 'rotated',
+        proxy: candidate,
+        reason: `validated after ${tried.length} attempt(s)`,
+        testUrl: getCONFIG().APP_URL || 'https://app.mathu.co.za',
+        latencyMs: result.latencyMs,
+      });
+      log(`[IP] Validated proxy ${candidate} in ${result.latencyMs}ms (HTTP ${result.statusCode || '?'})`, 'INFO');
+      // Update env vars so HTTP clients that read them (e.g. fetch in Node) use the new proxy
+      process.env.HTTP_PROXY = candidate;
+      process.env.HTTPS_PROXY = candidate;
+      return candidate;
+    }
+    triedReasons.push({ proxy: candidate, reason: result.reason || 'unknown', latencyMs: result.latencyMs });
+    log(`[IP] Proxy ${candidate} FAILED validation (${result.reason || 'unknown'}, ${result.latencyMs}ms)`, 'DEBUG');
+  }
+  // All tested proxies failed
+  _recordProxyOutcome({
+    timestamp: Date.now(),
+    action: 'failed',
+    proxy: null,
+    reason: `all ${tried.length} tested proxies failed validation`,
+    testUrl: getCONFIG().APP_URL || 'https://app.mathu.co.za',
+  });
+  log(`[IP] rotateToValidatedProxy: all ${tried.length} tested proxies failed. Reasons: ${JSON.stringify(triedReasons)}`, 'WARN');
+  return null;
+}
+
+/**
+ * Bypass the proxy — set `__proxyDisabled = true` so the next browser launch
+ * uses a direct connection. Records the bypass in the proxy outcome log.
+ */
+function bypassProxy(reason: string): void {
+  if (!(globalThis as any).__proxyDisabled) {
+    (globalThis as any).__proxyDisabled = true;
+    log(`[IP] Proxy BYPASSED — reason: ${reason}. Using direct connection.`, 'WARN');
+  }
+  _recordProxyOutcome({
+    timestamp: Date.now(),
+    action: 'bypassed',
+    proxy: getCurrentProxy(),
+    reason,
+  });
+}
+
+/**
+ * Validate the current proxy (or rotate to a new one if it fails).
+ * Called by `browser.ts` `setupContext` BEFORE creating the browser context.
+ *
+ * Returns:
+ *   - 'current'   — current proxy passed validation, use it
+ *   - 'rotated'   — current proxy failed, rotated to a new validated one
+ *   - 'bypassed'  — all proxies failed, fall back to direct connection
+ *   - 'direct'    — no proxy was active (already on direct)
+ */
+async function ensureValidProxy(): Promise<'current' | 'rotated' | 'bypassed' | 'direct'> {
+  // If proxies are already disabled (e.g. by chrome-error handler), don't re-enable
+  if ((globalThis as any).__proxyDisabled) return 'direct';
+
+  const currentProxy = getCurrentProxy();
+  if (!currentProxy) {
+    // No proxy active — try to activate one
+    if (_proxyUrls.length === 0) return 'direct';
+    const validated = await rotateToValidatedProxy();
+    if (validated) return 'rotated';
+    bypassProxy('all proxies failed validation during ensureValidProxy');
+    return 'bypassed';
+  }
+
+  // Validate the current proxy
+  const result = await validateProxy(currentProxy);
+  if (result.ok) {
+    _recordProxyOutcome({
+      timestamp: Date.now(),
+      action: 'validated',
+      proxy: currentProxy,
+      reason: 'pre-launch validation passed',
+      testUrl: getCONFIG().APP_URL || 'https://app.mathu.co.za',
+      latencyMs: result.latencyMs,
+    });
+    log(`[IP] Pre-launch validation: current proxy OK (${currentProxy}, ${result.latencyMs}ms, HTTP ${result.statusCode})`, 'DEBUG');
+    return 'current';
+  }
+
+  // Current proxy failed — try to rotate
+  log(`[IP] Pre-launch validation: current proxy FAILED (${currentProxy}, ${result.reason}, ${result.latencyMs}ms). Rotating...`, 'WARN');
+  const newProxy = await rotateToValidatedProxy();
+  if (newProxy) return 'rotated';
+
+  // All proxies failed
+  bypassProxy(`current proxy failed validation (${result.reason}); rotation exhausted`);
+  return 'bypassed';
+}
+
+/**
+ * Report a network error (called by cycle manager when navigation fails).
+ * Categorizes the error and records it for dashboard display.
+ */
+function recordNetworkError(error: any, context?: { url?: string; cycleCount?: number }): void {
+  const msg = String(error?.message || error);
+  let errorType = 'UNKNOWN';
+
+  // Categorize common Playwright / Node network errors
+  if (/ERR_CONNECTION_CLOSED/i.test(msg)) errorType = 'ERR_CONNECTION_CLOSED';
+  else if (/ERR_CONNECTION_RESET/i.test(msg)) errorType = 'ERR_CONNECTION_RESET';
+  else if (/ERR_CONNECTION_REFUSED/i.test(msg)) errorType = 'ERR_CONNECTION_REFUSED';
+  else if (/ERR_CONNECTION_TIMED_OUT|ERR_TIMED_OUT/i.test(msg)) errorType = 'ERR_CONNECTION_TIMED_OUT';
+  else if (/ERR_NAME_NOT_RESOLVED/i.test(msg)) errorType = 'ERR_NAME_NOT_RESOLVED';
+  else if (/ERR_PROXY_CONNECTION_FAILED/i.test(msg)) errorType = 'ERR_PROXY_CONNECTION_FAILED';
+  else if (/ERR_TUNNEL_CONNECTION_FAILED/i.test(msg)) errorType = 'ERR_TUNNEL_CONNECTION_FAILED';
+  else if (/ERR_INTERNET_DISCONNECTED/i.test(msg)) errorType = 'ERR_INTERNET_DISCONNECTED';
+  else if (/ERR_BLOCKED_BY_CLIENT/i.test(msg)) errorType = 'ERR_BLOCKED_BY_CLIENT';
+  else if (/ERR_CERT/i.test(msg)) errorType = 'ERR_CERT';
+  else if (/chrome-error/i.test(msg)) errorType = 'CHROME_ERROR_PAGE';
+  else if (/Timeout \d+ms exceeded/i.test(msg)) errorType = 'NAV_TIMEOUT';
+  else if (/Target closed|Target page.*closed/i.test(msg)) errorType = 'TARGET_CLOSED';
+  else if (/net::ERR/i.test(msg)) {
+    const m = msg.match(/net::(ERR_[A-Z_]+)/i);
+    if (m) errorType = m[1];
+  }
+
+  const rec: NetworkErrorRecord = {
+    timestamp: Date.now(),
+    errorType,
+    url: context?.url,
+    proxy: getCurrentProxy(),
+    message: msg.substring(0, 300),
+    cycleCount: context?.cycleCount,
+  };
+  _recordNetworkError(rec);
+  log(`[IP] Network error recorded: ${errorType}${context?.url ? ' @ ' + context.url : ''}${rec.proxy ? ' (via ' + rec.proxy + ')' : ''}`, 'WARN');
+}
 
 /**
  * Check the current server IP and compare with previous.
@@ -292,6 +592,11 @@ function getStatus(): Record<string, any> {
     isIpBlocked: _isIpBlocked,
     ipChecked: _ipChecked,
     proxySource: _proxyUrls.length > 0 ? 'proxyscrape' : 'none',
+    // New: dashboard surface
+    proxyDisabled: !!(globalThis as any).__proxyDisabled,
+    latestProxyOutcome: _latestProxyOutcome,
+    latestNetworkError: _latestNetworkError,
+    networkErrorCount: _networkErrorHistory.length,
   };
 }
 
@@ -349,4 +654,14 @@ module.exports = {
   rotateProxy,
   getStatus,
   start,
+  // New: proxy validation + recovery
+  validateProxy,
+  rotateToValidatedProxy,
+  ensureValidProxy,
+  bypassProxy,
+  // New: network error tracking
+  recordNetworkError,
+  getLatestProxyOutcome,
+  getLatestNetworkError,
+  getNetworkErrorHistory,
 };
