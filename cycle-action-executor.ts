@@ -641,6 +641,10 @@ const ACTION_HANDLERS: Record<string, (ctx: ActionCtx) => Promise<void>> = {
   // Navigation
   navigate_back:  _handleNavigateBack,
   reload_browser: _handleReloadBrowser,
+  // BUG FIX (2026-09-08): pixel-fallback.ts returns 'reload_page' (4 places)
+  // — alias it to the same handler as 'reload_browser' so it actually works
+  // instead of being logged as "Unknown action: reload_page".
+  reload_page:    _handleReloadBrowser,
   select_option:  _handleSelectOption,
   // Timing
   wait:           _handleWait,
