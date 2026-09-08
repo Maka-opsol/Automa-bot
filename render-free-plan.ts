@@ -701,6 +701,45 @@ function getLatestScreenshot() {
 (globalThis as any).__setLatestScreenshot = setLatestScreenshot;
 (globalThis as any).__getLatestScreenshot = getLatestScreenshot;
 
+// ── Proxy outcome / network error cache (for dashboard) ──
+// These mirror the values tracked in network-ip-rotator.ts. The rotator
+// calls these setters whenever it records a new outcome, so the dashboard
+// can display them without importing the rotator directly.
+let _latestProxyOutcome: { timestamp: number; action: string; proxy?: string | null; reason?: string; testUrl?: string; latencyMs?: number } | null = null;
+let _latestNetworkError: { timestamp: number; errorType: string; url?: string; proxy?: string | null; message: string; cycleCount?: number } | null = null;
+
+function setLatestProxyOutcome(outcome: any) {
+  if (!outcome) return;
+  _latestProxyOutcome = outcome;
+}
+
+function getLatestProxyOutcome() {
+  // 1-hour TTL
+  if (_latestProxyOutcome && Date.now() - _latestProxyOutcome.timestamp > 60 * 60 * 1000) {
+    _latestProxyOutcome = null;
+  }
+  return _latestProxyOutcome;
+}
+
+function setLatestNetworkError(rec: any) {
+  if (!rec) return;
+  _latestNetworkError = rec;
+}
+
+function getLatestNetworkError() {
+  // 1-hour TTL
+  if (_latestNetworkError && Date.now() - _latestNetworkError.timestamp > 60 * 60 * 1000) {
+    _latestNetworkError = null;
+  }
+  return _latestNetworkError;
+}
+
+// Expose globally
+(globalThis as any).__setLatestProxyOutcome = setLatestProxyOutcome;
+(globalThis as any).__getLatestProxyOutcome = getLatestProxyOutcome;
+(globalThis as any).__setLatestNetworkError = setLatestNetworkError;
+(globalThis as any).__getLatestNetworkError = getLatestNetworkError;
+
 function getStats() {
   try {
     const stateMachine = container.get('stateMachine');
