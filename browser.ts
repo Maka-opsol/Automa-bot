@@ -266,7 +266,7 @@ class BrowserManager {
     this.browserInstance.on('error', (err: Error) => { logError('Browser process error', err); this.browserDisconnected = true; });
   }
 
-  async setupContext() { 
+  async setupContext() {
     const log = getLog();
     const logError = getLogError();
     if (!this.browserInstance) throw new Error('Browser instance not available');
@@ -278,14 +278,27 @@ class BrowserManager {
     // Also implement auto-disable: if the browser has had proxy issues (chrome-error,
     // repeated blank pages, navigation timeouts), disable the proxy for this context
     // to allow the bot to continue working without the proxy.
+    //
+    // BUG FIX (2026-09-08): Before assigning a proxy, validate it against
+    // app.mathu.co.za. If validation fails, try rotating to a new validated
+    // proxy. If all proxies fail, fall back to direct connection. This prevents
+    // the bot from wasting 30s navigation timeouts on a dead peer.
     try {
       const ipRotator = require('./network-ip-rotator');
-      const currentProxy = ipRotator.getCurrentProxy?.();
 
-      // Check if proxies have been disabled due to errors
+      // If proxies were disabled by a previous error path (chrome-error,
+      // blank-page escalation), honor that decision and use direct.
       const _proxyDisabled = (globalThis as any).__proxyDisabled || false;
 
-      if (currentProxy && !_proxyDisabled) {
+      let proxyMode: 'current' | 'rotated' | 'bypassed' | 'direct' = 'direct';
+      if (!_proxyDisabled && typeof ipRotator.ensureValidProxy === 'function') {
+        proxyMode = await ipRotator.ensureValidProxy();
+      }
+
+      // After ensureValidProxy, re-read the current proxy (it may have rotated)
+      const currentProxy = ipRotator.getCurrentProxy?.();
+
+      if (currentProxy && proxyMode !== 'bypassed' && proxyMode !== 'direct' && !_proxyDisabled) {
         // Parse the proxy URL to separate credentials (if any) from the server URL.
         // Playwright requires credentials as separate username/password properties,
         // not inline in the URL string.
@@ -299,19 +312,19 @@ class BrowserManager {
             proxyConfig.password = decodeURIComponent(proxyUrl.password);
           }
           contextOptions.proxy = proxyConfig;
-          log(`Context proxy set to: ${proxyConfig.server}${proxyConfig.username ? ' (with auth)' : ''}`, 'INFO', 'browser');
+          log(`Context proxy set to: ${proxyConfig.server}${proxyConfig.username ? ' (with auth)' : ''} [mode=${proxyMode}]`, 'INFO', 'browser');
         } catch {
           // If URL parsing fails, pass the raw proxy string
           contextOptions.proxy = { server: currentProxy };
-          log(`Context proxy set to (raw): ${currentProxy}`, 'INFO', 'browser');
+          log(`Context proxy set to (raw): ${currentProxy} [mode=${proxyMode}]`, 'INFO', 'browser');
         }
-      } else if (_proxyDisabled) {
-        log('Proxy DISABLED (auto-recovery from proxy errors) — using direct connection', 'WARN', 'browser');
+      } else if (_proxyDisabled || proxyMode === 'bypassed') {
+        log(`Proxy DISABLED (mode=${proxyMode}) — using direct connection`, 'WARN', 'browser');
       } else {
         log('No proxy available — using direct connection', 'DEBUG', 'browser');
       }
     } catch (e: any) {
-      log(`Failed to get proxy for context: ${e.message}`, 'WARN', 'browser');
+      log(`Failed to validate/get proxy for context: ${e.message}`, 'WARN', 'browser');
     }
     this.contextInstance = await Promise.race([
       this.browserInstance.newContext(contextOptions),
