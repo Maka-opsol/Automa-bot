@@ -90,7 +90,7 @@ class AuthHealer {
       });
       await sleep(5000);
 
-      const screenshot = await page.screenshot({ type: 'jpeg', quality: 30 });
+      const screenshot = await page.screenshot({ type: 'jpeg', quality: 30, timeout: 15000, animations: 'disabled' });
       const screenshotBase64 = screenshot.toString('base64');
       const html = await page.content();
       const currentUrl = page.url();
