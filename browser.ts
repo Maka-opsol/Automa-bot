@@ -250,8 +250,17 @@ class BrowserManager {
     // unnecessarily. Default to headless: true unless explicitly disabled.
     const _headless = getCONFIG().HEADLESS === false ? false : true;
     const options: any = { headless: _headless, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 60000 };
-    // Tell Chromium to expect per-context proxies (avoids chromewebdata loop)
-    options.proxy = { server: 'per-context' };
+    // BUG FIX (2026-09-08): Only set per-context proxy mode when a proxy is
+    // actually active. When `__proxyDisabled` is true, DON'T pass
+    // `proxy: { server: 'per-context' }` — otherwise Chromium receives the
+    // `--proxy-server=http://per-context` flag, which it interprets as a
+    // literal proxy URL (host="per-context", port=80). When a context is
+    // created without a proxy override, Chromium tries to connect to this
+    // bogus proxy → ERR_PROXY_CONNECTION_FAILED. This was causing the bot
+    // to fail even after the proxy was disabled.
+    if (!(globalThis as any).__proxyDisabled) {
+      options.proxy = { server: 'per-context' };
+    }
     if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
     return options;
   }
@@ -267,14 +276,22 @@ class BrowserManager {
     const _w = Number(CONFIG.DISPLAY_WIDTH) || 1280;
     const _h = Number(CONFIG.DISPLAY_HEIGHT) || 800;
     const flags = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-extensions', '--disable-background-networking', '--disable-http2', `--window-size=${_w},${_h}`];
-    const options: any = { headless: true, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000, proxy: { server: 'per-context' } };
+    const options: any = { headless: true, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000 };
+    // BUG FIX (2026-09-08): Only set per-context proxy when proxy is active.
+    if (!(globalThis as any).__proxyDisabled) {
+      options.proxy = { server: 'per-context' };
+    }
     if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
     return options;
   }
 
   getMinimalLaunchOptions() { 
     const CONFIG = getCONFIG();
-    const options: any = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-zygote', '--single-process', '--disable-http2'], timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 30000, proxy: { server: 'per-context' } };
+    const options: any = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-zygote', '--single-process', '--disable-http2'], timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 30000 };
+    // BUG FIX (2026-09-08): Only set per-context proxy when proxy is active.
+    if (!(globalThis as any).__proxyDisabled) {
+      options.proxy = { server: 'per-context' };
+    }
     if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
     return options;
   }
