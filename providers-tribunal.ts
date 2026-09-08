@@ -476,12 +476,22 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
 
   // Validate actionType — reject unrecognized actions to prevent
   // "Unknown action" warnings in the executor. Fall back to 'wait'.
-  const VALID_ACTIONS = new Set([
-    'click', 'input_email', 'input_password', 'keypad_input',
-    'scroll_vertical', 'scroll_horizontal', 'wait',
-    'flutter_swipe', 'flutter_tap',
-  ]);
-  const safeActionType = VALID_ACTIONS.has(cleanRep.actionType)
+  // BUG FIX (2026-09-08): This whitelist was out of sync with
+  // providers-prompts.ts VALID_ACTION_TYPES (only had 9 actions vs 17).
+  // Now imports from providers-prompts to stay in sync.
+  let _VALID_ACTIONS: Set<string>;
+  try {
+    const prompts = require('./providers-prompts');
+    _VALID_ACTIONS = new Set(prompts.VALID_ACTION_TYPES || []);
+  } catch {
+    _VALID_ACTIONS = new Set([
+      'click', 'flutter_tap', 'double_click', 'hover', 'long_press',
+      'input_email', 'input_password', 'type_text', 'keypad_input',
+      'flutter_swipe', 'drag', 'scroll_vertical', 'scroll_horizontal',
+      'press_key', 'navigate_back', 'select_option', 'reload_browser', 'wait',
+    ]);
+  }
+  const safeActionType = _VALID_ACTIONS.has(cleanRep.actionType)
     ? cleanRep.actionType
     : 'wait';
   if (safeActionType !== cleanRep.actionType) {
