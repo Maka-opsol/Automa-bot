@@ -258,7 +258,7 @@ function _samplePixelsFromPng(pngBuffer: Buffer): Array<[number, number, number]
  */
 async function _isPageVisuallyBlank(page: any): Promise<boolean> {
   try {
-    const buf = await page.screenshot({ type: 'png', fullPage: false });
+    const buf = await page.screenshot({ type: 'png', fullPage: false, timeout: 8000, animations: 'disabled' });
     const samples = _samplePixelsFromPng(buf);
     if (samples && samples.length >= 8) {
       // Compute per-channel standard deviation
@@ -276,7 +276,7 @@ async function _isPageVisuallyBlank(page: any): Promise<boolean> {
     // PNG parsing failed — fall back to buffer size heuristic
     // A real rendered page at quality 20 produces >3KB even if mostly blank.
     // A genuinely blank page (solid white/black rectangle) compresses to <2KB.
-    const jpegBuf = await page.screenshot({ type: 'jpeg', quality: 20 }).catch(() => null);
+    const jpegBuf = await page.screenshot({ type: 'jpeg', quality: 20, timeout: 8000, animations: 'disabled' }).catch(() => null);
     if (jpegBuf && jpegBuf.length < 2000) {
       log(`Pixel sampling unavailable, JPEG size=${jpegBuf.length}bytes < 2000 → assuming blank`, 'DEBUG', 'auth-guard');
       return true;
