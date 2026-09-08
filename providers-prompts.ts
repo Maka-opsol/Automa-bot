@@ -44,6 +44,8 @@ const VALID_ACTION_TYPES = [
   'press_key',
   // Navigation
   'navigate_back', 'select_option',
+  // Browser recovery
+  'reload_browser',
   // Timing
   'wait',
 ];
