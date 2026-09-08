@@ -336,6 +336,22 @@ function notifyLastKnownGoodUrl(url: string | null | undefined): void {
       url.includes('msftauth.net')) {
     return;
   }
+  // BUG FIX (2026-09-08): Never store Chrome error URLs.
+  // `chrome-error://chromewebdata/` is what Chromium shows when a navigation
+  // fails (network error, DNS failure, proxy broken). If we store it as the
+  // "last known good URL", `_getRecoveryUrl()` returns it, and the next
+  // `page.goto('chrome-error://chromewebdata/')` fails with ERR_ABORTED
+  // because Chromium doesn't allow `page.goto` to `chrome-error://` URLs.
+  // This created a death loop: blank-page escalation → self-heal failed →
+  // restart → page.goto('chrome-error://chromewebdata/') → ERR_ABORTED →
+  // blank-page escalation again.
+  if (url.includes('chrome-error://') || url.includes('chromewebdata')) {
+    return;
+  }
+  // Also reject other internal Chromium URLs that aren't real pages
+  if (url.startsWith('chrome://') || url.startsWith('devtools://') || url.startsWith('data:')) {
+    return;
+  }
   if (_lastKnownGoodUrl !== url) {
     _lastKnownGoodUrl = url;
   }
@@ -742,16 +758,37 @@ async function ensureAuthenticated(page: any) {
   // The page shows a blank Chrome error page — navigating to APP_URL recovers.
   // If this happens repeatedly, disable the proxy entirely (it's causing more
   // harm than good).
+  //
+  // BUG FIX (2026-09-08): Lowered threshold from 3 → 1 for proxy-disable.
+  // The previous threshold (3 occurrences) meant the bot wasted 6+ minutes
+  // cycling on chrome-error pages before the proxy was disabled. The first
+  // chrome-error page is already strong evidence the proxy is broken — there's
+  // no reason to wait. We still keep the counter for logging/observability.
   if (url.includes('chrome-error://') || url.includes('chromewebdata')) {
     // Track consecutive chrome-error occurrences
     const errorCount = ((globalThis as any).__chromeErrorCount || 0) + 1;
     (globalThis as any).__chromeErrorCount = errorCount;
 
-    if (errorCount >= 3) {
-      // 3+ chrome-error pages = proxy is broken. Disable it.
-      (globalThis as any).__proxyDisabled = true;
-      log(`Chrome error page detected ${errorCount} times — DISABLING PROXY (auto-recovery). Browser will use direct connection.`, 'ERROR', 'auth-guard');
-      try { (_deps.alerting?.sendAlert || (() => {}))('Proxy disabled due to repeated chrome-error pages. Using direct connection.'); } catch {}
+    // FIRST chrome-error page = proxy is broken. Disable it immediately.
+    // The user's directive: "If something is wrong with the browser, the bots
+    // repeating actions or gets a chromedata error, turn off the proxies."
+    if (errorCount >= 1 && !(globalThis as any).__proxyDisabled) {
+      try {
+        const ipRotator = require('./network-ip-rotator');
+        const currentProxy = ipRotator.getCurrentProxy?.();
+        if (currentProxy) {
+          (globalThis as any).__proxyDisabled = true;
+          log(`Chrome error page detected (occurrence #${errorCount}, proxy=${currentProxy}) — DISABLING PROXY immediately. Browser will use direct connection on next launch.`, 'ERROR', 'auth-guard');
+          try { (_deps.alerting?.sendAlert || (() => {}))(`Proxy disabled: chrome-error page detected (proxy=${currentProxy}). Switching to direct connection.`); } catch {}
+        } else {
+          log(`Chrome error page detected (occurrence #${errorCount}) — no proxy active, will recover via navigation.`, 'WARN', 'auth-guard');
+        }
+      } catch {
+        log(`Chrome error page detected (occurrence #${errorCount}) — ip-rotator not loaded, will recover via navigation.`, 'WARN', 'auth-guard');
+      }
+    } else if (errorCount >= 3 && (globalThis as any).__proxyDisabled) {
+      // Already disabled — log it for visibility.
+      log(`Chrome error page detected ${errorCount} times — proxy already disabled, but page still failing.`, 'WARN', 'auth-guard');
     }
 
     const recoveryUrl = CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za';
