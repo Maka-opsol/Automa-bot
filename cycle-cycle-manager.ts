@@ -73,11 +73,28 @@ function _getRecoveryUrl(): string {
       ? authGuard.getLastKnownGoodUrl()
       : null;
     if (lastGoodUrl && typeof lastGoodUrl === 'string' && lastGoodUrl.length > 0) {
-      return lastGoodUrl;
+      // BUG FIX (2026-09-08): Defensive guard — never return a chrome-error,
+      // about:blank, or chrome:// URL as the recovery target.
+      // `notifyLastKnownGoodUrl` already filters these out, but defense-in-depth
+      // in case a stale value was stored before the filter was added, or the
+      // filter was bypassed somehow.
+      if (lastGoodUrl.includes('chrome-error://') ||
+          lastGoodUrl.includes('chromewebdata') ||
+          lastGoodUrl.startsWith('about:blank') ||
+          lastGoodUrl.startsWith('chrome://') ||
+          lastGoodUrl.startsWith('devtools://') ||
+          lastGoodUrl.startsWith('data:')) {
+        // Fall through to default APP_URL below
+      } else {
+        return lastGoodUrl;
+      }
     }
   } catch { /* non-critical */ }
   const CONFIG = getCONFIG();
-  return CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za';
+  // Normalize: strip trailing slashes from APP_URL so we don't get double-slash
+  // when callers append paths like '/assignments'
+  const _appUrl = String(CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za').replace(/\/+$/, '');
+  return _appUrl;
 }
 
 // ─── Module state ───
