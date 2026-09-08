@@ -245,7 +245,15 @@ class BrowserManager {
 
   getReducedLaunchOptions() { 
     const CONFIG = getCONFIG();
-    const flags = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-extensions', '--disable-background-networking', '--disable-http2', `--window-size=${CONFIG.DISPLAY_WIDTH},${CONFIG.DISPLAY_HEIGHT}`];
+    // BUG FIX (2026-09-08): Provide explicit fallbacks for DISPLAY_WIDTH/HEIGHT.
+    // During cold start or after a self-heal rollback, `_deps.config` may be
+    // momentarily empty (DI container not yet re-initialized), causing
+    // `CONFIG.DISPLAY_WIDTH` to be `undefined` and producing the malformed
+    // Chromium flag `--window-size=undefined,undefined` which causes the
+    // browser launch to fail with "Target page, context or browser has been closed".
+    const _w = Number(CONFIG.DISPLAY_WIDTH) || 1280;
+    const _h = Number(CONFIG.DISPLAY_HEIGHT) || 800;
+    const flags = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-extensions', '--disable-background-networking', '--disable-http2', `--window-size=${_w},${_h}`];
     const options: any = { headless: true, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000, proxy: { server: 'per-context' } };
     if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
     return options;
