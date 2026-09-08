@@ -1138,9 +1138,126 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
 
       log(`Fresh start: navigating to ${targetUrl}`, 'INFO', 'cycle');
-      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
-        log(`Initial navigation failed: ${e.message || e}`, 'WARN', 'cycle');
-      });
+      // ─────────────────────────────────────────────────────────────────────
+      // PROXY-AWARE NAVIGATION RECOVERY (Task 29, 2026-09-08)
+      // ─────────────────────────────────────────────────────────────────────
+      // The bot uses a ProxyScrape ZA proxy for IP masking. When that proxy
+      // silently fails (peer returns 502, hangs the connection, DNS fails
+      // through the tunnel), `page.goto` times out at 30s or fails with
+      // ERR_CONNECTION_CLOSED / ERR_TUNNEL_CONNECTION_FAILED. Without
+      // recovery, the bot cycles on blank pages for 2-6 minutes before the
+      // chrome-error URL appears and the auth-guard's threshold kicks in.
+      //
+      // Strategy: 3 bounded retries with a FRESH browser context each time:
+      //   Attempt 1 — current proxy (already validated by `setupContext`)
+      //   Attempt 2 — rotate to a different validated proxy
+      //   Attempt 3 — direct connection (bypass proxy entirely)
+      //
+      // Each retry uses `closeBrowser` + `safeBrowserRetry` so the new
+      // context picks up the latest `__proxyDisabled` / `ensureValidProxy`
+      // decision. Network errors are recorded via `recordNetworkError` for
+      // dashboard display. After the 3rd attempt fails, we log + continue
+      // (the cycle's normal blank-page escalation will eventually self-heal).
+      let _initialNavOk = false;
+      const MAX_NAV_ATTEMPTS = 3;
+      const _navAttemptOutcomes: Array<{ attempt: number; mode: string; ok: boolean; errorType?: string; message?: string }> = [];
+
+      for (let _navAttempt = 1; _navAttempt <= MAX_NAV_ATTEMPTS && !_initialNavOk; _navAttempt++) {
+        const _mode = _navAttempt === 1 ? 'proxy' : _navAttempt === 2 ? 'rotated' : 'direct';
+        try {
+          if (_navAttempt > 1) {
+            // Before retrying: relaunch browser with fresh context.
+            // Attempt 2: rotate to a different validated proxy.
+            // Attempt 3: bypass proxy entirely (direct connection).
+            try {
+              const ipRotator = require('./network-ip-rotator');
+              if (_navAttempt === 2 && typeof ipRotator.rotateToValidatedProxy === 'function') {
+                const newProxy = await ipRotator.rotateToValidatedProxy(5);
+                if (!newProxy) {
+                  log('Attempt 2: no validated proxy available — skipping to direct connection.', 'WARN', 'cycle');
+                  // Skip directly to attempt 3 (direct)
+                  (globalThis as any).__proxyDisabled = true;
+                } else {
+                  log(`Attempt 2: rotated to validated proxy ${newProxy}.`, 'INFO', 'cycle');
+                }
+              }
+              if (_navAttempt === 3) {
+                // Bypass proxy entirely.
+                if (typeof ipRotator.bypassProxy === 'function') {
+                  ipRotator.bypassProxy('navigation failed with proxy attempts 1+2');
+                } else {
+                  (globalThis as any).__proxyDisabled = true;
+                }
+                log('Attempt 3: bypassing proxy — using direct connection.', 'WARN', 'cycle');
+                try {
+                  const alerting = getDep('alerting');
+                  alerting?.sendAlert?.('Proxy bypassed: navigation failed after 2 attempts with proxy. Switching to direct connection.');
+                } catch {}
+              }
+            } catch { /* ip-rotator not loaded */ }
+
+            // Relaunch browser with fresh context (picks up the new proxy mode)
+            _networkSetup = false;
+            const bm = _browserDep?.getBrowserManager?.();
+            if (bm) bm._intentionalClose = true;
+            await closeBrowser?.();
+            await new Promise(r => setTimeout(r, 2000));
+            page = await safeBrowserRetry(async (p: any) => {
+              if (authenticate) await authenticate(p);
+              return p;
+            });
+            if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
+              try { await network.setupInterception(page); _networkSetup = true; } catch {}
+            }
+          }
+
+          log(`Navigation attempt ${_navAttempt}/${MAX_NAV_ATTEMPTS} [${_mode}]: ${targetUrl}`, 'INFO', 'cycle');
+          await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          _initialNavOk = true;
+          _navAttemptOutcomes.push({ attempt: _navAttempt, mode: _mode, ok: true });
+          log(`Navigation attempt ${_navAttempt} succeeded [${_mode}].`, 'INFO', 'cycle');
+        } catch (navErr: any) {
+          const _errMsg = navErr?.message || String(navErr);
+          // Categorize the error for dashboard + decision-making
+          let _errorType = 'UNKNOWN';
+          try {
+            const ipRotator = require('./network-ip-rotator');
+            if (typeof ipRotator.recordNetworkError === 'function') {
+              ipRotator.recordNetworkError(navErr, { url: targetUrl });
+              // Re-read the categorized type from the latest record
+              const rec = ipRotator.getLatestNetworkError?.();
+              if (rec?.errorType) _errorType = rec.errorType;
+            }
+          } catch { /* ip-rotator not loaded */ }
+
+          _navAttemptOutcomes.push({ attempt: _navAttempt, mode: _mode, ok: false, errorType: _errorType, message: _errMsg.substring(0, 200) });
+          log(`Navigation attempt ${_navAttempt} [${_mode}] failed: ${_errorType} — ${_errMsg.substring(0, 150)}`, 'WARN', 'cycle');
+
+          // If this is a connection-closed / tunnel-failed / proxy error,
+          // we know the proxy is bad — don't bother retrying with the same
+          // proxy, skip straight to rotation (attempt 2) or bypass (attempt 3).
+          const _isProxyError = /ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_PROXY_CONNECTION_FAILED|ERR_TUNNEL_CONNECTION_FAILED|ERR_NAME_NOT_RESOLVED|ERR_INTERNET_DISCONNECTED|chrome-error|CHROME_ERROR_PAGE/i.test(_errMsg);
+          const _isTimeout = /Timeout \d+ms exceeded/i.test(_errMsg);
+
+          if (_isProxyError && _navAttempt === 1) {
+            log('Proxy error detected — skipping rotation, going straight to attempt 2 (rotate).', 'WARN', 'cycle');
+            // Force the loop to attempt 2 (which will rotate)
+            // (the for-loop will naturally increment to attempt 2)
+          } else if (_isTimeout && _navAttempt === 1) {
+            // First attempt timed out — proxy may be slow but not necessarily broken.
+            // Try rotation (attempt 2) before giving up entirely.
+            log('Navigation timeout on attempt 1 — will try rotating proxy on attempt 2.', 'WARN', 'cycle');
+          } else if (_navAttempt === MAX_NAV_ATTEMPTS) {
+            // Last attempt failed — log and continue (blank-page escalation will handle it)
+            log(`All ${MAX_NAV_ATTEMPTS} navigation attempts failed. Outcomes: ${JSON.stringify(_navAttemptOutcomes)}`, 'ERROR', 'cycle');
+            try {
+              const alerting = getDep('alerting');
+              alerting?.sendAlert?.(`All ${MAX_NAV_ATTEMPTS} navigation attempts failed. Last error: ${_errorType}. Bot will continue and rely on blank-page escalation.`);
+            } catch {}
+          }
+          // Loop continues to next attempt
+        }
+      } // end for (navigation attempts)
 
       // BUG FIX (2026-09-06): Force GC + check heap AFTER page.goto() too.
       // The navigation itself may have allocated a lot (DOM, JS, network
@@ -1159,6 +1276,107 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
       log('Fresh start: waiting for Flutter canvas to render...', 'INFO', 'cycle');
       await _waitForRenderedPage(page, 20000);
+
+      // ─────────────────────────────────────────────────────────────────────
+      // PERSISTENT-BLANK-AFTER-NAV BROWSER-PROGRESS FAILURE (Task 29)
+      // ─────────────────────────────────────────────────────────────────────
+      // If navigation "succeeded" (page.goto didn't throw) but the rendered
+      // page is still blank after a 20s render wait, that's a distinct failure
+      // category: BROWSER_PROGRESS_FAILURE. The page loaded but nothing painted
+      // — meaning the proxy delivered a white screen, the JS bundle failed to
+      // execute, or the Flutter canvas never initialized.
+      //
+      // Rather than waiting indefinitely (the old behavior), we poll the page
+      // for up to 15 more seconds (3 × 5s polls). If still blank, we:
+      //   1. Record a network error (BROWSER_PROGRESS_FAILURE).
+      //   2. If a proxy is active and this isn't attempt 3, rotate/bypass and
+      //      retry the entire navigation (loop back to attempt N+1).
+      //   3. If we've exhausted retries, fall through to the normal cycle —
+      //      the blank-page escalation ladder will eventually trigger self-heal.
+      if (!_initialNavOk) {
+        // Navigation itself failed all 3 attempts — don't double-recover here.
+        // The blank-page escalation ladder below will handle it.
+        log('Navigation did not succeed — relying on blank-page escalation.', 'WARN', 'cycle');
+      } else {
+        // Navigation "succeeded" — verify the page actually has content.
+        let _persistentBlank = false;
+        let _blankPolls = 0;
+        const MAX_BLANK_POLLS = 3;
+        const BLANK_POLL_INTERVAL_MS = 5000;
+        for (let _bp = 0; _bp < MAX_BLANK_POLLS; _bp++) {
+          try {
+            const authGuard = getDep('authGuard');
+            if (typeof authGuard?._isPageBlank === 'function') {
+              const blank = await authGuard._isPageBlank(page);
+              if (!blank) {
+                _blankPolls = 0; // got content — exit early
+                break;
+              }
+            } else {
+              break; // can't check — assume ok
+            }
+          } catch { break; }
+          _blankPolls++;
+          if (_bp < MAX_BLANK_POLLS - 1) {
+            await new Promise(r => setTimeout(r, BLANK_POLL_INTERVAL_MS));
+          }
+        }
+        _persistentBlank = _blankPolls >= MAX_BLANK_POLLS;
+
+        if (_persistentBlank) {
+          // Record as a distinct browser-progress failure
+          try {
+            const ipRotator = require('./network-ip-rotator');
+            if (typeof ipRotator.recordNetworkError === 'function') {
+              ipRotator.recordNetworkError(
+                new Error('Persistent blank screenshot after navigation — browser did not progress (canvas not painted)'),
+                { url: targetUrl }
+              );
+            }
+          } catch { /* ip-rotator not loaded */ }
+
+          log(`BROWSER_PROGRESS_FAILURE: page blank after ${MAX_BLANK_POLLS} polls (${MAX_BLANK_POLLS * BLANK_POLL_INTERVAL_MS / 1000}s). Nav "succeeded" but nothing painted.`, 'ERROR', 'cycle');
+
+          // If a proxy is still active, this is likely a proxy delivering a
+          // blank response — bypass and let the next cycle try direct.
+          try {
+            const ipRotator = require('./network-ip-rotator');
+            const currentProxy = ipRotator.getCurrentProxy?.();
+            if (currentProxy && !(globalThis as any).__proxyDisabled) {
+              if (typeof ipRotator.bypassProxy === 'function') {
+                ipRotator.bypassProxy('persistent blank screenshot after navigation (proxy may be delivering empty response)');
+              } else {
+                (globalThis as any).__proxyDisabled = true;
+              }
+              log(`Proxy was active during persistent-blank — bypassing. Next cycle will use direct connection.`, 'WARN', 'cycle');
+              try {
+                const alerting = getDep('alerting');
+                alerting?.sendAlert?.('Proxy bypassed: persistent blank screenshot after navigation. Browser progress stalled — switching to direct connection.');
+              } catch {}
+            }
+          } catch { /* ip-rotator not loaded */ }
+
+          // Reload the page once with a fresh navigation — sometimes a single
+          // navigation gets a bad response but a retry gets the real page.
+          try {
+            log('Attempting one page.reload() to recover from persistent blank...', 'WARN', 'cycle');
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 });
+            await new Promise(r => setTimeout(r, 5000));
+            // Check again
+            const authGuard = getDep('authGuard');
+            if (typeof authGuard?._isPageBlank === 'function') {
+              const stillBlank = await authGuard._isPageBlank(page);
+              if (stillBlank) {
+                log('Page still blank after reload — falling through to cycle. Blank-page escalation will handle it.', 'WARN', 'cycle');
+              } else {
+                log('Page recovered after reload — proceeding with cycle.', 'INFO', 'cycle');
+              }
+            }
+          } catch (reloadErr: any) {
+            log(`Page reload during persistent-blank recovery failed: ${reloadErr?.message || reloadErr}`, 'WARN', 'cycle');
+          }
+        }
+      }
     }
 
     let questionsCompleted = checkpoint?.questionsCompleted || 0;
@@ -1503,6 +1721,40 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             continue;
           } else if (blankPageCounter >= BLANK_RELOAD_THRESHOLD) {
             // Step 1: Reload MathU
+            // BUG FIX (2026-09-08): If a proxy is active and we're hitting blank
+            // pages, the proxy is likely silently failing (peer returning 502,
+            // DNS failure through the tunnel, etc.). Disable the proxy before
+            // reloading — otherwise we just reload through the same broken proxy
+            // and get another blank page (which would escalate to restart, then
+            // self-heal, burning 5+ minutes before any real recovery).
+            try {
+              const ipRotator = require('./network-ip-rotator');
+              const currentProxy = ipRotator.getCurrentProxy?.();
+              if (currentProxy && !(globalThis as any).__proxyDisabled) {
+                (globalThis as any).__proxyDisabled = true;
+                log(`Blank-page escalation ${blankPageCounter}: proxy was active (${currentProxy}) — DISABLING PROXY before reload.`, 'ERROR', 'cycle');
+                try {
+                  const alerting = getDep('alerting');
+                  alerting?.sendAlert?.(`Proxy disabled: blank-page escalation step ${blankPageCounter}. Switching to direct connection.`);
+                } catch {}
+                // Relaunch browser WITHOUT proxy before reload — `setupContext`
+                // reads `__proxyDisabled` at launch time.
+                try {
+                  _networkSetup = false;
+                  const bm = _browserDep?.getBrowserManager?.();
+                  if (bm) bm._intentionalClose = true;
+                  await closeBrowser?.();
+                  await new Promise(r => setTimeout(r, 2000));
+                  page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+                  if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
+                    try { await network.setupInterception(page); _networkSetup = true; } catch {}
+                  }
+                } catch (relaunchErr: any) {
+                  log(`Browser relaunch during proxy-disable failed: ${relaunchErr?.message || relaunchErr}`, 'WARN', 'cycle');
+                }
+              }
+            } catch { /* ip-rotator not loaded — skip */ }
+
             log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — reloading MathU`, 'WARN', 'cycle');
             const targetUrl = _getRecoveryUrl();
             if (targetUrl) {
@@ -1639,7 +1891,13 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         // BUG FIX (2026-09-04): Lowered quality from 20 to 15 to reduce heap pressure.
         // Each screenshot is a base64 string in memory (~50KB at quality 20, ~30KB at 15).
         // Over 60+ cycles, the accumulated transient allocations push heap past the limit.
-        screenshot = await page.screenshot({ type: 'jpeg', quality: 15 });
+        //
+        // BUG FIX (2026-09-08): Explicit 10s timeout (default 30s).
+        // Playwright waits for `document.fonts.ready` before capturing — through
+        // a slow / blocked proxy, @font-face fetches can hang for the full 30s.
+        // Fail fast so we can retry / recover instead of crashing the cycle.
+        // `animations: 'disabled'` skips animation-completion wait too.
+        screenshot = await page.screenshot({ type: 'jpeg', quality: 15, timeout: 10000, animations: 'disabled' });
       } catch (ssErr: any) {
         const ssMsg = ssErr?.message || String(ssErr);
         if (ssMsg.includes('closed') || ssMsg.includes('Closed')) {
@@ -1647,7 +1905,69 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           page = await _relaunchBrowser();
           continue;
         }
-        throw ssErr;
+        // BUG FIX (2026-09-08): Screenshot timeout (fonts stuck via proxy, or
+        // render hang). Multi-stage recovery so we don't crash the cycle:
+        //   Stage 1: Pre-warm document.fonts.ready with a 3s race, then retry
+        //            screenshot with a short 5s timeout.
+        //   Stage 2: Reload the page once (clean DOM state), wait, retry once
+        //            more with 8s timeout.
+        //   Stage 3: Skip the cycle (continue main loop) instead of throwing —
+        //            the next cycle will try again from a fresh state.
+        const isTimeout = ssErr?.name === 'TimeoutError'
+          || /Timeout \d+ms exceeded/i.test(ssMsg)
+          || /timeout/i.test(ssMsg);
+        if (!isTimeout) throw ssErr;
+
+        log('Screenshot timed out (fonts/render hang). Recovering...', 'WARN', 'cycle');
+
+        // Stage 1: pre-warm fonts + retry short
+        try {
+          await Promise.race([
+            page.evaluate(() => (document as any).fonts?.ready ?? Promise.resolve()),
+            new Promise(r => setTimeout(r, 3000)),
+          ]);
+        } catch { /* fonts API missing — ignore */ }
+        let recovered = false;
+        try {
+          screenshot = await page.screenshot({ type: 'jpeg', quality: 15, timeout: 5000, animations: 'disabled' });
+          if (screenshot && screenshot.length > 0) {
+            log(`Screenshot recovered on stage-1 retry (${screenshot.length} bytes)`, 'INFO', 'cycle');
+            recovered = true;
+          }
+        } catch (retry1Err: any) {
+          log(`Stage-1 retry failed: ${retry1Err?.message || retry1Err}`, 'WARN', 'cycle');
+        }
+
+        // Stage 2: reload page once and retry
+        if (!recovered) {
+          try {
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+            await _waitForRenderedPage(page, 8000);
+          } catch (reloadErr: any) {
+            log(`Page reload during screenshot recovery failed: ${reloadErr?.message || reloadErr}`, 'WARN', 'cycle');
+          }
+          try {
+            screenshot = await page.screenshot({ type: 'jpeg', quality: 15, timeout: 8000, animations: 'disabled' });
+            if (screenshot && screenshot.length > 0) {
+              log(`Screenshot recovered on stage-2 retry (${screenshot.length} bytes)`, 'INFO', 'cycle');
+              recovered = true;
+            }
+          } catch (retry2Err: any) {
+            log(`Stage-2 retry failed: ${retry2Err?.message || retry2Err}`, 'WARN', 'cycle');
+          }
+        }
+
+        // Stage 3: skip cycle (don't crash)
+        if (!recovered) {
+          log('Screenshot failed 3× — skipping cycle with 15s wait. Next cycle will retry from fresh state.', 'WARN', 'cycle');
+          // Clear stale screenshot from dashboard so user sees we're not stuck
+          try {
+            const setShot = (globalThis as any).__setLatestScreenshot;
+            if (setShot) setShot('', 'screenshot-timeout-recovery');
+          } catch { /* non-critical */ }
+          await new Promise(r => setTimeout(r, 15000));
+          continue;
+        }
       }
 
       // ── Screenshot validity check ──
@@ -1657,7 +1977,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         log(`Screenshot suspiciously small (${screenshot.length} bytes) — page may be blank. Waiting 3s and retaking...`, 'WARN', 'cycle');
         await new Promise(r => setTimeout(r, 3000));
         try {
-          const retryShot = await page.screenshot({ type: 'jpeg', quality: 15 });
+          const retryShot = await page.screenshot({ type: 'jpeg', quality: 15, timeout: 8000, animations: 'disabled' });
           if (retryShot.length > screenshot.length) {
             log(`Retry screenshot is ${retryShot.length} bytes (was ${screenshot.length}) — using retry`, 'INFO', 'cycle');
             screenshot = retryShot;
@@ -1883,10 +2203,34 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 action?.reasoning?.includes('No valid responses from any provider') ||
                 action?.reasoning?.includes('No providers') ||
                 // Generic fallback-error from vision pipeline (provider: 'fallback-error')
-                action?.provider === 'fallback-error'
+                action?.provider === 'fallback-error' ||
+                // BUG FIX (2026-09-08): If ALL providers failed (0 success), the
+                // tribunal returns "Tribunal success: 0/N (0%)" but still returns
+                // a wait action. Catch this case too — any wait action from the
+                // tribunal when we know providers are failing should trigger pixel fallback.
+                action?.reasoning?.includes('Fallback due to tribunal failure') ||
+                action?.reasoning?.includes('0/0') ||
+                action?.reasoning?.includes('0%')
               );
-            if (isTribunalErrorWait) {
-              logError(`Tribunal/vision returned error-wait, trying pixel fallback. reasoning=${action?.reasoning || 'unknown'}`, new Error(action?.reasoning || ''));
+            // BUG FIX (2026-09-08): Also catch the case where determineNextAction
+            // catches a tribunal exception and returns a generic error-wait.
+            // The reasoning is "Fallback due to tribunal failure" — but we also
+            // need to catch when ALL providers failed (the tribunal may return
+            // success with 0 valid responses, or the vision pipeline may have
+            // been called separately and logged "All vision fallbacks exhausted"
+            // even though the tribunal itself returned a different reasoning).
+            // Simplest fix: if the action is wait+error/unknown AND no pixel
+            // fallback has been tried yet this cycle, try it.
+            const _shouldTryPixelFallback = isTribunalErrorWait ||
+              (action?.actionType === 'wait' &&
+               (action?.currentState === 'error' || action?.currentState === 'unknown') &&
+               !action?._pixelFallbackTried);
+            if (_shouldTryPixelFallback) {
+              if (!isTribunalErrorWait) {
+                log(`Tribunal returned wait+error/unknown (reasoning: ${action?.reasoning?.substring(0, 100)}). Trying pixel fallback as safety net.`, 'WARN', 'cycle');
+              } else {
+                logError(`Tribunal/vision returned error-wait, trying pixel fallback. reasoning=${action?.reasoning || 'unknown'}`, new Error(action?.reasoning || ''));
+              }
             // v14: Feed tribunal failure to self-heal error buffer
             try { (getDep('selfHeal') || require('./self-heal'))?.pushSelfHealError?.(`tribunal fallback wait: ${action.reasoning || 'unknown'}`, 'tribunal'); } catch {}
               action = await getFallbackAction(page, currentState || undefined);
@@ -2446,7 +2790,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           && _postActionHeapMB < 150) {
         try {
           const pixelCal = require('./pixel-calibration');
-          const pngShot = await page.screenshot({ type: 'png', fullPage: false }).catch(() => null);
+          const pngShot = await page.screenshot({ type: 'png', fullPage: false, timeout: 10000, animations: 'disabled' }).catch(() => null);
           if (pngShot && pngShot.length > 100) {
             const dprMod = require('./browser');
             const dpr = dprMod._dprScale || 1.0;
@@ -2539,7 +2883,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         while (Date.now() - downloadStartTime < MODULE_DOWNLOAD_TIMEOUT_MS) {
           await dlSleep(MODULE_DOWNLOAD_POLL_INTERVAL_MS);
           try {
-            const pollScreenshot = await page.screenshot({ type: 'jpeg', quality: 15 });
+            const pollScreenshot = await page.screenshot({ type: 'jpeg', quality: 15, timeout: 10000, animations: 'disabled' });
             const pollHash = crypto.createHash('md5').update(pollScreenshot).digest('hex');
 
             if (pollHash !== _preDownloadScreenshotHash) {
@@ -2553,7 +2897,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               // v17: Skip PNG pixel check on tight heap — use heuristic instead
               if (process.memoryUsage().heapUsed / 1024 / 1024 < 150) {
                 try {
-                  const pngScreenshot = await page.screenshot({ type: 'png', fullPage: false });
+                  const pngScreenshot = await page.screenshot({ type: 'png', fullPage: false, timeout: 10000, animations: 'disabled' });
                   const pixelMod = require('./pixel-fallback');
                   const decoded = pixelMod._decodePNG?.(pngScreenshot);
                   if (decoded && pixelMod._isModuleContentLoaded?.(decoded.rgba, decoded.width, decoded.height)) {
