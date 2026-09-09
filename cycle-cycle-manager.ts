@@ -1447,6 +1447,16 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     let _humanInterventionLogged = false; // Task 35: Track if we've already logged the pause message
     const MAX_UNKNOWN_STATE = 3; // After this many unknowns, force recovery
 
+    // TASK 39 (2026-09-09): Track consecutive "no providers" tribunal failures.
+    // If ALL vision providers are unavailable for 30 minutes straight,
+    // pause the bot for 3 hours and don't touch the browser.
+    // API rate limits typically reset daily, so waiting 3h gives time for
+    // cooldowns to expire without burning cycles on doomed tribunal calls.
+    let _noProvidersSince: number | null = null; // timestamp when providers first became unavailable
+    const NO_PROVIDERS_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+    const NO_PROVIDERS_PAUSE_MS = 3 * 60 * 60 * 1000; // 3 hours
+    let _noProvidersPauseUntil: number | null = null; // timestamp until which we should pause
+
     // v12: Blank-page escalation ladder — prevents infinite blank/wait loops
     // Track consecutive blank-page detections separately from unknown states.
     // Step 1 (count >= 2): reload MathU
@@ -1570,6 +1580,39 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
       if (_humanInterventionLogged) {
         log('Human intervention RESUMED — bot continues normal operation.', 'INFO', 'cycle');
+        _humanInterventionLogged = false;
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // NO-PROVIDERS PAUSE (Task 39, 2026-09-09)
+      // ─────────────────────────────────────────────────────────────────────
+      // If ALL vision providers have been unavailable for 30+ minutes,
+      // pause the bot for 3 hours. Don't touch the browser at all — just
+      // sleep in 5-minute intervals until the pause expires.
+      //
+      // This prevents the bot from cycling for hours on doomed tribunal calls
+      // when every provider is rate-limited (429) or down.
+      if (_noProvidersPauseUntil && Date.now() < _noProvidersPauseUntil) {
+        const _remaining = Math.round((_noProvidersPauseUntil - Date.now()) / 60000);
+        if (!_humanInterventionLogged) {
+          log(`NO-PROVIDERS PAUSE: All vision providers unavailable for 30+ min. Pausing for ${_remaining} more min. Not touching browser.`, 'WARN', 'cycle');
+          try {
+            const alerting = getDep('alerting');
+            alerting?.sendAlert?.(`No providers for 30+ min. Bot pausing for 3h. Will resume at ${new Date(_noProvidersPauseUntil).toISOString()}.`);
+          } catch {}
+          _humanInterventionLogged = true;
+        }
+        // Sleep 5 minutes, then check again
+        await new Promise(r => setTimeout(r, 5 * 60 * 1000));
+        continue;
+      }
+      // Pause expired — clear it
+      if (_noProvidersPauseUntil && Date.now() >= _noProvidersPauseUntil) {
+        log('NO-PROVIDERS PAUSE expired — resuming normal operation. Checking providers again.', 'INFO', 'cycle');
+        _noProvidersPauseUntil = null;
+        _noProvidersSince = null;
+        (globalThis as any).__noProvidersSince = null;
+        (globalThis as any).__noProvidersPauseUntil = null;
         _humanInterventionLogged = false;
       }
 
@@ -2322,6 +2365,43 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               (action?.actionType === 'wait' &&
                (action?.currentState === 'error' || action?.currentState === 'unknown') &&
                !action?._pixelFallbackTried);
+
+            // ─────────────────────────────────────────────────────────────────
+            // TASK 39 (2026-09-09): Track "no providers" duration.
+            // If the tribunal returns "No providers" or "No valid responses",
+            // start (or continue) the no-providers timer. If it's been 30+
+            // minutes, trigger a 3-hour pause (checked at top of cycle loop).
+            // ─────────────────────────────────────────────────────────────────
+            if (action?.reasoning?.includes('No providers') ||
+                action?.reasoning?.includes('No valid responses from any provider') ||
+                action?.reasoning?.includes('0/0')) {
+              if (!_noProvidersSince) {
+                _noProvidersSince = Date.now();
+                log(`No providers detected — starting 30-min timer. If providers don't recover, bot will pause for 3h.`, 'WARN', 'cycle');
+              }
+              const _elapsed = Date.now() - _noProvidersSince;
+              if (_elapsed >= NO_PROVIDERS_THRESHOLD_MS && !_noProvidersPauseUntil) {
+                _noProvidersPauseUntil = Date.now() + NO_PROVIDERS_PAUSE_MS;
+                // Expose via globals for dashboard /api/health
+                (globalThis as any).__noProvidersSince = _noProvidersSince;
+                (globalThis as any).__noProvidersPauseUntil = _noProvidersPauseUntil;
+                log(`No providers for ${Math.round(_elapsed / 60000)} min — triggering 3h pause. Bot will not touch the browser until ${new Date(_noProvidersPauseUntil).toISOString()}.`, 'ERROR', 'cycle');
+                try {
+                  const alerting = getDep('alerting');
+                  alerting?.sendAlert?.(`No vision providers for ${Math.round(_elapsed / 60000)} min. Bot pausing for 3h (until ${new Date(_noProvidersPauseUntil).toISOString()}). Browser will not be touched.`);
+                } catch {}
+              }
+            } else {
+              // Providers recovered — reset the timer
+              if (_noProvidersSince) {
+                log('Providers recovered — clearing no-providers timer.', 'INFO', 'cycle');
+                _noProvidersSince = null;
+                _noProvidersPauseUntil = null;
+                (globalThis as any).__noProvidersSince = null;
+                (globalThis as any).__noProvidersPauseUntil = null;
+              }
+            }
+
             if (_shouldTryPixelFallback) {
               if (!isTribunalErrorWait) {
                 log(`Tribunal returned wait+error/unknown (reasoning: ${action?.reasoning?.substring(0, 100)}). Trying pixel fallback as safety net.`, 'WARN', 'cycle');
