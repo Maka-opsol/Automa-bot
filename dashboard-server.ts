@@ -679,6 +679,18 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
             : 0,
           forceHeaded: !!(globalThis as any).__forceHeaded,
         },
+        // Task 39: no-providers pause status
+        noProvidersPause: {
+          active: !!(globalThis as any).__noProvidersPauseUntil && Date.now() < (globalThis as any).__noProvidersPauseUntil,
+          since: (globalThis as any).__noProvidersSince || null,
+          pauseUntil: (globalThis as any).__noProvidersPauseUntil || null,
+          remainingMinutes: (globalThis as any).__noProvidersPauseUntil
+            ? Math.max(0, Math.round(((globalThis as any).__noProvidersPauseUntil - Date.now()) / 60000))
+            : 0,
+          elapsedMinutes: (globalThis as any).__noProvidersSince
+            ? Math.round((Date.now() - (globalThis as any).__noProvidersSince) / 60000)
+            : 0,
+        },
       };
       jsonRes(res, health);
     });
