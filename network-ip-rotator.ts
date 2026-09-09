@@ -333,18 +333,55 @@ async function rotateToValidatedProxy(maxToTry: number = 5): Promise<string | nu
 }
 
 /**
- * Bypass the proxy — set `__proxyDisabled = true` so the next browser launch
- * uses a direct connection. Records the bypass in the proxy outcome log.
+ * Bypass the proxy — FULLY shut it down so no code path uses it anymore.
+ *
+ * BUG FIX (2026-09-09): The old `bypassProxy()` only set `__proxyDisabled = true`
+ * but did NOT clear:
+ *   - `process.env.HTTP_PROXY` / `process.env.HTTPS_PROXY` — Node's `fetch()`
+ *     (used by vision providers, self-heal, ip-rotator's own validateProxy, etc.)
+ *     respects these env vars and STILL routes through the dead proxy.
+ *   - `_currentProxyIndex` — `getCurrentProxy()` still returns the old proxy URL,
+ *     so any code that checks it thinks a proxy is active.
+ *
+ * This was causing `ERR_PROXY_CONNECTION_FAILED` and `ERR_EMPTY_RESPONSE` even
+ * AFTER the proxy was "disabled" — the bot kept using the dead proxy via env vars.
+ *
+ * Now `bypassProxy()` is the SINGLE canonical way to disable the proxy. It:
+ *   1. Sets `__proxyDisabled = true` (stops Playwright context from using proxy)
+ *   2. Clears `process.env.HTTP_PROXY` / `HTTPS_PROXY` (stops Node fetch)
+ *   3. Resets `_currentProxyIndex = -1` (stops `getCurrentProxy()` from returning stale proxy)
+ *   4. Records the bypass in the proxy outcome log
  */
 function bypassProxy(reason: string): void {
+  const wasActive = !!(globalThis as any).__proxyDisabled === false && getCurrentProxy();
   if (!(globalThis as any).__proxyDisabled) {
     (globalThis as any).__proxyDisabled = true;
-    log(`[IP] Proxy BYPASSED — reason: ${reason}. Using direct connection.`, 'WARN');
+    log(`[IP] Proxy BYPASSED — reason: ${reason}. Fully shutting down proxy (env vars + state).`, 'WARN');
+  }
+  // Clear environment variables so Node's fetch() / HTTP clients stop using the proxy
+  if (process.env.HTTP_PROXY) {
+    const _oldProxy = process.env.HTTP_PROXY;
+    delete process.env.HTTP_PROXY;
+    log(`[IP] Cleared process.env.HTTP_PROXY (was: ${_oldProxy})`, 'DEBUG');
+  }
+  if (process.env.HTTPS_PROXY) {
+    delete process.env.HTTPS_PROXY;
+    log('[IP] Cleared process.env.HTTPS_PROXY', 'DEBUG');
+  }
+  if (process.env.NO_PROXY) {
+    delete process.env.NO_PROXY;
+    log('[IP] Cleared process.env.NO_PROXY', 'DEBUG');
+  }
+  // Reset the ip-rotator state so getCurrentProxy() returns null
+  const _oldIndex = _currentProxyIndex;
+  _currentProxyIndex = -1;
+  if (wasActive || _oldIndex >= 0) {
+    log(`[IP] Reset _currentProxyIndex from ${_oldIndex} to -1 (no proxy active)`, 'DEBUG');
   }
   _recordProxyOutcome({
     timestamp: Date.now(),
     action: 'bypassed',
-    proxy: getCurrentProxy(),
+    proxy: null, // proxy is now null — fully shut down
     reason,
   });
 }
