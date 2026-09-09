@@ -32,9 +32,29 @@ function _getBL(): any {
   }
 }
 
+// ─── Lazy VoidAI require (resilient to transform failures) ───
+// Same pattern as BazaarLink: lazy import so VoidAI degrades gracefully
+// if the module fails to load (corrupted file, OOM-damaged source, etc.)
+let _voidModule: any = null;
+let _voidLoadError: string | null = null;
+
+function _getVoid(): any {
+  if (_voidLoadError) return null; // already failed, don't retry
+  if (_voidModule) return _voidModule;
+  try {
+    _voidModule = require('./providers-codegen-voidai');
+    return _voidModule;
+  } catch (err: any) {
+    _voidLoadError = String(err.message || err).substring(0, 300);
+    log(`VoidAI module failed to load (tribunal will skip VoidAI): ${_voidLoadError}`, 'ERROR', 'codegen');
+    return null;
+  }
+}
+
 // ─── IMPORTANT: Provider Scope ─────────────────────────────────────────
 // This tribunal is for CODE GENERATION ONLY.
 //   - BazaarLink: primary codegen provider (50 free req/day)
+//   - VoidAI: codegen provider using OpenAI SDK with api.voidai.app baseURL
 //   - Mistral: dedicated codegen provider
 //   - OpenRouter is NOT used here — it's for the vision/general tribunal only.
 //   - Cloudflare, Gemini, etc. are NOT codegen providers — never call them here.
@@ -174,10 +194,17 @@ function discoverModels() {
   const blModels = bl?.getBazaarLinkModels?.() || [];
   const hasBazaarLink = !!getCONFIG().BAZAARLINK_API_KEY && !!bl;
 
+  // VoidAI models (codegen — uses OpenAI SDK with api.voidai.app baseURL)
+  const voidMod = _getVoid();
+  const voidModels = voidMod?.getVoidAIModels?.() || [];
+  const hasVoidAI = !!getCONFIG().VOIDAI_API_KEY && !!voidMod;
+
   return {
     blModels,
     hasMistral: !!getCONFIG().MISTRAL_CODE_API_KEY,
     hasBazaarLink,
+    voidModels,
+    hasVoidAI,
   };
 }
 
@@ -195,10 +222,12 @@ async function generateCodeFixViaTribunal(
   const models = discoverModels();
 
   const totalModels = models.blModels.length
-    + (models.hasMistral ? 1 : 0);
+    + (models.hasMistral ? 1 : 0)
+    + models.voidModels.length;
 
   const blModelList = models.blModels.join(', ');
-  log(`\u{1f9e0} CODEGEN TRIBUNAL: Consulting ${totalModels} models — BazaarLink [${blModelList}]${models.hasMistral ? ' + Mistral' : ''}${options?.allowNonCodegenFallback ? ' (non-codegen fallback ENABLED)' : ''}...`, 'INFO', 'codegen');
+  const voidModelList = models.voidModels.join(', ');
+  log(`\u{1f9e0} CODEGEN TRIBUNAL: Consulting ${totalModels} models — BazaarLink [${blModelList}]${models.hasVoidAI ? ` + VoidAI [${voidModelList}]` : ''}${models.hasMistral ? ' + Mistral' : ''}${options?.allowNonCodegenFallback ? ' (non-codegen fallback ENABLED)' : ''}...`, 'INFO', 'codegen');
 
   const prompt = buildCodeGenPrompt(investigationData, errorLogs, options?.feedbackInfo);
   const screenshot = investigationData?.screenshot || null;  // v14: JPEG base64
@@ -281,11 +310,44 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
     );
   }
 
+  // VoidAI (codegen — uses OpenAI SDK with api.voidai.app baseURL)
+  // Stagger 3s between VoidAI model calls to avoid rate limiting (same as BazaarLink).
+  if (models.hasVoidAI) {
+    const VOID_STAGGER_MS = 3000;
+    for (let i = 0; i < models.voidModels.length; i++) {
+      const modelSlug = models.voidModels[i];
+      if (i > 0) {
+        log(`Tribunal: staggering VoidAI/${modelSlug} (${VOID_STAGGER_MS}ms delay)`, 'DEBUG', 'codegen');
+        await _sleep(VOID_STAGGER_MS);
+      }
+      log(`Tribunal: calling VoidAI/${modelSlug}`, 'DEBUG', 'codegen');
+      try {
+        const result = await _getVoid().callVoidAICodeGenWithModel(prompt, signal, modelSlug);
+        if (!result) {
+          log(`VoidAI/${modelSlug}: parseCodegenResponse returned null`, 'WARN', 'codegen');
+        } else if (Array.isArray(result)) {
+          log(`VoidAI/${modelSlug}: got ${result.length} raw fix(es) from parser`, 'DEBUG', 'codegen');
+        } else {
+          log(`VoidAI/${modelSlug}: got non-array result: ${typeof result}`, 'DEBUG', 'codegen');
+        }
+        collected.push({ provider: `VoidAI/${modelSlug}`, fixes: validateFixArray(result) });
+      } catch (err: any) {
+        collected.push({ provider: `VoidAI/${modelSlug}`, fixes: [], error: String(err.message || err).substring(0, 200) });
+      }
+    }
+    // Push any collected VoidAI results into allPromises (already resolved)
+    for (const c of collected) {
+      if (c.provider.startsWith('VoidAI/')) {
+        allPromises.push(Promise.resolve(c));
+      }
+    }
+  }
+
   // NO OpenRouter here — it's for vision/general tribunal only.
   // NO Cloudflare, Gemini, or any other non-codegen provider.
 
   if (allPromises.length === 0) {
-    log('No codegen providers available. Need BAZAARLINK_API_KEY or MISTRAL_CODE_API_KEY.', 'ERROR', 'codegen');
+    log('No codegen providers available. Need BAZAARLINK_API_KEY, VOIDAI_API_KEY, or MISTRAL_CODE_API_KEY.', 'ERROR', 'codegen');
     return null;
   }
 
@@ -508,7 +570,8 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
   const models = discoverModels();
 
   const totalModels = models.blModels.length
-    + (models.hasMistral ? 1 : 0);
+    + (models.hasMistral ? 1 : 0)
+    + models.voidModels.length;
 
   log(`\u{1f9e0} TRIBUNAL RAW: Consulting ${totalModels} codegen models for generic task...`, 'INFO', 'codegen');
 
@@ -533,8 +596,23 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
     } else if (models.hasBazaarLink) {
       log('Tribunal raw: BazaarLink budget exhausted — skipping', 'WARN', 'codegen');
     }
+    // VoidAI for raw consultation (staggered 3s apart)
+    const VOID_STAGGER_MS = 3000;
+    const voidCollected: Array<{ provider: string; raw: string } | null>[] = [];
+    if (models.hasVoidAI) {
+      for (let i = 0; i < models.voidModels.length; i++) {
+        const modelSlug = models.voidModels[i];
+        if (i > 0) {
+          log(`Tribunal raw: staggering VoidAI/${modelSlug} (${VOID_STAGGER_MS}ms delay)`, 'DEBUG', 'codegen');
+          await _sleep(VOID_STAGGER_MS);
+        }
+        log(`Tribunal raw: calling VoidAI/${modelSlug}`, 'DEBUG', 'codegen');
+        voidCollected.push(await _callRawVoidAI(prompt, ctl.signal, modelSlug));
+      }
+    }
     const allPromises: Promise<{ provider: string; raw: string } | null>[] = [
       ...blCollected.map(r => Promise.resolve(r)),
+      ...voidCollected.map(r => Promise.resolve(r)),
     ];
     if (models.hasMistral) {
       allPromises.push(
@@ -593,6 +671,24 @@ async function _callRawBazaarLink(prompt: string, signal: any, modelSlug: string
     return { provider: `BL/${modelSlug}`, raw };
   } catch (err: any) {
     log(`Tribunal raw BL/${modelSlug} failed: ${String(err.message || err).substring(0, 200)}`, 'DEBUG', 'codegen');
+    return null;
+  }
+}
+
+/**
+ * Call a VoidAI model for raw text (not fix-validated).
+ */
+async function _callRawVoidAI(prompt: string, signal: any, modelSlug: string) {
+  try {
+    const voidMod = _getVoid();
+    if (!voidMod) return null;
+    const result = await voidMod.callVoidAICodeGenWithModel(prompt, signal, modelSlug);
+    if (!result) return null;
+    const raw = typeof result === 'string' ? result : JSON.stringify(result);
+    if (!raw || raw.trim().length === 0) return null;
+    return { provider: `VoidAI/${modelSlug}`, raw };
+  } catch (err: any) {
+    log(`Tribunal raw VoidAI/${modelSlug} failed: ${String(err.message || err).substring(0, 200)}`, 'DEBUG', 'codegen');
     return null;
   }
 }
