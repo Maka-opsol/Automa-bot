@@ -669,6 +669,16 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           networkError: latestNetworkError,
           networkErrorCount: ipRotatorStatus?.networkErrorCount || 0,
         },
+        // Task 35: human intervention status
+        humanIntervention: {
+          paused: !!(globalThis as any).__humanInterventionRequested,
+          reason: (globalThis as any).__humanInterventionReason || null,
+          since: (globalThis as any).__humanInterventionSince || null,
+          pausedForSeconds: (globalThis as any).__humanInterventionSince
+            ? Math.round((Date.now() - (globalThis as any).__humanInterventionSince) / 1000)
+            : 0,
+          forceHeaded: !!(globalThis as any).__forceHeaded,
+        },
       };
       jsonRes(res, health);
     });
@@ -730,6 +740,104 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
         jsonRes(res, { available: true, timestamp: Date.now(), screenshot: jpeg });
       } catch (e: any) {
         jsonRes(res, { available: false, error: e.message }, 500);
+      }
+    });
+    return true;
+  }
+
+  // ── Human Intervention: Pause/Resume ──
+  // Task 35 (2026-09-09): When paused, the bot stops ALL browser interaction.
+  // The user can fix things manually (solve captcha, log in, etc.) then resume.
+  if (pathname === '/api/intervention/pause' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, (rawBody: string) => {
+        try {
+          const body = rawBody ? JSON.parse(rawBody) : {};
+          const reason = body?.reason || body || 'manual dashboard request';
+          (globalThis as any).__humanInterventionRequested = true;
+          (globalThis as any).__humanInterventionReason = String(reason).substring(0, 200);
+          (globalThis as any).__humanInterventionSince = Date.now();
+          jsonRes(res, { ok: true, message: 'Bot paused. No browser interaction until /api/intervention/resume is called.', reason, timestamp: Date.now() });
+        } catch (e: any) {
+          // Even if body parse fails, still pause with default reason
+          (globalThis as any).__humanInterventionRequested = true;
+          (globalThis as any).__humanInterventionReason = 'manual dashboard request';
+          (globalThis as any).__humanInterventionSince = Date.now();
+          jsonRes(res, { ok: true, message: 'Bot paused (body parse failed, used default reason).', timestamp: Date.now() });
+        }
+      });
+    });
+    return true;
+  }
+
+  if (pathname === '/api/intervention/resume' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        const wasPaused = (globalThis as any).__humanInterventionRequested;
+        (globalThis as any).__humanInterventionRequested = false;
+        (globalThis as any).__humanInterventionReason = null;
+        (globalThis as any).__humanInterventionSince = null;
+        jsonRes(res, { ok: true, wasPaused, message: 'Bot resumed. Normal operation continues on next cycle.' });
+      } catch (e: any) {
+        jsonRes(res, { ok: false, error: e.message }, 500);
+      }
+    });
+    return true;
+  }
+
+  if (pathname === '/api/intervention/status') {
+    authWrap(() => {
+      jsonRes(res, {
+        paused: !!(globalThis as any).__humanInterventionRequested,
+        reason: (globalThis as any).__humanInterventionReason || null,
+        since: (globalThis as any).__humanInterventionSince || null,
+        pausedForSeconds: (globalThis as any).__humanInterventionSince
+          ? Math.round((Date.now() - (globalThis as any).__humanInterventionSince) / 1000)
+          : 0,
+        forceHeaded: !!(globalThis as any).__forceHeaded,
+      });
+    });
+    return true;
+  }
+
+  // ── Browser Headed/Headless Toggle ──
+  // Task 35: Switch browser to headed mode for visual debugging.
+  // On Render, this requires Xvfb to be installed (apt-get install xvfb).
+  // When toggled, the bot will relaunch the browser on the next cycle.
+  if (pathname === '/api/browser/headed' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        (globalThis as any).__forceHeaded = true;
+        // Auto-pause the bot so the user can interact with the browser
+        if (!(globalThis as any).__humanInterventionRequested) {
+          (globalThis as any).__humanInterventionRequested = true;
+          (globalThis as any).__humanInterventionReason = 'headed mode enabled — user wants to interact';
+          (globalThis as any).__humanInterventionSince = Date.now();
+        }
+        jsonRes(res, {
+          ok: true,
+          message: 'Headed mode enabled. Bot paused. Browser will relaunch as headed on next cycle. Use /api/browser/headless to switch back.',
+          note: 'On Render, requires Xvfb: apt-get install xvfb && start-stop-daemon --start --background --exec /usr/bin/Xvfb -- :99 -screen 0 1280x720x24 && export DISPLAY=:99',
+          paused: true,
+        });
+      } catch (e: any) {
+        jsonRes(res, { ok: false, error: e.message }, 500);
+      }
+    });
+    return true;
+  }
+
+  if (pathname === '/api/browser/headless' && req.method === 'POST') {
+    authWrap(() => {
+      try {
+        (globalThis as any).__forceHeaded = false;
+        jsonRes(res, {
+          ok: true,
+          message: 'Headless mode enabled. Browser will relaunch as headless on next cycle.',
+          note: 'Bot remains paused — use /api/intervention/resume to continue.',
+        });
+      } catch (e: any) {
+        jsonRes(res, { ok: false, error: e.message }, 500);
       }
     });
     return true;
