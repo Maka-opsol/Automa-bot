@@ -777,9 +777,15 @@ async function ensureAuthenticated(page: any) {
         const ipRotator = require('./network-ip-rotator');
         const currentProxy = ipRotator.getCurrentProxy?.();
         if (currentProxy) {
-          (globalThis as any).__proxyDisabled = true;
           log(`Chrome error page detected (occurrence #${errorCount}, proxy=${currentProxy}) — DISABLING PROXY immediately. Browser will use direct connection on next launch.`, 'ERROR', 'auth-guard');
           try { (_deps.alerting?.sendAlert || (() => {}))(`Proxy disabled: chrome-error page detected (proxy=${currentProxy}). Switching to direct connection.`); } catch {}
+          // BUG FIX (2026-09-09): Use bypassProxy() to FULLY shut down the proxy
+          // (clears env vars + resets ip-rotator state), not just set the flag.
+          if (typeof ipRotator.bypassProxy === 'function') {
+            ipRotator.bypassProxy(`chrome-error page detected (occurrence #${errorCount})`);
+          } else {
+            (globalThis as any).__proxyDisabled = true;
+          }
         } else {
           log(`Chrome error page detected (occurrence #${errorCount}) — no proxy active, will recover via navigation.`, 'WARN', 'auth-guard');
         }
@@ -789,6 +795,18 @@ async function ensureAuthenticated(page: any) {
     } else if (errorCount >= 3 && (globalThis as any).__proxyDisabled) {
       // Already disabled — log it for visibility.
       log(`Chrome error page detected ${errorCount} times — proxy already disabled, but page still failing.`, 'WARN', 'auth-guard');
+
+      // BUG FIX (2026-09-09): HARD EXIT on persistent network failure.
+      // If we've seen 20+ chrome-error pages, the Render instance's network
+      // is completely broken. Cycling for hours won't fix a network outage.
+      // EXIT the process so Render can restart it cleanly.
+      if (errorCount >= 20) {
+        log(`FATAL: Chrome error page detected ${errorCount} times — network is completely unreachable. Exiting for clean Render restart.`, 'FATAL', 'auth-guard');
+        try { (_deps.alerting?.sendAlert || (() => {}))(`FATAL: Network unreachable (chrome-error count=${errorCount}). Process exiting for clean Render restart.`); } catch {}
+        try { require('./survival-restart-guardian').preserveBeforeExit?.('chrome_error_persistent').catch(() => {}); } catch {}
+        const origExit = (process as any)._originalExit || process.exit.bind(process);
+        origExit(137);
+      }
     }
 
     const recoveryUrl = CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za';
