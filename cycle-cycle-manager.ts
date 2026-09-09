@@ -1193,7 +1193,12 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 if (!newProxy) {
                   log('Attempt 2: no validated proxy available — skipping to direct connection.', 'WARN', 'cycle');
                   // Skip directly to attempt 3 (direct)
-                  (globalThis as any).__proxyDisabled = true;
+                  // BUG FIX (2026-09-09): Use bypassProxy() to fully shut down proxy
+                  if (typeof ipRotator.bypassProxy === 'function') {
+                    ipRotator.bypassProxy('no validated proxy available (attempt 2)');
+                  } else {
+                    (globalThis as any).__proxyDisabled = true;
+                  }
                 } else {
                   log(`Attempt 2: rotated to validated proxy ${newProxy}.`, 'INFO', 'cycle');
                 }
@@ -1271,6 +1276,24 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               const alerting = getDep('alerting');
               alerting?.sendAlert?.(`All ${MAX_NAV_ATTEMPTS} navigation attempts failed. Last error: ${_errorType}. Bot will continue and rely on blank-page escalation.`);
             } catch {}
+
+            // BUG FIX (2026-09-09): NETWORK-UNREACHABLE EXIT CONDITION.
+            // If ALL 3 navigation attempts failed AND the chrome-error count is
+            // high (> 10), the Render instance's network is completely broken.
+            // Cycling on blank pages for hours won't fix a network outage —
+            // EXIT the process so Render can restart it cleanly. A fresh
+            // instance may get a different network path / IP / container.
+            const _chromeErrCount = (globalThis as any).__chromeErrorCount || 0;
+            if (_chromeErrCount >= 10) {
+              log(`FATAL: Network unreachable — all ${MAX_NAV_ATTEMPTS} navigation attempts failed AND chrome-error count is ${_chromeErrCount}. Exiting for clean restart.`, 'FATAL', 'cycle');
+              try {
+                const alerting = getDep('alerting');
+                alerting?.sendAlert?.(`FATAL: Network unreachable (chrome-error count=${_chromeErrCount}). Process exiting for clean Render restart.`);
+              } catch {}
+              try { require('./survival-restart-guardian').preserveBeforeExit?.('network_unreachable').catch(() => {}); } catch {}
+              const origExit = (process as any)._originalExit || process.exit.bind(process);
+              origExit(137);
+            }
           }
           // Loop continues to next attempt
         }
@@ -1748,12 +1771,17 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               const ipRotator = require('./network-ip-rotator');
               const currentProxy = ipRotator.getCurrentProxy?.();
               if (currentProxy && !(globalThis as any).__proxyDisabled) {
-                (globalThis as any).__proxyDisabled = true;
                 log(`Blank-page escalation ${blankPageCounter}: proxy was active (${currentProxy}) — DISABLING PROXY before reload.`, 'ERROR', 'cycle');
                 try {
                   const alerting = getDep('alerting');
                   alerting?.sendAlert?.(`Proxy disabled: blank-page escalation step ${blankPageCounter}. Switching to direct connection.`);
                 } catch {}
+                // BUG FIX (2026-09-09): Use bypassProxy() to FULLY shut down the proxy
+                if (typeof ipRotator.bypassProxy === 'function') {
+                  ipRotator.bypassProxy(`blank-page escalation step ${blankPageCounter}`);
+                } else {
+                  (globalThis as any).__proxyDisabled = true;
+                }
                 // Relaunch browser WITHOUT proxy before reload — `setupContext`
                 // reads `__proxyDisabled` at launch time.
                 try {
