@@ -1444,6 +1444,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     let _appErrorCount = 0; // BUG FIX (2026-09-07): Track consecutive app_error states for browser relaunch
     let consecutiveTribunalFailures = 0;
     let unknownStateCounter = 0; // Counts consecutive 'unknown' currentState results
+    let _humanInterventionLogged = false; // Task 35: Track if we've already logged the pause message
     const MAX_UNKNOWN_STATE = 3; // After this many unknowns, force recovery
 
     // v12: Blank-page escalation ladder — prevents infinite blank/wait loops
@@ -1532,6 +1533,45 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
     while (questionsCompleted < CONFIG.MAX_QUESTIONS && !stopRequested) {
       try { fs.writeFileSync(CONFIG.HEARTBEAT_FILE, String(Date.now())); } catch (_e: any) { /* best-effort heartbeat write */ }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // HUMAN INTERVENTION PAUSE (Task 35, 2026-09-09)
+      // ─────────────────────────────────────────────────────────────────────
+      // When `__humanInterventionRequested` is set (via dashboard API or by
+      // the bot itself when truly stuck), the bot PAUSES completely:
+      //   - NO screenshots
+      //   - NO clicks / actions
+      //   - NO navigation
+      //   - NO auth checks
+      //   - NO tribunal calls
+      // Just waits in a 5s poll loop until the flag is cleared via API.
+      //
+      // This lets the user:
+      //   - Connect to the dashboard and see what state the bot is in
+      //   - Optionally toggle headed mode to see the browser visually
+      //   - Fix the issue manually (solve captcha, log in, navigate, etc.)
+      //   - Click "Resume" on the dashboard to clear the flag
+      if ((globalThis as any).__humanInterventionRequested) {
+        const _reason = (globalThis as any).__humanInterventionReason || 'manual request';
+        const _since = (globalThis as any).__humanInterventionSince || Date.now();
+        const _pausedFor = Math.round((Date.now() - _since) / 1000);
+        if (!_humanInterventionLogged) {
+          log(`HUMAN INTERVENTION PAUSED — reason: ${_reason}. Bot will not touch the browser. Use dashboard /api/intervention/resume to continue.`, 'WARN', 'cycle');
+          _humanInterventionLogged = true;
+          // Send alert so the user knows
+          try {
+            const alerting = getDep('alerting');
+            alerting?.sendAlert?.(`Human intervention required: ${_reason}. Bot paused — no browser interaction until resumed via dashboard.`);
+          } catch {}
+        }
+        // Wait 5s before checking again — don't busy-loop
+        await new Promise(r => setTimeout(r, 5000));
+        continue;
+      }
+      if (_humanInterventionLogged) {
+        log('Human intervention RESUMED — bot continues normal operation.', 'INFO', 'cycle');
+        _humanInterventionLogged = false;
+      }
 
       // v11: OOM EMERGENCY PERIODIC HEAL — check at the top of every cycle
       // iteration. If the restart guardian is in emergency mode (OOM loop
@@ -1687,6 +1727,18 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 const healResult = await selfHealMod.performSelfHeal({ skipRuntimeHeal: true });
                 selfHealRunning = false;
                 log(`Blank-page self-heal result: ${JSON.stringify(healResult?.summary || healResult)?.substring(0, 200)}`, 'INFO', 'cycle');
+                // TASK 35: If self-heal FAILED, request human intervention.
+                // The bot is truly stuck — no amount of automated recovery will help.
+                if (!healResult?.healed && !healResult?.success) {
+                  log('Self-heal FAILED — requesting human intervention. Bot will pause.', 'ERROR', 'cycle');
+                  (globalThis as any).__humanInterventionRequested = true;
+                  (globalThis as any).__humanInterventionReason = `Self-heal failed (blank-page escalation step ${blankPageCounter})`;
+                  (globalThis as any).__humanInterventionSince = Date.now();
+                  try {
+                    const alerting = getDep('alerting');
+                    alerting?.sendAlert?.('Human intervention required: Self-heal failed. Bot paused. Use dashboard /api/intervention/resume when fixed.');
+                  } catch {}
+                }
               } else {
                 log('Blank-page self-heal: not available or already running', 'WARN', 'cycle');
               }
