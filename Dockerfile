@@ -9,6 +9,12 @@ LABEL org.opencontainers.image.authors="U.S.J Sibiya"
 # The rest are the full set Chromium needs on Debian Bookworm (from
 # npx playwright install-deps chromium).  Being explicit avoids one-more-
 # missing-lib roundtrips on 512 MB builds that take several minutes each.
+#
+# TASK 35 (2026-09-09): Added xvfb + xauth for headed browser mode.
+# When the user calls /api/browser/headed, the bot needs a virtual display
+# to run Chromium in headed mode on a headless server. Xvfb provides a
+# virtual X server that Chromium can render to. xauth is needed for
+# DISPLAY-based authentication.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
     libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
@@ -19,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     python3 make g++ \
     curl \
+    xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -49,11 +56,15 @@ RUN npx playwright install chromium
 COPY . .
 
 # Runtime directories under /tmp (ephemeral disk)
+# TASK 35 (2026-09-09): Also create /tmp/.X11-unix for Xvfb (headed mode)
+# and make it writable by the node user. Xvfb creates its socket here.
 RUN mkdir -p /tmp/mathu-logs/screenshots \
     /tmp/.browser-data \
     /tmp/mathu-backups \
     /tmp/mathu-staging \
-    /tmp/mathu-regression
+    /tmp/mathu-regression \
+    /tmp/.X11-unix \
+    && chmod 1777 /tmp/.X11-unix
 
 USER node
 
@@ -62,6 +73,7 @@ EXPOSE 10000
 ENV NODE_ENV=production \
     PORT=10000 \
     HEADLESS=true \
+    DISPLAY=:99 \
     MAX_MEMORY_MB=448 \
     MEMORY_WARNING_THRESHOLD_MB=200 \
     MEMORY_RESTART_THRESHOLD_MB=220 \
@@ -82,4 +94,12 @@ ENV NODE_ENV=production \
 HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -sf http://localhost:10000/health || exit 1
 
-CMD ["node", "--expose-gc", "--max-old-space-size=384", "--import", "tsx", "render-free-plan.ts"]
+# TASK 35 (2026-09-09): Start Xvfb in the background before the bot.
+# Xvfb provides a virtual X display at :99 with 1280x720 resolution and
+# 24-bit color depth. This allows the bot to switch to headed mode
+# (via /api/browser/headed) for visual debugging / human intervention.
+#
+# The bot runs as the `node` user, but Xvfb needs to run before USER switch.
+# We use a shell CMD to start Xvfb in the background, wait for it, then
+# launch the bot. If Xvfb fails to start, the bot still runs (headless only).
+CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp &\n sleep 1\n exec node --expose-gc --max-old-space-size=384 --import tsx render-free-plan.ts"]
