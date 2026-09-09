@@ -49,13 +49,19 @@ async function recoverIfStuck(page: any, screenshotBuffer: any, action: any) {
       // BUG FIX (2026-09-07): If a proxy is active and actions are repeating,
       // the proxy may be silently dropping the bot's actions (clicks, taps not
       // registering). Disable the proxy so the browser uses a direct connection.
+      // BUG FIX (2026-09-09): Use bypassProxy() to FULLY shut down the proxy
+      // (clears env vars + resets ip-rotator state), not just set the flag.
       try {
         const ipRotator = require('./network-ip-rotator');
         const currentProxy = ipRotator.getCurrentProxy?.();
         if (currentProxy && !(globalThis as any).__proxyDisabled) {
-          (globalThis as any).__proxyDisabled = true;
           log(`Proxy was active (${currentProxy}) when actions stopped working — DISABLING PROXY (actions may not be registering through proxy). Browser will relaunch with direct connection.`, 'ERROR', 'stagnation');
           try { getSendAlert()('Proxy disabled: repeated actions not working. Switching to direct connection.'); } catch {}
+          if (typeof ipRotator.bypassProxy === 'function') {
+            ipRotator.bypassProxy(`repeated actions not working (stagnation)`);
+          } else {
+            (globalThis as any).__proxyDisabled = true;
+          }
         }
       } catch {}
 
