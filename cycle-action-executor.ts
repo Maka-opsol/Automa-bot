@@ -577,9 +577,24 @@ async function _handleNavigateBack(ctx: ActionCtx): Promise<void> {
 async function _handleReloadBrowser(ctx: ActionCtx): Promise<void> {
   const { page, CONFIG, wm } = ctx;
   try {
-    log('Reloading current page (AI requested reload_browser)...', 'INFO', 'action');
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-    log('Page reloaded successfully.', 'INFO', 'action');
+    // BUG FIX (2026-09-09): If the current page URL is chrome-error://,
+    // page.reload() will fail with ERR_TIMED_OUT (can't reload an error page).
+    // Instead, navigate to APP_URL directly.
+    const currentUrl = page.url();
+    if (currentUrl && (currentUrl.includes('chrome-error://') || currentUrl.includes('chromewebdata'))) {
+      const _appUrl = String(CONFIG.APP_URL || 'https://app.mathu.co.za').replace(/\/+$/, '');
+      log(`reload_browser: page is on chrome-error URL (${currentUrl}) — navigating to ${_appUrl} instead of reload.`, 'INFO', 'action');
+      try {
+        await page.goto(_appUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        log('Navigation to APP_URL succeeded (reload_browser on chrome-error page).', 'INFO', 'action');
+      } catch (navErr: any) {
+        log(`reload_browser navigation to ${_appUrl} also failed: ${navErr?.message || navErr}`, 'WARN', 'action');
+      }
+    } else {
+      log('Reloading current page (AI requested reload_browser)...', 'INFO', 'action');
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+      log('Page reloaded successfully.', 'INFO', 'action');
+    }
   } catch (e: any) {
     log(`reload_browser failed: ${e.message}`, 'WARN', 'action');
   }
