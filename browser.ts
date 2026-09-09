@@ -248,7 +248,12 @@ class BrowserManager {
     // this fails with "Missing X server or $DISPLAY" + "The platform failed to
     // initialize. Exiting." — the bot then cascades to reduced/minimal strategies
     // unnecessarily. Default to headless: true unless explicitly disabled.
-    const _headless = getCONFIG().HEADLESS === false ? false : true;
+    //
+    // TASK 35 (2026-09-09): Support `__forceHeaded` global to toggle headed mode
+    // for human intervention. When the user calls /api/browser/headed, this flag
+    // is set and the next browser launch will be headed (requires Xvfb on Render).
+    const _forceHeaded = !!(globalThis as any).__forceHeaded;
+    const _headless = _forceHeaded ? false : (getCONFIG().HEADLESS === false ? false : true);
     const options: any = { headless: _headless, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 60000 };
     // BUG FIX (2026-09-08): Only set per-context proxy mode when a proxy is
     // actually active. When `__proxyDisabled` is true, DON'T pass
