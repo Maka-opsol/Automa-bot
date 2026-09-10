@@ -99,7 +99,22 @@ HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
 # 24-bit color depth. This allows the bot to switch to headed mode
 # (via /api/browser/headed) for visual debugging / human intervention.
 #
-# The bot runs as the `node` user, but Xvfb needs to run before USER switch.
-# We use a shell CMD to start Xvfb in the background, wait for it, then
-# launch the bot. If Xvfb fails to start, the bot still runs (headless only).
-CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp &\n sleep 1\n exec node --expose-gc --max-old-space-size=384 --import tsx render-free-plan.ts"]
+# TASK 40 (2026-09-10): Clean up stale Xvfb lock files before starting.
+# When the bot process restarts (e.g. after OOM) but the container keeps
+# running, the old Xvfb may still be alive with a stale /tmp/.X99-lock.
+# The new Xvfb would fail with "Server is already active for display 99".
+# Fix: remove the lock file + kill any existing Xvfb process before start.
+#
+# TASK 41 (2026-09-10): Raised V8 heap limit from 384MB → 448MB.
+# The bot was crashing at 380MB V8 heap because:
+#   - Chromium --single-process mode shares the V8 heap with Node
+#   - Flutter Web loads ~150MB into the heap
+#   - DI container + modules = ~80MB
+#   - Tribunal calls (JSON parse, provider responses) = ~50MB transient
+#   - Total steady-state: ~280-350MB, with spikes to 380MB+
+# The 384MB limit was too tight — any spike caused V8 OOM → crash →
+# memory_protection restart → still 380MB → crash → death loop.
+# 448MB gives 64MB headroom above the typical peak, enough to absorb
+# transient spikes without crashing. Render free plan has 512MB total,
+# so 448MB V8 + ~64MB non-V8 (Chromium C++ heap, stack, etc.) = 512MB.
+CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null; pkill -f 'Xvfb :99' 2>/dev/null; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp & sleep 1; exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
