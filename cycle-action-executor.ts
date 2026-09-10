@@ -601,6 +601,32 @@ async function _handleReloadBrowser(ctx: ActionCtx): Promise<void> {
   await sleep(CONFIG.BETWEEN_STEPS_MS * wm);
 }
 
+// ── Request Human Intervention ──
+// TASK 43 (2026-09-10): When the AI tribunal decides the bot can't proceed
+// automatically (password expired, MFA enrollment, account locked, etc.),
+// it returns actionType 'request_human_intervention'. This handler sets
+// the global pause flag — the bot will NOT touch the browser until the user
+// resumes via dashboard /api/intervention/resume.
+async function _handleRequestHumanIntervention(ctx: ActionCtx): Promise<void> {
+  const { action, CONFIG } = ctx;
+  const reason = action?.reasoning || 'AI determined human intervention is required';
+  log(`AI requested human intervention: ${reason.substring(0, 200)}`, 'WARN', 'action');
+  // Set the global pause flag — cycle-manager checks this at the top of every
+  // cycle iteration and will pause BEFORE any browser interaction.
+  (globalThis as any).__humanInterventionRequested = true;
+  (globalThis as any).__humanInterventionReason = reason.substring(0, 200);
+  (globalThis as any).__humanInterventionSince = Date.now();
+  // Send ONE alert (dedup will suppress repeats)
+  try {
+    const alerting = require('./alerting');
+    if (alerting?.sendAlert) alerting.sendAlert(`Human intervention required (AI-decided): ${reason.substring(0, 150)}`, 1);
+  } catch {}
+  // Do NOT close the browser — the user may need to interact with it.
+  // The cycle-manager's finally block checks __humanInterventionRequested
+  // and skips closeBrowser() when it's set.
+  await sleep(CONFIG.BETWEEN_STEPS_MS || 5000);
+}
+
 // ── Select Dropdown Option ──
 async function _handleSelectOption(ctx: ActionCtx): Promise<void> {
   const { page, action, CONFIG, wm, browser } = ctx;
@@ -661,6 +687,10 @@ const ACTION_HANDLERS: Record<string, (ctx: ActionCtx) => Promise<void>> = {
   // instead of being logged as "Unknown action: reload_page".
   reload_page:    _handleReloadBrowser,
   select_option:  _handleSelectOption,
+  // TASK 43: Human intervention — AI decided the bot can't proceed automatically.
+  // This sets the human intervention pause flag. The bot will NOT touch the
+  // browser until the user resumes via dashboard.
+  request_human_intervention: _handleRequestHumanIntervention,
   // Timing
   wait:           _handleWait,
 };
