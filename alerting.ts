@@ -150,6 +150,34 @@ let alertRateLimiter = {
   resetTime: Date.now(),
 };
 
+// TASK 42 (2026-09-10): Message deduplication — if the same alert (by
+// first-100-chars fingerprint) was sent recently, suppress it entirely.
+// This prevents ntfy from being flooded with identical "Cycle error:
+// MICROSOFT_RECOVERY_PAGE" alerts every 18 minutes when the bot is paused.
+const DEDUP_WINDOW_MS = 30 * 60 * 1000; // 30 minutes — same message within 30 min = suppress
+const _recentAlertMessages: Map<string, number> = new Map(); // fingerprint → timestamp
+
+function _fingerprintAlert(message: any): string {
+  // Use first 100 chars as fingerprint — long URLs in the message would
+  // otherwise make every alert unique, defeating dedup.
+  return String(message).substring(0, 100);
+}
+
+function _isDuplicateAlert(message: any): boolean {
+  const fp = _fingerprintAlert(message);
+  const now = Date.now();
+  const lastSent = _recentAlertMessages.get(fp);
+  if (lastSent && (now - lastSent) < DEDUP_WINDOW_MS) {
+    return true; // duplicate
+  }
+  // Clean old entries (keep map from growing unbounded)
+  for (const [key, ts] of _recentAlertMessages) {
+    if (now - ts > DEDUP_WINDOW_MS) _recentAlertMessages.delete(key);
+  }
+  _recentAlertMessages.set(fp, now);
+  return false;
+}
+
 function canSendAlert() { 
   const now = Date.now();
   if (now - alertRateLimiter.resetTime > 3600000) {
@@ -185,6 +213,11 @@ function _rotateAlertLog(alertLog: string) {
 }
 
 async function sendAlert(message: any, priority = 3) { 
+  // TASK 42: Suppress duplicate alerts (same first-100-chars within 30 min)
+  if (_isDuplicateAlert(message)) {
+    log(`Alert suppressed (duplicate within 30min): ${String(message).substring(0, 80)}`, 'DEBUG', 'alerting');
+    return;
+  }
   if (!canSendAlert()) {
     log(`Alert suppressed due to rate limiting: ${message}`, 'DEBUG', 'alerting');
     return;
