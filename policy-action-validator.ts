@@ -137,6 +137,15 @@ function validateAction(action: Action, currentState: string): ValidationResult 
 
   const actionType = action.actionType;
 
+  // TASK 43 (2026-09-10): 'request_human_intervention' is ALWAYS allowed on
+  // ANY state. The AI can decide at any point that the bot can't proceed
+  // automatically (password expired, MFA, account locked, etc.). We don't
+  // restrict this to specific states — it's a universal escape hatch.
+  if (actionType === 'request_human_intervention') {
+    _totalValidated++;
+    return { allowed: true, reason: 'Human intervention requested by AI (allowed on any state)' };
+  }
+
   // Get allowed actions for current state (fallback to 'unknown')
   const allowedActions = STATE_ACTION_WHITELIST[currentState] || STATE_ACTION_WHITELIST['unknown'];
 
