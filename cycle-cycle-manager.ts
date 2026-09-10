@@ -3890,9 +3890,17 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     // v4: Record error code for desperation analysis
     _recordErrorForDesperation(errorCode);
     if (CONFIG.ALERT_ON_ERROR) try {
-      const alertMsg = err instanceof Error ? err.message : String(err);
-      const alertStack = err?.stack ? `\n${(err.stack as string).split('\n').slice(1, 5).join('\n')}` : '';
-      sendAlert(`Cycle error: ${alertMsg}${alertStack}`);
+      // TASK 42 (2026-09-10): Suppress cycle-error alerts when human
+      // intervention is already requested. The initial alert was already
+      // sent — repeating it on every cycle burns ntfy quota and may
+      // cause rate limiting that blocks genuinely important alerts.
+      if ((globalThis as any).__humanInterventionRequested) {
+        log('Cycle error alert suppressed (human intervention already requested — initial alert was sent)', 'DEBUG', 'cycle');
+      } else {
+        const alertMsg = err instanceof Error ? err.message : String(err);
+        const alertStack = err?.stack ? `\n${(err.stack as string).split('\n').slice(1, 5).join('\n')}` : '';
+        sendAlert(`Cycle error: ${alertMsg}${alertStack}`);
+      }
     } catch (e: any) {}
 
     // Error routing based on type
@@ -4013,7 +4021,18 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
     // v6: Clear mid-quiz flag so monitors don't preserve browser after cycle ends
     try { const memoryMode = require('./memory-mode'); memoryMode.setMidQuiz(false); } catch {}
-    if (closeBrowser) await closeBrowser();
+    // TASK 42 (2026-09-10): Do NOT close the browser if human intervention
+    // is requested. The user may need to interact with the browser (e.g.
+    // Microsoft password-reset page, captcha, MFA enrollment). Closing
+    // the browser would destroy the page state and force a re-navigate
+    // cycle that re-triggers the same human-intervention condition.
+    // The bot will pause at the top of the next cycle iteration and NOT
+    // touch the browser until the user resumes via dashboard.
+    if (!(globalThis as any).__humanInterventionRequested) {
+      if (closeBrowser) await closeBrowser();
+    } else {
+      log('Human intervention requested — keeping browser open for user interaction.', 'INFO', 'cycle');
+    }
     if (clearCache) clearCache();
     _networkSetup = false;
     if (CONFIG.ENABLE_GC_ON_CYCLE && global.gc) { global.gc(); log('Garbage collection triggered.', 'DEBUG', 'cycle'); }
