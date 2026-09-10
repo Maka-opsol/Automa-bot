@@ -593,62 +593,21 @@ async function ensureAuthenticated(page: any) {
     hostname.endsWith('.login.live.com') ||
     hostname.endsWith('.msftauth.net');
 
-  // Password-reset / recovery / proofup / MFA-enrollment pages.
-  // These are Microsoft pages but NOT login pages — the bot CANNOT proceed
-  // automatically. Detect and escalate (alert + degrade) instead of looping.
-  const onPasswordResetPage =
-    hostname === 'passwordreset.microsoftonline.com' ||
-    hostname.endsWith('.passwordreset.microsoftonline.com') ||
-    hostname === 'account.live.com' && url.includes('/resetpassword') ||
-    url.includes('/proofup') ||
-    url.includes('/strongauth') ||
-    url.includes('/recovery') ||
-    url.includes('/resetpassword') ||
-    url.includes('/forgotpassword');
-
-  // BUG FIX (2026-09-04): Detect AADSTS error pages.
-  // When the bot (or self-heal code) navigates directly to
-  // https://login.microsoftonline.com/ (the root URL), Microsoft returns
-  // "AADSTS900561: The endpoint only accepts POST requests. Received a GET
-  // request." This is because the root URL is an API endpoint, not a login
-  // page. The bot gets stuck on this error page in a loop.
-  // Detection: the URL or page content contains "AADSTS" (Azure AD Sign-in
-  // error code prefix). Since we can't check page content here (would need
-  // a screenshot), we detect via URL — Microsoft error pages have the error
-  // code in the URL query params (e.g. ?error=AADSTS900561).
-  const onAadstsErrorPage = url.includes('AADSTS') || url.includes('error=AADSTS');
-
-  if (onPasswordResetPage || onAadstsErrorPage) {
-    // Microsoft redirected us to a password-reset / recovery / AADSTS error page.
-    // This means the account requires human intervention:
-    //   - Password expired and must be changed
-    //   - MFA enrollment required
-    //   - Account locked / suspicious activity
-    //   - Conditional access policy denied the sign-in
-    //   - AADSTS error (e.g. AADSTS900561 GET-vs-POST) — the bot navigated to
-    //     a POST-only endpoint with a GET request, or Microsoft rejected the
-    //     auth flow.
-    // The bot CANNOT proceed automatically. Alert once and degrade to DORMANT
-    // so we stop burning cycles on a page that needs human action.
-    const pageType = onAadstsErrorPage ? 'AADSTS error' : 'password-reset/recovery';
-    const msg = `Microsoft ${pageType} page detected (hostname=${hostname}). ${onAadstsErrorPage ? 'Auth flow error (AADSTS) — the bot likely navigated to a POST-only endpoint with GET, or Microsoft rejected the auth.' : 'Account requires human intervention (expired password / MFA enrollment / locked / conditional access).'} Bot will degrade to DORMANT to stop burning cycles. URL=${url.substring(0, 200)}`;
-    log(msg, 'ERROR', 'auth-guard');
-    try {
-      const alerting = _deps.alerting;
-      if (alerting?.sendAlert) alerting.sendAlert(msg, 1);
-    } catch { /* best effort */ }
-    try {
-      const { degradationLadder } = require('./self-heal-degradation-ladder');
-      degradationLadder.setLevel(4, `MICROSOFT_${onAadstsErrorPage ? 'AADSTS_ERROR' : 'RECOVERY_PAGE'}: ${hostname} — ${onAadstsErrorPage ? 'auth flow error' : 'account requires human intervention'}`);
-    } catch { /* non-critical */ }
-    // Throw so cycle-manager catches and the daemon sleeps via backoff
-    // (degradation to DORMANT means the daemon won't try again soon).
-    const err: any = new Error(`MICROSOFT_${onAadstsErrorPage ? 'AADSTS_ERROR' : 'RECOVERY_PAGE'}: ${onAadstsErrorPage ? 'auth flow error' : 'account requires human intervention'}`);
-    err.code = onAadstsErrorPage ? 'MICROSOFT_AADSTS_ERROR' : 'MICROSOFT_RECOVERY_PAGE';
-    err.retryable = false;
-    err.healable = false;
-    throw err;
-  }
+  // TASK 43 (2026-09-10): Removed hardcoded password-reset / AADSTS URL detection.
+  // The bot was mistaking legitimate login pages for human-intervention pages
+  // because Microsoft login URLs sometimes contain path segments like '/recovery'
+  // or query params like 'AADSTS' even on normal login flows.
+  //
+  // Instead of URL-pattern-matching to decide "this needs a human", we now let
+  // the AI tribunal (vision providers) look at the screenshot and decide. The AI
+  // can return `currentState: 'human_intervention'` if it sees a page that truly
+  // requires human action (password expired, MFA enrollment, account locked, etc.).
+  // The cycle-manager then pauses the bot based on the AI's decision — not dumb
+  // selectors.
+  //
+  // The old code that threw MICROSOFT_RECOVERY_PAGE / MICROSOFT_AADSTS_ERROR
+  // has been removed. The bot will no longer preemptively pause on these URLs —
+  // it will take a screenshot and let the AI decide what to do.
 
   if (onMicrosoftLogin) {
     // BUG FIX (2026-09-07): Reset chrome-error counter when we successfully
