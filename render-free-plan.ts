@@ -9,7 +9,7 @@
 //
 // This raw setInterval runs from the very first line of the process. It has
 // NO dependencies on any project module — just process.memoryUsage() and
-// process.exit(). If heap exceeds 300MB during boot, we exit immediately
+// process.exit(). If heap exceeds 350MB during boot, we exit immediately
 // (exit code 137 = SIGKILL = Render auto-restarts) before V8 can crash.
 //
 // BUG FIX (2026-09-04, v2): Threshold raised from 200 to 300MB now that the
@@ -17,10 +17,12 @@
 // of headroom below V8's 384MB limit — enough to exit cleanly before V8's
 // own OOM killer fires.
 // ═══════════════════════════════════════════════════════════════════════════════
-// BUG FIX (2026-09-06): Set to 300MB for 384MB V8 limit. With esbuild (no tsx),
-// baseline is 66MB. Flutter Web loading allocates ~150MB. 66+150 = 216MB.
-// 300MB threshold gives 84MB headroom below V8's 384MB limit.
-const EARLY_OOM_THRESHOLD_MB = 300;
+// TASK 41 (2026-09-10): Raised to 350MB for new 448MB V8 limit.
+// Old: 300MB threshold / 384MB V8 = 84MB headroom
+// New: 350MB threshold / 448MB V8 = 98MB headroom
+// The bot's steady-state heap is 280-350MB; 350MB threshold only fires on
+// real boot spikes, not normal operation.
+const EARLY_OOM_THRESHOLD_MB = 350;
 const EARLY_OOM_CHECK_INTERVAL_MS = 2000; // every 2s — fast enough to catch boot spikes
 let _earlyOomTriggered = false;
 const _earlyOomInterval = setInterval(() => {
@@ -30,12 +32,14 @@ const _earlyOomInterval = setInterval(() => {
     const rssMB = mem.rss / 1024 / 1024;
     // BUG FIX (2026-09-05): Check BOTH heap AND RSS. On Render free plan (512MB),
     // the kernel OOM killer fires on RSS, not V8 heap. Chromium single-process
-    // uses ~100-150MB RSS on top of Node's heap. If RSS > 450MB, the kernel
+    // uses ~100-150MB RSS on top of Node's heap. If RSS > 480MB, the kernel
     // will SIGKILL the process before our heap guardian can react.
-    // RSS limit: 450MB (leaves 62MB for OS + other processes)
-    if (rssMB >= 450 && !_earlyOomTriggered) {
+    // TASK 41 (2026-09-10): Raised RSS limit from 450→480MB to match new 448MB V8 limit.
+    // Old: 450MB RSS / 384MB V8 = 66MB non-V8 headroom
+    // New: 480MB RSS / 448MB V8 = 32MB non-V8 headroom (tighter, but V8 now has more room)
+    if (rssMB >= 480 && !_earlyOomTriggered) {
       _earlyOomTriggered = true;
-      console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 450MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
+      console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 480MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
       clearInterval(_earlyOomInterval);
       process.exit(137);
     }
@@ -206,13 +210,13 @@ const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilien
   const _mem = process.memoryUsage();
   const _postContainerHeapMB = _mem.heapUsed / 1024 / 1024;
   const _postContainerRSSMB = _mem.rss / 1024 / 1024;
-  if (_postContainerRSSMB >= 450) {
-    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 450MB after container init. Kernel OOM imminent. Exiting immediately.`);
+  if (_postContainerRSSMB >= 480) {
+    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 480MB after container init. Kernel OOM imminent. Exiting immediately.`);
     clearInterval(_earlyOomInterval);
     process.exit(137);
   }
-  if (_postContainerHeapMB >= 300) {
-    console.error(`[FATAL] [boot-oom] Heap ${_postContainerHeapMB.toFixed(0)}MB >= 300MB after container init. Exiting immediately.`);
+  if (_postContainerHeapMB >= 350) {
+    console.error(`[FATAL] [boot-oom] Heap ${_postContainerHeapMB.toFixed(0)}MB >= 350MB after container init. Exiting immediately.`);
     clearInterval(_earlyOomInterval);
     process.exit(137);
   }
@@ -612,8 +616,13 @@ function _startMemoryMonitor(): void {
     // about:blank, which caused "circular path detected" and "page still blank".
     // With hard-coded thresholds, the memory monitor only fires when there's
     // a REAL memory problem, not just because the mode threshold is set too low.
-    const HARD_RESTART_HEAP_MB = 300; // only fire if heap > 300MB (out of 384MB V8 limit)
-    const HARD_RSS_LIMIT_MB = 440;   // only fire if RSS > 440MB (out of 512MB container)
+    // TASK 41 (2026-09-10): Raised thresholds to match new V8 limit (448MB).
+    // Old: HARD_RESTART_HEAP_MB=300 (out of 384MB V8) → too aggressive, caused
+    //      memory_protection death loops when heap spiked to 320MB.
+    // New: HARD_RESTART_HEAP_MB=380 (out of 448MB V8) → gives 68MB headroom.
+    //      The bot typically runs at 280-350MB; 380MB only fires on real spikes.
+    const HARD_RESTART_HEAP_MB = 380; // only fire if heap > 380MB (out of 448MB V8 limit)
+    const HARD_RSS_LIMIT_MB = 470;   // only fire if RSS > 470MB (out of 512MB container)
     if (used > HARD_RESTART_HEAP_MB || rss > HARD_RSS_LIMIT_MB) {
       log(`Memory CRITICAL (hard threshold): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'ERROR', 'render-free-plan');
       // BUG FIX (2026-09-06): Cap maxLevel at L2 to prevent closing the browser.
