@@ -2060,7 +2060,26 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
         log('Screenshot timed out (fonts/render hang). Recovering...', 'WARN', 'cycle');
 
-        // Stage 1: pre-warm fonts + retry short
+        // Helper: CDP screenshot that bypasses Playwright's document.fonts.ready wait.
+        // Playwright's page.screenshot() ALWAYS waits for fonts to load before
+        // capturing — when a @font-face URL hangs through a proxy, every retry
+        // also times out. CDP's Page.captureScreenshot does NOT wait for fonts.
+        const _cdpScreenshot = async (pg: any, timeoutMs: number = 5000): Promise<Buffer | null> => {
+          try {
+            const client = await pg.context().newCDPSession(pg);
+            const result = await Promise.race([
+              client.send('Page.captureScreenshot', { format: 'jpeg', quality: 15 }),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('CDP screenshot timeout')), timeoutMs)),
+            ]) as any;
+            try { await client.detach(); } catch {}
+            if (result?.data) {
+              return Buffer.from(result.data, 'base64');
+            }
+            return null;
+          } catch { return null; }
+        };
+
+        // Stage 1: pre-warm fonts + retry via CDP (bypasses font wait)
         try {
           await Promise.race([
             page.evaluate(() => (document as any).fonts?.ready ?? Promise.resolve()),
@@ -2069,16 +2088,17 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         } catch { /* fonts API missing — ignore */ }
         let recovered = false;
         try {
-          screenshot = await page.screenshot({ type: 'jpeg', quality: 15, timeout: 5000, animations: 'disabled' });
-          if (screenshot && screenshot.length > 0) {
-            log(`Screenshot recovered on stage-1 retry (${screenshot.length} bytes)`, 'INFO', 'cycle');
+          const _cdpShot = await _cdpScreenshot(page, 5000);
+          if (_cdpShot && _cdpShot.length > 0) {
+            screenshot = _cdpShot;
+            log(`Screenshot recovered on stage-1 CDP retry (${screenshot.length} bytes)`, 'INFO', 'cycle');
             recovered = true;
           }
         } catch (retry1Err: any) {
-          log(`Stage-1 retry failed: ${retry1Err?.message || retry1Err}`, 'WARN', 'cycle');
+          log(`Stage-1 CDP retry failed: ${retry1Err?.message || retry1Err}`, 'WARN', 'cycle');
         }
 
-        // Stage 2: reload page once and retry
+        // Stage 2: reload page once and retry via CDP (bypasses font wait)
         if (!recovered) {
           try {
             await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
@@ -2087,13 +2107,14 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             log(`Page reload during screenshot recovery failed: ${reloadErr?.message || reloadErr}`, 'WARN', 'cycle');
           }
           try {
-            screenshot = await page.screenshot({ type: 'jpeg', quality: 15, timeout: 8000, animations: 'disabled' });
-            if (screenshot && screenshot.length > 0) {
-              log(`Screenshot recovered on stage-2 retry (${screenshot.length} bytes)`, 'INFO', 'cycle');
+            const _cdpShot = await _cdpScreenshot(page, 8000);
+            if (_cdpShot && _cdpShot.length > 0) {
+              screenshot = _cdpShot;
+              log(`Screenshot recovered on stage-2 CDP retry (${screenshot.length} bytes)`, 'INFO', 'cycle');
               recovered = true;
             }
           } catch (retry2Err: any) {
-            log(`Stage-2 retry failed: ${retry2Err?.message || retry2Err}`, 'WARN', 'cycle');
+            log(`Stage-2 CDP retry failed: ${retry2Err?.message || retry2Err}`, 'WARN', 'cycle');
           }
         }
 
