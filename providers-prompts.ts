@@ -46,6 +46,8 @@ const VALID_ACTION_TYPES = [
   'navigate_back', 'select_option',
   // Browser recovery
   'reload_browser',
+  // Human intervention
+  'request_human_intervention',
   // Timing
   'wait',
 ];
@@ -174,6 +176,25 @@ APP ERROR DETECTION (CRITICAL — HIGHEST PRIORITY):
 - Do NOT attempt to click anything on an error dialog. Do NOT try to work around it. The bot will handle recovery automatically.
 - This takes priority over ALL other instructions. If you see an error message, the only correct action is to report it.
 - Example: {"reasoning": "Error dialog visible: Something went wrong with maintenance mode", "actionType": "wait", "currentState": "app_error", "targetX": 0.5, "targetY": 0.5, "targetX2": 0.5, "targetY2": 0.5, "keypadSequence": [], "submitX": 0.5, "submitY": 0.5, "value": "", "clearFirst": true}
+
+HUMAN INTERVENTION DETECTION (TASK 43 — AI-DECIDED):
+- If you see a page that genuinely requires human action — something the bot CANNOT solve automatically — use actionType "request_human_intervention".
+- Examples of pages that DO require human intervention:
+  • "Your password has expired" / "Please change your password" — requires the user to type a new password
+  • "Additional security verification required" / MFA enrollment — requires the user to set up an authenticator app
+  • "Your account has been locked" — requires the user to contact support
+  • "Approve sign-in request" sent to a phone — requires the user to tap approve on their device
+  • "Enter the code from your authenticator app" — requires a one-time code the bot doesn't have
+  • CAPTCHA that the bot has failed to solve multiple times (only if you've already tried and failed)
+- Examples that do NOT require human intervention (the bot can handle these):
+  • Normal login pages with email/password fields — the bot enters credentials
+  • "Stay signed in?" prompts — the bot clicks "Yes" or "No"
+  • Normal CAPTCHA (try to solve it first — only escalate after multiple failures)
+  • Error pages with a "Try again" button — the bot clicks it
+  • Password-reset links where the bot CAN enter a new password using configured credentials
+- When you use actionType "request_human_intervention", set currentState to "human_intervention" and explain in reasoning exactly what the bot sees and why it can't proceed.
+- Example: {"reasoning": "Page shows 'Your password has expired. Please choose a new password.' This requires the user to set a new password — the bot cannot do this automatically.", "actionType": "request_human_intervention", "currentState": "human_intervention", "targetX": 0, "targetY": 0, "targetX2": 0, "targetY2": 0, "keypadSequence": [], "submitX": 0, "submitY": 0, "value": "", "clearFirst": false}
+- IMPORTANT: Do NOT use request_human_intervention for normal login pages, email input, password input, or other routine auth flows. Only use it when you are certain the bot cannot proceed without human help.
 
 Return the JSON as specified.
 `;
