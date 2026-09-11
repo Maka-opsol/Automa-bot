@@ -363,10 +363,12 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
     providers.map(async (provider: any) => {
       const start = Date.now();
       try {
-        // Allow 1 retry for transient 5xx server errors (503, 502).
-        // maxRetries=0 was too aggressive — it kills providers on temporary
-        // unavailability, wasting the other 5 providers' votes.
-        const maxRetries = 1;
+        // TASK 47 (2026-09-11): maxRetries=0 — no retries after first tribunal call.
+        // Retries were wasting bandwidth: if a provider returned 429 (rate limited),
+        // retrying after 2-3s just hit the same rate limit again. Each retry
+        // burns API quota and bandwidth. Better to fail fast and let the
+        // tribunal use the other providers' votes.
+        const maxRetries = 0;
         const res = await safeCall(
           (sig: any) => provider.fn(base64Image, fullPrompt, sig || signal, { validate: true, maxRetries }),
           `Tribunal ${provider.name}`,
@@ -476,22 +478,12 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
 
   // Validate actionType — reject unrecognized actions to prevent
   // "Unknown action" warnings in the executor. Fall back to 'wait'.
-  // BUG FIX (2026-09-08): This whitelist was out of sync with
-  // providers-prompts.ts VALID_ACTION_TYPES (only had 9 actions vs 17).
-  // Now imports from providers-prompts to stay in sync.
-  let _VALID_ACTIONS: Set<string>;
-  try {
-    const prompts = require('./providers-prompts');
-    _VALID_ACTIONS = new Set(prompts.VALID_ACTION_TYPES || []);
-  } catch {
-    _VALID_ACTIONS = new Set([
-      'click', 'flutter_tap', 'double_click', 'hover', 'long_press',
-      'input_email', 'input_password', 'type_text', 'keypad_input',
-      'flutter_swipe', 'drag', 'scroll_vertical', 'scroll_horizontal',
-      'press_key', 'navigate_back', 'select_option', 'reload_browser', 'wait',
-    ]);
-  }
-  const safeActionType = _VALID_ACTIONS.has(cleanRep.actionType)
+  const VALID_ACTIONS = new Set([
+    'click', 'input_email', 'input_password', 'keypad_input',
+    'scroll_vertical', 'scroll_horizontal', 'wait',
+    'flutter_swipe', 'flutter_tap',
+  ]);
+  const safeActionType = VALID_ACTIONS.has(cleanRep.actionType)
     ? cleanRep.actionType
     : 'wait';
   if (safeActionType !== cleanRep.actionType) {
