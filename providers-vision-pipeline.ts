@@ -240,7 +240,7 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
       const raw = await safeCall(
         (sig: any) => provider.fn(compressedBase64, prompt, sig, { validate: false }),
         `Vision ${provider.name}`,
-        { timeoutMs, url: provider.name, maxRetries: 1, signal }
+        { timeoutMs, url: provider.name, maxRetries: 0, signal }
       );
       const latency = Date.now() - start;
 
