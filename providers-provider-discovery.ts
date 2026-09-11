@@ -29,19 +29,21 @@ const PROVIDER_QUERIES = {
   'NVIDIA': 'NVIDIA NIM llama-3.2-11b-vision-instruct',
   'Cloudflare': 'Cloudflare Workers AI @cf/meta/llama-3.2-11b-vision',
   'Cerebras': 'Cerebras gemma model fast inference',
-  'Gemini': 'Gemini 1.5 flash model',
+  'Gemini': 'Gemini 2.5 flash model',
 };
 
 /** Default model names when web search fails */
+// TASK 49 (2026-09-11): Updated ALL defaults to current (non-decommissioned) models.
+// Old defaults were causing death loops because they pointed to EOL/decommissioned models.
 const PROVIDER_DEFAULTS: Record<string, string> = {
-  'Groq': 'llama-3.2-11b-vision-preview',
+  'Groq': 'llama-3.3-70b-versatile',           // was llama-3.2-11b-vision-preview (decommissioned)
   'GitHub GPT': 'gpt-4o-mini',
   'z.ai': 'GLM-4.6V-Flash',
   'Agnes': 'agnes-2.0-flash',
-  'NVIDIA': 'meta/llama-3.2-11b-vision-instruct',
-  'Cloudflare': '@cf/meta/llama-3.2-11b-vision',
-  'Cerebras': 'gemma-2-27b-it',
-  'Gemini': 'gemini-1.5-flash',
+  'NVIDIA': 'meta/llama-3.1-70b-instruct',     // was meta/llama-3.2-11b-vision-instruct (EOL)
+  'Cloudflare': '@cf/meta/llama-4-scout-17b-16e-instruct',  // was @cf/meta/llama-3.2-11b-vision
+  'Cerebras': 'gemma-4-31b',
+  'Gemini': 'gemini-2.5-flash',                 // was gemini-1.5-flash (deprecated 404)
 };
 
 /** Regex patterns to extract model names from web search results */
