@@ -2434,6 +2434,30 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               action = await getFallbackAction(page, currentState || undefined);
               // v15: Save tribunal-failure fallback actions to cache too
               await _saveActionToCache(action, currentState, base64, actionCache, _actionCacheSig, _isCacheExcluded, log);
+
+              // TASK 50 (2026-09-11): If pixel fallback ALSO failed (returned wait/error/null),
+              // do a random swipe on the page to preserve the session. This keeps the
+              // Flutter app alive (prevents session timeout) while waiting for providers
+              // to recover. Better than just waiting — at least we're doing SOMETHING.
+              if (!action || action.actionType === 'wait' || action.currentState === 'error' || action.currentState === 'unknown') {
+                log('Pixel fallback also failed — doing a random swipe to preserve session while providers recover.', 'INFO', 'cycle');
+                try {
+                  // Random swipe from a random point to another random point
+                  const _swipeStartX = 0.2 + Math.random() * 0.6;
+                  const _swipeStartY = 0.3 + Math.random() * 0.4;
+                  const _swipeEndX = _swipeStartX + (Math.random() - 0.5) * 0.3;
+                  const _swipeEndY = _swipeStartY + (Math.random() - 0.5) * 0.3;
+                  action = {
+                    actionType: 'flutter_swipe',
+                    currentState: currentState || 'unknown',
+                    targetX: Math.max(0.05, Math.min(0.95, _swipeStartX)),
+                    targetY: Math.max(0.05, Math.min(0.95, _swipeStartY)),
+                    targetX2: Math.max(0.05, Math.min(0.95, _swipeEndX)),
+                    targetY2: Math.max(0.05, Math.min(0.95, _swipeEndY)),
+                    reasoning: 'Session-preservation swipe — all providers and pixel fallback failed. Swiping to keep the Flutter session alive while waiting for providers to recover.',
+                  };
+                } catch {}
+              }
             }
           } catch (err: any) {
             const errMsg = err?.message || String(err);
@@ -2451,6 +2475,23 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             action = await getFallbackAction(page, currentState || undefined);
             // v15: Save catch-path fallback actions to cache too
             await _saveActionToCache(action, currentState, base64, actionCache, _actionCacheSig, _isCacheExcluded, log);
+
+            // TASK 50 (2026-09-11): If pixel fallback also failed in the catch path,
+            // do a random swipe to preserve the session.
+            if (!action || action.actionType === 'wait' || action.currentState === 'error' || action.currentState === 'unknown') {
+              log('Pixel fallback also failed (catch path) — doing a random swipe to preserve session.', 'INFO', 'cycle');
+              const _sx = 0.2 + Math.random() * 0.6;
+              const _sy = 0.3 + Math.random() * 0.4;
+              action = {
+                actionType: 'flutter_swipe',
+                currentState: currentState || 'unknown',
+                targetX: Math.max(0.05, Math.min(0.95, _sx)),
+                targetY: Math.max(0.05, Math.min(0.95, _sy)),
+                targetX2: Math.max(0.05, Math.min(0.95, _sx + (Math.random() - 0.5) * 0.3)),
+                targetY2: Math.max(0.05, Math.min(0.95, _sy + (Math.random() - 0.5) * 0.3)),
+                reasoning: 'Session-preservation swipe (catch path) — tribunal threw exception, pixel fallback also failed.',
+              };
+            }
           }
         }
       }
