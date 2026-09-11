@@ -25,7 +25,14 @@ async function recoverIfStuck(page: any, screenshotBuffer: any, action: any) {
       const CONFIG = getCONFIG();
       log(`⚠️ Screenshot unchanged ${consecutiveUnchangedCount} consecutive cycles -- possible stagnation.`, 'WARN', 'stagnation');
       if (CONFIG.ALERT_ON_STAGNATION) try { getSendAlert()(`Stagnation detected: screenshot unchanged ${consecutiveUnchangedCount} cycles`); } catch (e: any) {}
-      await page.reload();
+      // TASK 52 (2026-09-11): Use domcontentloaded + timeout + try/catch.
+      // Old code used page.reload() with default 'load' wait — hangs on
+      // font/image resources through proxy, throws ERR_CONNECTION_CLOSED.
+      try {
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+      } catch (reloadErr: any) {
+        log(`Stagnation reload failed (non-critical): ${reloadErr?.message || reloadErr}`, 'DEBUG', 'stagnation');
+      }
       await sleep(5000);
       _deps.browser?.scrollPage?.(page, 0, 300);
       await sleep(2000);
