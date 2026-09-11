@@ -157,7 +157,7 @@ const AUTO_DOWNGRADE_RSS_MB = 380;
 //   'self_heal_granted_ts'  — when full power was granted for this session
 const CALIBRATION_KEY_SELF_HEAL_SESSION = 'self_heal_session';
 const CALIBRATION_KEY_SELF_HEAL_GRANTED_TS = 'self_heal_granted_ts';
-const SELF_HEAL_SESSION_TIMEOUT_MS = 15 * 60 * 1000; // 15 min max per session (v7: was 30min)
+const SELF_HEAL_SESSION_TIMEOUT_MS = 0; // TASK 48: 0 = no timeout. Was 15min — self-heal should run as long as needed.
 let _selfHealSessionTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Modules to disable in memory_protection mode
@@ -711,8 +711,10 @@ function _checkForActiveSelfHealSession(): void {
     const grantedTs = parseInt(session.grantedTs || '0', 10);
     const elapsed = Date.now() - grantedTs;
 
-    if (elapsed > SELF_HEAL_SESSION_TIMEOUT_MS) {
+    if (SELF_HEAL_SESSION_TIMEOUT_MS > 0 && elapsed > SELF_HEAL_SESSION_TIMEOUT_MS) {
       // Session expired — abort it, stay in memory_protection
+      // TASK 48: Only check timeout if SELF_HEAL_SESSION_TIMEOUT_MS > 0.
+      // When set to 0, self-heal sessions never expire — they run as long as needed.
       _log(`Self-heal session expired (${Math.round(elapsed / 60000)}min > ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min timeout). Aborting.`, 'WARN');
       _writeSelfHealSessionToDB({ status: 'aborted', reason: 'session_timeout', abortedAt: Date.now() });
       return;
@@ -723,7 +725,7 @@ function _checkForActiveSelfHealSession(): void {
     // are designed for 1GB+ and will OOM-kill a 512MB instance. Use
     // memory_protection instead, which has appropriately clamped thresholds.
     const targetMode = _isSmallInstance ? 'memory_protection' : 'full_power';
-    _log(`Resuming self-heal session (elapsed: ${Math.round(elapsed / 60000)}min, timeout: ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min). Granting ${targetMode.toUpperCase()}${_isSmallInstance ? ' (small instance — full_power unsafe)' : ''}.`, 'WARN');
+    _log(`Resuming self-heal session (elapsed: ${Math.round(elapsed / 60000)}min${SELF_HEAL_SESSION_TIMEOUT_MS > 0 ? `, timeout: ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min` : ', no timeout'}). Granting ${targetMode.toUpperCase()}${_isSmallInstance ? ' (small instance — full_power unsafe)' : ''}.`, 'WARN');
     _selfHealSessionActive = true;
     // Fire-and-forget: at startup, no browser to close anyway
     _applyMode(targetMode, `self_heal_resume:elapsed_${Math.round(elapsed / 60000)}min`).catch(() => {});
@@ -754,6 +756,13 @@ function _writeSelfHealSessionToDB(state: Record<string, any>): void {
  * before this fires, we abort automatically to prevent permanent full power.
  */
 function _startSelfHealSessionTimeout(remainingMs: number): void {
+  // TASK 48 (2026-09-11): If remainingMs <= 0, don't start a timer at all.
+  // Self-heal should never time out — it runs as long as needed to fix the problem.
+  if (remainingMs <= 0) {
+    if (_selfHealSessionTimer) { clearTimeout(_selfHealSessionTimer); _selfHealSessionTimer = null; }
+    _log('Self-heal session timeout DISABLED — session will run until explicitly ended.', 'INFO');
+    return;
+  }
   if (_selfHealSessionTimer) { clearTimeout(_selfHealSessionTimer); _selfHealSessionTimer = null; }
   _selfHealSessionTimer = setTimeout(() => {
     _log('Self-heal session timed out — forcing abort and return to MEMORY PROTECTION', 'ERROR');
@@ -815,7 +824,7 @@ async function beginSelfHealSession(reason: string): Promise<boolean> {
   const healMode: MemoryMode = 'memory_protection';
   // v5 FIX: await the mode switch (it's async now)
   await _applyMode(healMode, `self_heal_begin:${reason}`);
-  _log(`SELF-HEAL SESSION STARTED: ${reason}. Promoted from ${wasMinimum ? 'MINIMUM' : 'MEMORY PROTECTION'} to ${healMode} for up to ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min. SAVE ALL PROGRESS TO DB.`, 'WARN');
+  _log(`SELF-HEAL SESSION STARTED: ${reason}. Promoted from ${wasMinimum ? 'MINIMUM' : 'MEMORY PROTECTION'} to ${healMode}${SELF_HEAL_SESSION_TIMEOUT_MS > 0 ? ` for up to ${SELF_HEAL_SESSION_TIMEOUT_MS / 60000}min` : ' (no timeout — runs until done)'}. SAVE ALL PROGRESS TO DB.`, 'WARN');
 
   // Start timeout
   _startSelfHealSessionTimeout(SELF_HEAL_SESSION_TIMEOUT_MS);
