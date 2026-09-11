@@ -52,7 +52,11 @@ function GroqProvider() {
     // This prevents stale closure after rollbackProvider().
     const buildRequest = () => {
       const config = getProviderConfig('Groq');
-      const model = config.model || 'qwen/qwen3.6-27b';
+      // TASK 49 (2026-09-11): Default to llama-3.3-70b-versatile (current model).
+      // Old default 'qwen/qwen3.6-27b' is a text model, not vision-capable.
+      // The provider-discovery module was finding 'llama-3.2-11b-vision-preview'
+      // via web search — that model has been DECOMMISSIONED.
+      const model = config.model || 'llama-3.3-70b-versatile';
       const userContent = base64Image
         ? [
             { type: 'text', text: prompt },
