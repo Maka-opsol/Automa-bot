@@ -39,8 +39,8 @@ const FALLBACK_FATIGUE_RESET_MS = 10 * 60 * 1000;
  * openrouter/free gets way more chances than any specific model.
  * It auto-routes to whatever's healthy — it'll work eventually.
  */
-const OR_FREE_RETRIES = 3;                    // retries (4 total attempts: 1 + 3)
-const OR_FREE_BASE_DELAY = 2000;              // 2s → 4s → 8s backoff
+const OR_FREE_RETRIES = 0;                    // TASK 47: no retries — was 3 (4 total attempts)
+const OR_FREE_BASE_DELAY = 2000;              // 2s → 4s → 8s backoff (unused with 0 retries)
 
 /** Record a specific-model failure. Returns true when fatigue threshold is hit. */
 function _recordFallbackFailure(): boolean {
@@ -172,7 +172,7 @@ function OpenRouterTribunalProvider() {
                 endpoint, apiKey, m, base64Image, prompt, 'OpenRouter',
                 { signal }
               ),
-              { providerName: 'OpenRouter', maxRetries: 1, baseDelay: 1000, signal }
+              { providerName: 'OpenRouter', maxRetries: 0, baseDelay: 1000, signal }
             );
             // Specific model worked — but openrouter/free is still king
             _resetFallbackFatigue();
