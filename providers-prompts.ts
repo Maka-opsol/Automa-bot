@@ -117,7 +117,7 @@ FLUTTER WEB PREFERENCES (when logged into MathU — NOT on login/Microsoft pages
 
 Return ONLY a JSON object with:
 {
-  "reasoning": "Brief explanation of what you see and why you choose this action.",
+  "reasoning": "Brief explanation of what you see and why you choose this action. If setting currentState to 'exploration', you MUST explain why the page does NOT match ANY of the known states listed below.",
   "currentState": "mathu_login | microsoft_email_input | assignments_page | video_player | exercise_info | exercise_memo | assessment | score_screen | pathway | error | captcha | flutter_modal | flutter_bottom_sheet | exploration",
   "actionType": "${ACTION_TYPE_STRING}",
   "targetX": 0.5,
@@ -195,6 +195,23 @@ HUMAN INTERVENTION DETECTION (TASK 43 — AI-DECIDED):
 - When you use actionType "request_human_intervention", set currentState to "human_intervention" and explain in reasoning exactly what the bot sees and why it can't proceed.
 - Example: {"reasoning": "Page shows 'Your password has expired. Please choose a new password.' This requires the user to set a new password — the bot cannot do this automatically.", "actionType": "request_human_intervention", "currentState": "human_intervention", "targetX": 0, "targetY": 0, "targetX2": 0, "targetY2": 0, "keypadSequence": [], "submitX": 0, "submitY": 0, "value": "", "clearFirst": false}
 - IMPORTANT: Do NOT use request_human_intervention for normal login pages, email input, password input, or other routine auth flows. Only use it when you are certain the bot cannot proceed without human help.
+
+EXPLORATION STATE (TASK 45 — REQUIRES PROOF):
+- The "exploration" state means "I don't recognize this page — it doesn't match any known state."
+- BEFORE setting currentState to "exploration", you MUST prove that the page does NOT match ANY known state. In your reasoning, list each known state you considered and explain why it doesn't apply:
+  • "Not mathu_login: no 'Sign in with Microsoft' button visible"
+  • "Not microsoft_email_input: no email input field visible"
+  • "Not assignments_page: no module cards or sidebar visible"
+  • "Not video_player: no video or play button visible"
+  • "Not exercise_info/exercise_memo: no math question or white card visible"
+  • "Not assessment: no assessment questions visible"
+  • "Not score_screen: no score or results visible"
+  • "Not error/app_error: no error dialog or message visible"
+  • "Not captcha: no CAPTCHA challenge visible"
+- Example GOOD reasoning for exploration: "Not mathu_login: no Sign in button. Not assignments_page: no module cards. Not video_player: no video. Not exercise_info: no math question. Not error: no error dialog. The page shows a settings menu with toggles — this doesn't match any known state."
+- Example BAD reasoning (do NOT do this): "I don't know what this is" or "Unknown page" — this is lazy and doesn't prove anything.
+- If the page DOES match a known state (even partially), use that state instead of "exploration".
+- When in doubt, prefer the closest matching known state over "exploration".
 
 Return the JSON as specified.
 `;
