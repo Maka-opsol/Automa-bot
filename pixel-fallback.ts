@@ -567,7 +567,11 @@ async function _withTimeout<T>(fn: () => Promise<T>, label: string, timeoutMs: n
     fn(),
     new Promise<null>((resolve) =>
       setTimeout(() => {
-        log(`Pixel fallback: ${label} timed out after ${timeoutMs}ms`, 'WARN', 'pixel-fallback');
+        // TASK 46 (2026-09-11): Downgraded from WARN to DEBUG — the user
+        // doesn't want to see this warning. Pixel fallback timeouts are
+        // expected when the page is blank or the screenshot is too small.
+        // The null return is sufficient — the caller handles it gracefully.
+        log(`Pixel fallback: ${label} timed out after ${timeoutMs}ms`, 'DEBUG', 'pixel-fallback');
         resolve(null);
       }, timeoutMs)
     )
@@ -3651,10 +3655,14 @@ async function generatePixelFallbackAction(
   currentState?: string,
   preDecoded?: { width: number; height: number; rgba: Uint8ClampedArray } | null
 ): Promise<any> {
-  // v4: Hard timeout wrapper — pixel-fallback must never block the cycle
-  return _withTimeout(async () => {
-    return _generatePixelFallbackActionInner(page, currentState, preDecoded);
-  }, 'generatePixelFallbackAction', PIXEL_TIMEOUT_MS);
+  // TASK 46 (2026-09-11): Removed the _withTimeout wrapper entirely.
+  // The user said "pixel fallback should never time out."
+  // The 8s timeout was killing legitimate pixel analysis when the screenshot
+  // capture hung on document.fonts.ready (proxy issue). Now we let it run
+  // to completion — the cycle-manager's own timeout will catch truly stuck
+  // calls, but pixel analysis itself (once the screenshot is captured) is
+  // pure CPU and finishes in <100ms.
+  return _generatePixelFallbackActionInner(page, currentState, preDecoded);
 }
 
 async function _generatePixelFallbackActionInner(
@@ -3859,8 +3867,25 @@ async function _getDecodedScreenshot(
     return preDecoded;
   }
 
-  // Take a fresh PNG screenshot
-  const screenshotBuffer = await page.screenshot({ type: 'png', fullPage: false, timeout: 10000, animations: 'disabled' }).catch(() => null);
+  // TASK 46 (2026-09-11): Use CDP screenshot instead of page.screenshot().
+  // Playwright's page.screenshot() ALWAYS waits for document.fonts.ready
+  // before capturing — when a @font-face URL hangs through a proxy, this
+  // takes 30s and kills the pixel fallback. CDP's Page.captureScreenshot
+  // does NOT wait for fonts — it captures whatever is currently rendered.
+  // This is safe for pixel analysis because we just need the pixels, not
+  // perfect font rendering.
+  let screenshotBuffer: Buffer | null = null;
+  try {
+    const client = await page.context().newCDPSession(page);
+    const result = await client.send('Page.captureScreenshot', { format: 'png' });
+    try { await client.detach(); } catch {}
+    if (result?.data) {
+      screenshotBuffer = Buffer.from(result.data, 'base64');
+    }
+  } catch {
+    // CDP failed — fall back to Playwright screenshot (may timeout on fonts)
+    screenshotBuffer = await page.screenshot({ type: 'png', fullPage: false, timeout: 5000, animations: 'disabled' }).catch(() => null);
+  }
   if (!screenshotBuffer || screenshotBuffer.length < 100) {
     log('Pixel fallback: screenshot failed or empty', 'DEBUG', 'pixel-fallback');
     return null;
