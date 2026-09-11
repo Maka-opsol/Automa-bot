@@ -3256,6 +3256,28 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         explorationMode = false;
       }
 
+      // ─────────────────────────────────────────────────────────────────────
+      // TASK 45 (2026-09-10): Validate "exploration" state — require proof.
+      // The AI must prove that the page doesn't match ANY known state before
+      // setting currentState to "exploration". If the reasoning is too short
+      // or doesn't mention "Not" for at least 3 known states, reject it
+      // and treat as "unknown" instead (which triggers the unknown-state
+      // escalation ladder: pixel fallback → reload → restart).
+      // ─────────────────────────────────────────────────────────────────────
+      if (action?.currentState === 'exploration') {
+        const reasoning = String(action?.reasoning || '');
+        // Count how many "Not <state>" patterns the AI mentioned
+        const notCount = (reasoning.match(/\bnot\s+\w+/gi) || []).length;
+        const reasoningLength = reasoning.length;
+        if (notCount < 3 || reasoningLength < 50) {
+          log(`Exploration state rejected — reasoning lacks proof (notCount=${notCount}, len=${reasoningLength}). Converting to 'unknown' for escalation. Reasoning: "${reasoning.substring(0, 100)}"`, 'WARN', 'cycle');
+          action.currentState = 'unknown';
+          // Don't change actionType — let the unknown-state handler deal with it
+        } else {
+          log(`Exploration state accepted — AI provided proof (${notCount} "Not" mentions, ${reasoningLength} chars).`, 'DEBUG', 'cycle');
+        }
+      }
+
       // Unknown state escape hatch — prevents 75s × N death spiral
       // When providers can't determine the page state, they return 'unknown'
       // and default to 'wait', creating an infinite idle loop. After
