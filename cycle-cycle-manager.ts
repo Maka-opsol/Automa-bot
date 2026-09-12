@@ -489,7 +489,7 @@ async function _checkOrPark(log: any): Promise<boolean> {
     log('OR daily limit exhausted, no other providers. Parking ~' + parkMinutes + 'min until midnight UTC. Screen untouched.', 'WARN', 'cycle');
     try {
       const sendAlert = require('./alerting').sendAlert;
-      sendAlert?.('OR budget parked: sleeping until midnight UTC, no other providers');
+      // TASK 61: Removed alert — routine daily event.
     } catch { /* non-critical */ }
     return true;
   } catch {
@@ -1258,7 +1258,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 log('Attempt 3: bypassing proxy — using direct connection.', 'WARN', 'cycle');
                 try {
                   const alerting = getDep('alerting');
-                  alerting?.sendAlert?.('Proxy bypassed: navigation failed after 2 attempts with proxy. Switching to direct connection.');
+                  // TASK 61: Removed alert — routine event.
                 } catch {}
               }
             } catch { /* ip-rotator not loaded */ }
@@ -1319,7 +1319,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             log(`All ${MAX_NAV_ATTEMPTS} navigation attempts failed. Outcomes: ${JSON.stringify(_navAttemptOutcomes)}`, 'ERROR', 'cycle');
             try {
               const alerting = getDep('alerting');
-              alerting?.sendAlert?.(`All ${MAX_NAV_ATTEMPTS} navigation attempts failed. Last error: ${_errorType}. Bot will continue and rely on blank-page escalation.`);
+              // TASK 61: Removed alert — routine event.
             } catch {}
 
             // BUG FIX (2026-09-09): NETWORK-UNREACHABLE EXIT CONDITION.
@@ -1436,7 +1436,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               log(`Proxy was active during persistent-blank — bypassing. Next cycle will use direct connection.`, 'WARN', 'cycle');
               try {
                 const alerting = getDep('alerting');
-                alerting?.sendAlert?.('Proxy bypassed: persistent blank screenshot after navigation. Browser progress stalled — switching to direct connection.');
+                // TASK 61: Removed alert — routine event.
               } catch {}
             }
           } catch { /* ip-rotator not loaded */ }
@@ -1651,7 +1651,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           log(`NO-PROVIDERS PAUSE: All vision providers unavailable for 30+ min. Pausing for ${_remaining} more min. Not touching browser.`, 'WARN', 'cycle');
           try {
             const alerting = getDep('alerting');
-            alerting?.sendAlert?.(`No providers for 30+ min. Bot pausing for 3h. Will resume at ${new Date(_noProvidersPauseUntil).toISOString()}.`);
+            // TASK 61: Removed alert — routine event when quotas exhaust.
           } catch {}
           _humanInterventionLogged = true;
         }
@@ -1922,7 +1922,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 log(`Blank-page escalation ${blankPageCounter}: proxy was active (${currentProxy}) — DISABLING PROXY before reload.`, 'ERROR', 'cycle');
                 try {
                   const alerting = getDep('alerting');
-                  alerting?.sendAlert?.(`Proxy disabled: blank-page escalation step ${blankPageCounter}. Switching to direct connection.`);
+                  // TASK 61: Removed alert — routine event.
                 } catch {}
                 // BUG FIX (2026-09-09): Use bypassProxy() to FULLY shut down the proxy
                 if (typeof ipRotator.bypassProxy === 'function') {
@@ -2522,7 +2522,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 } catch {}
                 try {
                   const alerting = getDep('alerting');
-                  alerting?.sendAlert?.(`No vision providers for ${Math.round(_elapsed / 60000)} min. Bot pausing for 3h. Sequential mode ENABLED to conserve quota.`);
+                  // TASK 61: Removed alert — routine event when quotas exhaust.
                 } catch {}
               }
             } else {
@@ -3491,7 +3491,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           stagnationAutoBanTriggered = true;
           try {
             const sendAlert = require('./alerting').sendAlert;
-            sendAlert?.('20-min stagnation auto-ban triggered: wait action banned');
+            // TASK 61: Removed alert — routine event.
           } catch { /* non-critical */ }
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
           lastScreenshotChangeTime = Date.now();
@@ -3693,7 +3693,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           stagnationAutoBanTriggered = true;
           try {
             const sendAlert = require('./alerting').sendAlert;
-            sendAlert?.('20-min stagnation auto-ban triggered: wait action banned');
+            // TASK 61: Removed alert — routine event.
           } catch { /* non-critical */ }
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
           lastScreenshotChangeTime = Date.now();
@@ -3896,7 +3896,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
             try {
               const sendAlert = require('./alerting').sendAlert;
-              sendAlert?.(`20-min zero progress: ${avenues.join(', ')}`);
+              // TASK 61: Removed alert — routine event.
             } catch {}
 
             // DIRECT full self-heal - bypass _isDesperatelyBroken, bypass
@@ -3951,7 +3951,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                     // On Render: exit(1) triggers auto-restart.
                     try {
                       const sendAlert = require('./alerting').sendAlert;
-                      sendAlert?.('Zero-progress self-heal succeeded — restarting process');
+                      // TASK 61: Removed alert — routine event.
                     } catch {}
                     try { await (getDep('shutdown')?.gracefulShutdown || (() => Promise.resolve()))('zero-progress-heal-restart'); } catch {}
                     process.exit(1);
@@ -4013,7 +4013,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     // Post-cycle alerting
     if (clickAttempts > 5) {
       const successRate = clickSuccesses / clickAttempts;
-      if (successRate < 0.3) { log(`Click executor failure rate high (${((1 - successRate) * 100).toFixed(0)}%). Triggering alert.`, 'WARN', 'cycle'); if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Click executor failure rate: ${(1 - successRate) * 100}%`); } catch (e: any) {} }
+      if (successRate < 0.3) { log(`Click executor failure rate high (${((1 - successRate) * 100).toFixed(0)}%).`, 'WARN', 'cycle'); }
     }
     log(`Cycle complete: ${questionsCompleted} questions processed`, 'INFO', 'cycle');
     consecutiveFailures = 0;
