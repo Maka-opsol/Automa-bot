@@ -3,6 +3,25 @@
 // Lazy requires to avoid top-level circular dependency chain
 const { getAvailableProviders, addProviderFailure, recordProviderResult } = require('./providers-registry');
 
+// TASK 54 (2026-09-11): Sequential single-provider mode.
+// When the bot has proven it lacks providers across restarts (persisted in DB),
+// switch from calling ALL providers in parallel to calling ONE provider at a time.
+// The providers are already sorted by health score (trust) by the registry's
+// getAvailableProviders() — highest health score first. We just use that order.
+let _sequentialMode: boolean | null = null; // null = not checked yet
+
+function _isSequentialMode(): boolean {
+  if (_sequentialMode !== null) return _sequentialMode;
+  try {
+    const db = require('./database');
+    const row = db.selectCalibration?.get('sequential_provider_mode');
+    _sequentialMode = row && row.value === 'true';
+  } catch {
+    _sequentialMode = false;
+  }
+  return _sequentialMode;
+}
+
 // Lazy logger - loaded on first use
 let _logger: any = null;
 function _getLogger() { if (!_logger) _logger = require('./logger'); return _logger; }
@@ -349,9 +368,12 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
     }
   }
 
-  // --- Consult all providers in parallel ---
-  // FIX: Add overall timeout so slow providers don't block the tribunal forever.
-  const TRIBUNAL_TIMEOUT_MS = 120000; // 120s total — don't cut off slow free-tier providers
+  // --- Consult providers ---
+  // TASK 54 (2026-09-11): If sequential mode is active (proven lack of providers
+  // across restarts), call ONE provider at a time, most trusted first.
+  // Stop as soon as one succeeds — saves free-tier API quota.
+  // Otherwise, call ALL providers in parallel (original behavior).
+  const TRIBUNAL_TIMEOUT_MS = 120000; // 120s total
   const tribunalController = new AbortController();
   const tribunalTimeout = setTimeout(() => tribunalController.abort(), TRIBUNAL_TIMEOUT_MS);
   if (signal) {
@@ -359,15 +381,17 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
     else { signal.addEventListener('abort', () => tribunalController.abort(), { once: true }); }
   }
 
-  const results: PromiseSettledResult<any>[] = await Promise.allSettled(
-    providers.map(async (provider: any) => {
+  let fulfilled: any[] = [];
+
+  if (_isSequentialMode()) {
+    // SEQUENTIAL MODE: try providers one at a time, most trusted first.
+    // getAvailableProviders() already sorts by health score (highest first),
+    // so we just iterate in order — no extra sorting needed.
+    log(`Tribunal: SEQUENTIAL MODE — trying providers one at a time (by health score): ${providers.map(p => `${p.name}(${(p.healthScore||0).toFixed(2)})`).join(' → ')}`, 'INFO', 'tribunal');
+    for (const provider of providers) {
+      if (tribunalController.signal.aborted) break;
       const start = Date.now();
       try {
-        // TASK 47 (2026-09-11): maxRetries=0 — no retries after first tribunal call.
-        // Retries were wasting bandwidth: if a provider returned 429 (rate limited),
-        // retrying after 2-3s just hit the same rate limit again. Each retry
-        // burns API quota and bandwidth. Better to fail fast and let the
-        // tribunal use the other providers' votes.
         const maxRetries = 0;
         const res = await safeCall(
           (sig: any) => provider.fn(base64Image, fullPrompt, sig || signal, { validate: true, maxRetries }),
@@ -375,26 +399,50 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
           { url: provider.name, signal: tribunalController.signal }
         );
         const latency = Date.now() - start;
-        // Note: safeCall already records to providers-health via recordCallResult internally.
-        // We also record to the registry for DB persistence.
         recordProviderResult(provider.name, true, latency);
-        return { ...res, _model: provider.name, _healthScore: provider.healthScore || 0.5, _latency: latency };
+        log(`Tribunal: ${provider.name} SUCCEEDED (${latency}ms) — using this result, skipping remaining providers.`, 'INFO', 'tribunal');
+        fulfilled = [{ ...res, _model: provider.name, _healthScore: provider.healthScore || 0.5, _latency: latency }];
+        break; // Got a result — don't call any more providers
       } catch (err: any) {
         const latency = Date.now() - start;
         recordProviderResult(provider.name, false, latency);
         addProviderFailure(provider.name, err);
         const errMsg = err && err.message ? String(err.message) : String(err);
-        log(`Tribunal: ${provider.name} failed: ${errMsg}`, 'WARN', 'tribunal');
-        return null;
+        log(`Tribunal: ${provider.name} failed — moving to next provider. (${errMsg.substring(0, 100)})`, 'WARN', 'tribunal');
+        // Continue to next provider
       }
-    })
-  );
-  clearTimeout(tribunalTimeout);
-
-  // --- Filter valid results ---
-  const fulfilled = results
-    .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value !== null)
-    .map(r => r.value);
+    }
+    clearTimeout(tribunalTimeout);
+  } else {
+    // PARALLEL MODE: call all providers at once (original behavior)
+    const results: PromiseSettledResult<any>[] = await Promise.allSettled(
+      providers.map(async (provider: any) => {
+        const start = Date.now();
+        try {
+          const maxRetries = 0;
+          const res = await safeCall(
+            (sig: any) => provider.fn(base64Image, fullPrompt, sig || signal, { validate: true, maxRetries }),
+            `Tribunal ${provider.name}`,
+            { url: provider.name, signal: tribunalController.signal }
+          );
+          const latency = Date.now() - start;
+          recordProviderResult(provider.name, true, latency);
+          return { ...res, _model: provider.name, _healthScore: provider.healthScore || 0.5, _latency: latency };
+        } catch (err: any) {
+          const latency = Date.now() - start;
+          recordProviderResult(provider.name, false, latency);
+          addProviderFailure(provider.name, err);
+          const errMsg = err && err.message ? String(err.message) : String(err);
+          log(`Tribunal: ${provider.name} failed: ${errMsg}`, 'WARN', 'tribunal');
+          return null;
+        }
+      })
+    );
+    clearTimeout(tribunalTimeout);
+    fulfilled = results
+      .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value !== null)
+      .map(r => r.value);
+  }
 
   const valid = fulfilled.filter(r => {
     if (!r) return false;
