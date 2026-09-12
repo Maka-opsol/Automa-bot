@@ -331,6 +331,23 @@ function resetDailyCounters(): void {
   _state.totalActiveMs = 0;
   _state.totalCyclesActive = 0;
   log('Work shifts: daily counters reset', 'INFO', 'work-shifts');
+
+  // TASK 60 (2026-09-11): Reset sequential provider mode at midnight.
+  // Free-tier API rate limits (OpenRouter free-models-per-day, Groq TPD, etc.)
+  // reset at midnight UTC. When they reset, we no longer need sequential mode
+  // — all providers should be available again. Clear the flag so the tribunal
+  // goes back to parallel mode (calling all providers at once for consensus).
+  try {
+    const db = require('./database');
+    if (db?.upsertCalibration) {
+      const row = db.selectCalibration?.get('sequential_provider_mode');
+      if (row && row.value === 'true') {
+        db.upsertCalibration.run('sequential_provider_mode', 'false', Date.now());
+        log('Midnight reset: sequential provider mode DISABLED — API quotas reset, returning to parallel mode.', 'INFO', 'work-shifts');
+        // TASK 61: Removed alert — happens daily at midnight.
+      }
+    }
+  } catch {}
 }
 
 // ─── Start / Stop ────────────────────────────────────────────────────────────
