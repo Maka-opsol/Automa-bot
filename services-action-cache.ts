@@ -133,7 +133,12 @@ function _regionSimilarity(a: number[], b: number[]): number {
  * 0.75 means 9 out of 12 regions must match.
  * Configurable via env var ACTION_CACHE_SIMILARITY_THRESHOLD (0.0 - 1.0).
  */
-const DEFAULT_SIMILARITY_THRESHOLD = 0.75;
+// TASK 55 (2026-09-11): Lowered from 0.75 to 0.50 (6/12 regions).
+// 0.75 was too strict — small layout changes (clock ticking, video thumbnail
+// changing frame, cursor blinking) caused 4+ regions to differ, missing the
+// cache and wasting an API call. 0.50 still rejects genuinely different pages
+// (which differ in 7+ regions) while catching pages that are mostly the same.
+const DEFAULT_SIMILARITY_THRESHOLD = 0.50;
 
 function _getSimilarityThreshold(): number {
   const config = _getConfig();
@@ -222,8 +227,12 @@ function _isSignatureSimilar(storedSig: string, targetSig: string): boolean {
   const target = _parseSignature(targetSig);
   if (!stored || !target) return false;
   if (stored.state !== target.state) return false;
-  // Length bucket must be within ±2KB (absorbs compression jitter)
-  if (Math.abs(stored.lenBucket - target.lenBucket) > 2048) return false;
+  // TASK 55 (2026-09-11): Widened from ±2KB to ±10KB.
+  // JPEG compression can produce files that differ by 5-8KB for the same
+  // page due to noise, rendering quality, or font hinting differences.
+  // ±10KB absorbs this while still rejecting genuinely different pages
+  // (which differ by 20KB+ due to completely different content).
+  if (Math.abs(stored.lenBucket - target.lenBucket) > 10240) return false;
   const sim = _regionSimilarity(stored.regions, target.regions);
   return sim >= _getSimilarityThreshold();
 }
@@ -690,6 +699,50 @@ function lookup(contextSignature: string): {
         }
       }
     }).catch(() => {});
+  }
+
+  // TASK 55 (2026-09-11): Last-resort fallback — try ANY cached action for
+  // the same state, ignoring the visual fingerprint entirely. This is better
+  // than wasting an API call — if we have a cached action for "assignments_page"
+  // that worked before, use it even if the screenshot differs slightly.
+  // The 3-failure eviction will clean it up if the action is wrong.
+  try {
+    const dbMod = _getDb();
+    if (dbMod) {
+      const target = _parseSignature(contextSignature);
+      if (target) {
+        const fallbackRow = dbMod.prepare(
+          `SELECT action_type, target_x, target_y, value, keypad_sequence, current_state,
+                  reasoning, hit_count, last_used
+           FROM action_cache
+           WHERE current_state = ? AND evicted = 0
+             AND failure_count < 3
+           ORDER BY last_used DESC
+           LIMIT 1`
+        ).get(target.state);
+        if (fallbackRow) {
+          const config = _getConfig();
+          const ttlMs = config.ACTION_CACHE_TTL_MS || DEFAULT_TTL_MS;
+          if (Date.now() - fallbackRow.last_used <= ttlMs) {
+            log(`Action cache FALLBACK HIT (state-only): sig=${contextSignature.substring(0, 8)} state=${target.state} type=${fallbackRow.action_type} — no exact/similar match, using any cached action for this state`, 'INFO', 'action-cache');
+            updateStats('hits');
+            return {
+              actionType: fallbackRow.action_type,
+              targetX: fallbackRow.target_x,
+              targetY: fallbackRow.target_y,
+              value: fallbackRow.value || '',
+              keypadSequence: fallbackRow.keypad_sequence ? JSON.parse(fallbackRow.keypad_sequence) : [],
+              currentState: fallbackRow.current_state,
+              reasoning: fallbackRow.reasoning || '',
+              hitCount: (fallbackRow.hit_count || 0) + 1,
+              lastUsed: Date.now(),
+            };
+          }
+        }
+      }
+    }
+  } catch (e: any) {
+    log(`Action cache state-only fallback error: ${e.message || e}`, 'DEBUG', 'action-cache');
   }
 
   updateStats('misses');
