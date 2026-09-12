@@ -737,7 +737,7 @@ async function ensureAuthenticated(page: any) {
         const currentProxy = ipRotator.getCurrentProxy?.();
         if (currentProxy) {
           log(`Chrome error page detected (occurrence #${errorCount}, proxy=${currentProxy}) — DISABLING PROXY immediately. Browser will use direct connection on next launch.`, 'ERROR', 'auth-guard');
-          try { (_deps.alerting?.sendAlert || (() => {}))(`Proxy disabled: chrome-error page detected (proxy=${currentProxy}). Switching to direct connection.`); } catch {}
+          // TASK 61: Removed alert — routine event.
           // BUG FIX (2026-09-09): Use bypassProxy() to FULLY shut down the proxy
           // (clears env vars + resets ip-rotator state), not just set the flag.
           if (typeof ipRotator.bypassProxy === 'function') {
