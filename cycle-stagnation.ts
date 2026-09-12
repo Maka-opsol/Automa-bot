@@ -24,7 +24,7 @@ async function recoverIfStuck(page: any, screenshotBuffer: any, action: any) {
     if (consecutiveUnchangedCount >= MAX_CONSECUTIVE_UNCHANGED) {
       const CONFIG = getCONFIG();
       log(`⚠️ Screenshot unchanged ${consecutiveUnchangedCount} consecutive cycles -- possible stagnation.`, 'WARN', 'stagnation');
-      if (CONFIG.ALERT_ON_STAGNATION) try { getSendAlert()(`Stagnation detected: screenshot unchanged ${consecutiveUnchangedCount} cycles`); } catch (e: any) {}
+      // TASK 61: Removed alert — routine event.
       // TASK 52 (2026-09-11): Use domcontentloaded + timeout + try/catch.
       // Old code used page.reload() with default 'load' wait — hangs on
       // font/image resources through proxy, throws ERR_CONNECTION_CLOSED.
@@ -63,7 +63,7 @@ async function recoverIfStuck(page: any, screenshotBuffer: any, action: any) {
         const currentProxy = ipRotator.getCurrentProxy?.();
         if (currentProxy && !(globalThis as any).__proxyDisabled) {
           log(`Proxy was active (${currentProxy}) when actions stopped working — DISABLING PROXY (actions may not be registering through proxy). Browser will relaunch with direct connection.`, 'ERROR', 'stagnation');
-          try { getSendAlert()('Proxy disabled: repeated actions not working. Switching to direct connection.'); } catch {}
+          // TASK 61: Removed alert — routine event.
           if (typeof ipRotator.bypassProxy === 'function') {
             ipRotator.bypassProxy(`repeated actions not working (stagnation)`);
           } else {
