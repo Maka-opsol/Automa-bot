@@ -101,6 +101,29 @@ function _getRecoveryUrl(): string {
 let stopRequested = false;
 let cycleStartTime: number | null = null;
 let browserRestartInterval = 4 * 60 * 60 * 1000;
+
+// TASK 57 (2026-09-11): Answer-type actions that must NEVER be cached on
+// question states. Each question is different — a cached answer from a
+// previous question would be wrong.
+const ANSWER_ACTIONS = new Set([
+  'keypad_input',
+  'input_email',
+  'input_password',
+  'type_text',
+]);
+
+// TASK 58 (2026-09-11): States where the AI must READ the page to generate
+// the correct answer. Cache is banned on these states UNTIL the AI submits
+// an answer (clicks a choice). After that, navigation actions (Next, book icon)
+// CAN be cached.
+const CACHE_BANNED_STATES = new Set([
+  'exercise_info',  // Math question — AI must read and solve it
+  'assessment',     // Assessment questions — AI must read and answer
+  'answering',      // Actively answering — AI must see the question
+  'question',       // Generic question state — AI must read it
+  'question_page',  // Question page — AI must read it
+  'blank_page',     // Don't cache blank pages
+]);
 let consecutiveFailures = 0;
 let selfHealRunning = false;
 let _networkSetup = false;
@@ -541,7 +564,7 @@ function _getSelfHealReason(CONFIG: any): string {
   if (_recentErrorCodes.length > 0) {
     const stallCode = _recentErrorCodes.find(e => PROGRESS_STALL_CODES.has(e.code));
     if (stallCode) {
-      if (stallCode.code === 'E_PROGRESS_STALL') return 'no progress in 30min';
+      if (stallCode.code === 'E_PROGRESS_STALL') return 'no progress in 60min';
       if (stallCode.code === 'E_SLOW_PROGRESS') return 'slow progress (stalled after initial questions)';
     }
   }
@@ -782,8 +805,30 @@ async function _saveActionToCache(
 ): Promise<boolean> {
   if (!action?.actionType) return false;
   if (!actionCache) return false;
-  if (isCacheExcluded) return false;
-  if (action.actionType === 'wait' || action.actionType === 'blank_page') return false;
+  if (isCacheExcluded) {
+    // TASK 57 (2026-09-11): On banned states, still save NON-answer actions.
+    // Answer-type actions (keypad_input, input_email, etc.) must NOT be cached
+    // on question states — each question is different. But navigation actions
+    // (click Next, click book icon, scroll) are always at the same position
+    // and CAN be safely cached.
+    //
+    // TASK 59 (2026-09-11): If the AI explicitly set "repeatable": true on
+    // the action, always save it — the AI has decided this action doesn't
+    // require reading the page content (e.g., clicking "Next" button).
+    if (action.repeatable === true) {
+      // AI says it's repeatable — save it regardless of state
+    } else if (ANSWER_ACTIONS.has(action.actionType)) {
+      return false; // Answer action on banned state — don't cache
+    }
+    // Not an answer action (and not explicitly repeatable) — proceed to save
+  }
+  // TASK 55 (2026-09-11): Allow 'wait' actions to be cached.
+  // The old code skipped caching 'wait' actions — but 'wait' IS a valid action
+  // (e.g., waiting for a video to finish, waiting for a page to load).
+  // If we don't cache it, the bot re-queries the tribunal every cycle for the
+  // same page, wasting API calls. The 3-failure eviction will clean up bad entries.
+  // Only skip 'blank_page' (not a real action type).
+  if (action.actionType === 'blank_page') return false;
 
   try {
     // Compute sig if not already computed for this cycle
@@ -1445,6 +1490,14 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     let consecutiveTribunalFailures = 0;
     let unknownStateCounter = 0; // Counts consecutive 'unknown' currentState results
     let _humanInterventionLogged = false; // Task 35: Track if we've already logged the pause message
+    // TASK 58 (2026-09-11): Track whether the AI has submitted an answer on
+    // the current question. Multiple-choice questions are answered by clicking
+    // a choice (click/flutter_tap). After the AI clicks, the next action is
+    // usually "click Next" or "click book icon" — these CAN be cached because
+    // their position doesn't change. But BEFORE the AI clicks, the cache must
+    // NOT activate — the AI must read each question and choose the right answer.
+    let _answerSubmitted = false;
+    let _answerSubmittedState: string | null = null; // which state the answer was submitted on
     const MAX_UNKNOWN_STATE = 3; // After this many unknowns, force recovery
 
     // TASK 39 (2026-09-09): Track consecutive "no providers" tribunal failures.
@@ -2268,12 +2321,53 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       let _actionCacheSig: string | null = null;
       let _actionCacheHit = false;
       const actionCache = _getActionCache();
-      const _isCacheExcluded = currentState === 'blank_page';
-      if (!action && actionCache && !_isCacheExcluded) {
+      // TASK 56 (2026-09-11): Ban cache for states that require the AI to
+      // READ the page content and generate the correct answer. On these states,
+      // each question is different — a cached click from a previous question
+      // would click the wrong answer. The AI MUST see the page every time.
+      //
+      // TASK 57 (2026-09-11): Partially relax the ban. After the AI has chosen
+      // an answer, the NEXT action is usually "click Next" or "click the book
+      // icon" — these are always at the same position regardless of the question.
+      // So we allow the cache for non-answer actions (click, flutter_tap, scroll,
+      // navigate) on these states, but BAN it for answer-type actions
+      // (keypad_input, input_email, input_password, type_text) which would
+      // be the actual answer to a different question.
+      // (CACHE_BANNED_STATES and ANSWER_ACTIONS are defined at module scope — see lines 108-126)
+      const _isCacheExcluded = CACHE_BANNED_STATES.has(currentState || '');
+      // TASK 58 (2026-09-11): On question states, only allow cache AFTER the AI
+      // has submitted an answer (clicked a choice). Before that, the AI must
+      // read the question and choose the right answer — no cache.
+      // After the AI clicks (answer submitted), the next action is likely
+      // "click Next" or "click book icon" — these CAN be cached.
+      //
+      // TASK 59 (2026-09-11): The AI can also set "repeatable": true on the
+      // action itself. If the AI says the action is repeatable (e.g., clicking
+      // "Next" button — always in the same position), allow cache even BEFORE
+      // an answer is submitted. The AI has explicitly said this action doesn't
+      // require reading the page content.
+      const _isCacheLookupAllowed = !_isCacheExcluded
+        || (_answerSubmitted && _answerSubmittedState === currentState)
+        || (action?.repeatable === true);
+      // Clear _answerSubmitted if the state changed (moved to a new question or different page)
+      if (_answerSubmitted && _answerSubmittedState !== currentState) {
+        _answerSubmitted = false;
+        _answerSubmittedState = null;
+      }
+      // TASK 55 (2026-09-11): Don't exclude cache for error/unknown states.
+      // Even if the tribunal returned 'error' or 'unknown' on the previous cycle,
+      // the visual page is still the same — the cache key should match.
+      // The state in the signature is just for grouping — the visual fingerprint
+      // is what determines if the page is the same. Use the current URL-based
+      // state if available, otherwise fall back to currentState.
+      if (!action && actionCache && _isCacheLookupAllowed) {
         try {
           // Compute context signature from current state + screenshot
-          // Use previous cycle's state as the context key (currentState is set from last cycle)
-          _actionCacheSig = actionCache.computeContextSignature(currentState, base64);
+          // TASK 55: Use 'unknown' as the state if currentState is null/empty —
+          // this ensures the signature is still computed (the visual fingerprint
+          // is the primary key, the state is just for grouping/query optimization).
+          const cacheState = currentState || 'unknown';
+          _actionCacheSig = actionCache.computeContextSignature(cacheState, base64);
           if (_actionCacheSig) {
             // Cold start (post-OOM): local action_cache is empty — use async
             // lookup which AWAITS the Turso read instead of fire-and-forget.
@@ -2286,11 +2380,22 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             // so subsequent cycles use the fast sync path
             if (cachedAction && useAsync) { _localCacheEmpty = false; }
             if (cachedAction) {
-              action = cachedAction;
-              _actionCacheHit = true;
-              const source = useAsync ? 'turso-cold' : 'local';
-              log(`Action cache HIT (${source}): type=${cachedAction.actionType} at (${cachedAction.targetX.toFixed(2)}, ${cachedAction.targetY.toFixed(2)}) state=${cachedAction.currentState}`, 'INFO', 'cycle');
-              updateStats({ actionCacheHits: (getStats().actionCacheHits || 0) + 1 });
+              // TASK 57 (2026-09-11): On banned states, reject cached answer-type actions.
+              // The AI must read each question — a cached keypad_input from a previous
+              // question would enter the wrong answer. But click/flutter_tap (Next button,
+              // book icon, scroll) are safe to cache because their position doesn't change.
+              if (_isCacheExcluded && ANSWER_ACTIONS.has(cachedAction.actionType)) {
+                log(`Action cache HIT but REJECTED (answer action on banned state): type=${cachedAction.actionType} state=${cachedAction.currentState} — AI must read this question.`, 'DEBUG', 'cycle');
+                action = null;
+                _actionCacheHit = false;
+                updateStats({ actionCacheMisses: (getStats().actionCacheMisses || 0) + 1 });
+              } else {
+                action = cachedAction;
+                _actionCacheHit = true;
+                const source = useAsync ? 'turso-cold' : 'local';
+                log(`Action cache HIT (${source}): type=${cachedAction.actionType} at (${cachedAction.targetX.toFixed(2)}, ${cachedAction.targetY.toFixed(2)}) state=${cachedAction.currentState}`, 'INFO', 'cycle');
+                updateStats({ actionCacheHits: (getStats().actionCacheHits || 0) + 1 });
+              }
             } else {
               updateStats({ actionCacheMisses: (getStats().actionCacheMisses || 0) + 1 });
             }
@@ -2407,9 +2512,17 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 (globalThis as any).__noProvidersSince = _noProvidersSince;
                 (globalThis as any).__noProvidersPauseUntil = _noProvidersPauseUntil;
                 log(`No providers for ${Math.round(_elapsed / 60000)} min — triggering 3h pause. Bot will not touch the browser until ${new Date(_noProvidersPauseUntil).toISOString()}.`, 'ERROR', 'cycle');
+                // TASK 54 (2026-09-11): Persist sequential mode flag in DB.
+                // This survives restarts — the tribunal will use sequential
+                // single-provider mode to conserve free-tier API quota.
+                try {
+                  const dbMod = require('./database');
+                  dbMod.upsertCalibration?.run('sequential_provider_mode', 'true', Date.now());
+                  log('Sequential provider mode ENABLED — will use one provider at a time to conserve quota.', 'WARN', 'cycle');
+                } catch {}
                 try {
                   const alerting = getDep('alerting');
-                  alerting?.sendAlert?.(`No vision providers for ${Math.round(_elapsed / 60000)} min. Bot pausing for 3h (until ${new Date(_noProvidersPauseUntil).toISOString()}). Browser will not be touched.`);
+                  alerting?.sendAlert?.(`No vision providers for ${Math.round(_elapsed / 60000)} min. Bot pausing for 3h. Sequential mode ENABLED to conserve quota.`);
                 } catch {}
               }
             } else {
@@ -2420,6 +2533,12 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 _noProvidersPauseUntil = null;
                 (globalThis as any).__noProvidersSince = null;
                 (globalThis as any).__noProvidersPauseUntil = null;
+                // TASK 54: Clear sequential mode — providers recovered, go back to parallel
+                try {
+                  const dbMod = require('./database');
+                  dbMod.upsertCalibration?.run('sequential_provider_mode', 'false', Date.now());
+                  log('Sequential provider mode DISABLED — providers recovered, returning to parallel mode.', 'INFO', 'cycle');
+                } catch {}
               }
             }
 
@@ -2948,6 +3067,16 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         clickSuccesses++;
         actionSuccess = true;
         consecutiveFailures = 0;
+
+        // TASK 58 (2026-09-11): If the AI clicked on a question state, mark
+        // that an answer has been submitted. On the NEXT cycle, the cache can
+        // activate for navigation actions (click Next, book icon) because
+        // the AI already chose its answer — the remaining actions are navigation.
+        if (CACHE_BANNED_STATES.has(currentState || '') && (action.actionType === 'click' || action.actionType === 'flutter_tap')) {
+          _answerSubmitted = true;
+          _answerSubmittedState = currentState;
+          log(`Answer submitted on state ${currentState} — cache will be allowed for navigation actions on next cycle.`, 'DEBUG', 'cycle');
+        }
 
         // ── BUG FIX (2026-09-04): Login-flow tracking ──
         // When the bot clicks on the mathu_login state, it is virtually
@@ -3695,7 +3824,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // stuck in a loop (answering the same question wrong, clicking the wrong
       // button, etc.). This is structurally broken behavior that self-heal should
       // investigate. Uses a separate, longer timeout than the zero-progress case.
-      // Default: 2x PROGRESS_TIMEOUT_MS (60min with default 30min config).
+      // Default: 2x PROGRESS_TIMEOUT_MS (120min with default 60min config).
       const SLOW_PROGRESS_MS = (CONFIG.PROGRESS_SLOW_TIMEOUT_MS || CONFIG.PROGRESS_TIMEOUT_MS * 2);
       if (questionsCompleted > 0 && Date.now() - lastProgressTime > SLOW_PROGRESS_MS) {
         const slowErr: any = new Error(`Slow progress: last question completion was ${Math.round((Date.now() - lastProgressTime) / 60000)}min ago`);
