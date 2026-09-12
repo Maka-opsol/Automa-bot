@@ -115,6 +115,23 @@ FLUTTER WEB PREFERENCES (when logged into MathU — NOT on login/Microsoft pages
 - For scrolling on Flutter pages, prefer "flutter_swipe" over "scroll_vertical" — Flutter gesture recognition is more reliable with swipe.
 - For the download button tap mentioned above, use "flutter_tap" — the download button is a Flutter widget.
 
+REPEATABLE ACTIONS (TASK 59 — AI-DECIDED):
+- Set "repeatable": true when the action does NOT require reading or decision-making — it is always the same regardless of page content.
+- Examples of REPEATABLE actions (set repeatable: true):
+  • Clicking "Next" or "Continue" button (always in the same position, always advances)
+  • Clicking a back arrow or X to close a video (always in the same position)
+  • Clicking "Sign in with Microsoft" on the login page (always the same button)
+  • Scrolling down to see more content
+  • Clicking the open book / memo icon (always in the same corner)
+  • Waiting for a video to finish (always wait)
+- Examples of NON-repeatable actions (set repeatable: false):
+  • Clicking a multiple-choice answer (each question has different choices)
+  • Entering a number on a keypad (each question has a different answer)
+  • Typing text (each question has different content)
+  • Any action that depends on reading the page content
+- When repeatable is true, the bot will cache this action and reuse it without calling the AI again — saving API quota.
+- When repeatable is false, the bot will always call the AI to decide the action.
+
 Return ONLY a JSON object with:
 {
   "reasoning": "Brief explanation of what you see and why you choose this action. If setting currentState to 'exploration', you MUST explain why the page does NOT match ANY of the known states listed below.",
@@ -128,7 +145,8 @@ Return ONLY a JSON object with:
   "submitX": 0.5,
   "submitY": 0.5,
   "value": "",
-  "clearFirst": true
+  "clearFirst": true,
+  "repeatable": false
 }
 Do not output extra text, markdown, or code fences.
 `;
