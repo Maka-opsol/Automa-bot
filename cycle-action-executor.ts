@@ -700,35 +700,14 @@ const ACTION_HANDLERS: Record<string, (ctx: ActionCtx) => Promise<void>> = {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function executeAction(page: any, action: any) {
-  // Race the entire action against a timeout.
-  // Wait actions use a dynamic timeout (waitTime + buffer) since they may
-  // legitimately need > 30s (e.g., BETWEEN_STEPS_MS * WAIT_MULTIPLIER = 75s).
-  const isWaitAction = action.actionType === 'wait';
-  const CONFIG = getCONFIG();
-  const wm = _waitMultiplier(CONFIG);
-  const estimatedWaitTime = isWaitAction
-    ? ((CONFIG.ENABLE_ADAPTIVE_PERFORMANCE && _deps.adaptivePerformanceEngine?.getAdjustedWait)
-        ? (_deps.adaptivePerformanceEngine.getAdjustedWait(CONFIG.BETWEEN_STEPS_MS) || CONFIG.BETWEEN_STEPS_MS * wm)
-        : CONFIG.BETWEEN_STEPS_MS * wm)
-    : 0;
-  const timeoutMs = isWaitAction
-    ? Math.max(estimatedWaitTime + WAIT_TIMEOUT_BUFFER_MS, ACTION_TIMEOUT_MS)
-    : ACTION_TIMEOUT_MS;
-
-  const actionPromise = _executeActionInner(page, action);
-  // FIX: Save timer handle and clear after race resolves
-  let actionTimer: any = null;
-  const timeoutPromise = new Promise<null>(resolve =>
-    actionTimer = setTimeout(() => resolve(null), timeoutMs)
-  );
-  try {
-    const result = await Promise.race([actionPromise, timeoutPromise]);
-    if (result === null) {
-      log(`Action ${action.actionType} timed out after ${timeoutMs / 1000}s`, 'WARN', 'action');
-    }
-  } finally {
-    if (actionTimer) clearTimeout(actionTimer);
-  }
+  // TASK 53 (2026-09-11): Removed the timeout race entirely.
+  // The user said "Actions shouldn't time out. Full stop."
+  // The 30s timeout was killing legitimate actions like input_email
+  // (which waits for the Microsoft login page to load through the proxy).
+  // Actions should run to completion — the cycle manager's own timeout
+  // and the browser's navigation timeout will catch truly stuck calls.
+  // Wait actions already use their own sleep — no external timeout needed.
+  await _executeActionInner(page, action);
 }
 
 async function _executeActionInner(page: any, action: any) {
