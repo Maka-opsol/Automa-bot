@@ -175,7 +175,7 @@ async function checkIpLocation() {
         // If we get here, no proxy gave the expected location
         if (CONFIG.ALERT_ON_ERROR) {
           const { sendAlert } = require('./alerting');
-          sendAlert(`Proxy IP verification failed: no ZA proxy returned correct location. Last proxy: ${proxy}`);
+          // TASK 61: Removed alert — routine event.
         }
         log('No proxy returned expected ZA location. Browser may be using wrong IP.', 'ERROR', 'ip-check');
         return null;
@@ -207,7 +207,7 @@ async function checkIpLocation() {
         log(`IP location mismatch! Expected "${CONFIG.EXPECTED_IP_CITY}, ${CONFIG.EXPECTED_IP_COUNTRY}" but got "${result.city}, ${result.country}"`, 'WARN', 'ip-check');
         if (CONFIG.ALERT_ON_ERROR) {
           const { sendAlert } = require('./alerting');
-          sendAlert(`IP location mismatch: ${result.city}, ${result.country}`);
+          // TASK 61: Removed alert — routine event.
         }
       } else {
         log('IP location matches expected region.', 'INFO', 'ip-check');
