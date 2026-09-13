@@ -1498,6 +1498,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     // NOT activate — the AI must read each question and choose the right answer.
     let _answerSubmitted = false;
     let _answerSubmittedState: string | null = null; // which state the answer was submitted on
+    // TASK 62 (2026-09-11): Track consecutive screenshot-unchanged cycles for
+    // cached actions. If a cached action doesn't change the screenshot 3 times
+    // in a row, evict it — the cached action is wrong for this page.
+    let _cacheHitUnchangedCount = 0;
+    let _cacheHitUnchangedSig: string | null = null;
     const MAX_UNKNOWN_STATE = 3; // After this many unknowns, force recovery
 
     // TASK 39 (2026-09-09): Track consecutive "no providers" tribunal failures.
@@ -3235,6 +3240,45 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           if (evicted) {
             log('Action cache entry evicted due to repeated failures — will re-query AI next cycle', 'WARN', 'cycle');
           }
+        }
+      }
+
+      // TASK 62 (2026-09-11): Screenshot-unchanged eviction for cached actions.
+      // If a cached action was used and the screenshot didn't change, increment
+      // a counter. After 3 consecutive unchanged screenshots, evict the cache
+      // entry — the cached action is wrong for this page.
+      if (_actionCacheHit && _actionCacheSig) {
+        if (screenshotHash === previousScreenshotHash) {
+          // Screenshot didn't change — but wait, previousScreenshotHash was
+          // already updated to the current hash at line ~2231. We need to
+          // compare with the hash BEFORE this cycle's screenshot was taken.
+          // Use _cacheHitUnchangedSig to track the last hash we saw when a
+          // cache hit occurred.
+          if (_cacheHitUnchangedSig === screenshotHash) {
+            _cacheHitUnchangedCount++;
+          } else {
+            _cacheHitUnchangedCount = 1;
+            _cacheHitUnchangedSig = screenshotHash;
+          }
+          if (_cacheHitUnchangedCount >= 3) {
+            log(`Cache eviction: cached action didn't change screenshot ${_cacheHitUnchangedCount} times — evicting. sig=${_actionCacheSig.substring(0, 8)}`, 'WARN', 'cycle');
+            try {
+              if (actionCache?.evictEntry) {
+                actionCache.evictEntry(_actionCacheSig);
+              } else if (actionCache?.recordFailure) {
+                // Fallback: force-evict via 3 rapid failures
+                actionCache.recordFailure(_actionCacheSig);
+                actionCache.recordFailure(_actionCacheSig);
+                actionCache.recordFailure(_actionCacheSig);
+              }
+            } catch {}
+            _cacheHitUnchangedCount = 0;
+            _cacheHitUnchangedSig = null;
+          }
+        } else {
+          // Screenshot changed — reset counter
+          _cacheHitUnchangedCount = 0;
+          _cacheHitUnchangedSig = null;
         }
       }
 
