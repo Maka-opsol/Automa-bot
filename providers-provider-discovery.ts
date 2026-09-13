@@ -36,7 +36,7 @@ const PROVIDER_QUERIES = {
 // TASK 49 (2026-09-11): Updated ALL defaults to current (non-decommissioned) models.
 // Old defaults were causing death loops because they pointed to EOL/decommissioned models.
 const PROVIDER_DEFAULTS: Record<string, string> = {
-  'Groq': 'llama-3.3-70b-versatile',           // was llama-3.2-11b-vision-preview (decommissioned)
+  'Groq': 'qwen/qwen3.6-27b',                    // user-specified
   'GitHub GPT': 'gpt-4o-mini',
   'z.ai': 'GLM-4.6V-Flash',
   'Agnes': 'agnes-2.0-flash',
