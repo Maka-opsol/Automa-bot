@@ -59,14 +59,12 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'Groq': {
     endpoint: null,  // Uses groq-sdk (not raw HTTP)
-    // TASK 49 (2026-09-11): qwen/qwen3.6-27b is a text model, not vision-capable.
-    // Updated to llama-3.3-70b-versatile (current Groq model, vision-capable via SDK).
-    model: 'llama-3.3-70b-versatile',
+    // TASK 62 (2026-09-11): User-specified Groq models.
+    model: 'qwen/qwen3.6-27b',
     envKeys: ['GROQ_API_KEY'],
-    visionCapable: true,  // qwen model supports vision via SDK
+    visionCapable: true,
     fallbackModels: [
-      'llama-3.1-8b-instant',
-      'llama3-70b-8192',
+      'qwen/qwen3.8-27b',
     ],
   },
   'z.ai': {
@@ -189,6 +187,7 @@ function loadDynamicModels() {
     // They keep getting loaded on boot even after we updated the defaults above.
     const STALE_MODELS = [
       'llama-3.2-11b-vision-preview',     // Groq — decommissioned
+      'llama-3.3-70b-versatile',          // Groq — replaced with qwen models (Task 62)
       'meta/llama-3.3-70b-instruct',      // NVIDIA — EOL 2026-08-26
       'meta/llama-3.2-11b-vision-instruct', // NVIDIA — EOL
       'gemini-1.5-flash',                  // Gemini — deprecated 404
