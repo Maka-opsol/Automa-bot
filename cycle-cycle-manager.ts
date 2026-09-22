@@ -2524,6 +2524,15 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             // If the tribunal returns "No providers" or "No valid responses",
             // start (or continue) the no-providers timer. If it's been 30+
             // minutes, trigger a 3-hour pause (checked at top of cycle loop).
+            //
+            // TASK 69 (2026-09-22): The tribunal now triggers the instant
+            // parallel→sequential switch ITSELF (in its `valid.length === 0`
+            // block) before returning. We ALSO call `triggerSequentialMode()`
+            // here as a defensive safety net — in case the tribunal's DB write
+            // failed or the action was synthesized by the vision pipeline
+            // (which calls runTribunal but may not pass through the same
+            // `valid.length === 0` code path on every exception branch).
+            // Idempotent — safe to call when sequential mode is already active.
             // ─────────────────────────────────────────────────────────────────
             if (action?.reasoning?.includes('No providers') ||
                 action?.reasoning?.includes('No valid responses from any provider') ||
@@ -2532,6 +2541,15 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 _noProvidersSince = Date.now();
                 log(`No providers detected — starting 30-min timer. If providers don't recover, bot will pause for 3h.`, 'WARN', 'cycle');
               }
+              // TASK 69: Defensive instant-switch (tribunal already triggers
+              // this internally, but call again here in case the tribunal's
+              // DB write failed or the action came from a different code path).
+              try {
+                const tribunal = require('./providers-tribunal');
+                if (typeof tribunal.triggerSequentialMode === 'function') {
+                  tribunal.triggerSequentialMode('cycle-manager: no-providers reasoning detected');
+                }
+              } catch {}
               const _elapsed = Date.now() - _noProvidersSince;
               if (_elapsed >= NO_PROVIDERS_THRESHOLD_MS && !_noProvidersPauseUntil) {
                 _noProvidersPauseUntil = Date.now() + NO_PROVIDERS_PAUSE_MS;
@@ -4297,4 +4315,4 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   }
 }
 
-module.exports = { runCycle, requestStop, isOrParked: () => _orParked, _injectDependencies, restoreCycleState: _restoreCycleState };
+module.exports = { runCycle, requestStop, isOrParked: () => _orParked, _injectDependencies, restoreCycleState: _restoreCycleState }; 
