@@ -22,28 +22,26 @@ function _getConfigLoader() { if (!_configLoader) { try { _configLoader = requir
  *   3. Non-destructive (bad regex matches don't overwrite DB config)
  */
 const PROVIDER_QUERIES = {
-  'Groq': 'Groq API models list llama vision',
+  'Groq': 'Groq llama-3.3-70b versatile vision model',
   'GitHub GPT': 'GitHub Models Azure OpenAI gpt-4o-mini',
   'z.ai': 'z.ai GLM-4.6V-Flash model',
   'Agnes': 'Agnes AI 2.0 flash model',
-  'NVIDIA': 'NVIDIA NIM llama-3.2-11b-vision-instruct',
-  'Cloudflare': 'Cloudflare Workers AI @cf/meta/llama-3.2-11b-vision',
+  'NVIDIA': 'NVIDIA NIM llama-3.1-8b-instruct',
+  'Cloudflare': 'Cloudflare Workers AI llama-4-scout',
   'Cerebras': 'Cerebras gemma model fast inference',
-  'Gemini': 'Gemini 2.5 flash model',
+  'Gemini': 'Gemini 1.5 flash model',
 };
 
 /** Default model names when web search fails */
-// TASK 49 (2026-09-11): Updated ALL defaults to current (non-decommissioned) models.
-// Old defaults were causing death loops because they pointed to EOL/decommissioned models.
 const PROVIDER_DEFAULTS: Record<string, string> = {
-  'Groq': 'qwen/qwen3.6-27b',                    // user-specified
+  'Groq': 'llama-3.3-70b-versatile',
   'GitHub GPT': 'gpt-4o-mini',
   'z.ai': 'GLM-4.6V-Flash',
   'Agnes': 'agnes-2.0-flash',
-  'NVIDIA': 'meta/llama-3.1-70b-instruct',     // was meta/llama-3.2-11b-vision-instruct (EOL)
-  'Cloudflare': '@cf/meta/llama-4-scout-17b-16e-instruct',  // was @cf/meta/llama-3.2-11b-vision
+  'NVIDIA': 'meta/llama-3.1-8b-instruct',
+  'Cloudflare': '@cf/meta/llama-4-scout-17b-16e-instruct',
   'Cerebras': 'gemma-4-31b',
-  'Gemini': 'gemini-2.5-flash',                 // was gemini-1.5-flash (deprecated 404)
+  'Gemini': 'gemini-2.5-flash',
 };
 
 /** Regex patterns to extract model names from web search results */
