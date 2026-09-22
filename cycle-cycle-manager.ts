@@ -123,11 +123,19 @@ const CACHE_BANNED_STATES = new Set([
   'question',       // Generic question state — AI must read it
   'question_page',  // Question page — AI must read it
   'blank_page',     // Don't cache blank pages
-  'exploration',    // Task 64: Don't cache exploration — each unknown page is different
-  'unknown',        // Task 64: Don't cache unknown state — AI must re-evaluate
-  'error',          // Task 64: Don't cache error states — recovery is context-specific
-  'app_error',      // Task 64: Don't cache app_error — recovery is context-specific
-  'human_intervention', // Task 64: Don't cache human intervention state
+  'exploration',    // Don't cache exploration — each unknown page is different
+  'unknown',        // Don't cache unknown state — AI must re-evaluate
+  'error',          // Don't cache error states — recovery is context-specific
+  'app_error',      // Don't cache app_error — recovery is context-specific
+  'human_intervention', // Don't cache human intervention state
+  // TASK 66 (2026-09-21): loading state must NOT be cached.
+  // The bot was stuck in a loop: AI returned "loading" state + "wait" action →
+  // cached → next cycle: cache hit with "wait" → page still loading →
+  // cache hit again with "wait" → forever. The page IS loading and the AI
+  // needs to check every cycle if it finished loading. Once it loads, the
+  // AI will see the actual content (assignments page, question, etc.) and
+  // the state will change — at that point caching can resume.
+  'loading',
 ]);
 let consecutiveFailures = 0;
 let selfHealRunning = false;
