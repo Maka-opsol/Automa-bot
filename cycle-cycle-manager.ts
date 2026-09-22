@@ -2508,6 +2508,15 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             const _shouldTryPixelFallback = isTribunalErrorWait ||
               (action?.actionType === 'wait' &&
                (action?.currentState === 'error' || action?.currentState === 'unknown') &&
+               !action?._pixelFallbackTried) ||
+              // TASK 68: Also try pixel fallback when tribunal says "wait" on
+              // non-login states (loading, exploration, assignments_page, etc.)
+              // — the provider might have been rate-limited and returned a guess.
+              (action?.actionType === 'wait' &&
+               action?.currentState !== 'mathu_login' &&
+               action?.currentState !== 'microsoft_email_input' &&
+               action?.currentState !== 'captcha' &&
+               action?.currentState !== 'human_intervention' &&
                !action?._pixelFallbackTried);
 
             // ─────────────────────────────────────────────────────────────────
