@@ -52,8 +52,7 @@ function GroqProvider() {
     // This prevents stale closure after rollbackProvider().
     const buildRequest = () => {
       const config = getProviderConfig('Groq');
-      // TASK 62 (2026-09-11): User-specified Groq models.
-      const model = config.model || 'qwen/qwen3.6-27b';
+      const model = config.model || 'llama-3.3-70b-versatile';
       const userContent = base64Image
         ? [
             { type: 'text', text: prompt },
