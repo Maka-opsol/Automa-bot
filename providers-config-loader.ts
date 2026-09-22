@@ -59,12 +59,14 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'Groq': {
     endpoint: null,  // Uses groq-sdk (not raw HTTP)
-    // TASK 62 (2026-09-11): User-specified Groq models.
-    model: 'qwen/qwen3.6-27b',
+    // TASK 67: Groq model names don't use 'qwen/' prefix.
+    // qwen/qwen3.6-27b → 404. Use llama-3.3-70b-versatile (confirmed working).
+    model: 'llama-3.3-70b-versatile',
     envKeys: ['GROQ_API_KEY'],
     visionCapable: true,
     fallbackModels: [
-      'qwen/qwen3.8-27b',
+      'llama-3.1-8b-instant',
+      'llama3-70b-8192',
     ],
   },
   'z.ai': {
@@ -83,13 +85,13 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'NVIDIA': {
     endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions',
-    // TASK 49 (2026-09-11): meta/llama-3.3-70b-instruct reached EOL on 2026-08-26.
-    // Updated to meta/llama-3.1-70b-instruct (still available on NVIDIA NIM free tier).
-    model: 'meta/llama-3.1-70b-instruct',
+    // TASK 67: meta/llama-3.3-70b-instruct is EOL (410 Gone since 2026-08-26).
+    // meta/llama-3.1-70b-instruct is ALSO EOL (same date).
+    // Use meta/llama-3.1-8b-instruct (smaller but still available on free tier).
+    model: 'meta/llama-3.1-8b-instruct',
     envKeys: ['NVIDIA_API_KEY'],
     visionCapable: true,
     fallbackModels: [
-      'meta/llama-3.1-8b-instruct',
       'nvidia/llama-3.1-nemotron-70b-instruct',
     ],
   },
@@ -101,7 +103,7 @@ const DEFAULTS: Record<string, ProviderDefault> = {
     fallbackModels: [
       '@cf/google/gemma-4-26b-a4b-it',
       '@cf/meta/llama-3.2-11b-vision-instruct',
-      // TASK 49 (2026-09-11): Removed @cf/moonshotai/kimi-k2.5 — returns 403 forbidden.
+      // TASK 67: Removed @cf/moonshotai/kimi-k2.5 — returns 403 forbidden.
     ],
   },
   'Cerebras': {
@@ -127,14 +129,12 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'Gemini': {
     endpoint: null,  // uses Google SDK, not HTTP endpoint
+    // TASK 67: gemini-2.5-pro, gemini-2.0-flash, gemini-1.5-flash all return 404.
+    // Only gemini-2.5-flash is valid now.
     model: 'gemini-2.5-flash',
     envKeys: ['GEMINI_API_KEY'],
     visionCapable: true,
-    fallbackModels: [
-      'gemini-2.5-pro',
-      // TASK 49 (2026-09-11): Removed gemini-2.0-flash and gemini-1.5-flash —
-      // both return 404 (deprecated). Only gemini-2.5-* models are valid now.
-    ],
+    fallbackModels: [],
   },
   'OpenRouter': {
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
@@ -182,21 +182,19 @@ function loadDynamicModels() {
       DYNAMIC_MODELS = parsed;
       _log(`Loaded ${Object.keys(parsed).length} dynamic models from DB`, 'DEBUG', 'config-loader');
     }
-    // TASK 49 (2026-09-11): Clear stale DB models that point to decommissioned/EOL models.
-    // The provider-discovery module found these via web search and persisted them to DB.
-    // They keep getting loaded on boot even after we updated the defaults above.
+    // TASK 67: Clear stale DB models that point to EOL/decommissioned models.
     const STALE_MODELS = [
-      'llama-3.2-11b-vision-preview',     // Groq — decommissioned
-      'llama-3.3-70b-versatile',          // Groq — replaced with qwen models (Task 62)
-      'meta/llama-3.3-70b-instruct',      // NVIDIA — EOL 2026-08-26
-      'meta/llama-3.2-11b-vision-instruct', // NVIDIA — EOL
-      'gemini-1.5-flash',                  // Gemini — deprecated 404
-      'gemini-2.0-flash',                  // Gemini — deprecated 404
-      'gemini-2.5-pro',                    // Gemini — may be deprecated, keeping as fallback only
-      '@cf/moonshotai/kimi-k2.5',          // Cloudflare — 403 forbidden
-      '@cf/meta/llama-3.2-11b-vision',    // Cloudflare — old default
-      'qwen/qwen3.6-27b',                  // Groq — text-only, not vision
-      'gemma-2-27b-it',                    // Cerebras — old
+      'qwen/qwen3.6-27b',
+      'qwen/qwen3.8-27b',
+      'llama-3.2-11b-vision-preview',
+      'meta/llama-3.3-70b-instruct',
+      'meta/llama-3.1-70b-instruct',
+      'meta/llama-3.2-11b-vision-instruct',
+      'gemini-1.5-flash',
+      'gemini-2.0-flash',
+      'gemini-2.5-pro',
+      '@cf/moonshotai/kimi-k2.5',
+      '@cf/meta/llama-3.2-11b-vision',
     ];
     let clearedCount = 0;
     for (const providerName of Object.keys(DYNAMIC_MODELS)) {
