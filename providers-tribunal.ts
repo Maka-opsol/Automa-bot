@@ -9,17 +9,79 @@ const { getAvailableProviders, addProviderFailure, recordProviderResult } = requ
 // The providers are already sorted by health score (trust) by the registry's
 // getAvailableProviders() — highest health score first. We just use that order.
 let _sequentialMode: boolean | null = null; // null = not checked yet
+let _sequentialModeLastCheck: number = 0; // timestamp of last DB check
+const SEQUENTIAL_MODE_RECHECK_MS = 60 * 1000; // re-check DB every 60s (catches midnight reset)
+
+// TASK 69 (2026-09-22): Instant parallel→sequential switch.
+// When a parallel tribunal round produces 0 valid responses (all providers
+// failed: 429 rate-limit, 5xx outage, EOL model, network error, etc.), set
+// this flag so the VERY NEXT tribunal call uses sequential mode — no 60s
+// DB re-check wait, no 30-min "no providers" timer wait.
+// Cleared after a successful sequential round (so we can try parallel again).
+let _forceSequentialNext: boolean = false;
 
 function _isSequentialMode(): boolean {
-  if (_sequentialMode !== null) return _sequentialMode;
+  // TASK 69: If force flag is set, use sequential IMMEDIATELY (no DB read).
+  // This is set in-process when parallel mode fails entirely.
+  if (_forceSequentialNext) return true;
+  // TASK 60 (2026-09-11): Re-check DB periodically so the midnight reset
+  // in services-work-shifts.ts takes effect without requiring a restart.
+  const now = Date.now();
+  if (_sequentialMode !== null && (now - _sequentialModeLastCheck) < SEQUENTIAL_MODE_RECHECK_MS) {
+    return _sequentialMode;
+  }
   try {
     const db = require('./database');
     const row = db.selectCalibration?.get('sequential_provider_mode');
     _sequentialMode = row && row.value === 'true';
+    _sequentialModeLastCheck = now;
   } catch {
     _sequentialMode = false;
   }
   return _sequentialMode;
+}
+
+/**
+ * TASK 69: Trigger sequential mode for the next tribunal call (and persist).
+ * Called by the tribunal itself when a parallel round fails entirely, OR
+ * externally by the cycle manager when it detects a no-providers situation.
+ * Safe to call multiple times — idempotent.
+ */
+function triggerSequentialMode(reason: string = 'parallel round failed'): void {
+  if (!_forceSequentialNext) {
+    _forceSequentialNext = true;
+    try {
+      const { log } = _getLogger();
+      log(`Tribunal: INSTANT switch to SEQUENTIAL MODE — reason: ${reason}. Next round will try providers one at a time.`, 'WARN', 'tribunal');
+    } catch {}
+  }
+  // Persist to DB so it survives restarts (idempotent — only writes if not already true)
+  try {
+    const db = require('./database');
+    const row = db.selectCalibration?.get('sequential_provider_mode');
+    if (!row || row.value !== 'true') {
+      db.upsertCalibration?.run('sequential_provider_mode', 'true', Date.now());
+      // Update cached value so _isSequentialMode sees it immediately
+      _sequentialMode = true;
+      _sequentialModeLastCheck = Date.now();
+    }
+  } catch {}
+}
+
+/**
+ * TASK 69: Clear the instant force flag (allow trying parallel again).
+ * Called after a successful sequential round so the tribunal can attempt
+ * parallel mode on the next cycle (since parallel gives weighted consensus
+// across multiple providers — strictly better than a single-provider result).
+ */
+function _clearSequentialForceFlag(): void {
+  if (_forceSequentialNext) {
+    _forceSequentialNext = false;
+    try {
+      const { log } = _getLogger();
+      log('Tribunal: sequential round succeeded — clearing instant force flag. Next round will try parallel mode.', 'INFO', 'tribunal');
+    } catch {}
+  }
 }
 
 // Lazy logger - loaded on first use
@@ -402,6 +464,11 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
         recordProviderResult(provider.name, true, latency);
         log(`Tribunal: ${provider.name} SUCCEEDED (${latency}ms) — using this result, skipping remaining providers.`, 'INFO', 'tribunal');
         fulfilled = [{ ...res, _model: provider.name, _healthScore: provider.healthScore || 0.5, _latency: latency }];
+        // TASK 69: Clear the instant force flag — sequential mode succeeded,
+        // so we can try parallel mode on the next cycle (parallel gives
+        // weighted consensus across multiple providers, which is strictly
+        // better than a single-provider result when quota permits).
+        _clearSequentialForceFlag();
         break; // Got a result — don't call any more providers
       } catch (err: any) {
         const latency = Date.now() - start;
@@ -462,6 +529,19 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
 
   if (valid.length === 0) {
     log('No valid model responses -- falling back to wait.', 'WARN', 'tribunal');
+    // TASK 69 (2026-09-22): If this was a PARALLEL round that produced 0 valid
+    // responses, INSTANTLY switch to sequential mode for the next round.
+    // Don't wait for the 30-min "no providers" timer in the cycle manager —
+    // if all parallel providers just failed, the very next call should try
+    // providers one at a time (conserves free-tier API quota, and a single
+    // surviving provider can still produce a useful action).
+    //
+    // The pixel fallback + session-preservation swipe (in the cycle manager)
+    // will still run for THIS round's action — the instant switch only
+    // affects the NEXT round.
+    if (!_isSequentialMode()) {
+      triggerSequentialMode(`all ${providers.length} parallel providers returned no valid response`);
+    }
     return { actionType: 'wait', currentState: 'error', reasoning: 'No valid responses from any provider', targetX: 0, targetY: 0 };
   }
 
@@ -555,4 +635,4 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   };
 }
 
-module.exports = { runTribunal };
+module.exports = { runTribunal, triggerSequentialMode };
