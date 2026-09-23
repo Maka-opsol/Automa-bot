@@ -864,6 +864,16 @@ async function _saveActionToCache(
       keypadSequence: action.keypadSequence,
       currentState: action.currentState || currentState || 'unknown',
       reasoning: action.reasoning,
+      // TASK 74 (2026-09-23): Pass through AI-decided skipExactMatch flag.
+      // When true, the cached action will NOT be returned by exact signature
+      // matching or state-only fallback — preventing the bot from reusing
+      // a popup click (e.g., "Stay signed in? Yes") on a different page
+      // that happens to share the same state label.
+      skipExactMatch: action.skipExactMatch === true,
+      // TASK 74: Pass the screenshot so save() can compute the click pixel hash.
+      // The hash is stored in the DB and used by the state-only fallback to
+      // verify the click area hasn't changed before returning the cached action.
+      base64Screenshot: base64,
     });
     _localCacheEmpty = false;
     return true;
@@ -2397,8 +2407,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             // This lets us immediately reuse actions persisted before the kill.
             const useAsync = _isLocalCacheEmpty();
             const cachedAction = useAsync
-              ? await actionCache.lookupAsync(_actionCacheSig)
-              : actionCache.lookup(_actionCacheSig);
+              ? await actionCache.lookupAsync(_actionCacheSig, base64)
+              : actionCache.lookup(_actionCacheSig, base64);
             // After a successful async populate, mark local as no longer empty
             // so subsequent cycles use the fast sync path
             if (cachedAction && useAsync) { _localCacheEmpty = false; }
