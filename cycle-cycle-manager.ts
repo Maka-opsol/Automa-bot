@@ -4266,14 +4266,27 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
       // v4: Full self-heal when the bot is DESPERATELY broken.
       // See _isDesperatelyBroken() for the full criteria.
-      // Note: performSelfHeal() now includes the runtime heal fast-pass
-      // internally, so even this path benefits from the new avenues.
+      //
+      // TASK 70 (2026-09-23): Pass `skipRuntimeHeal: true` so we go DIRECTLY
+      // to the codegen tribunal. Previously this call omitted the option, so
+      // performSelfHeal() ran the runtime heal fast-pass first — which always
+      // "succeeded" (clearing caches always returns true) — and returned
+      // `true` WITHOUT ever invoking the codegen tribunal. That meant the
+      // "Full self-heal successful" log was misleading: no code fix was ever
+      // generated, no AI was consulted, no patch was applied. The bot would
+      // then reset the failure count and continue with the same broken state.
+      //
+      // The runtime heal fast-pass is still useful for transient issues
+      // (already triggered earlier in this cycle via the runtime-heal-on-error
+      // block above), so by the time we reach this DESPERATE trigger, runtime
+      // avenues have already been exhausted. Skipping them here ensures the
+      // codegen tribunal actually runs.
       if (CONFIG.SELF_HEAL_ENABLED && !selfHealRunning && performSelfHeal && _isDesperatelyBroken(CONFIG)) {
         // Build a human-readable reason for WHY self-heal triggered
         const healReason = _getSelfHealReason(CONFIG);
-        log(`${consecutiveFailures} consecutive failures (DESPERATE: ${healReason}). Attempting full self-heal...`, 'WARN', 'cycle');
+        log(`${consecutiveFailures} consecutive failures (DESPERATE: ${healReason}). Attempting full self-heal (code-patch pipeline)...`, 'WARN', 'cycle');
         selfHealRunning = true;
-        performSelfHeal().then((healed: any) => { 
+        performSelfHeal({ skipRuntimeHeal: true }).then((healed: any) => { 
           selfHealRunning = false;
           if (healed) { log('Full self-heal successful. Resetting failure count.', 'INFO', 'cycle'); consecutiveFailures = 0; }
           else { log('Self-heal failed. Alerting and stopping.', 'ERROR', 'cycle'); if (CONFIG.ALERT_ON_ERROR) try { sendAlert('Self-heal failed after multiple attempts. Stopping.'); } catch (e: any) {} stopRequested = true; }
@@ -4315,4 +4328,4 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   }
 }
 
-module.exports = { runCycle, requestStop, isOrParked: () => _orParked, _injectDependencies, restoreCycleState: _restoreCycleState }; 
+module.exports = { runCycle, requestStop, isOrParked: () => _orParked, _injectDependencies, restoreCycleState: _restoreCycleState };
