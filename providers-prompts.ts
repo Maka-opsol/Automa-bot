@@ -132,6 +132,21 @@ REPEATABLE ACTIONS (TASK 59 — AI-DECIDED):
 - When repeatable is true, the bot will cache this action and reuse it without calling the AI again — saving API quota.
 - When repeatable is false, the bot will always call the AI to decide the action.
 
+SKIP EXACT MATCH (TASK 74 — AI-DECIDED):
+- Set "skipExactMatch": true when the action should NOT be reused for exact state matching — even if the bot later sees a page with the same state label, this cached action should NOT be returned.
+- Use case: You click "Yes" on a "Stay signed in?" popup, but you set currentState to "mathu_login" because the bot is still in the login flow. Later, the bot reaches the actual MathU login page (which has "Sign in with Microsoft" and "Sign in with Apple" buttons). If skipExactMatch is false, the cache might return the cached "Yes" click — which would click the wrong button. Setting skipExactMatch: true prevents this.
+- Examples of when to set skipExactMatch: true:
+  • Clicking a popup button ("Stay signed in?", "Allow notifications?", cookie consent)
+  • Clicking a button that's only on ONE specific page version (A/B test variant)
+  • Clicking a transient UI element (tooltip, banner, modal that won't appear again)
+  • Any action where the click target is in a similar position to a different button on a related page
+- Examples of when to set skipExactMatch: false (default):
+  • Clicking "Sign in with Microsoft" on the actual login page (always the same button)
+  • Clicking "Next" on a question page (always in the same position)
+  • Clicking the download button on a module card (always in the same position)
+  • Any action where the click target is stable and unique to this state
+- When skipExactMatch is true, the bot will still cache the action (so it remembers what it did), but it will NOT use it for exact signature matching or state-only fallback matching. The AI must be called fresh next time.
+
 Return ONLY a JSON object with:
 {
   "reasoning": "Brief explanation of what you see and why you choose this action. If setting currentState to 'exploration', you MUST explain why the page does NOT match ANY of the known states listed below.",
@@ -146,7 +161,8 @@ Return ONLY a JSON object with:
   "submitY": 0.5,
   "value": "",
   "clearFirst": true,
-  "repeatable": false
+  "repeatable": false,
+  "skipExactMatch": false
 }
 Do not output extra text, markdown, or code fences.
 `;
