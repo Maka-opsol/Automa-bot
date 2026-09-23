@@ -1101,7 +1101,12 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     authWrap(() => {
       try {
         const { performSelfHeal } = require('./self-heal');
-        performSelfHeal().then((result: any) => {
+        // TASK 70 (2026-09-23): Pass skipRuntimeHeal: true so the manual
+        // dashboard trigger goes directly to the codegen tribunal. Without
+        // this, the runtime heal fast-pass would always "succeed" (clearing
+        // caches always returns true) and the codegen tribunal would never
+        // be invoked — defeating the purpose of a manual trigger.
+        performSelfHeal({ skipRuntimeHeal: true }).then((result: any) => {
           jsonRes(res, { success: result });
         }).catch((err: any) => {
           jsonRes(res, { error: err.message }, 500);
