@@ -632,6 +632,15 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
     keypadSequence: cleanRep.keypadSequence,
     submitX: cleanRep.submitX ?? 0,
     submitY: cleanRep.submitY ?? 0,
+    // TASK 74 (2026-09-23): Pass through AI-decided flags.
+    // repeatable: AI says this action is always the same (e.g., clicking "Next")
+    //   → allows caching even on banned states.
+    // skipExactMatch: AI says this action should NOT be reused for exact matching
+    //   (e.g., clicking a popup button on a login page) → prevents the cache
+    //   from returning this action when the bot later sees a different page
+    //   with the same state label.
+    repeatable: cleanRep.repeatable === true,
+    skipExactMatch: cleanRep.skipExactMatch === true,
   };
 }
 
