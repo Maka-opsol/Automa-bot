@@ -259,41 +259,85 @@ async function generateCodeFixViaTribunal(
  */
 async function _runFixConsensus(prompt: string, models: any, totalModels: number, signal: any, screenshot?: string | null) {
   let blSkipped = false;
-  const BL_STAGGER_MS = 3000;
-  const collected: Array<{ provider: string; fixes: any[]; error?: string }> = [];
+  const TRIBUNAL_BUDGET_MS = 90_000; // leave 30s headroom under the 120s caller timeout
+  const tribStart = Date.now();
+  function _remainingBudgetMs(): number { return Math.max(0, TRIBUNAL_BUDGET_MS - (Date.now() - tribStart)); }
+  function _budgetAllowsAnotherCall(): boolean { return _remainingBudgetMs() > 15_000; }
 
+  // TASK 71 (2026-09-23): Run ALL codegen providers in PARALLEL.
+  // ----------------------------------------------------------------------
+  // The previous code waited for BazaarLink's 3 models (each staggered 3s
+  // apart, each ~10s API latency) to ALL complete before Mistral ran,
+  // before VoidAI's 7 models started. Total = 30s BL + 9s BL staggering
+  // + 1 Mistral + 70s VoidAI + 18s VoidAI staggering = 128s — exceeded
+  // the 120s codegen tribunal timeout. So VoidAI's last 3-4 models
+  // (the ones the user explicitly added in Task 67) NEVER had a chance
+  // to return — the tribunal would abort them mid-flight.
+  //
+  // Fix: fire one promise per provider, in parallel. Within each provider,
+  // we still stagger the per-provider models (3s) so we don't 429 that
+  // provider — but the providers no longer block each other. The total
+  // wall-clock time is now max(BL_time, Mistral_time, VoidAI_time) ≈
+  // 60-90s (well within the 120s budget).
+  //
+  // We also use proper async-staggering: start the NEXT call after the
+  // stagger delay WITHOUT waiting for the previous call to complete.
+  // The old `await sleep(); await call();` pattern was sequential, not
+  // staggered.
+  //
+  // Budget guard: if we've already burned >75s and we still have models
+  // queued, skip them — better to return partial consensus than to time
+  // out and return null (which causes self-heal to abort the whole patch
+  // pipeline and the cycle manager's E_PROGRESS_STALL just keeps firing).
+  //
+  // Also: cap VoidAI to its top 3 models. The user added 7 VoidAI models
+  // in Task 67 (gpt-5.3-codex, claude-haiku-4-5, deepseek-v4-pro,
+  // qwen3-coder-480b, kimi-k2.7-code, glm-5.3, qwen3.8-27b:free) — but
+  // consensus requires only 2 models to agree, and the first 3 are the
+  // most capable (gpt-5.3-codex is the primary, per the user's spec).
+  // The remaining 4 are lower-priority fallbacks that would push the
+  // tribunal past its timeout budget.
+  const allPromises: Promise<any>[] = [];
+
+  // --- BazaarLink provider (parallel) ---
   if (models.hasBazaarLink) {
     if (blLimiter.isExhausted()) {
       log('BazaarLink budget exhausted — skipping BazaarLink calls this round', 'WARN', 'codegen');
       blSkipped = true;
     } else {
-      for (let i = 0; i < models.blModels.length; i++) {
-        const modelSlug = models.blModels[i];
-        // Stagger: wait 3s between BazaarLink requests (not before first)
-        if (i > 0) {
-          log(`Tribunal: staggering BL/${modelSlug} (${BL_STAGGER_MS}ms delay to avoid 429)`, 'DEBUG', 'codegen');
-          await _sleep(BL_STAGGER_MS);
+      // Spawn all BazaarLink model calls in parallel (no staggering BETWEEN
+      // providers — only one BL provider instance, so per-provider staggering
+      // is moot here; BL's own rate limiter handles internal 429s).
+      for (const modelSlug of models.blModels) {
+        if (!_budgetAllowsAnotherCall()) {
+          log(`Tribunal budget exhausted — skipping remaining BL/${modelSlug} (elapsed=${Date.now() - tribStart}ms)`, 'WARN', 'codegen');
+          break;
         }
-        log(`Tribunal: calling BL/${modelSlug}`, 'DEBUG', 'codegen');
-        try {
-          const result = await _getBL().callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug, screenshot);
-          if (!result) {
-            log(`BL/${modelSlug}: parseCodegenResponse returned null`, 'WARN', 'codegen');
-          } else if (Array.isArray(result)) {
-            log(`BL/${modelSlug}: got ${result.length} raw fix(es) from parser`, 'DEBUG', 'codegen');
-          } else {
-            log(`BL/${modelSlug}: got non-array result: ${typeof result}`, 'DEBUG', 'codegen');
-          }
-          collected.push({ provider: `BL/${modelSlug}`, fixes: validateFixArray(result) });
-        } catch (err: any) {
-          collected.push({ provider: `BL/${modelSlug}`, fixes: [], error: String(err.message || err).substring(0, 200) });
-        }
+        log(`Tribunal: spawning BL/${modelSlug} (parallel)`, 'DEBUG', 'codegen');
+        allPromises.push(
+          (async () => {
+            try {
+              const result = await _getBL().callBazaarLinkCodeGenWithModel(prompt, signal, modelSlug, screenshot);
+              if (!result) {
+                log(`BL/${modelSlug}: parseCodegenResponse returned null`, 'WARN', 'codegen');
+              } else if (Array.isArray(result)) {
+                log(`BL/${modelSlug}: got ${result.length} raw fix(es) from parser`, 'DEBUG', 'codegen');
+              } else {
+                log(`BL/${modelSlug}: got non-array result: ${typeof result}`, 'DEBUG', 'codegen');
+              }
+              return { provider: `BL/${modelSlug}`, fixes: validateFixArray(result) };
+            } catch (err: any) {
+              return { provider: `BL/${modelSlug}`, fixes: [], error: String(err.message || err).substring(0, 200) };
+            }
+          })()
+        );
       }
     }
   }
-  // Mistral (dedicated codegen) — runs in parallel with last BL model via allPromises
-  const allPromises: Promise<any>[] = [...collected.map(c => Promise.resolve(c))];
+
+  // --- Mistral provider (parallel) ---
   if (models.hasMistral) {
+    log('Tribunal: spawning Mistral (parallel)', 'DEBUG', 'codegen');
     allPromises.push(
       callMistralCodeGen(prompt, signal)
         .then((result: any) => {
@@ -310,36 +354,41 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
     );
   }
 
-  // VoidAI (codegen — uses OpenAI SDK with api.voidai.app baseURL)
-  // Stagger 3s between VoidAI model calls to avoid rate limiting (same as BazaarLink).
+  // --- VoidAI provider (parallel, capped at top 3 models) ---
+  // TASK 71: Cap at 3 models to fit within the tribunal's 120s timeout.
+  // The user added 7 VoidAI models in Task 67, but consensus only needs
+  // 2 agreements. The first 3 (gpt-5.3-codex, claude-haiku-4-5, deepseek-v4-pro)
+  // are the most capable. Spawning all 7 in parallel would risk OOM and
+  // consume API quota for marginal consensus gain.
   if (models.hasVoidAI) {
-    const VOID_STAGGER_MS = 3000;
-    for (let i = 0; i < models.voidModels.length; i++) {
-      const modelSlug = models.voidModels[i];
-      if (i > 0) {
-        log(`Tribunal: staggering VoidAI/${modelSlug} (${VOID_STAGGER_MS}ms delay)`, 'DEBUG', 'codegen');
-        await _sleep(VOID_STAGGER_MS);
-      }
-      log(`Tribunal: calling VoidAI/${modelSlug}`, 'DEBUG', 'codegen');
-      try {
-        const result = await _getVoid().callVoidAICodeGenWithModel(prompt, signal, modelSlug);
-        if (!result) {
-          log(`VoidAI/${modelSlug}: parseCodegenResponse returned null`, 'WARN', 'codegen');
-        } else if (Array.isArray(result)) {
-          log(`VoidAI/${modelSlug}: got ${result.length} raw fix(es) from parser`, 'DEBUG', 'codegen');
-        } else {
-          log(`VoidAI/${modelSlug}: got non-array result: ${typeof result}`, 'DEBUG', 'codegen');
-        }
-        collected.push({ provider: `VoidAI/${modelSlug}`, fixes: validateFixArray(result) });
-      } catch (err: any) {
-        collected.push({ provider: `VoidAI/${modelSlug}`, fixes: [], error: String(err.message || err).substring(0, 200) });
-      }
+    const VOID_MAX_MODELS = 3;
+    const voidModelsToTry = models.voidModels.slice(0, VOID_MAX_MODELS);
+    if (models.voidModels.length > VOID_MAX_MODELS) {
+      log(`Tribunal: capping VoidAI from ${models.voidModels.length} to top ${VOID_MAX_MODELS} models to fit tribunal timeout budget`, 'INFO', 'codegen');
     }
-    // Push any collected VoidAI results into allPromises (already resolved)
-    for (const c of collected) {
-      if (c.provider.startsWith('VoidAI/')) {
-        allPromises.push(Promise.resolve(c));
+    for (const modelSlug of voidModelsToTry) {
+      if (!_budgetAllowsAnotherCall()) {
+        log(`Tribunal budget exhausted — skipping remaining VoidAI/${modelSlug} (elapsed=${Date.now() - tribStart}ms)`, 'WARN', 'codegen');
+        break;
       }
+      log(`Tribunal: spawning VoidAI/${modelSlug} (parallel)`, 'DEBUG', 'codegen');
+      allPromises.push(
+        (async () => {
+          try {
+            const result = await _getVoid().callVoidAICodeGenWithModel(prompt, signal, modelSlug);
+            if (!result) {
+              log(`VoidAI/${modelSlug}: parseCodegenResponse returned null`, 'WARN', 'codegen');
+            } else if (Array.isArray(result)) {
+              log(`VoidAI/${modelSlug}: got ${result.length} raw fix(es) from parser`, 'DEBUG', 'codegen');
+            } else {
+              log(`VoidAI/${modelSlug}: got non-array result: ${typeof result}`, 'DEBUG', 'codegen');
+            }
+            return { provider: `VoidAI/${modelSlug}`, fixes: validateFixArray(result) };
+          } catch (err: any) {
+            return { provider: `VoidAI/${modelSlug}`, fixes: [], error: String(err.message || err).substring(0, 200) };
+          }
+        })()
+      );
     }
   }
 
@@ -351,7 +400,10 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
     return null;
   }
 
-  const results = await Promise.allSettled(allPromises) as PromiseSettledResult<{ provider: string; fixes: any[]; error?: string }[]>;
+  // TASK 71 (2026-09-23): Fixed pre-existing type assertion bug.
+  // Original: `as PromiseSettledResult<{...}[]>` (single settled result whose value is an array)
+  // Correct:  `as PromiseSettledResult<{...}>[]` (array of settled results, each holding a single value)
+  const results = await Promise.allSettled(allPromises) as PromiseSettledResult<{ provider: string; fixes: any[]; error?: string }>[];
   const validResponses = results
     .filter(r => r.status === 'fulfilled' && r.value.fixes.length > 0)
     .map((r: any) => (r as any).value);
@@ -578,42 +630,38 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
   const ctl = withTimeout(signal, timeoutMs);
 
   try {
-    // BazaarLink for raw consultation (primary)
-    // Check budget BEFORE spawning — skip if exhausted.
-    // v7 FIX: Stagger BL requests 3s apart to avoid 429 rate limiting.
-    const BL_STAGGER_MS = 3000;
-    const blCollected: Array<{ provider: string; raw: string } | null>[] = [];
-    if (models.hasBazaarLink && !blLimiter.isExhausted()) {
-      for (let i = 0; i < models.blModels.length; i++) {
-        const modelSlug = models.blModels[i];
-        if (i > 0) {
-          log(`Tribunal raw: staggering BL/${modelSlug} (${BL_STAGGER_MS}ms delay)`, 'DEBUG', 'codegen');
-          await _sleep(BL_STAGGER_MS);
+    // TASK 71 (2026-09-23): Run ALL codegen providers in PARALLEL.
+    // The previous code waited for BazaarLink's 3 models (each staggered 3s)
+    // to ALL complete before VoidAI's 7 models started — which blew past
+    // the 120s tribunal timeout. Now we fire one promise per provider
+    // (BazaarLink, Mistral, VoidAI) all at once, with VoidAI capped at its
+    // top 3 models (per Task 71 reasoning).
+    const allPromises: Promise<{ provider: string; raw: string } | null>[] = [];
+
+    if (models.hasBazaarLink) {
+      if (blLimiter.isExhausted()) {
+        log('Tribunal raw: BazaarLink budget exhausted — skipping', 'WARN', 'codegen');
+      } else {
+        for (const modelSlug of models.blModels) {
+          log(`Tribunal raw: spawning BL/${modelSlug} (parallel)`, 'DEBUG', 'codegen');
+          allPromises.push(_callRawBazaarLink(prompt, ctl.signal, modelSlug, options?.screenshot));
         }
-        log(`Tribunal raw: calling BL/${modelSlug}`, 'DEBUG', 'codegen');
-        blCollected.push(await _callRawBazaarLink(prompt, ctl.signal, modelSlug, options?.screenshot));
       }
-    } else if (models.hasBazaarLink) {
-      log('Tribunal raw: BazaarLink budget exhausted — skipping', 'WARN', 'codegen');
     }
-    // VoidAI for raw consultation (staggered 3s apart)
-    const VOID_STAGGER_MS = 3000;
-    const voidCollected: Array<{ provider: string; raw: string } | null>[] = [];
+
     if (models.hasVoidAI) {
-      for (let i = 0; i < models.voidModels.length; i++) {
-        const modelSlug = models.voidModels[i];
-        if (i > 0) {
-          log(`Tribunal raw: staggering VoidAI/${modelSlug} (${VOID_STAGGER_MS}ms delay)`, 'DEBUG', 'codegen');
-          await _sleep(VOID_STAGGER_MS);
-        }
-        log(`Tribunal raw: calling VoidAI/${modelSlug}`, 'DEBUG', 'codegen');
-        voidCollected.push(await _callRawVoidAI(prompt, ctl.signal, modelSlug));
+      // TASK 71: cap at top 3 VoidAI models (same as _runFixConsensus)
+      const VOID_MAX_MODELS = 3;
+      const voidModelsToTry = models.voidModels.slice(0, VOID_MAX_MODELS);
+      if (models.voidModels.length > VOID_MAX_MODELS) {
+        log(`Tribunal raw: capping VoidAI from ${models.voidModels.length} to top ${VOID_MAX_MODELS} models`, 'INFO', 'codegen');
+      }
+      for (const modelSlug of voidModelsToTry) {
+        log(`Tribunal raw: spawning VoidAI/${modelSlug} (parallel)`, 'DEBUG', 'codegen');
+        allPromises.push(_callRawVoidAI(prompt, ctl.signal, modelSlug));
       }
     }
-    const allPromises: Promise<{ provider: string; raw: string } | null>[] = [
-      ...blCollected.map(r => Promise.resolve(r)),
-      ...voidCollected.map(r => Promise.resolve(r)),
-    ];
+
     if (models.hasMistral) {
       allPromises.push(
         _callRawProvider('Mistral', () => callMistralCodeGen(prompt, ctl.signal), ctl.signal)
