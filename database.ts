@@ -97,7 +97,7 @@ function runMigrations() {
   // FIX: Bumped from 22 to 28 to include action_cache table (migration 27)
   // and banned_actions table (migration 22). Without this, action_cache
   // table is never created locally, causing "no such table" errors.
-  const target = 29;
+  const target = 30;
   if (current === target) { log(`Database schema version ${target} ready.`, 'INFO', 'database'); return; }
   if (current > target) { log(`Database schema version ${current} is ahead of expected ${target}`, 'WARN', 'database'); return; }
   const backupPath = CONFIG.DB_PATH + '.backup.' + Date.now();
@@ -133,6 +133,24 @@ function runMigrations() {
     // A 'start' without a matching 'stop' from the same PID = OOM/SIGKILL.
     // This table is the foundation for boot-time self-heal triggering.
     () => { db.exec(`CREATE TABLE IF NOT EXISTS process_lifecycle ( id INTEGER PRIMARY KEY AUTOINCREMENT, pid INTEGER NOT NULL, event TEXT NOT NULL CHECK(event IN ('start', 'stop')), timestamp INTEGER NOT NULL, heap_mb REAL DEFAULT 0, rss_mb REAL DEFAULT 0, extra TEXT ); CREATE INDEX IF NOT EXISTS idx_lifecycle_timestamp ON process_lifecycle(timestamp); CREATE INDEX IF NOT EXISTS idx_lifecycle_pid ON process_lifecycle(pid); CREATE INDEX IF NOT EXISTS idx_lifecycle_event ON process_lifecycle(event);`); },
+    // v30: TASK 74 (2026-09-23) — Action cache pixel verification + AI skipExactMatch flag.
+    //   click_pixel_hash: Hash of a ~32x32 pixel region around the click point,
+    //     stored at save time. On state-only fallback lookup, the bot decodes
+    //     the current screenshot, extracts the same region, and compares the
+    //     hash. If they don't match, the cached action is rejected — the page
+    //     has changed in the click area.
+    //   skip_exact_match: AI-decided flag. When true (1), the action will NOT
+    //     be returned by exact signature matching OR state-only fallback.
+    //     Use case: AI clicks "Stay signed in? Yes" popup on the ADVlearn page
+    //     but labels it mathu_login (still in login flow). With skip_exact_match=1,
+    //     this cached click won't be reused later when the bot is on the actual
+    //     MathU login page (which has Sign in with Microsoft / Apple buttons
+    //     in a similar area).
+    () => {
+      try { db.exec(`ALTER TABLE action_cache ADD COLUMN click_pixel_hash TEXT;`); } catch (_e: any) { /* column may already exist */ }
+      try { db.exec(`ALTER TABLE action_cache ADD COLUMN skip_exact_match INTEGER DEFAULT 0;`); } catch (_e: any) { /* column may already exist */ }
+      try { db.exec(`CREATE INDEX IF NOT EXISTS idx_action_cache_skip_exact ON action_cache(skip_exact_match);`); } catch (_e: any) { /* index may already exist */ }
+    },
   ];
 
   const transaction = db.transaction(() => {
