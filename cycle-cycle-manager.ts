@@ -124,6 +124,11 @@ const CACHE_BANNED_STATES = new Set([
   'question_page',  // Question page — AI must read it
   'blank_page',     // Don't cache blank pages
   'exploration',    // Don't cache exploration — each unknown page is different
+  'exploring',      // TASK 73 (2026-09-23): AI returns "exploring" (verb, -ing form)
+                    // but the cache only banned "exploration" (noun). The bot was
+                    // stuck clicking (990, 375) forever on every exploring page
+                    // because the state-only fallback kept hitting the same
+                    // cached click. Both forms are now banned.
   'unknown',        // Don't cache unknown state — AI must re-evaluate
   'error',          // Don't cache error states — recovery is context-specific
   'app_error',      // Don't cache app_error — recovery is context-specific
