@@ -68,7 +68,13 @@ function _getVoid(): any {
 // stuck in a retry loop when both BazaarLink and Mistral are down.
 
 // ─── Default timeout for tribunal calls when no external signal is provided ───
-const DEFAULT_TRIBUNAL_TIMEOUT_MS = 120_000; // 2 minutes
+// TASK 77 (2026-09-24): Increased from 120s to 300s (5 minutes).
+// Code generation is much slower than vision analysis — LLMs like
+// gpt-5.3-codex and claude-haiku-4-5 can take 60-90s per response,
+// and the tribunal calls multiple models in parallel. 120s was too
+// tight and caused AbortErrors that killed valid responses mid-flight.
+// 300s gives even the slowest models time to complete.
+const DEFAULT_TRIBUNAL_TIMEOUT_MS = 300_000; // 5 minutes
 
 // v7: Prefixes that the /tmp overlay allows. Fixes for files not
 // matching these prefixes will be silently rejected here — saving API
@@ -199,13 +205,89 @@ function discoverModels() {
   const voidModels = voidMod?.getVoidAIModels?.() || [];
   const hasVoidAI = !!getCONFIG().VOIDAI_API_KEY && !!voidMod;
 
+  // TASK 76 (2026-09-24): Filter out models that returned 402 (insufficient
+  // credits) during this self-heal session. These models won't recover until
+  // the BazaarLink account is topped up — retrying them wastes API budget
+  // and tribunal timeout.
+  const blModelsFiltered = blModels.filter((m: string) => !_isModelExhausted(`BL/${m}`));
+  const voidModelsFiltered = hasVoidAI
+    ? voidModels.filter((m: string) => !_isModelExhausted(`VoidAI/${m}`))
+    : [];
+  if (blModels.length > blModelsFiltered.length) {
+    log(`BazaarLink: skipping ${blModels.length - blModelsFiltered.length} exhausted model(s): ${blModels.filter((m: string) => _isModelExhausted(`BL/${m}`)).join(', ')}`, 'WARN', 'codegen');
+  }
+  if (hasVoidAI && voidModels.length > voidModelsFiltered.length) {
+    log(`VoidAI: skipping ${voidModels.length - voidModelsFiltered.length} exhausted model(s): ${voidModels.filter((m: string) => _isModelExhausted(`VoidAI/${m}`)).join(', ')}`, 'WARN', 'codegen');
+  }
+
+  // TASK 76: Also check if Mistral is exhausted
+  const hasMistral = !!getCONFIG().MISTRAL_CODE_API_KEY && !_isModelExhausted('Mistral');
+  if (!!getCONFIG().MISTRAL_CODE_API_KEY && _isModelExhausted('Mistral')) {
+    log('Mistral: skipping (exhausted — 402/403/model_not_found)', 'WARN', 'codegen');
+  }
+
   return {
-    blModels,
-    hasMistral: !!getCONFIG().MISTRAL_CODE_API_KEY,
+    blModels: blModelsFiltered,
+    hasMistral,
     hasBazaarLink,
-    voidModels,
+    voidModels: voidModelsFiltered,
     hasVoidAI,
   };
+}
+
+// ─── TASK 76 (2026-09-24): Exhausted Model Tracking ──────────────────────
+//
+// When a codegen provider returns 402 (insufficient credits) or a similar
+// permanent error, we add the model to this set. The model is then skipped
+// for the rest of the self-heal session (and future sessions until the
+// process restarts — at which point the set is cleared, giving the model
+// another chance in case credits were topped up).
+//
+// This prevents the codegen tribunal from wasting 3 retry attempts calling
+// the same model that returned 402 on attempt 1.
+
+const _exhaustedModels = new Set<string>();
+
+function _isModelExhausted(providerModel: string): boolean {
+  return _exhaustedModels.has(providerModel);
+}
+
+function _markModelExhausted(providerModel: string, reason: string): void {
+  if (!_exhaustedModels.has(providerModel)) {
+    _exhaustedModels.add(providerModel);
+    log(`Model ${providerModel} MARKED AS EXHAUSTED (will be skipped for rest of session): ${reason}`, 'ERROR', 'codegen');
+  }
+}
+
+/**
+ * Check if an error indicates the model is permanently unavailable (402, etc).
+ * Returns true if the error should cause the model to be marked as exhausted.
+ */
+function _isPermanentModelError(err: any): { permanent: boolean; reason: string } {
+  const errMsg = String(err?.message || err || '').toLowerCase();
+  // 402 Insufficient credits (BazaarLink)
+  if (errMsg.includes('402') || errMsg.includes('insufficient credits') || errMsg.includes('insufficient_credit')) {
+    return { permanent: true, reason: '402 Insufficient credits' };
+  }
+  // 403 Forbidden (API key revoked)
+  if (errMsg.includes('403') && (errMsg.includes('forbidden') || errMsg.includes('api key'))) {
+    return { permanent: true, reason: '403 Forbidden (API key issue)' };
+  }
+  // Model not found / decommissioned
+  if (errMsg.includes('model_not_found') || errMsg.includes('does not exist') || errMsg.includes('decommissioned')) {
+    return { permanent: true, reason: 'Model not found/decommissioned' };
+  }
+  return { permanent: false, reason: '' };
+}
+
+/**
+ * Check if an error is an AbortError (timeout) — should NOT be treated as
+ * a hard failure. The model might work on retry with a longer timeout.
+ */
+function _isAbortError(err: any): boolean {
+  const errMsg = String(err?.message || err || '').toLowerCase();
+  return errMsg.includes('aborted') || errMsg.includes('user aborted')
+    || err?.name === 'AbortError' || err?.name === 'TimeoutError';
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -223,7 +305,7 @@ async function generateCodeFixViaTribunal(
 
   const totalModels = models.blModels.length
     + (models.hasMistral ? 1 : 0)
-    + models.voidModels.length;
+    + (models.hasVoidAI ? models.voidModels.length : 0);
 
   const blModelList = models.blModels.join(', ');
   const voidModelList = models.voidModels.join(', ');
@@ -327,6 +409,15 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
               }
               return { provider: `BL/${modelSlug}`, fixes: validateFixArray(result) };
             } catch (err: any) {
+              // TASK 76 (2026-09-24): Check for permanent errors (402, 403, model_not_found)
+              const permCheck = _isPermanentModelError(err);
+              if (permCheck.permanent) {
+                _markModelExhausted(`BL/${modelSlug}`, permCheck.reason);
+              } else if (_isAbortError(err)) {
+                // AbortError = timeout, not a real failure. Log differently.
+                log(`BL/${modelSlug}: request timed out (AbortError) — model may be slow, not broken. Error: ${String(err.message || err).substring(0, 100)}`, 'WARN', 'codegen');
+                return { provider: `BL/${modelSlug}`, fixes: [], error: `Timeout: ${String(err.message || err).substring(0, 100)}` };
+              }
               return { provider: `BL/${modelSlug}`, fixes: [], error: String(err.message || err).substring(0, 200) };
             }
           })()
@@ -350,7 +441,16 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
           }
           return { provider: 'Mistral', fixes: validateFixArray(result) };
         })
-        .catch((err: any) => ({ provider: 'Mistral', fixes: [], error: String(err.message || err).substring(0, 200) }))
+        .catch((err: any) => {
+          // TASK 76: Check for permanent errors
+          const permCheck = _isPermanentModelError(err);
+          if (permCheck.permanent) {
+            _markModelExhausted('Mistral', permCheck.reason);
+          } else if (_isAbortError(err)) {
+            log(`Mistral: request timed out (AbortError) — model may be slow, not broken.`, 'WARN', 'codegen');
+          }
+          return { provider: 'Mistral', fixes: [], error: String(err.message || err).substring(0, 200) };
+        })
     );
   }
 
@@ -385,6 +485,14 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
             }
             return { provider: `VoidAI/${modelSlug}`, fixes: validateFixArray(result) };
           } catch (err: any) {
+            // TASK 76: Check for permanent errors (402, 403, model_not_found)
+            const permCheck = _isPermanentModelError(err);
+            if (permCheck.permanent) {
+              _markModelExhausted(`VoidAI/${modelSlug}`, permCheck.reason);
+            } else if (_isAbortError(err)) {
+              log(`VoidAI/${modelSlug}: request timed out (AbortError) — model may be slow, not broken.`, 'WARN', 'codegen');
+              return { provider: `VoidAI/${modelSlug}`, fixes: [], error: `Timeout: ${String(err.message || err).substring(0, 100)}` };
+            }
             return { provider: `VoidAI/${modelSlug}`, fixes: [], error: String(err.message || err).substring(0, 200) };
           }
         })()
@@ -623,7 +731,7 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
 
   const totalModels = models.blModels.length
     + (models.hasMistral ? 1 : 0)
-    + models.voidModels.length;
+    + (models.hasVoidAI ? models.voidModels.length : 0);
 
   log(`\u{1f9e0} TRIBUNAL RAW: Consulting ${totalModels} codegen models for generic task...`, 'INFO', 'codegen');
 
