@@ -1407,7 +1407,10 @@ async function performSelfHeal(options?: SelfHealOptions) {
 
     // Tribunal abort signal — created here so both the two-pass file
     // identification (3c) and the fix generation (4) share the same timeout.
-    const tribunalSignal = AbortSignal.timeout(getCONFIG().SELF_HEAL_TRIBUNAL_TIMEOUT_MS || 120_000);
+    // TASK 77 (2026-09-24): Increased default from 120s to 300s.
+    // Code generation LLMs can take 60-90s per response; 120s caused
+    // AbortErrors that killed valid responses mid-flight.
+    const tribunalSignal = AbortSignal.timeout(getCONFIG().SELF_HEAL_TRIBUNAL_TIMEOUT_MS || 300_000);
 
     // 3c. v15: Two-pass file identification.
     //     If no target file was found (enrichment returned only a file listing),
