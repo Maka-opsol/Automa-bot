@@ -778,6 +778,7 @@ let _degradationLadder: any = null;
 function _getDegradationLadder() { if (!_degradationLadder) { try { _degradationLadder = require('./self-heal-degradation-ladder'); } catch { _degradationLadder = null; } } return _degradationLadder; }
 let _actionCache: any = null;
 let _actionCacheLoadAttempted = false;
+let _explorationEvicted = false; // TASK 77: track if we've evicted 'explor' entries
 function _getActionCache() {
   if (!_actionCache) {
     if (_actionCacheLoadAttempted) {
@@ -787,6 +788,19 @@ function _getActionCache() {
     } else {
       try { _actionCache = require('./services-action-cache'); } catch { _actionCache = null; }
       _actionCacheLoadAttempted = true;
+    }
+    // TASK 77 (2026-09-24): On first successful load, evict all 'explor' entries.
+    // The user explicitly requested this cleanup — existing 'exploring'/'exploration'
+    // entries in the cache cause the bot to click the wrong spot on unknown pages.
+    if (_actionCache && !_explorationEvicted) {
+      _explorationEvicted = true;
+      try {
+        const evicted = _actionCache.evictExplorationEntries?.();
+        if (evicted && evicted > 0) {
+          // Logged inside the function — just reset _localCacheEmpty if we evicted entries
+          _localCacheEmpty = null; // force re-check
+        }
+      } catch {}
     }
   }
   return _actionCache;
