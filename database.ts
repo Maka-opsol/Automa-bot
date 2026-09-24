@@ -97,7 +97,7 @@ function runMigrations() {
   // FIX: Bumped from 22 to 28 to include action_cache table (migration 27)
   // and banned_actions table (migration 22). Without this, action_cache
   // table is never created locally, causing "no such table" errors.
-  const target = 30;
+  const target = 31;
   if (current === target) { log(`Database schema version ${target} ready.`, 'INFO', 'database'); return; }
   if (current > target) { log(`Database schema version ${current} is ahead of expected ${target}`, 'WARN', 'database'); return; }
   const backupPath = CONFIG.DB_PATH + '.backup.' + Date.now();
@@ -150,6 +150,24 @@ function runMigrations() {
       try { db.exec(`ALTER TABLE action_cache ADD COLUMN click_pixel_hash TEXT;`); } catch (_e: any) { /* column may already exist */ }
       try { db.exec(`ALTER TABLE action_cache ADD COLUMN skip_exact_match INTEGER DEFAULT 0;`); } catch (_e: any) { /* column may already exist */ }
       try { db.exec(`CREATE INDEX IF NOT EXISTS idx_action_cache_skip_exact ON action_cache(skip_exact_match);`); } catch (_e: any) { /* index may already exist */ }
+    },
+    // v31: TASK 76 (2026-09-24) — Fix patch_embeddings table missing `timestamp` column.
+    // The table was created in database.ts migration 23 with `created_at` but NOT
+    // `timestamp`. Later, self-heal-patch-memory.ts tried to create the same table
+    // with `timestamp` — but `CREATE TABLE IF NOT EXISTS` is a no-op if the table
+    // already exists. So the `timestamp` column was never added, causing:
+    //   "searchSimilar: DB query failed (no such column: timestamp)"
+    // This migration adds the missing column. Also adds `status`, `embedding_type`,
+    // `fingerprint`, and `weights` columns if they're missing (same root cause).
+    () => {
+      try { db.exec(`ALTER TABLE patch_embeddings ADD COLUMN timestamp INTEGER;`); } catch (_e: any) { /* column may already exist */ }
+      try { db.exec(`ALTER TABLE patch_embeddings ADD COLUMN status TEXT DEFAULT 'pending';`); } catch (_e: any) { /* column may already exist */ }
+      try { db.exec(`ALTER TABLE patch_embeddings ADD COLUMN embedding_type TEXT DEFAULT 'fingerprint';`); } catch (_e: any) { /* column may already exist */ }
+      try { db.exec(`ALTER TABLE patch_embeddings ADD COLUMN fingerprint TEXT;`); } catch (_e: any) { /* column may already exist */ }
+      try { db.exec(`ALTER TABLE patch_embeddings ADD COLUMN weights TEXT;`); } catch (_e: any) { /* column may already exist */ }
+      // Backfill timestamp from created_at for existing rows
+      try { db.exec(`UPDATE patch_embeddings SET timestamp = created_at WHERE timestamp IS NULL AND created_at IS NOT NULL;`); } catch (_e: any) { /* non-critical */ }
+      try { db.exec(`CREATE INDEX IF NOT EXISTS idx_patch_emb_ts ON patch_embeddings(timestamp);`); } catch (_e: any) { /* index may already exist */ }
     },
   ];
 
