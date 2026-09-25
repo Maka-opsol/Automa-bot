@@ -77,7 +77,20 @@ async function callVoidAICodeGenWithModel(prompt: any, signal: any, modelSlug: a
     }, { signal });
     content = response.choices[0].message.content ?? '';
   } catch (err: any) {
-    throw new Error(`VoidAI ${modelSlug}: ${err.message || err}`);
+    // TASK 79 (2026-09-25): Include more context in error messages.
+    // The OpenAI SDK sometimes throws errors with very short messages
+    // (e.g., just "5" for a 500 error). Include status, code, and type
+    // for better debugging.
+    const status = err?.status || err?.statusCode || '';
+    const code = err?.error?.code || err?.code || '';
+    const type = err?.error?.type || err?.type || '';
+    const detail = err?.error?.message || err?.message || String(err);
+    const parts: string[] = [`VoidAI ${modelSlug}`];
+    if (status) parts.push(`HTTP ${status}`);
+    if (code) parts.push(`code=${code}`);
+    if (type) parts.push(`type=${type}`);
+    parts.push(detail);
+    throw new Error(parts.join(': '));
   }
 
   if (!content || content.trim().length === 0) {
