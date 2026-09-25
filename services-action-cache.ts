@@ -759,7 +759,7 @@ async function lookupAsync(contextSignature: string, currentBase64Screenshot?: s
     if (dbMod) {
       const row = dbMod.prepare(
         `SELECT action_type, target_x, target_y, value, keypad_sequence, current_state,
-                reasoning, hit_count, last_used, skip_exact_match
+                reasoning, hit_count, last_used, skip_exact_match, click_pixel_hash
          FROM action_cache WHERE context_sig = ? AND evicted = 0`
       ).get(contextSignature);
 
@@ -797,20 +797,47 @@ async function lookupAsync(contextSignature: string, currentBase64Screenshot?: s
             // Return null so cycle-manager falls through to the tribunal.
             return null;
           }
-          log(`Action cache HIT (local): sig=${contextSignature.substring(0, 8)} type=${row.action_type} hits=${row.hit_count}`, 'INFO', 'action-cache');
-          updateStats('hits');
-          dbMod.prepare(
-            `UPDATE action_cache SET hit_count = hit_count + 1, last_used = ? WHERE context_sig = ?`
-          ).run(Date.now(), contextSignature);
-          const udb = _getUnifiedDb();
-          if (udb) { udb.getActionCache(contextSignature).catch(() => {}); }
-          return {
-            actionType: row.action_type, targetX: row.target_x, targetY: row.target_y,
-            value: row.value || '',
-            keypadSequence: row.keypad_sequence ? JSON.parse(row.keypad_sequence) : [],
-            currentState: row.current_state, reasoning: row.reasoning || '[cached action]',
-            hitCount: row.hit_count, lastUsed: row.last_used,
-          };
+          // TASK 78 (2026-09-24): Verify click pixel hash on EXACT match too.
+          // User: "If the pixels AND the hash don't match, don't use the exact
+          // state matching."
+          if (row.click_pixel_hash && currentBase64Screenshot) {
+            const currentClickHash = _computeClickPixelHash(currentBase64Screenshot, row.target_x, row.target_y);
+            if (!_clickHashesMatch(row.click_pixel_hash, currentClickHash)) {
+              log(`Action cache HIT but REJECTED (pixel mismatch on exact match): sig=${contextSignature.substring(0, 8)} type=${row.action_type} — signature matched but click area changed. Falling through.`, 'INFO', 'action-cache');
+              // Don't return — fall through to similar/state-only fallback
+            } else {
+              log(`Action cache HIT (local, pixel verified): sig=${contextSignature.substring(0, 8)} type=${row.action_type} hits=${row.hit_count}`, 'INFO', 'action-cache');
+              updateStats('hits');
+              dbMod.prepare(
+                `UPDATE action_cache SET hit_count = hit_count + 1, last_used = ? WHERE context_sig = ?`
+              ).run(Date.now(), contextSignature);
+              const udb = _getUnifiedDb();
+              if (udb) { udb.getActionCache(contextSignature).catch(() => {}); }
+              return {
+                actionType: row.action_type, targetX: row.target_x, targetY: row.target_y,
+                value: row.value || '',
+                keypadSequence: row.keypad_sequence ? JSON.parse(row.keypad_sequence) : [],
+                currentState: row.current_state, reasoning: row.reasoning || '[cached action]',
+                hitCount: row.hit_count, lastUsed: row.last_used,
+              };
+            }
+          } else {
+            // No click_pixel_hash stored OR no current screenshot — old behavior
+            log(`Action cache HIT (local): sig=${contextSignature.substring(0, 8)} type=${row.action_type} hits=${row.hit_count}`, 'INFO', 'action-cache');
+            updateStats('hits');
+            dbMod.prepare(
+              `UPDATE action_cache SET hit_count = hit_count + 1, last_used = ? WHERE context_sig = ?`
+            ).run(Date.now(), contextSignature);
+            const udb = _getUnifiedDb();
+            if (udb) { udb.getActionCache(contextSignature).catch(() => {}); }
+            return {
+              actionType: row.action_type, targetX: row.target_x, targetY: row.target_y,
+              value: row.value || '',
+              keypadSequence: row.keypad_sequence ? JSON.parse(row.keypad_sequence) : [],
+              currentState: row.current_state, reasoning: row.reasoning || '[cached action]',
+              hitCount: row.hit_count, lastUsed: row.last_used,
+            };
+          }
         }
         } // TASK 74: close else (skip_exact_match === 1) block
       }
@@ -929,7 +956,7 @@ function lookup(contextSignature: string, currentBase64Screenshot?: string | nul
     if (dbMod) {
       const row = dbMod.prepare(
         `SELECT action_type, target_x, target_y, value, keypad_sequence, current_state,
-                reasoning, hit_count, last_used, skip_exact_match
+                reasoning, hit_count, last_used, skip_exact_match, click_pixel_hash
          FROM action_cache WHERE context_sig = ? AND evicted = 0`
       ).get(contextSignature);
 
@@ -946,12 +973,16 @@ function lookup(contextSignature: string, currentBase64Screenshot?: string | nul
         const ttlMs = config.ACTION_CACHE_TTL_MS || DEFAULT_TTL_MS;
         if (Date.now() - row.last_used > ttlMs) {
           _markEvicted(contextSignature);
-          // Don't return — fall through to Turso check below
+          // Don't return — fall through to Turso below
         } else {
-          // BUG FIX (2026-09-04): High-hit-count eviction (sync path).
-          // Same logic as lookupAsync: if the same cached action is being hit
-          // >10 times without success, the action is clearly wrong for the page.
-          // Evict so the next cycle re-queries the tribunal.
+          // BUG FIX (2026-09-04): High-hit-count eviction.
+          // If the same cached action is being hit >10 times without success,
+          // the action is clearly wrong for the page (e.g., the bot is stuck
+          // on a page that visually resembles the cached state but is actually
+          // different — like a Microsoft password-reset page that visually
+          // resembles the email input page). Evict the entry so the next
+          // cycle re-queries the tribunal instead of serving the same stale
+          // action 30+ times in a loop.
           const currentHitCount = (row.hit_count || 0) + 1;
           const maxHitsBeforeEviction = Number(_getConfig().ACTION_CACHE_MAX_HITS_BEFORE_EVICT) || DEFAULT_MAX_HITS_BEFORE_EVICT;
           if (currentHitCount > maxHitsBeforeEviction) {
@@ -962,31 +993,76 @@ function lookup(contextSignature: string, currentBase64Screenshot?: string | nul
             if (udb) { udb.evictActionCache(contextSignature).catch(() => {}); }
             return null;
           }
-          log(`Action cache HIT (local): sig=${contextSignature.substring(0, 8)} type=${row.action_type} hits=${row.hit_count}`, 'INFO', 'action-cache');
-          updateStats('hits');
+          // TASK 78 (2026-09-24): Verify click pixel hash on EXACT match too.
+          // User: "If the pixels AND the hash don't match, don't use the exact
+          // state matching."
+          // The signature hash already matched (that's how we got this row).
+          // Now also verify the click pixel hash: if the stored hash exists AND
+          // the current screenshot is available, compute the current hash at
+          // (row.target_x, row.target_y) and compare. If they don't match, the
+          // click area has changed — reject the exact match and fall through.
+          if (row.click_pixel_hash && currentBase64Screenshot) {
+            const currentClickHash = _computeClickPixelHash(currentBase64Screenshot, row.target_x, row.target_y);
+            if (!_clickHashesMatch(row.click_pixel_hash, currentClickHash)) {
+              log(`Action cache HIT but REJECTED (pixel mismatch on exact match): sig=${contextSignature.substring(0, 8)} type=${row.action_type} — signature matched but click area changed. Falling through to fallback.`, 'INFO', 'action-cache');
+              // Don't return — fall through to similar/state-only fallback
+            } else {
+              // Both signature hash AND click pixel hash match — use it
+              log(`Action cache HIT (local, pixel verified): sig=${contextSignature.substring(0, 8)} type=${row.action_type} hits=${row.hit_count}`, 'INFO', 'action-cache');
+              updateStats('hits');
 
-          // Update hit count and last used locally
-          dbMod.prepare(
-            `UPDATE action_cache SET hit_count = hit_count + 1, last_used = ? WHERE context_sig = ?`
-          ).run(Date.now(), contextSignature);
+              // Update hit count and last used locally
+              dbMod.prepare(
+                `UPDATE action_cache SET hit_count = hit_count + 1, last_used = ? WHERE context_sig = ?`
+              ).run(Date.now(), contextSignature);
 
-          // Async: update hit count in Turso via unifiedDb
-          const udb = _getUnifiedDb();
-          if (udb) {
-            udb.getActionCache(contextSignature).catch(() => {}); // updates hit count
+              // Async: update hit count in Turso via unifiedDb
+              const udb = _getUnifiedDb();
+              if (udb) {
+                udb.getActionCache(contextSignature).catch(() => {}); // updates hit count
+              }
+
+              return {
+                actionType: row.action_type,
+                targetX: row.target_x,
+                targetY: row.target_y,
+                value: row.value || '',
+                keypadSequence: row.keypad_sequence ? JSON.parse(row.keypad_sequence) : [],
+                currentState: row.current_state,
+                reasoning: row.reasoning || '[cached action]',
+                hitCount: row.hit_count,
+                lastUsed: row.last_used,
+              };
+            }
+          } else {
+            // No click_pixel_hash stored (old entry) OR no current screenshot —
+            // use old behavior (signature-only match)
+            log(`Action cache HIT (local): sig=${contextSignature.substring(0, 8)} type=${row.action_type} hits=${row.hit_count}`, 'INFO', 'action-cache');
+            updateStats('hits');
+
+            // Update hit count and last used locally
+            dbMod.prepare(
+              `UPDATE action_cache SET hit_count = hit_count + 1, last_used = ? WHERE context_sig = ?`
+            ).run(Date.now(), contextSignature);
+
+            // Async: update hit count in Turso via unifiedDb
+            const udb = _getUnifiedDb();
+            if (udb) {
+              udb.getActionCache(contextSignature).catch(() => {}); // updates hit count
+            }
+
+            return {
+              actionType: row.action_type,
+              targetX: row.target_x,
+              targetY: row.target_y,
+              value: row.value || '',
+              keypadSequence: row.keypad_sequence ? JSON.parse(row.keypad_sequence) : [],
+              currentState: row.current_state,
+              reasoning: row.reasoning || '[cached action]',
+              hitCount: row.hit_count,
+              lastUsed: row.last_used,
+            };
           }
-
-          return {
-            actionType: row.action_type,
-            targetX: row.target_x,
-            targetY: row.target_y,
-            value: row.value || '',
-            keypadSequence: row.keypad_sequence ? JSON.parse(row.keypad_sequence) : [],
-            currentState: row.current_state,
-            reasoning: row.reasoning || '[cached action]',
-            hitCount: row.hit_count,
-            lastUsed: row.last_used,
-          };
         }
         } // TASK 74: close else (skip_exact_match === 1) block
       }
