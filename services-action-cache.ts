@@ -328,6 +328,17 @@ function _parseCompositeHash(composite: string): { byte: string | null; pixel: s
 let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 
+// TASK 80 (2026-09-25): Hardcoded state ban check.
+// The user is tired of exploring state entries "messing everything up".
+// This is the ULTIMATE safety net — regardless of what the cycle manager
+// says, the action cache module itself refuses to serve or store entries
+// for any state containing 'explor' (case-insensitive).
+// This check runs in lookup(), lookupAsync(), save(), and _findSimilarLocalHit().
+function _isStateBanned(state: string | null | undefined): boolean {
+  if (!state) return false;
+  return state.toLowerCase().includes('explor');
+}
+
 function _getConfig() {
   return _deps.config || (() => { try { return require('./get-config'); } catch { return {}; } })();
 }
@@ -574,6 +585,12 @@ function _findSimilarLocalHit(targetSig: string): {
   const target = _parseSignature(targetSig);
   if (!target) return null;
 
+  // TASK 80 (2026-09-25): Hardcoded ban check for similar match too.
+  if (_isStateBanned(target.state)) {
+    log(`Action cache similar match REJECTED (hardcoded ban): state='${target.state}' contains 'explor'`, 'DEBUG', 'action-cache');
+    return null;
+  }
+
   let dbMod: any = null;
   try { dbMod = _getDb(); } catch { return null; }
   if (!dbMod) return null;
@@ -752,6 +769,16 @@ async function lookupAsync(contextSignature: string, currentBase64Screenshot?: s
   lastUsed: number;
 } | null> {
   const log = _getLog();
+
+  // TASK 80 (2026-09-25): Hardcoded ban check — refuse to serve cache
+  // entries for any state containing 'explor'. This is the ultimate
+  // safety net that cannot be bypassed by _answerSubmitted or any other
+  // cycle-manager flag.
+  const _parsedTarget = _parseSignature(contextSignature);
+  if (_parsedTarget && _isStateBanned(_parsedTarget.state)) {
+    log(`Action cache lookup REJECTED (hardcoded ban): state='${_parsedTarget.state}' contains 'explor'`, 'DEBUG', 'action-cache');
+    return null;
+  }
 
   // FAST PATH: Check local DB first (sync, zero latency)
   try {
@@ -949,6 +976,14 @@ function lookup(contextSignature: string, currentBase64Screenshot?: string | nul
   lastUsed: number;
 } | null {
   const log = _getLog();
+
+  // TASK 80 (2026-09-25): Hardcoded ban check — refuse to serve cache
+  // entries for any state containing 'explor'.
+  const _parsedTarget = _parseSignature(contextSignature);
+  if (_parsedTarget && _isStateBanned(_parsedTarget.state)) {
+    log(`Action cache lookup REJECTED (hardcoded ban): state='${_parsedTarget.state}' contains 'explor'`, 'DEBUG', 'action-cache');
+    return null;
+  }
 
   // FAST PATH: Check local DB first (sync, zero latency)
   try {
@@ -1230,6 +1265,16 @@ async function save(
   }
 ): Promise<void> {
   const log = _getLog();
+
+  // TASK 80 (2026-09-25): Hardcoded ban check — refuse to save cache
+  // entries for any state containing 'explor'. Even if the cycle manager's
+  // _isCacheExcluded check is bypassed, this prevents the entry from being
+  // written to the DB.
+  if (_isStateBanned(action.currentState)) {
+    log(`Action cache save REJECTED (hardcoded ban): state='${action.currentState}' contains 'explor'`, 'DEBUG', 'action-cache');
+    return;
+  }
+
   try {
     let dbMod = _getDb();
     if (!dbMod) {
