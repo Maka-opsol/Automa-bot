@@ -799,49 +799,10 @@ async function lookupAsync(contextSignature: string, currentBase64Screenshot?: s
     return similarLocal;
   }
 
-  const udb = _getUnifiedDb();
-  if (udb) {
-    try {
-      const tursoRow = await udb.getActionCache(contextSignature);
-      if (tursoRow) {
-        const config = _getConfig();
-        const ttlMs = config.ACTION_CACHE_TTL_MS || DEFAULT_TTL_MS;
-        if (Date.now() - tursoRow.last_used <= ttlMs) {
-          // Populate local DB for future fast hits
-          try {
-            const dbMod = _getDb();
-            if (dbMod) {
-              const keypadJson = tursoRow.keypad_sequence || null;
-              dbMod.prepare(
-                `INSERT OR REPLACE INTO action_cache (context_sig, action_type, target_x, target_y, value,
-                  keypad_sequence, current_state, reasoning, success_count, failure_count,
-                  hit_count, created_at, last_used, evicted)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
-              ).run(
-                contextSignature, tursoRow.action_type, tursoRow.target_x, tursoRow.target_y,
-                tursoRow.value || '', keypadJson, tursoRow.current_state, tursoRow.reasoning || '',
-                tursoRow.success_count || 1, tursoRow.failure_count || 0,
-                tursoRow.hit_count || 0, Date.now(), tursoRow.last_used
-              );
-            }
-          } catch {}
-
-          log(`Action cache HIT (turso-cold): sig=${contextSignature.substring(0, 8)} type=${tursoRow.action_type} hits=${tursoRow.hit_count}`, 'INFO', 'action-cache');
-          updateStats('hits');
-          updateStats('tursoHits');
-          return {
-            actionType: tursoRow.action_type, targetX: tursoRow.target_x, targetY: tursoRow.target_y,
-            value: tursoRow.value || '',
-            keypadSequence: tursoRow.keypad_sequence ? JSON.parse(tursoRow.keypad_sequence) : [],
-            currentState: tursoRow.current_state, reasoning: tursoRow.reasoning || '[cached action]',
-            hitCount: tursoRow.hit_count || 1, lastUsed: tursoRow.last_used,
-          };
-        }
-      }
-    } catch (e: any) {
-      log(`Action cache Turso lookup error: ${e.message || e}`, 'DEBUG', 'action-cache');
-    }
-  }
+  // TASK 82 (2026-09-25): Turso exact match REMOVED (same as local exact match).
+  // The Turso lookup was doing `getActionCache(contextSignature)` which is
+  // an exact signature match — same problem as the local exact match.
+  // If similar match missed, return null (cache miss → tribunal called fresh).
 
   updateStats('misses');
   return null;
@@ -968,89 +929,16 @@ function lookup(contextSignature: string, currentBase64Screenshot?: string | nul
     }).catch(() => {});
   }
 
-  // TASK 55 (2026-09-11): Last-resort fallback — try ANY cached action for
-  // the same state, ignoring the visual fingerprint entirely. This is better
-  // than wasting an API call — if we have a cached action for "assignments_page"
-  // that worked before, use it even if the screenshot differs slightly.
-  // The 3-failure eviction will clean it up if the action is wrong.
-  //
-  // TASK 74 (2026-09-23): This is now a TRUE last resort. Two new guards:
-  //   1. Filter out skip_exact_match=1 entries (AI said don't reuse)
-  //   2. If click_pixel_hash is stored AND currentBase64Screenshot is provided,
-  //      verify the click area matches before returning. This prevents the
-  //      "Stay signed in? Yes" cached click from being reused on the actual
-  //      MathU login page (different button in same area).
-  try {
-    const dbMod = _getDb();
-    if (dbMod) {
-      const target = _parseSignature(contextSignature);
-      if (target) {
-        // TASK 74: Try with skip_exact_match filter first (new schema).
-        // If column doesn't exist (pre-migration), retry without it.
-        let fallbackRow: any = null;
-        try {
-          fallbackRow = dbMod.prepare(
-            `SELECT action_type, target_x, target_y, value, keypad_sequence, current_state,
-                    reasoning, hit_count, last_used, click_pixel_hash, skip_exact_match
-             FROM action_cache
-             WHERE current_state = ? AND evicted = 0
-               AND failure_count < 3
-               AND (skip_exact_match = 0 OR skip_exact_match IS NULL)
-             ORDER BY last_used DESC
-             LIMIT 5`
-          ).all(target.state); // Note: .all() to get multiple candidates for pixel verification
-        } catch (e: any) {
-          // Column may not exist yet (migration v30 not applied) — retry without new columns
-          fallbackRow = dbMod.prepare(
-            `SELECT action_type, target_x, target_y, value, keypad_sequence, current_state,
-                    reasoning, hit_count, last_used
-             FROM action_cache
-             WHERE current_state = ? AND evicted = 0
-               AND failure_count < 3
-             ORDER BY last_used DESC
-             LIMIT 5`
-          ).all(target.state);
-        }
-
-        if (fallbackRow && Array.isArray(fallbackRow) && fallbackRow.length > 0) {
-          const config = _getConfig();
-          const ttlMs = config.ACTION_CACHE_TTL_MS || DEFAULT_TTL_MS;
-          // TASK 74: Iterate candidates and pick the first one that passes
-          // click pixel hash verification (if hash is stored and current
-          // screenshot is available). If no hash stored, accept the first
-          // non-expired candidate (old behavior).
-          for (const candidate of fallbackRow) {
-            if (Date.now() - candidate.last_used > ttlMs) continue; // expired
-            // TASK 74: Verify click pixel hash if both stored hash and current screenshot available
-            if (candidate.click_pixel_hash && currentBase64Screenshot) {
-              const currentHash = _computeClickPixelHash(currentBase64Screenshot, candidate.target_x, candidate.target_y);
-              if (!_clickHashesMatch(candidate.click_pixel_hash, currentHash)) {
-                log(`Action cache FALLBACK REJECTED (pixel mismatch): sig=${contextSignature.substring(0, 8)} state=${target.state} type=${candidate.action_type} — click area changed (stored=${candidate.click_pixel_hash.substring(0, 16)} current=${(currentHash || '').substring(0, 16)})`, 'INFO', 'action-cache');
-                continue; // Try next candidate
-              }
-            }
-            log(`Action cache FALLBACK HIT (state-only): sig=${contextSignature.substring(0, 8)} state=${target.state} type=${candidate.action_type} — no exact/similar match, using any cached action for this state${candidate.click_pixel_hash ? ' (pixel verified)' : ''}`, 'INFO', 'action-cache');
-            updateStats('hits');
-            return {
-              actionType: candidate.action_type,
-              targetX: candidate.target_x,
-              targetY: candidate.target_y,
-              value: candidate.value || '',
-              keypadSequence: candidate.keypad_sequence ? JSON.parse(candidate.keypad_sequence) : [],
-              currentState: candidate.current_state,
-              reasoning: candidate.reasoning || '',
-              hitCount: (candidate.hit_count || 0) + 1,
-              lastUsed: Date.now(),
-            };
-          }
-          // All candidates failed pixel verification or were expired
-          log(`Action cache FALLBACK: ${fallbackRow.length} candidate(s) for state=${target.state} but all failed pixel verification or expired`, 'DEBUG', 'action-cache');
-        }
-      }
-    }
-  } catch (e: any) {
-    log(`Action cache state-only fallback error: ${e.message || e}`, 'DEBUG', 'action-cache');
-  }
+  // TASK 82 (2026-09-25): STATE-ONLY FALLBACK REMOVED.
+  // User: "Activating action caches when the state matches is doomed for
+  // disaster."
+  // The state-only fallback was returning ANY cached action for the same
+  // state label, ignoring the visual fingerprint entirely. This caused
+  // wrong clicks on pages that shared a state label but had different
+  // content (e.g., a video_player state could be many different videos
+  // with different buttons). The similar match path (50% region
+  // similarity + pixel verification) is sufficient — if it misses, the
+  // cache returns null and the tribunal is called fresh.
 
   updateStats('misses');
   return null;
