@@ -12,8 +12,8 @@
 // process.exit(). If heap exceeds 350MB during boot, we exit immediately
 // (exit code 137 = SIGKILL = Render auto-restarts) before V8 can crash.
 //
-// BUG FIX (2026-09-04, v2): Threshold raised from 200 to 300MB now that the
-// Dockerfile --max-old-space-size is 384MB (was 256MB). 300MB gives ~80MB
+// TASK 86 (2026-09-25): Reduced from 448MB to 384MB.
+// Dockerfile --max-old-space-size is 384MB (was 448MB). 300MB gives ~84MB
 // of headroom below V8's 384MB limit — enough to exit cleanly before V8's
 // own OOM killer fires.
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -22,7 +22,11 @@
 // New: 350MB threshold / 448MB V8 = 98MB headroom
 // The bot's steady-state heap is 280-350MB; 350MB threshold only fires on
 // real boot spikes, not normal operation.
-const EARLY_OOM_THRESHOLD_MB = 350;
+// TASK 86 (2026-09-25): Reduced from 350MB to 300MB for new 384MB V8 limit.
+// Old: 350MB threshold / 448MB V8 = 98MB headroom — but 448MB V8 + 150MB
+// Chromium RSS = 598MB total, exceeding 512MB container → OOM kill.
+// New: 300MB threshold / 384MB V8 = 84MB headroom, and 384MB + 128MB = 512MB.
+const EARLY_OOM_THRESHOLD_MB = 300;
 const EARLY_OOM_CHECK_INTERVAL_MS = 2000; // every 2s — fast enough to catch boot spikes
 let _earlyOomTriggered = false;
 const _earlyOomInterval = setInterval(() => {
@@ -37,7 +41,10 @@ const _earlyOomInterval = setInterval(() => {
     // TASK 41 (2026-09-10): Raised RSS limit from 450→480MB to match new 448MB V8 limit.
     // Old: 450MB RSS / 384MB V8 = 66MB non-V8 headroom
     // New: 480MB RSS / 448MB V8 = 32MB non-V8 headroom (tighter, but V8 now has more room)
-    if (rssMB >= 480 && !_earlyOomTriggered) {
+    // TASK 86 (2026-09-25): Reduced from 480MB to 450MB for new 384MB V8 limit.
+    // Old: 480MB RSS / 448MB V8 = only 32MB non-V8 headroom (too tight)
+    // New: 450MB RSS / 384MB V8 = 66MB non-V8 headroom (safer)
+    if (rssMB >= 450 && !_earlyOomTriggered) {
       _earlyOomTriggered = true;
       console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 480MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
       clearInterval(_earlyOomInterval);
@@ -621,8 +628,14 @@ function _startMemoryMonitor(): void {
     //      memory_protection death loops when heap spiked to 320MB.
     // New: HARD_RESTART_HEAP_MB=380 (out of 448MB V8) → gives 68MB headroom.
     //      The bot typically runs at 280-350MB; 380MB only fires on real spikes.
-    const HARD_RESTART_HEAP_MB = 380; // only fire if heap > 380MB (out of 448MB V8 limit)
-    const HARD_RSS_LIMIT_MB = 470;   // only fire if RSS > 470MB (out of 512MB container)
+    // TASK 86 (2026-09-25): Reduced from 380MB to 330MB for new 384MB V8 limit.
+    // Old: 380MB / 448MB V8 = 68MB headroom
+    // New: 330MB / 384MB V8 = 54MB headroom
+    const HARD_RESTART_HEAP_MB = 330; // only fire if heap > 330MB (out of 384MB V8 limit)
+    // TASK 86 (2026-09-25): Reduced from 470MB to 460MB for new 384MB V8 limit.
+    // Old: 470MB RSS / 512MB container = 42MB headroom (too tight with 448MB V8)
+    // New: 460MB RSS / 512MB container = 52MB headroom (safer with 384MB V8)
+    const HARD_RSS_LIMIT_MB = 460;   // only fire if RSS > 460MB (out of 512MB container)
     if (used > HARD_RESTART_HEAP_MB || rss > HARD_RSS_LIMIT_MB) {
       log(`Memory CRITICAL (hard threshold): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'ERROR', 'render-free-plan');
       // BUG FIX (2026-09-06): Cap maxLevel at L2 to prevent closing the browser.
