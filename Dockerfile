@@ -56,14 +56,22 @@ RUN npx playwright install chromium
 COPY . .
 
 # Runtime directories under /tmp (ephemeral disk)
-# TASK 35 (2026-09-09): Also create /tmp/.X11-unix for Xvfb (headed mode)
-# and make it writable by the node user. Xvfb creates its socket here.
+# TASK 35 (2026-09-09): Also create /tmp/.X11-unix for Xvfb (headed mode).
+# TASK 44 (2026-09-10): Fix "_XSERVTransmkdir: Owner of /tmp/.X11-unix
+# should be set to root" warning.
+# Xvfb requires /tmp/.X11-unix to be:
+#   - Owned by root:root
+#   - Permissions 1777 (sticky bit + world-writable)
+# The sticky bit (1xxx) prevents users from deleting each other's sockets.
+# The `chown root:root` is explicit even though RUN runs as root — it
+# ensures the ownership survives any future COPY --chown operations.
 RUN mkdir -p /tmp/mathu-logs/screenshots \
     /tmp/.browser-data \
     /tmp/mathu-backups \
     /tmp/mathu-staging \
     /tmp/mathu-regression \
     /tmp/.X11-unix \
+    && chown root:root /tmp/.X11-unix \
     && chmod 1777 /tmp/.X11-unix
 
 USER node
@@ -117,4 +125,12 @@ HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
 # 448MB gives 64MB headroom above the typical peak, enough to absorb
 # transient spikes without crashing. Render free plan has 512MB total,
 # so 448MB V8 + ~64MB non-V8 (Chromium C++ heap, stack, etc.) = 512MB.
-CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null; pkill -f 'Xvfb :99' 2>/dev/null; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp & sleep 1; exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
+# TASK 44 (2026-09-10): Added `|| true` to cleanup commands so they don't
+# cause the shell to exit if the files don't exist or can't be deleted
+# (e.g. owned by root from a previous container). The Xvfb startup is
+# non-fatal — if it fails, the bot still runs in headless mode.
+# TASK 86 (2026-09-25): Reduced from 448MB to 384MB.
+# 448MB V8 + ~100-150MB Chromium RSS = 548-598MB total, which EXCEEDS the
+# 512MB container limit → kernel OOM killer fires. 384MB V8 + 128MB for
+# Chromium/OS = 512MB, fitting within the container.
+CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; exec node --expose-gc --max-old-space-size=384 --import tsx render-free-plan.ts"]
