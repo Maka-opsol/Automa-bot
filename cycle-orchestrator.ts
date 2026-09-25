@@ -200,9 +200,21 @@ async function startDaemon() {
         }
       }
       // HF Spaces: Much shorter sleep between cycles (keep the space active)
-      const sleepMs = isHFSpaces
+      let sleepMs = isHFSpaces
         ? (15 * 60 * 1000 + Math.random() * 15 * 60 * 1000) // 15-30 min on HF Spaces
         : getRandomSleepTime();
+
+      // TASK 83 (2026-09-25): If the cycle ended with 0 questions completed
+      // (e.g., all vision providers were rate-limited), use a SHORT 2-minute
+      // sleep instead of the normal 15-30 min. This lets the bot retry
+      // quickly when providers might have recovered, instead of sleeping
+      // for 23 minutes while the bot is stuck.
+      if ((globalThis as any).__cycleZeroQuestions) {
+        sleepMs = 2 * 60 * 1000; // 2 minutes
+        (globalThis as any).__cycleZeroQuestions = false; // reset for next cycle
+        log(`Cycle ended with 0 questions — using SHORT retry delay (${sleepMs / 60000} min) instead of normal sleep. Vision providers may have recovered.`, 'INFO', 'orchestrator');
+      }
+
       const sleepMin = (sleepMs / 60000).toFixed(0);
       const wakeIso = _nowIsoInTimezone(Date.now() + sleepMs);
       // BUG FIX (2026-09-04): Show SAST wake time so the user knows when the
