@@ -838,21 +838,20 @@ async function _saveActionToCache(
   if (!action?.actionType) return false;
   if (!actionCache) return false;
   if (isCacheExcluded) {
-    // TASK 57 (2026-09-11): On banned states, still save NON-answer actions.
-    // Answer-type actions (keypad_input, input_email, etc.) must NOT be cached
-    // on question states — each question is different. But navigation actions
-    // (click Next, click book icon, scroll) are always at the same position
-    // and CAN be safely cached.
-    //
-    // TASK 59 (2026-09-11): If the AI explicitly set "repeatable": true on
-    // the action, always save it — the AI has decided this action doesn't
-    // require reading the page content (e.g., clicking "Next" button).
+    // TASK 80 (2026-09-25): On banned states, ONLY save if the AI explicitly
+    // set "repeatable": true. Previously, click/flutter_tap actions on
+    // exploring state were being saved because they're not ANSWER_ACTIONS
+    // (keypad_input, input_email, etc.). This caused the bot to click the
+    // wrong spot on unknown pages. Now ALL non-repeatable actions on banned
+    // states are rejected.
     if (action.repeatable === true) {
       // AI says it's repeatable — save it regardless of state
-    } else if (ANSWER_ACTIONS.has(action.actionType)) {
-      return false; // Answer action on banned state — don't cache
+    } else {
+      // TASK 80: Don't save ANY action on banned states (not just answer actions).
+      // The only exception is repeatable: true.
+      return false;
     }
-    // Not an answer action (and not explicitly repeatable) — proceed to save
+    // repeatable === true — proceed to save
   }
   // TASK 55 (2026-09-11): Allow 'wait' actions to be cached.
   // The old code skipped caching 'wait' actions — but 'wait' IS a valid action
