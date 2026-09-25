@@ -7,6 +7,10 @@ function getCONFIG(): Record<string, any> { return _deps.config || require('./ge
 const { callMistralCodeGen, parseCodegenResponse } = require('./providers-codegen-mistral');
 const blLimiter = require('./bazaarlink-rate-limiter');
 const { log, logError } = require('./logger');
+// TASK 79 (2026-09-25): Increase max listeners to avoid MaxListenersExceededWarning
+// when 7+ models are spawned in parallel — each OpenAI SDK call adds an abort
+// listener to the shared AbortSignal, and the default limit is 10.
+const { setMaxListeners } = require('events');
 
 // ─── Utility ───
 function _sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
@@ -68,13 +72,17 @@ function _getVoid(): any {
 // stuck in a retry loop when both BazaarLink and Mistral are down.
 
 // ─── Default timeout for tribunal calls when no external signal is provided ───
-// TASK 77 (2026-09-24): Increased from 120s to 300s (5 minutes).
-// Code generation is much slower than vision analysis — LLMs like
-// gpt-5.3-codex and claude-haiku-4-5 can take 60-90s per response,
-// and the tribunal calls multiple models in parallel. 120s was too
-// tight and caused AbortErrors that killed valid responses mid-flight.
-// 300s gives even the slowest models time to complete.
-const DEFAULT_TRIBUNAL_TIMEOUT_MS = 300_000; // 5 minutes
+// TASK 79 (2026-09-25): Codegen tribunals should NOT time out.
+// The user explicitly said: "At this point, codegen tribunals shouldn't time out."
+// Set to 30 minutes (1,800,000ms) — practically infinite. Code generation
+// LLMs (gpt-5.3-codex, claude-haiku-4-5, etc.) can take 2-5 minutes per
+// response, and with 7 models in parallel, the slowest one determines the
+// wall-clock time. A 300s timeout (Task 77) was still too tight and caused
+// AbortErrors that killed valid responses mid-flight.
+//
+// The caller (self-heal.ts) also respects SELF_HEAL_TRIBUNAL_TIMEOUT_MS —
+// if set to 0, it skips AbortSignal.timeout entirely.
+const DEFAULT_TRIBUNAL_TIMEOUT_MS = 1_800_000; // 30 minutes (practically no timeout)
 
 // v7: Prefixes that the /tmp overlay allows. Fixes for files not
 // matching these prefixes will be silently rejected here — saving API
@@ -172,14 +180,20 @@ function validateFixArray(parsed: any) {
  */
 function withTimeout(signal: any, timeoutMs: number): AbortController {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error('Tribunal timeout')), timeoutMs);
+  // TASK 79 (2026-09-25): If timeoutMs is 0 or Infinity, don't set a timer —
+  // the tribunal should not time out. Only the caller's external signal
+  // (if any) can abort it.
+  let timer: any = null;
+  if (timeoutMs > 0 && timeoutMs !== Infinity) {
+    timer = setTimeout(() => controller.abort(new Error('Tribunal timeout')), timeoutMs);
+  }
   // If the caller's signal aborts, abort ours too
   if (signal) {
-    if (signal.aborted) { clearTimeout(timer); controller.abort(signal.reason); return controller; }
-    signal.addEventListener('abort', () => { clearTimeout(timer); controller.abort(signal.reason); }, { once: true });
+    if (signal.aborted) { if (timer) clearTimeout(timer); controller.abort(signal.reason); return controller; }
+    signal.addEventListener('abort', () => { if (timer) clearTimeout(timer); controller.abort(signal.reason); }, { once: true });
   }
   // Return controller so the caller can clear the timer if the promise settles first
-  (controller as any)._cleanup = () => clearTimeout(timer);
+  (controller as any)._cleanup = () => { if (timer) clearTimeout(timer); };
   return controller;
 }
 
@@ -341,10 +355,20 @@ async function generateCodeFixViaTribunal(
  */
 async function _runFixConsensus(prompt: string, models: any, totalModels: number, signal: any, screenshot?: string | null) {
   let blSkipped = false;
-  const TRIBUNAL_BUDGET_MS = 90_000; // leave 30s headroom under the 120s caller timeout
-  const tribStart = Date.now();
-  function _remainingBudgetMs(): number { return Math.max(0, TRIBUNAL_BUDGET_MS - (Date.now() - tribStart)); }
-  function _budgetAllowsAnotherCall(): boolean { return _remainingBudgetMs() > 15_000; }
+  // TASK 79 (2026-09-25): No more tribunal budget — codegen tribunals don't
+  // time out. The budget guard is removed (always allow all models to spawn).
+  // The _budgetAllowsAnotherCall() function always returns true now.
+
+  // TASK 79: Increase max listeners on the signal to avoid
+  // MaxListenersExceededWarning when 7+ models are spawned in parallel.
+  // Each OpenAI SDK call adds an abort listener to the shared AbortSignal.
+  try {
+    if (signal && typeof setMaxListeners === 'function') {
+      // setMaxListeners(50, signal) — allows up to 50 parallel calls
+      // (we have max 3 BL + 1 Mistral + 3 VoidAI = 7)
+      setMaxListeners(50, signal);
+    }
+  } catch { /* non-critical */ }
 
   // TASK 71 (2026-09-23): Run ALL codegen providers in PARALLEL.
   // ----------------------------------------------------------------------
@@ -391,10 +415,7 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
       // providers — only one BL provider instance, so per-provider staggering
       // is moot here; BL's own rate limiter handles internal 429s).
       for (const modelSlug of models.blModels) {
-        if (!_budgetAllowsAnotherCall()) {
-          log(`Tribunal budget exhausted — skipping remaining BL/${modelSlug} (elapsed=${Date.now() - tribStart}ms)`, 'WARN', 'codegen');
-          break;
-        }
+        // TASK 79: Budget guard removed — codegen tribunals don't time out.
         log(`Tribunal: spawning BL/${modelSlug} (parallel)`, 'DEBUG', 'codegen');
         allPromises.push(
           (async () => {
@@ -464,13 +485,10 @@ async function _runFixConsensus(prompt: string, models: any, totalModels: number
     const VOID_MAX_MODELS = 3;
     const voidModelsToTry = models.voidModels.slice(0, VOID_MAX_MODELS);
     if (models.voidModels.length > VOID_MAX_MODELS) {
-      log(`Tribunal: capping VoidAI from ${models.voidModels.length} to top ${VOID_MAX_MODELS} models to fit tribunal timeout budget`, 'INFO', 'codegen');
+      log(`Tribunal: capping VoidAI from ${models.voidModels.length} to top ${VOID_MAX_MODELS} models (conserves API quota + memory)`, 'INFO', 'codegen');
     }
     for (const modelSlug of voidModelsToTry) {
-      if (!_budgetAllowsAnotherCall()) {
-        log(`Tribunal budget exhausted — skipping remaining VoidAI/${modelSlug} (elapsed=${Date.now() - tribStart}ms)`, 'WARN', 'codegen');
-        break;
-      }
+      // TASK 79: Budget guard removed — codegen tribunals don't time out.
       log(`Tribunal: spawning VoidAI/${modelSlug} (parallel)`, 'DEBUG', 'codegen');
       allPromises.push(
         (async () => {
@@ -736,6 +754,13 @@ async function consultTribunalRaw(prompt: string, signal?: any, options?: { time
   log(`\u{1f9e0} TRIBUNAL RAW: Consulting ${totalModels} codegen models for generic task...`, 'INFO', 'codegen');
 
   const ctl = withTimeout(signal, timeoutMs);
+
+  // TASK 79: Increase max listeners for parallel calls
+  try {
+    if (ctl.signal && typeof setMaxListeners === 'function') {
+      setMaxListeners(50, ctl.signal);
+    }
+  } catch { /* non-critical */ }
 
   try {
     // TASK 71 (2026-09-23): Run ALL codegen providers in PARALLEL.
