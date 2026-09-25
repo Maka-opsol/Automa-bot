@@ -198,8 +198,11 @@ async function checkMemory(options?: { preserveBrowser?: boolean }): Promise<boo
     try {
       const memoryMode = require('./memory-mode');
       memoryMode.recordOOMExit(heapMB, rssMB);
-      // Force L3 (close browser) — don't preserve it, kernel is about to kill us
-      await memoryMode.shedMemory(`rss-hard-limit:${rssMB.toFixed(0)}MB`, { preserveBrowser: false, maxLevel: 3 });
+      // TASK 87 (2026-09-25): PROTECT BROWSER AT ALL COSTS.
+      // User: "No browser, No progress." Don't close the browser even on
+      // RSS hard limit. Use L2 (page reload) + GC instead. If the kernel
+      // OOM killer fires, Render will restart the process.
+      await memoryMode.shedMemory(`rss-hard-limit:${rssMB.toFixed(0)}MB`, { preserveBrowser: true, maxLevel: 2 });
       if (global.gc) { try { global.gc(); } catch {} }
     } catch { /* best effort */ }
     const afterMB = getHeapUsedMB();
