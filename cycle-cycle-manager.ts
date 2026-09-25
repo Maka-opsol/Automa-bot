@@ -3487,7 +3487,19 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         try {
           const semState = await progressSemanticDetector.getSemanticState(page);
           if (semState) {
-            log(`Semantic state: Q${semState.questionNumber}/${semState.totalQuestions} module=${semState.module} score=${semState.score}`, 'DEBUG', 'cycle');
+            // TASK 84 (2026-09-25): Only log if at least one field is non-null.
+            // On Flutter Web SPA, the page content is inside a canvas, so
+            // document.body.innerText returns empty/canvas text that doesn't
+            // match any parsing patterns. This produced misleading log lines
+            // like "Semantic state: Qnull/null module=null score=null" on
+            // every cycle. Now we only log when there's actual semantic data.
+            const hasData = semState.questionNumber !== null
+              || semState.totalQuestions !== null
+              || semState.module !== null
+              || semState.score !== null;
+            if (hasData) {
+              log(`Semantic state: Q${semState.questionNumber}/${semState.totalQuestions} module=${semState.module} score=${semState.score}`, 'DEBUG', 'cycle');
+            }
           }
         } catch (e: any) { /* non-critical */ }
       }
@@ -4130,6 +4142,18 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     log(`Cycle complete: ${questionsCompleted} questions processed`, 'INFO', 'cycle');
     consecutiveFailures = 0;
 
+    // TASK 83 (2026-09-25): If the cycle ended with 0 questions completed,
+    // signal the orchestrator to use a SHORT sleep (2 min) instead of the
+    // normal 15-30 min sleep. This way, if vision providers were rate-limited,
+    // the bot retries quickly instead of sleeping for 23 minutes.
+    // The orchestrator checks (globalThis as any).__cycleZeroQuestions.
+    if (questionsCompleted === 0) {
+      (globalThis as any).__cycleZeroQuestions = true;
+      log('Cycle ended with 0 questions — orchestrator will use short retry delay (2 min) instead of normal sleep.', 'INFO', 'cycle');
+    } else {
+      (globalThis as any).__cycleZeroQuestions = false;
+    }
+
     // ─── Training maintenance: prune old data every 50 cycles ───
     const _cycleNum = getStats().cycleCount || 0;
     if (_cycleNum % 50 === 0) {
@@ -4345,11 +4369,12 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     // cycle that re-triggers the same human-intervention condition.
     // The bot will pause at the top of the next cycle iteration and NOT
     // touch the browser until the user resumes via dashboard.
-    if (!(globalThis as any).__humanInterventionRequested) {
-      if (closeBrowser) await closeBrowser();
-    } else {
-      log('Human intervention requested — keeping browser open for user interaction.', 'INFO', 'cycle');
-    }
+    //
+    // TASK 87 (2026-09-25): PROTECT BROWSER AT ALL COSTS.
+    // User: "No browser, No progress." The browser is NEVER closed at the
+    // end of a cycle, even on errors. This preserves the page state so
+    // the next cycle can continue where it left off.
+    log('Keeping browser open (Task 87: protect browser at all costs) — page state preserved for next cycle.', 'INFO', 'cycle');
     if (clearCache) clearCache();
     _networkSetup = false;
     if (CONFIG.ENABLE_GC_ON_CYCLE && global.gc) { global.gc(); log('Garbage collection triggered.', 'DEBUG', 'cycle'); }
