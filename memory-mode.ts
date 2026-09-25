@@ -106,9 +106,12 @@ type MemoryMode = 'full_power' | 'memory_protection' | 'minimum';
 
 const MODE_THRESHOLDS = {
   full_power: {
-    warnHeapMB: 350,
-    restartHeapMB: 400,
-    rssHardLimitMB: 420,
+    // TASK 86 (2026-09-25): Reduced from 350/400/420 to 300/330/450 for new 384MB V8 limit.
+    // Old: 350/400 with 448MB V8 = 48MB headroom (but 448+150 Chromium = 598 > 512 container → OOM)
+    // New: 300/330 with 384MB V8 = 54MB headroom (and 384+128 = 512, fits container)
+    warnHeapMB: 300,
+    restartHeapMB: 330,
+    rssHardLimitMB: 450,
     gcIntervalMs: 90 * 1000,
     monitorIntervalMs: 20 * 1000,
     warningStreak: 2,
@@ -415,7 +418,15 @@ async function _shedMemoryImpl(reason: string = 'unknown', options?: {
 
   // ── L3: Close browser entirely (last resort) ──
   // Frees ~100-200MB. DESTROYS quiz state — only when NOT preserving browser.
-  if (maxLevel >= 3 && !preserveBrowser) {
+  // TASK 87 (2026-09-25): PROTECT BROWSER AT ALL COSTS.
+  // User: "No browser, No progress." The browser is NEVER closed by memory
+  // shedding. L3 is effectively disabled. If memory is critical, we rely
+  // on L1 (cache clear) + L2 (page reload) + GC instead. If the kernel
+  // OOM killer fires, so be it — Render will restart the process and the
+  // bot will re-navigate. But we will NOT voluntarily destroy the browser
+  // state that the bot has worked hard to reach.
+  if (false && maxLevel >= 3 && !preserveBrowser) {
+    // DEAD CODE — L3 disabled by Task 87. Kept for reference.
     if (!_browserClosedByProtection) {
       try {
         const { container } = require('./container');
