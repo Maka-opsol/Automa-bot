@@ -72,7 +72,13 @@ function triggerSequentialMode(reason: string = 'parallel round failed'): void {
  * TASK 69: Clear the instant force flag (allow trying parallel again).
  * Called after a successful sequential round so the tribunal can attempt
  * parallel mode on the next cycle (since parallel gives weighted consensus
-// across multiple providers — strictly better than a single-provider result).
+ * across multiple providers — strictly better than a single-provider result).
+ *
+ * TASK 85 (2026-09-25): Also clear the DB flag `sequential_provider_mode`.
+ * Previously, only the in-memory `_forceSequentialNext` flag was cleared,
+ * but the DB flag persisted — so the bot stayed in sequential mode (calling
+ * only 1 provider) even after a successful sequential round. This caused
+ * the bot to only use Agnes and never try the other 6 providers in parallel.
  */
 function _clearSequentialForceFlag(): void {
   if (_forceSequentialNext) {
@@ -82,6 +88,21 @@ function _clearSequentialForceFlag(): void {
       log('Tribunal: sequential round succeeded — clearing instant force flag. Next round will try parallel mode.', 'INFO', 'tribunal');
     } catch {}
   }
+  // TASK 85: Also clear the DB flag so the next cycle uses parallel mode.
+  // This is idempotent — safe to call when the flag is already false.
+  try {
+    const db = require('./database');
+    const row = db.selectCalibration?.get('sequential_provider_mode');
+    if (row && row.value === 'true') {
+      db.upsertCalibration?.run('sequential_provider_mode', 'false', Date.now());
+      _sequentialMode = false;
+      _sequentialModeLastCheck = Date.now();
+      try {
+        const { log } = _getLogger();
+        log('Tribunal: cleared sequential_provider_mode DB flag — next cycle will try parallel mode with ALL providers.', 'INFO', 'tribunal');
+      } catch {}
+    }
+  } catch {}
 }
 
 // Lazy logger - loaded on first use
@@ -417,8 +438,11 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   // base64 strings and JSON responses. If we're already at 70%+ heap,
   // the provider call itself will push us past the hard threshold
   // and into OOM kill territory.
-  const NODE_HEAP_LIMIT_MB = 256; // BUG FIX (2026-09-06): was 384 — reduced to match --max-old-space-size=256
-  const PRE_CALL_SHED_THRESHOLD = NODE_HEAP_LIMIT_MB * 0.7; // 179MB
+  // TASK 86 (2026-09-25): Fixed from 256 to 384 to match actual V8 limit.
+  // The old value (256) was left over from when the Dockerfile used
+  // --max-old-space-size=256. It's now 384MB.
+  const NODE_HEAP_LIMIT_MB = 384;
+  const PRE_CALL_SHED_THRESHOLD = NODE_HEAP_LIMIT_MB * 0.7; // 268MB
   const preCallHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
   if (preCallHeapMB > PRE_CALL_SHED_THRESHOLD) {
     log(`Pre-provider memory shield: heap=${preCallHeapMB.toFixed(1)}MB > ${PRE_CALL_SHED_THRESHOLD.toFixed(0)}MB — forcing L2 page reload before tribunal calls`, 'WARN', 'tribunal');
