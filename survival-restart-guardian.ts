@@ -443,13 +443,12 @@ function _writeLastResortStateDump(): void {
 
 /** Method 4: Close browser immediately. */
 function _closeBrowserForMemory(): void {
-  try {
-    const browser = (_deps as any).browser;
-    if (browser?.closeBrowser) {
-      browser.closeBrowser().catch(() => {});
-      _log('Browser closed for emergency memory preservation', 'WARN');
-    }
-  } catch {}
+  // TASK 87 (2026-09-25): PROTECT BROWSER AT ALL COSTS.
+  // User: "No browser, No progress." This function is now a NO-OP.
+  // The browser is NEVER closed for memory preservation. We rely on
+  // GC + cache clearing + page reload instead.
+  _log('Browser close SKIPPED (Task 87: protect browser at all costs) — using GC + cache clear instead', 'INFO');
+  return;
 }
 
 /** Method 5: Force garbage collection. */
