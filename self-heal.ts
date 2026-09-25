@@ -1308,7 +1308,21 @@ async function performSelfHeal(options?: SelfHealOptions) {
     log(`Manual override set to ${getCONFIG().SELF_HEAL_MANUAL_OVERRIDE}, skipping self-heal`, 'INFO', 'self-heal');
     return false;
   }
-  if (!checkSelfHealSafety()) return false;
+  // TASK 81 (2026-09-25): Cooldown handling fix.
+  // User: "How did the self-heal even fail if it never started to begin with?"
+  // The old code did `if (!checkSelfHealSafety()) return false;` — returning
+  // false made the cycle manager think self-heal FAILED, triggering
+  // "Self-heal failed. Alerting and stopping." But self-heal didn't fail —
+  // it was in COOLDOWN (a previous attempt failed 28 min ago, cooldown is
+  // 30 min). The bot was stopped unnecessarily.
+  //
+  // Fix: When in cooldown, return `true` (not `false`). This tells the cycle
+  // manager "don't stop — we're just waiting for cooldown to expire." The
+  // bot will continue cycling and retry self-heal after cooldown ends.
+  if (!checkSelfHealSafety()) {
+    log('Self-heal in cooldown or daily limit reached — NOT a failure. Bot should continue cycling. Will retry after cooldown/limit expires.', 'INFO', 'self-heal');
+    return true; // NOT false — cooldown is not a failure
+  }
 
   // v4: If in memory_protection, request a self-heal session to get full power.
   // This is the ONLY way to get full power automatically. The session has a
