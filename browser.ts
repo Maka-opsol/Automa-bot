@@ -627,7 +627,10 @@ class BrowserManager {
     try { this.dprScale = await this.pageInstance.evaluate(() => window.devicePixelRatio) || 1.0; log(`DPR calibrated: ${this.dprScale}`, 'DEBUG', 'browser'); } catch (err: any) { log(`DPR calibration failed: ${(err as Error).message}`, 'WARN', 'browser'); this.dprScale = 1.0; }
   }
 
-  async compressScreenshot(base64: string, maxWidth = 640, quality = 15) { 
+  // TASK 89 (2026-09-25): Lowered defaults from 640px/q15 to 512px/q10.
+  // The bot was OOM-looping on the assignments page — smaller screenshots
+  // mean less transient memory during parallel tribunal calls.
+  async compressScreenshot(base64: string, maxWidth = 512, quality = 10) { 
     if (!base64) return base64;
     if (!sharp) return base64;
     try {
