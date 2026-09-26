@@ -277,11 +277,58 @@ function GroqProvider() {
         try { require('./providers-base').storeRawResponse('Groq', content, JSON.stringify(response), body.model); } catch {}
         return content;
       } catch (err: any) {
+        const errMsg = String(err?.message || err || '');
+
+        // TASK 93 (2026-09-27): Handle context_length_exceeded error.
+        // Vision models (llama-3.2-90b-vision-preview) have smaller context
+        // windows than text models. The prompt + base64 screenshot can exceed
+        // the limit. Fix: retry with a smaller screenshot and reduced max_tokens.
+        if (errMsg.includes('context_length_exceeded') || errMsg.includes('reduce the length')) {
+          log(`Groq: model ${body.model} context_length_exceeded — retrying with smaller image + reduced tokens`, 'WARN', 'groq');
+
+          // Retry with: smaller image (re-compress to 384px/q5) + fewer max_tokens
+          let smallerContent = prompt;
+          if (modelSupportsVision && base64Image) {
+            try {
+              // Re-compress the screenshot to a smaller size
+              const sharp = require('sharp');
+              const buf = Buffer.from(base64Image, 'base64');
+              const smallerBuf = await sharp(buf)
+                .resize(384, null, { fit: 'inside', withoutEnlargement: true })
+                .jpeg({ quality: 5 })
+                .toBuffer();
+              const smallerBase64 = smallerBuf.toString('base64');
+              smallerContent = [
+                { type: 'text', text: prompt },
+                { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${smallerBase64}` } },
+              ] as any;
+              log(`Groq: re-compressed screenshot to 384px/q5 (${smallerBase64.length} chars) for context_length retry`, 'DEBUG', 'groq');
+            } catch (compressErr: any) {
+              log(`Groq: screenshot re-compression failed: ${compressErr.message} — falling back to text-only`, 'WARN', 'groq');
+              smallerContent = prompt; // text-only fallback
+            }
+          }
+
+          const retryBody: any = {
+            model: body.model,
+            messages: [{ role: 'user', content: smallerContent }],
+            max_tokens: 2048, // reduced from 4096
+            temperature: 0.1,
+          };
+          const response = await client.chat.completions.create(retryBody, requestOptions);
+          if (!response?.choices?.[0]?.message?.content) {
+            throw new Error('GROQ_EMPTY_RESPONSE');
+          }
+          const content = response.choices[0].message.content;
+          try { require('./providers-base').storeRawResponse('Groq', content, JSON.stringify(response), body.model); } catch {}
+          return content;
+        }
+
         // TASK 90: Handle "messages[0].content must be a string" error.
         // This is a FALLBACK — normally we detect text-only models proactively
         // (Task 91). But if a model is misidentified as vision-capable, the
         // API will still reject the array content. Catch it and retry text-only.
-        if (err.message && err.message.includes('messages[0].content must be a string')) {
+        if (errMsg.includes('messages[0].content must be a string')) {
           log(`Groq: model ${body.model} rejected vision content (unexpected) — retrying text-only`, 'WARN', 'groq');
           const textOnlyBody: any = {
             model: body.model,
