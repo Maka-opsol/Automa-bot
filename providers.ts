@@ -40,10 +40,13 @@ async function determineNextAction(base64Image: string, pageUrl: string | null =
   const { compressScreenshot } = getBrowser();
   const _compress = typeof compressScreenshot === 'function' ? compressScreenshot : (img: string, _w?: number, _q?: number) => img;
   const { getCachedAction, setCachedAction } = getCache();
-  // BUG FIX (2026-09-04): Lowered from 768px quality 30 to 640px quality 15.
-  // This reduces the base64 string size by ~40% (768×30 ≈ 70KB, 640×15 ≈ 30KB),
-  // saving ~1-2MB of transient heap per cycle across 3 provider calls.
-  const compressed = await _compress(base64Image, 640, 15);
+  // TASK 89 (2026-09-25): Lowered from 640px quality 15 to 512px quality 10.
+  // The bot was OOM-looping on the assignments page because the 30KB base64
+  // screenshots, multiplied by 7 parallel provider calls, were pushing memory
+  // past the hard restart threshold. 512px/q10 produces ~18KB screenshots —
+  // 40% smaller, saving ~84KB across 7 parallel calls. Vision models can
+  // still parse 512px images fine — the buttons/text are large enough.
+  const compressed = await _compress(base64Image, 512, 10);
   const cached = getCachedAction(base64Image);
   if (cached) return cached;
   const key = `action:${crypto.createHash('sha256').update(compressed).digest('hex')}`;
