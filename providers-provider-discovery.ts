@@ -20,9 +20,14 @@ function _getConfigLoader() { if (!_configLoader) { try { _configLoader = requir
  *   1. Rate-limited (cooldown between full refreshes)
  *   2. Selective (only discover for providers that need it)
  *   3. Non-destructive (bad regex matches don't overwrite DB config)
+ *
+ * TASK 88 (2026-09-25): Groq now uses SDK-based discovery (groq.models.list())
+ * instead of web search. This is much more reliable — the API returns the
+ * exact list of available models, no guessing needed.
  */
 const PROVIDER_QUERIES = {
-  'Groq': 'Groq llama-3.3-70b versatile vision model',
+  // TASK 88: Groq uses SDK-based discovery (groq.models.list()) — see _discoverGroqModelViaSDK()
+  'Groq': 'Groq llama-3.3-70b versatile vision model', // fallback web search query
   'GitHub GPT': 'GitHub Models Azure OpenAI gpt-4o-mini',
   'z.ai': 'z.ai GLM-4.6V-Flash model',
   'Agnes': 'Agnes AI 2.0 flash model',
@@ -82,8 +87,29 @@ function extractModelName(text: any, providerName: string): string | null {
  * Discover a single provider's model via web search.
  * Returns { providerName, model, source } or null.
  * Source is 'web_search' or 'default' for diagnostic purposes.
+ *
+ * TASK 88 (2026-09-25): For Groq, uses SDK-based discovery (groq.models.list())
+ * instead of web search. Much more reliable — the API returns the exact list
+ * of available models, no guessing needed.
  */
 async function discoverProviderModel(providerName: string): Promise<{ providerName: string; model: string; source: string } | null> {
+  // TASK 88: Groq uses SDK-based discovery
+  if (providerName === 'Groq') {
+    try {
+      const groq = require('./providers-groq');
+      if (groq?.getBestModel) {
+        const model = await groq.getBestModel();
+        if (model) {
+          _log(`Found model for Groq via SDK: ${model} (groq.models.list())`, 'INFO', 'provider-discovery');
+          return { providerName: 'Groq', model, source: 'sdk' };
+        }
+      }
+    } catch (e: any) {
+      _logError(`Groq SDK discovery failed for Groq`, e);
+    }
+    // Fall through to web search / default if SDK fails
+  }
+
   const query = PROVIDER_QUERIES[providerName];
   if (!query) return null;
 
@@ -161,9 +187,10 @@ async function refreshAllProviderModels(options: { force?: boolean; providerName
       const result = await discoverProviderModel(providerName);
       if (!result) continue;
 
-      // Only update DB if discovered via web search (not default)
+      // Only update DB if discovered via web search OR SDK (not default)
       // Defaults should not overwrite existing DB config
-      if (result.source !== 'web_search') continue;
+      // TASK 88: 'sdk' source (Groq models.list()) is also authoritative
+      if (result.source !== 'web_search' && result.source !== 'sdk') continue;
 
       const current = loader.getProviderConfig(providerName);
       if (current && current.model !== result.model) {
@@ -171,7 +198,7 @@ async function refreshAllProviderModels(options: { force?: boolean; providerName
         // The discovered model is `result.model`, not a bare `model`.
         loader.updateProviderConfig(providerName, { ...current, model: result.model }, false);
         updatedCount++;
-        _log(`Updated ${providerName} model to ${result.model}`, 'INFO', 'provider-discovery');
+        _log(`Updated ${providerName} model to ${result.model} (source: ${result.source})`, 'INFO', 'provider-discovery');
       }
     } catch (e: any) {
       _logError(`Failed to discover model for ${providerName}`, e);
