@@ -433,16 +433,20 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   log(`Tribunal: consulting ${providers.length} provider(s) [${providerNames}]`, 'INFO', 'tribunal');
 
   // ── Pre-provider memory shield ──
-  // v8: If heap is above 70% of max-old-space-size, force a page reload
+  // v8: If heap is above 50% of max-old-space-size, force a page reload
   // (L2 shed) BEFORE calling providers. Provider calls allocate large
-  // base64 strings and JSON responses. If we're already at 70%+ heap,
-  // the provider call itself will push us past the hard threshold
-  // and into OOM kill territory.
-  // TASK 86 (2026-09-25): Fixed from 256 to 384 to match actual V8 limit.
-  // The old value (256) was left over from when the Dockerfile used
-  // --max-old-space-size=256. It's now 384MB.
+  // base64 strings and JSON responses. With 7 parallel providers, each
+  // call uses ~100KB transient memory = ~700KB total. On the assignments
+  // page, base heap is already ~280MB, so even small allocations can
+  // push past the 330MB hard restart threshold.
+  //
+  // TASK 89 (2026-09-25): Lowered from 70% (268MB) to 50% (192MB).
+  // The bot was OOM-looping on the assignments page because the pre-call
+  // shield wasn't aggressive enough. At 50%, the shield fires BEFORE
+  // memory gets critical, giving GC time to clean up before the provider
+  // calls allocate their transient memory.
   const NODE_HEAP_LIMIT_MB = 384;
-  const PRE_CALL_SHED_THRESHOLD = NODE_HEAP_LIMIT_MB * 0.7; // 268MB
+  const PRE_CALL_SHED_THRESHOLD = NODE_HEAP_LIMIT_MB * 0.5; // 192MB
   const preCallHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
   if (preCallHeapMB > PRE_CALL_SHED_THRESHOLD) {
     log(`Pre-provider memory shield: heap=${preCallHeapMB.toFixed(1)}MB > ${PRE_CALL_SHED_THRESHOLD.toFixed(0)}MB — forcing L2 page reload before tribunal calls`, 'WARN', 'tribunal');
@@ -452,6 +456,11 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
     } catch (e: any) {
       log(`Pre-tribunal shed failed: ${e.message}`, 'WARN', 'tribunal');
     }
+  }
+  // TASK 89: Also force GC before provider calls — clears any dangling
+  // references from the previous cycle's screenshot/action processing.
+  if (global.gc) {
+    try { global.gc(); } catch {}
   }
 
   // --- Consult providers ---
