@@ -74,16 +74,27 @@ const MODELS_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 // them over text-only models.
 
 function _isVisionModel(modelId: string): boolean {
-  const lower = modelId.toLowerCase();
-  // Primary indicator: "vision" in the model name
-  if (lower.includes('vision')) return true;
-  // Known vision model IDs that don't have "vision" in the name
-  // (add more as Groq releases new vision models)
-  const knownVisionModels = [
-    'llama-4-scout',     // Llama 4 models support vision natively
-    'llama-4-maverick',
-  ];
-  return knownVisionModels.some(m => lower.startsWith(m));
+    if (!modelId || typeof modelId !== 'string') return false;
+    const lower = modelId.toLowerCase();
+
+    // 1. Explicit keyword / infix check
+    if (lower.includes('vision')) return true;
+
+    // 2. Multimodal family prefixes/infixes (e.g., Qwen and LLaVA variants)
+    if (lower.includes('qwen') || lower.includes('llava')) return true;
+
+    // 3. Known explicit prefixes and model names (including vendor namespaces like meta-llama/)
+    const knownVisionPrefixes = [
+        'llama-4-scout',
+        'llama-4-maverick',
+        'llama-3.2-11b',
+        'llama-3.2-90b',
+        'qwen/qwen3.6',
+        'qwen/qwen3.8',
+        'meta-llama/llama-4-scout',
+    ];
+
+    return knownVisionPrefixes.some(m => lower.includes(m));
 }
 
 /**
