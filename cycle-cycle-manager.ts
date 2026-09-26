@@ -2480,6 +2480,15 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               action = await determineNextAction(base64, page.url(), explorationMode ? explorationMap : null);
             }
 
+            // TASK 89 (2026-09-25): Force GC after tribunal — the tribunal call
+            // allocates 7 parallel provider responses (~700KB total). If we don't
+            // GC here, that transient memory stays allocated during action
+            // execution and cache write, which can push past the hard restart
+            // threshold on the assignments page where base heap is already high.
+            if (global.gc) {
+              try { global.gc(); } catch {}
+            }
+
             // ── Eager action cache write (pre-execution) ──────────────────
             // Persist to Turso IMMEDIATELY after tribunal decides.
             // If OOM kills before execution, this survives. If the action
