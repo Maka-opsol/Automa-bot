@@ -56,10 +56,44 @@ let _cachedModels: string[] | null = null;
 let _modelsCacheTime = 0;
 const MODELS_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
+// ─── TASK 91 (2026-09-26): Vision Model Detection ──────────────────────
+//
+// Groq models that support vision (multimodal image input).
+// These accept content arrays: [{type:'text',...}, {type:'image_url',...}]
+//
+// Known vision-capable Groq models (as of 2026-09):
+//   - llama-3.2-90b-vision-preview
+//   - llama-3.2-11b-vision-preview
+//   - Any model with "vision" in the ID
+//
+// Text-only models (llama-3.3-70b-versatile, llama-3.1-8b-instant, etc.)
+// only accept string content. They CANNOT process screenshots.
+//
+// The bot needs vision models to analyze MathU screenshots. During a
+// provider drought, Groq vision models are critical — so we prioritize
+// them over text-only models.
+
+function _isVisionModel(modelId: string): boolean {
+  const lower = modelId.toLowerCase();
+  // Primary indicator: "vision" in the model name
+  if (lower.includes('vision')) return true;
+  // Known vision model IDs that don't have "vision" in the name
+  // (add more as Groq releases new vision models)
+  const knownVisionModels = [
+    'llama-4-scout',     // Llama 4 models support vision natively
+    'llama-4-maverick',
+  ];
+  return knownVisionModels.some(m => lower.startsWith(m));
+}
+
 /**
  * List all available Groq models using the SDK.
- * Returns a list of model IDs.
+ * Returns a list of model IDs, sorted with VISION models first.
  * Cached for 30 minutes to avoid hitting the API on every call.
+ *
+ * TASK 91 (2026-09-26): Vision models are prioritized over text-only
+ * models. The bot needs vision to analyze MathU screenshots — without
+ * it, Groq is useless for the tribunal.
  */
 async function listAvailableModels(): Promise<string[]> {
   const log = _getLogger().log;
@@ -72,7 +106,7 @@ async function listAvailableModels(): Promise<string[]> {
   const client = _getClient();
   if (!client) {
     log('Groq SDK not available — cannot list models', 'WARN', 'groq');
-    return _cachedModels || ['llama-3.3-70b-versatile']; // fallback to last known
+    return _cachedModels || ['llama-3.2-90b-vision-preview'];
   }
 
   try {
@@ -82,7 +116,6 @@ async function listAvailableModels(): Promise<string[]> {
     // Extract model IDs
     const allModels: string[] = [];
     if (modelsList && typeof modelsList[Symbol.iterator] === 'function') {
-      // Paginated iterator — iterate through all pages
       for await (const page of modelsList) {
         if (Array.isArray(page?.data)) {
           for (const model of page.data) {
@@ -91,12 +124,10 @@ async function listAvailableModels(): Promise<string[]> {
         }
       }
     } else if (Array.isArray(modelsList?.data)) {
-      // Non-paginated response
       for (const model of modelsList.data) {
         if (model?.id) allModels.push(model.id);
       }
     } else if (Array.isArray(modelsList)) {
-      // Plain array response
       for (const model of modelsList) {
         if (typeof model === 'string') allModels.push(model);
         else if (model?.id) allModels.push(model.id);
@@ -105,25 +136,25 @@ async function listAvailableModels(): Promise<string[]> {
 
     if (allModels.length === 0) {
       log('Groq models.list() returned no models — using fallback', 'WARN', 'groq');
-      return _cachedModels || ['llama-3.3-70b-versatile'];
+      return _cachedModels || ['llama-3.2-90b-vision-preview'];
     }
 
-    // Sort by preference: llama-3.3-70b-versatile first, then other llama-3.x
+    // TASK 91: Sort with VISION models first, then text-only.
+    // Within vision models, prefer larger context / newer models.
     const preferredOrder = (a: string, b: string) => {
-      const aLower = a.toLowerCase();
-      const bLower = b.toLowerCase();
+      const aVision = _isVisionModel(a);
+      const bVision = _isVisionModel(b);
 
-      // Most preferred: llama-3.3-70b-versatile (proven, vision-capable)
-      if (aLower === 'llama-3.3-70b-versatile') return -1;
-      if (bLower === 'llama-3.3-70b-versatile') return 1;
+      // Vision models ALWAYS come first
+      if (aVision && !bVision) return -1;
+      if (!aVision && bVision) return 1;
 
-      // Next: other llama-3.x models with vision capability
-      const aLlama3 = aLower.includes('llama-3') && (aLower.includes('vision') || aLower.includes('versatile'));
-      const bLlama3 = bLower.includes('llama-3') && (bLower.includes('vision') || bLower.includes('versatile'));
-      if (aLlama3 && !bLlama3) return -1;
-      if (!aLlama3 && bLlama3) return 1;
+      // Within the same category, prefer larger models (90b > 11b)
+      const aSize = parseInt(a.match(/(\d+)b/i)?.[1] || '0', 10);
+      const bSize = parseInt(b.match(/(\d+)b/i)?.[1] || '0', 10);
+      if (aSize !== bSize) return bSize - aSize; // larger first
 
-      // Alphabetical for the rest
+      // Alphabetical for same-size models
       return a.localeCompare(b);
     };
 
@@ -131,23 +162,44 @@ async function listAvailableModels(): Promise<string[]> {
 
     _cachedModels = allModels;
     _modelsCacheTime = Date.now();
-    log(`Groq models fetched: ${allModels.length} models available. Top: ${allModels.slice(0, 5).join(', ')}${allModels.length > 5 ? '...' : ''}`, 'INFO', 'groq');
+
+    // Log vision vs text-only breakdown
+    const visionModels = allModels.filter(_isVisionModel);
+    const textModels = allModels.filter(m => !_isVisionModel(m));
+    log(`Groq models fetched: ${allModels.length} total (${visionModels.length} vision, ${textModels.length} text-only). Vision: [${visionModels.slice(0, 5).join(', ')}]`, 'INFO', 'groq');
 
     return allModels;
   } catch (e: any) {
     log(`Groq models.list() failed: ${e.message || e}`, 'WARN', 'groq');
-    return _cachedModels || ['llama-3.3-70b-versatile']; // fallback to last known
+    return _cachedModels || ['llama-3.2-90b-vision-preview'];
   }
 }
 
 /**
- * Get the best available Groq model.
- * Uses listAvailableModels() and picks the first one (already sorted by preference).
- * Falls back to 'llama-3.3-70b-versatile' if the API call fails.
+ * Get the best available Groq VISION model.
+ * Uses listAvailableModels() and picks the first vision-capable model.
+ * Only falls back to text-only if NO vision models are available.
  */
 async function getBestModel(): Promise<string> {
   const models = await listAvailableModels();
-  return models[0] || 'llama-3.3-70b-versatile';
+
+  // Find the first vision-capable model
+  const visionModel = models.find(_isVisionModel);
+  if (visionModel) {
+    return visionModel;
+  }
+
+  // No vision models available — use the first text-only model
+  // (will automatically use text-only mode in makeRequest)
+  return models[0] || 'llama-3.2-90b-vision-preview';
+}
+
+/**
+ * Check if a model supports vision (image input).
+ * Used by makeRequest() to decide whether to send content as array or string.
+ */
+function isVisionCapable(modelId: string): boolean {
+  return _isVisionModel(modelId);
 }
 
 function GroqProvider() {
@@ -185,24 +237,57 @@ function GroqProvider() {
     const makeRequest = async () => {
       const { model, userContent } = await buildRequest();
 
+      // TASK 91 (2026-09-26): Check if the model supports vision.
+      // If it's a text-only model, send just the prompt as a string
+      // (no image array) — prevents the 400 "content must be a string" error.
+      const modelSupportsVision = isVisionCapable(model);
+
       // Groq SDK (OpenAI-compatible): pass signal via RequestOptions (2nd arg),
       // NOT as abortSignal in the request body — the SDK rejects that with 400.
       const body: any = {
         model,
-        messages: [{ role: 'user', content: userContent }],
+        messages: [{ role: 'user', content: modelSupportsVision ? userContent : prompt }],
         max_tokens: 4096,
         temperature: 0.1,
       };
       const requestOptions: any = signal ? { signal } : undefined;
 
-      const response = await client.chat.completions.create(body, requestOptions);
-
-      if (!response?.choices?.[0]?.message?.content) {
-        throw new Error('GROQ_EMPTY_RESPONSE');
+      if (!modelSupportsVision && base64Image) {
+        log(`Groq: model ${model} is text-only — sending prompt without screenshot`, 'DEBUG', 'groq');
       }
-      const content = response.choices[0].message.content;
-      try { require('./providers-base').storeRawResponse('Groq', content, JSON.stringify(response), body.model); } catch {}
-      return content;
+
+      try {
+        const response = await client.chat.completions.create(body, requestOptions);
+
+        if (!response?.choices?.[0]?.message?.content) {
+          throw new Error('GROQ_EMPTY_RESPONSE');
+        }
+        const content = response.choices[0].message.content;
+        try { require('./providers-base').storeRawResponse('Groq', content, JSON.stringify(response), body.model); } catch {}
+        return content;
+      } catch (err: any) {
+        // TASK 90: Handle "messages[0].content must be a string" error.
+        // This is a FALLBACK — normally we detect text-only models proactively
+        // (Task 91). But if a model is misidentified as vision-capable, the
+        // API will still reject the array content. Catch it and retry text-only.
+        if (err.message && err.message.includes('messages[0].content must be a string')) {
+          log(`Groq: model ${body.model} rejected vision content (unexpected) — retrying text-only`, 'WARN', 'groq');
+          const textOnlyBody: any = {
+            model: body.model,
+            messages: [{ role: 'user', content: prompt }], // string, not array
+            max_tokens: 4096,
+            temperature: 0.1,
+          };
+          const response = await client.chat.completions.create(textOnlyBody, requestOptions);
+          if (!response?.choices?.[0]?.message?.content) {
+            throw new Error('GROQ_EMPTY_RESPONSE');
+          }
+          const content = response.choices[0].message.content;
+          try { require('./providers-base').storeRawResponse('Groq', content, JSON.stringify(response), body.model); } catch {}
+          return content;
+        }
+        throw err;
+      }
     };
 
     // P7: Pass providerName for health-aware retries
@@ -248,4 +333,4 @@ function GroqProvider() {
   };
 }
 
-module.exports = { GroqProvider, listAvailableModels, getBestModel };
+module.exports = { GroqProvider, listAvailableModels, getBestModel, isVisionCapable };
