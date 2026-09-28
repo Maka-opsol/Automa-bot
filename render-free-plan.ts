@@ -371,6 +371,20 @@ startSelfHealV2Subsystems(CONFIG);
 startResilienceSubsystems();
 
 // ═══════════════════════════════════════════════════════════════════════
+// TASK 95 (2026-09-27): Memory Warfare — aggressive GC + leak detection
+// ═══════════════════════════════════════════════════════════════════════
+// User: "The bot needs to be constantly at war with its memory."
+// Runs GC every 15s, tracks heap trends, detects leaks, and provides
+// forceGC() for the cycle manager to call at key points.
+try {
+  const memoryWarfare = require('./memory-warfare');
+  memoryWarfare.startMemoryWarfare();
+  log('Memory warfare started — aggressive GC every 15s', 'INFO', 'render-free-plan');
+} catch (e: any) {
+  log(`Memory warfare failed to start: ${e.message}`, 'WARN', 'render-free-plan');
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // WORKER FALLBACK: Start rewardTracker in-process
 // ═══════════════════════════════════════════════════════════════════════
 log('Render: Running all subsystems in-process (no worker threads, saves ~90-150 MB)', 'INFO', 'render-free-plan');
