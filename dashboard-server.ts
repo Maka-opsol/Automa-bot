@@ -239,7 +239,17 @@ async function captureLiveScreenshot(): Promise<string | null> {
     const browserMod = require('./browser');
     const page = browserMod.browserManager?.getPage?.() || browserMod.browserManager?.pageInstance;
     if (!page || page.isClosed()) return null;
-    const buf = await page.screenshot({ type: 'jpeg', quality: 40 });
+
+    // TASK 94 (2026-09-27): Use a short timeout (5s) instead of the default 30s.
+    // The old code used the default 30s timeout, which caused:
+    //   "page.screenshot: Timeout 30000ms exceeded" — waiting for fonts to load
+    // This was flooding the logs every time the dashboard polled for a live
+    // screenshot. The Flutter Web app has custom fonts that take a long time
+    // to load, and Playwright waits for document.fonts.ready before taking
+    // the screenshot. With a 5s timeout, we either get the screenshot quickly
+    // or give up silently — no more 30s timeout spam.
+    const buf = await page.screenshot({ type: 'jpeg', quality: 40, timeout: 5000, animations: 'disabled' }).catch(() => null);
+    if (!buf) return null;
     let base64 = buf.toString('base64');
     // Try sharp compression first (much smaller)
     try {
