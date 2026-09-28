@@ -544,6 +544,13 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
       .map(r => r.value);
   }
 
+  // TASK 95 (2026-09-27): Aggressive GC after provider calls — free the
+  // 7 parallel HTTP response objects immediately. Don't wait for the next
+  // cycle's GC — the consensus computation needs clean memory.
+  if (global.gc) {
+    try { global.gc(); } catch {}
+  }
+
   const valid = fulfilled.filter(r => {
     if (!r) return false;
     const hasAction = r.actionType && typeof r.actionType === 'string' && r.actionType.trim().length > 0;
