@@ -3491,6 +3491,9 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       screenshot = null as any;
       base64 = null as any;
       _actionCacheSig = null;
+      // TASK 95 (2026-09-27): Aggressive GC after nulling — frees the
+      // actual memory immediately, not just the reference.
+      if (global.gc) { try { global.gc(); } catch {} }
       // Resilience: semantic progress detection
       if (progressSemanticDetector) {
         try {
