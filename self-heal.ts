@@ -400,26 +400,71 @@ async function investigatePage() {
   log('Investigating page for self-healing...', 'INFO', 'self-heal');
   let isolatedBrowser: any = null;
   let page: any = null;
+  let usingCycleBrowser = false;
   try {
-    // Boot-time OOM heals run BEFORE the browser is initialised, so
-    // _deps.browser is absent.  In that case return a log-only
-    // investigation — the tribunal can still work from error patterns
-    // and target-file hints (enrichInvestigationWithTargetFile).
+    // TASK 94 (2026-09-27): Use the cycle's EXISTING browser page first.
+    // The old code always launched an ISOLATED browser and navigated to
+    // /assignments — but this:
+    //   1. Takes 30s+ to navigate (often times out)
+    //   2. Doesn't have the session/cookies from the cycle's browser
+    //   3. Destroys the page state we're trying to preserve (Task 87)
+    //
+    // Now we try the cycle's browser FIRST. If it's available and has a
+    // valid page, we just take a screenshot of whatever page is currently
+    // showing — no navigation needed. Only fall back to an isolated
+    // browser if the cycle's browser is not available.
+
+    // Try to get the cycle's browser page
+    try {
+      const browserMod = _deps.browser || require('./browser');
+      const cyclePage = browserMod.getPage?.() || browserMod.browserManager?.pageInstance;
+      if (cyclePage && !cyclePage.isClosed()) {
+        log('Investigation: using cycle browser page (no navigation — preserving page state per Task 87)', 'INFO', 'self-heal');
+        page = cyclePage;
+        usingCycleBrowser = true;
+
+        // Take screenshot of the CURRENT page (no navigation)
+        // Use a short timeout — if the page is already loaded, this is instant
+        const screenshot = await page.screenshot({ type: 'jpeg', quality: 30, timeout: 5000, animations: 'disabled' }).catch(() => null);
+        if (screenshot) {
+          const base64 = screenshot.toString('base64');
+          const html = await page.content().catch(() => '');
+          const url = page.url();
+          log(`Investigation: captured screenshot from cycle browser (url=${url}, ${base64.length} chars)`, 'INFO', 'self-heal');
+
+          // Capture console messages (best effort — we can't retroactively
+          // get past messages, but we can attach current pageErrors if available)
+          const consoleMessages: Array<{ type: string; text: string; url?: string }> = [];
+          const pageErrors: string[] = [];
+
+          return {
+            screenshot: base64,
+            html,
+            url,
+            bootTime: false,
+            pageText: '',
+            pageTitle: await page.title().catch(() => ''),
+            consoleErrors: consoleMessages,
+            pageErrors,
+            domStats: { nodeCount: 0, scriptCount: 0, imgCount: 0 },
+          };
+        }
+        log('Investigation: cycle browser screenshot failed — falling back to isolated browser', 'WARN', 'self-heal');
+        page = null; // reset for isolated browser fallback
+        usingCycleBrowser = false;
+      }
+    } catch (cycleErr: any) {
+      log(`Investigation: cycle browser not available (${cycleErr.message}) — falling back to isolated browser`, 'DEBUG', 'self-heal');
+    }
+
+    // FALLBACK: Launch an isolated browser for investigation
+    // (only reached if the cycle's browser is not available or screenshot failed)
     const config = getCONFIG();
     if (!config.APP_URL) {
       log('No APP_URL configured for investigation (boot-time heal) — using log-based context', 'WARN', 'self-heal');
       return { screenshot: null, html: null, url: null, bootTime: true };
     }
 
-    // CRITICAL: Use an ISOLATED Playwright browser for investigation.
-    // The shared BrowserManager singleton is the cycle's browser — calling
-    // launchBrowser() kills it (cleanup()), and closeBrowser() kills it again.
-    // After the self-heal loop exhausts all attempts, the cycle's browser
-    // would be permanently dead with no re-launch path, causing
-    // "Browser disconnected" crashes on the next cycle iteration.
-    //
-    // By launching a separate chromium instance, the cycle's browser
-    // stays untouched throughout the entire self-heal process.
     const { chromium } = require('playwright');
     const os = require('os');
     const path = require('path');
@@ -542,8 +587,13 @@ async function investigatePage() {
     logError('Investigation failed', err);
     return null;
   } finally {
-    // Only close the ISOLATED browser — never touch the shared singleton
-    if (page) { try { await page.close().catch(() => {}); } catch {} }
+    // TASK 94 (2026-09-27): Only close the ISOLATED browser — never touch
+    // the shared singleton. If we used the cycle's browser (usingCycleBrowser),
+    // do NOT close the page — that would destroy the cycle's page state
+    // (violating Task 87: protect browser at all costs).
+    if (!usingCycleBrowser && page) {
+      try { await page.close().catch(() => {}); } catch {}
+    }
     if (isolatedBrowser) {
       try { await isolatedBrowser.close().catch(() => {}); } catch {}
     }
