@@ -43,7 +43,13 @@ const SYNC_INTERVAL_MS_DEFAULT = 120000; // 120s — push local → Turso (was 3
 // On 512MB Render, the Node heap is ~256MB max, but RSS includes the
 // browser process (~100-200MB). When heap is 80MB+, RSS is already
 // ~300-400MB, and the sync's HTTP allocations can push past 512MB.
-const SYNC_HEAP_GUARD_MB = 80;
+// TASK 95 (2026-09-27): Raised from 80MB to 300MB.
+// The bot's steady-state heap is ~200-280MB. With the old 80MB guard,
+// Turso syncs were ALWAYS skipped — the action_cache was never synced
+// to cloud storage. Raised to 300MB so syncs actually happen during
+// normal operation. The sync's HTTP allocation is ~50-100KB — negligible
+// compared to the 384MB V8 heap limit.
+const SYNC_HEAP_GUARD_MB = 300;
 // v19: RSS hard limit — skip sync if total process RSS is above this.
 // On Render free plan (512MB), the OOM killer fires at ~512MB RSS.
 // Leave 100MB headroom for the browser and GC overhead.
