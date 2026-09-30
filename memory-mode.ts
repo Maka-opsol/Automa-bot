@@ -731,6 +731,21 @@ function _checkForActiveSelfHealSession(): void {
       return;
     }
 
+    // TASK 96 (2026-09-29): Don't resume sessions older than 60 minutes.
+    // The old code resumed sessions regardless of age (even 8225 minutes = 5.7 days!).
+    // This kept the bot in a permanent "self-heal session" state, which:
+    //   1. Prevented normal memory_protection from engaging
+    //   2. Kept heavy modules loaded (wasting memory)
+    //   3. Made the bot think it was still healing when it wasn't
+    // Now: sessions older than 60 minutes are aborted on boot.
+    const MAX_RESUMABLE_SESSION_AGE_MS = 60 * 60 * 1000; // 60 minutes
+    if (elapsed > MAX_RESUMABLE_SESSION_AGE_MS) {
+      _log(`Self-heal session too old (${Math.round(elapsed / 60000)}min > 60min max). Aborting — was likely stuck from a previous crash.`, 'WARN');
+      _writeSelfHealSessionToDB({ status: 'aborted', reason: 'session_too_old', abortedAt: Date.now() });
+      _selfHealSessionActive = false;
+      return;
+    }
+
     // Session still valid — grant full power again to continue healing
     // v20: On small instances (<=1GB), full_power is unsafe — the thresholds
     // are designed for 1GB+ and will OOM-kill a 512MB instance. Use
