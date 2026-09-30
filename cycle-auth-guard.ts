@@ -661,6 +661,32 @@ async function ensureAuthenticated(page: any) {
     const preRefreshBlank = await _isPageBlank(page);
     if (preRefreshBlank) {
       (page as any)._authBlankPage = true;
+      // TASK 97 (2026-09-29): Don't re-authenticate on blank pages!
+      // The blank page is NOT a session expiry — it's Flutter still rendering.
+      // Re-authenticating every time the page is blank causes a login loop:
+      //   1. Page loads → blank (Flutter initializing)
+      //   2. Auth guard sees blank → "session invalid" → login flow
+      //   3. Login flow completes → returns to app → blank again
+      //   4. Repeat every 2 minutes, burning all provider quota on login clicks
+      //
+      // Instead: wait for the page to render (up to 30s), then re-check.
+      // Only re-authenticate if the page is STILL blank after 30s.
+      log('SPA session check: page is blank — waiting for Flutter to render before re-auth (up to 30s)...', 'WARN', 'auth-guard');
+      const renderDeadline = Date.now() + 30000;
+      let rendered = false;
+      while (Date.now() < renderDeadline) {
+        await new Promise(r => setTimeout(r, 3000));
+        const stillBlank = await _isPageBlank(page);
+        if (!stillBlank) {
+          rendered = true;
+          log('SPA session check: page rendered after blank wait — session is valid, skipping re-auth', 'INFO', 'auth-guard');
+          authAttempts = 0;
+          return page;
+        }
+      }
+      if (!rendered) {
+        log('SPA session check: page still blank after 30s wait — proceeding with re-auth', 'WARN', 'auth-guard');
+      }
     }
     log('SPA session invalid, attempting re-auth (no URL change)...', 'WARN', 'auth-guard');
   } else {
