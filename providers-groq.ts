@@ -77,20 +77,26 @@ function _isVisionModel(modelId: string): boolean {
     if (!modelId || typeof modelId !== 'string') return false;
     const lower = modelId.toLowerCase();
 
-    // 1. Explicit keyword / infix check
+    // 1. Explicit keyword / infix check — "vision" in the name is the most reliable indicator
     if (lower.includes('vision')) return true;
 
-    // 2. Multimodal family prefixes/infixes (e.g., Qwen and LLaVA variants)
-    if (lower.includes('qwen') || lower.includes('llava')) return true;
+    // 2. LLaVA variants are always vision-capable
+    if (lower.includes('llava')) return true;
 
     // 3. Known explicit prefixes and model names (including vendor namespaces like meta-llama/)
+    // TASK 96 (2026-09-29): Removed broad 'qwen' match — not all Qwen models support vision.
+    // Only Qwen-VL (Vision-Language) variants do. The old code matched ALL qwen models,
+    // causing text-only models like qwen/qwen3.8-27b to be incorrectly identified as
+    // vision-capable, resulting in 400 "content must be a string" errors.
     const knownVisionPrefixes = [
         'llama-4-scout',
         'llama-4-maverick',
-        'llama-3.2-11b',
-        'llama-3.2-90b',
-        'qwen/qwen3.6',
-        'qwen/qwen3.8',
+        'llama-3.2-11b-vision',     // Only vision variants
+        'llama-3.2-90b-vision',     // Only vision variants
+        'qwen-vl',                   // Qwen Vision-Language variants
+        'qwen2-vl',
+        'qwen/qwen2-vl',
+        'qwen/qwen-vl',
         'meta-llama/llama-4-scout',
     ];
 
