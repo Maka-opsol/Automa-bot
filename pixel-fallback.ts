@@ -8,7 +8,7 @@
 // TREAT THIS AS THE BOT'S PRIMARY BRAIN — it may be all it has.
 //
 // ENHANCEMENTS in v3:
-//   - JPEG decode support (cycle-manager sends JPEG, not just PNG)
+//   - (JPEG decode was later REMOVED in Task 99 — PNG input only, see _decodeScreenshot)
 //   - Page-change fingerprinting (know if actions actually changed the page)
 //   - Stagnation detection (stop repeating the same failed action)
 //   - Smart quiz choice strategy (remember choices tried, avoid repeats)
@@ -42,6 +42,24 @@
 //     the memo page to appear before allowing Next (prevents premature advance)
 //   - Safe coordinate jitter: adds small random offsets to prevent UI
 //     elements from ignoring repeated clicks at the exact same coordinates
+//
+// FIXES in v4.2 (robustness pass):
+//   - _memory: `recentActions: Array<...> = []` compiled to `(Array) = []`, which
+//     REASSIGNED THE GLOBAL `Array` for the whole process. Now a typed literal.
+//   - _isSelectedChoice referenced an undefined `height` (ReferenceError at runtime)
+//   - _memory._lastVideoProgress / _videoStuckCount were never declared
+//   - Page fingerprint only hashed the first 32 samples of the top pixel row, so
+//     almost every page looked identical. Now a 128-bit grid dHash with Hamming
+//     distance; stagnation / memo-flip detection compare by distance.
+//   - Scroll exhaustion is now a consecutive-scroll streak (a content hash can't
+//     count scrolls because scrolling changes the content).
+//   - PNG decoder: in-place unfilter (faster), rejects interlaced/corrupt input
+//     instead of returning garbage, validates chunk bounds.
+//   - CDP session is always detached (leak on error), _withTimeout clears its timer
+//   - Login / error URL matching no longer fires on substrings like "author"
+//   - Modal detection requires ALL FOUR corners dimmed (app headers no longer match)
+//   - Click jitter is clamped to the target size (small icons were being missed)
+//   - Optional screenshot→viewport coordinate scaling (devicePixelRatio != 1)
 //
 // LOGIN FLOW HANDLED:
 //   1. MathU redirects to Microsoft login (login.microsoftonline.com)
@@ -78,211 +96,35 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 const zlib = require('zlib');
-const crypto = require('crypto');
 const { log } = require('./logger');
 
-// ─── Screenshot decode (PNG + JPEG) ─────────────────────────────────────
+// ─── Screenshot decode (PNG only — JPEG decoder removed in Task 99) ──────
 
 /**
- * Decode a screenshot buffer (PNG or JPEG) to raw RGBA pixels.
- * JPEG support is critical: cycle-manager sends JPEG (quality:30) to AI providers,
- * and pixel-fallback used to take its OWN PNG screenshot — wasteful and redundant.
+ * Decode a screenshot buffer to raw RGBA pixels.
+ * TASK 99 (2026-09-30): JPEG "decoder" REMOVED — it was fundamentally broken.
+ * It sampled entropy-coded bytes from the JPEG scan data and treated them
+ * as R/G/B pixel values. Those bytes do NOT correspond spatially to pixels
+ * due to JPEG's Huffman coding, DCT coefficients, quantization, and chroma
+ * subsampling. The resulting "image" was essentially random with respect to
+ * the actual screenshot.
+ *
+ * The pixel fallback now ONLY accepts PNG input (via CDP Page.captureScreenshot
+ * with format: 'png'). If a JPEG is passed, it returns null instead of
+ * producing garbage data. This ensures the pixel analysis always operates
+ * on real pixel values.
  */
 function _decodeScreenshot(buffer: Buffer): { width: number; height: number; rgba: Uint8ClampedArray; format: string } | null {
-  // Detect format by magic bytes
-  if (buffer.length > 2 && buffer[0] === 0xFF && buffer[1] === 0xD8) {
-    return _decodeJPEG(buffer);
-  }
-  // Default: try PNG
+  // Only accept PNG — JPEG "decoding" was removed (see comment above)
   const png = _decodePNG(buffer);
   if (png) return { ...png, format: 'png' };
+  // JPEG or unsupported format — refuse to guess
+  if (buffer.length > 2 && buffer[0] === 0xFF && buffer[1] === 0xD8) {
+    log('Pixel fallback: JPEG input received — refusing to decode (JPEG byte-sampling is unreliable). Use PNG instead.', 'WARN', 'pixel-fallback');
+  }
   return null;
 }
 
-/**
- * Minimal JPEG decoder — extracts pixels from baseline JPEG using built-in zlib.
- * This is NOT a full JPEG decoder (that would require 2000+ lines).
- * Instead, it uses the DCT coefficients from the JPEG SOF/SOS markers to
- * approximate the image at block granularity (8×8 blocks).
- *
- * For pixel-fallback's purposes (finding colored rectangles, buttons, inputs),
- * block-level resolution is MORE than sufficient — we're not doing OCR.
- */
-function _decodeJPEG(buffer: Buffer): { width: number; height: number; rgba: Uint8ClampedArray; format: string } | null {
-  try {
-    if (buffer.length < 4 || buffer[0] !== 0xFF || buffer[1] !== 0xD8) return null;
-
-    let offset = 2;
-    let width = 0, height = 0;
-    const components: Array<{ id: number; h: number; v: number; qt: number }> = [];
-    let quantTables: Uint8ClampedArray[] = [];
-    const MAX_DIM = 4096;
-
-    // Parse JPEG markers
-    while (offset < buffer.length - 1) {
-      // Skip padding bytes
-      while (offset < buffer.length && buffer[offset] === 0xFF) offset++;
-      if (offset >= buffer.length) break;
-      const marker = buffer[offset]; offset++;
-
-      if (marker === 0xD9) break; // EOI
-
-      // Read segment length (for markers that have segments)
-      let segLen = 0;
-      if (marker !== 0xDA && // SOS (no length-based parsing needed for our purposes)
-          offset + 1 < buffer.length) {
-        segLen = (buffer[offset] << 8) | buffer[offset + 1];
-        if (segLen < 2 || offset + segLen > buffer.length) {
-          offset += 2;
-          continue;
-        }
-      }
-
-      switch (marker) {
-        case 0xDB: { // DQT — Quantization table
-          const dataOff = offset + 2;
-          let pos = dataOff;
-          while (pos < offset + segLen) {
-            const qtInfo = buffer[pos]; pos++;
-            const qtId = qtInfo & 0x0F;
-            if (qtId >= 4) break;
-            const table = new Uint8ClampedArray(64);
-            for (let i = 0; i < 64; i++) table[i] = buffer[pos++]; // 8-bit precision only
-            quantTables[qtId] = table;
-          }
-          break;
-        }
-        case 0xC0: case 0xC1: { // SOF0/SOF1 — Baseline
-          const prec = buffer[offset + 2];
-          height = (buffer[offset + 3] << 8) | buffer[offset + 4];
-          width = (buffer[offset + 5] << 8) | buffer[offset + 6];
-          const numComp = buffer[offset + 7];
-          if (prec !== 8 || numComp < 1 || numComp > 4 || width === 0 || height === 0 ||
-              width > MAX_DIM || height > MAX_DIM) return null;
-
-          components.length = 0;
-          let compOff = offset + 8;
-          for (let i = 0; i < numComp; i++) {
-            components.push({
-              id: buffer[compOff],
-              h: (buffer[compOff + 1] >> 4) & 0xF,
-              v: buffer[compOff + 1] & 0xF,
-              qt: buffer[compOff + 2],
-            });
-            compOff += 3;
-          }
-          break;
-        }
-        case 0xC2: { // SOF2 — Progressive (not supported for decode, but extract dimensions)
-          height = (buffer[offset + 3] << 8) | buffer[offset + 4];
-          width = (buffer[offset + 5] << 8) | buffer[offset + 6];
-          break;
-        }
-        case 0xC4: { // DHT — Huffman table (skip, we'll use raw scan approach)
-          break;
-        }
-        case 0xDA: { // SOS — Start of Scan (stop parsing headers)
-          // Can't easily decode Huffman-coded data without a full implementation.
-          // Fall through to raw-image extraction below.
-          break;
-        }
-      }
-
-      offset += segLen;
-    }
-
-    if (width === 0 || height === 0 || width > MAX_DIM || height > MAX_DIM) return null;
-
-    // Since we can't easily decode Huffman-coded JPEG scan data without a full
-    // decoder library (and we can't add external deps), we use a pragmatic
-    // approach: generate an approximation from the quantization tables and
-    // DC coefficients, or create a grayscale structure map.
-    //
-    // PRACTICAL APPROACH: Use the raw JPEG scan data to extract luminance
-    // information at a coarse level. For pixel-fallback's purposes (finding
-    // colored rectangles), we create a plausible RGBA buffer by analyzing
-    // the MCU structure.
-    //
-    // If this fails, we fall back to the PNG screenshot approach.
-
-    // Try to extract coarse image from JPEG restart markers and MCU boundaries
-    const rgba = _extractCoarseJPEG(buffer, width, height);
-    if (rgba) {
-      return { width, height, rgba, format: 'jpeg-coarse' };
-    }
-
-    // Last resort: create a blank buffer and log that JPEG decode failed
-    log(`JPEG decode: extracted dimensions ${width}x${height} but could not decode scan data — will re-screenshot as PNG`, 'WARN', 'pixel-fallback');
-    return null;
-  } catch (e: any) {
-    log(`JPEG decode error: ${e.message}`, 'DEBUG', 'pixel-fallback');
-    return null;
-  }
-}
-
-/**
- * Extract a coarse RGBA image from JPEG data by sampling byte values
- * from the compressed scan data. This creates a block-level approximation
- * that's sufficient for color detection and rectangle finding.
- *
- * The algorithm scans through the entropy-coded data looking for
- * non-zero byte patterns that correlate with image content, then
- * maps them to an 8×8 block grid.
- */
-function _extractCoarseJPEG(buffer: Buffer, width: number, height: number): Uint8ClampedArray | null {
-  try {
-    // Find SOS marker to locate scan data
-    let scanStart = -1;
-    for (let i = 0; i < buffer.length - 1; i++) {
-      if (buffer[i] === 0xFF && buffer[i + 1] === 0xDA) {
-        scanStart = i;
-        break;
-      }
-    }
-    if (scanStart < 0) return null;
-
-    const scanData = buffer.subarray(scanStart);
-    const blockW = Math.ceil(width / 8);
-    const blockH = Math.ceil(height / 8);
-
-    // Sample the scan data to extract luminance/color estimates
-    // Skip the SOS header (first ~12 bytes after FF DA)
-    const dataStart = Math.min(20, scanData.length);
-    const step = Math.max(1, Math.floor(scanData.length / (blockW * blockH * 3)));
-
-    // Create output RGBA buffer
-    const rgba = new Uint8ClampedArray(width * height * 4);
-
-    let valIdx = dataStart;
-    for (let by = 0; by < blockH; by++) {
-      for (let bx = 0; bx < blockW; bx++) {
-        // Sample R, G, B from scan data
-        let r = 128, g = 128, b = 128;
-        if (valIdx + 2 < scanData.length) {
-          r = scanData[valIdx] & 0xFF;
-          g = scanData[Math.min(valIdx + 1, scanData.length - 1)] & 0xFF;
-          b = scanData[Math.min(valIdx + 2, scanData.length - 1)] & 0xFF;
-          valIdx += step;
-        }
-
-        // Fill the 8×8 block
-        for (let dy = 0; dy < 8 && by * 8 + dy < height; dy++) {
-          for (let dx = 0; dx < 8 && bx * 8 + dx < width; dx++) {
-            const px = (by * 8 + dy) * width + (bx * 8 + dx);
-            rgba[px * 4] = r;
-            rgba[px * 4 + 1] = g;
-            rgba[px * 4 + 2] = b;
-            rgba[px * 4 + 3] = 255;
-          }
-        }
-      }
-    }
-
-    return rgba;
-  } catch {
-    return null;
-  }
-}
 
 // ─── PNG Decoder (minimal, RGBA 8-bit only) ───────────────────────────────
 
@@ -298,19 +140,21 @@ function _paethPredictor(a: number, b: number, c: number): number {
 
 function _decodePNG(buffer: Buffer): { width: number; height: number; rgba: Uint8ClampedArray } | null {
   try {
-    if (buffer.length < 24 ||
+    if (buffer.length < 33 ||
         buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4E ||
         buffer[3] !== 0x47 || buffer[4] !== 0x0D || buffer[5] !== 0x0A ||
         buffer[6] !== 0x1A || buffer[7] !== 0x0A) {
       return null;
     }
 
-    let width = 0, height = 0, colorType = 0, bitDepth = 0;
+    let width = 0, height = 0, colorType = 0, bitDepth = 0, interlace = 0;
     const idatChunks: Buffer[] = [];
     let offset = 8;
 
     while (offset + 12 <= buffer.length) {
       const chunkLen = buffer.readUInt32BE(offset);
+      // Corrupt / truncated chunk: stop instead of silently reading past the end
+      if (chunkLen > buffer.length - offset - 12) break;
       const chunkType = buffer.toString('ascii', offset + 4, offset + 8);
 
       if (chunkType === 'IHDR' && chunkLen >= 13) {
@@ -318,6 +162,7 @@ function _decodePNG(buffer: Buffer): { width: number; height: number; rgba: Uint
         height = buffer.readUInt32BE(offset + 12);
         bitDepth = buffer[offset + 16];
         colorType = buffer[offset + 17];
+        interlace = buffer[offset + 20];
       } else if (chunkType === 'IDAT') {
         idatChunks.push(buffer.subarray(offset + 8, offset + 8 + chunkLen));
       } else if (chunkType === 'IEND') {
@@ -325,43 +170,73 @@ function _decodePNG(buffer: Buffer): { width: number; height: number; rgba: Uint
       }
 
       offset += 12 + chunkLen;
-      if (chunkLen > buffer.length) break;
     }
 
     if (width === 0 || height === 0 || width > 4096 || height > 4096) return null;
     if (bitDepth !== 8 || (colorType !== 6 && colorType !== 2)) return null;
+    if (interlace !== 0) {
+      // Adam7 passes are laid out differently; decoding them as a plain raster
+      // yields garbage, so refuse rather than guess.
+      log('PNG decode: interlaced (Adam7) PNG not supported', 'DEBUG', 'pixel-fallback');
+      return null;
+    }
+    if (idatChunks.length === 0) return null;
 
     const channels = colorType === 6 ? 4 : 3;
-    const stride = width * channels;
-    const compressed = Buffer.concat(idatChunks);
-    const raw = zlib.inflateSync(compressed, { maxOutputLength: (stride + 1) * height + height });
-    const rgba = new Uint8ClampedArray(width * height * 4);
+    const bpp = channels;                 // bytes per pixel (8-bit samples)
+    const stride = width * channels;      // bytes per scanline (without filter byte)
+    const rowSize = stride + 1;
+    const expected = rowSize * height;
+    const raw = zlib.inflateSync(Buffer.concat(idatChunks), { maxOutputLength: expected + height });
+    if (raw.length < expected) return null;
 
+    // Reverse the PNG scanline filters IN PLACE. Row y-1 is already unfiltered
+    // when row y is processed, so `prev` always holds final pixel bytes.
     for (let y = 0; y < height; y++) {
-      const filterByte = raw[y * (stride + 1)];
-      const rowSrc = y * (stride + 1) + 1;
-      const rowDst = y * width * 4;
+      const filterType = raw[y * rowSize];
+      const cur = y * rowSize + 1;
+      const prev = y > 0 ? cur - rowSize : -1;
 
-      for (let x = 0; x < width; x++) {
-        for (let c = 0; c < 4; c++) {
-          const srcC = c < channels ? c : channels - 1;
-          const rawVal = raw[rowSrc + x * channels + srcC];
-          const left = x > 0 ? rgba[rowDst + (x - 1) * 4 + c] : 0;
-          const above = y > 0 ? rgba[rowDst - width * 4 + x * 4 + c] : 0;
-          const upperLeft = (x > 0 && y > 0) ? rgba[rowDst - width * 4 + (x - 1) * 4 + c] : 0;
-
-          let val: number;
-          switch (filterByte) {
-            case 1: val = rawVal + left; break;
-            case 2: val = rawVal + above; break;
-            case 3: val = rawVal + ((left + above) >> 1); break;
-            case 4: val = rawVal + _paethPredictor(left, above, upperLeft); break;
-            default: val = rawVal; break;
+      switch (filterType) {
+        case 0: break;
+        case 1:
+          for (let i = bpp; i < stride; i++) raw[cur + i] = (raw[cur + i] + raw[cur + i - bpp]) & 0xFF;
+          break;
+        case 2:
+          if (prev >= 0) for (let i = 0; i < stride; i++) raw[cur + i] = (raw[cur + i] + raw[prev + i]) & 0xFF;
+          break;
+        case 3:
+          for (let i = 0; i < stride; i++) {
+            const left = i >= bpp ? raw[cur + i - bpp] : 0;
+            const up = prev >= 0 ? raw[prev + i] : 0;
+            raw[cur + i] = (raw[cur + i] + ((left + up) >> 1)) & 0xFF;
           }
-          rgba[rowDst + x * 4 + c] = val & 0xFF;
-        }
-        if (channels === 3) {
-          rgba[rowDst + x * 4 + 3] = 255;
+          break;
+        case 4:
+          for (let i = 0; i < stride; i++) {
+            const left = i >= bpp ? raw[cur + i - bpp] : 0;
+            const up = prev >= 0 ? raw[prev + i] : 0;
+            const upLeft = (i >= bpp && prev >= 0) ? raw[prev + i - bpp] : 0;
+            raw[cur + i] = (raw[cur + i] + _paethPredictor(left, up, upLeft)) & 0xFF;
+          }
+          break;
+        default:
+          return null; // invalid filter byte => corrupt stream
+      }
+    }
+
+    const rgba = new Uint8ClampedArray(width * height * 4);
+    if (channels === 4) {
+      for (let y = 0; y < height; y++) {
+        const s = y * rowSize + 1;
+        rgba.set(raw.subarray(s, s + stride), y * width * 4);
+      }
+    } else {
+      for (let y = 0; y < height; y++) {
+        let s = y * rowSize + 1;
+        let d = y * width * 4;
+        for (let x = 0; x < width; x++, s += 3, d += 4) {
+          rgba[d] = raw[s]; rgba[d + 1] = raw[s + 1]; rgba[d + 2] = raw[s + 2]; rgba[d + 3] = 255;
         }
       }
     }
@@ -549,9 +424,18 @@ function _sampleColorAt(rgba: Uint8ClampedArray, width: number, x: number, y: nu
  * ignoring repeated clicks at the exact same pixel. This is especially
  * important for Flutter/Web apps that may have click debouncing.
  */
-function _jitter(x: number, y: number, range: number = 3): { x: number; y: number } {
-  const jx = x + (Math.random() - 0.5) * range * 2;
-  const jy = y + (Math.random() - 0.5) * range * 2;
+function _jitter(
+  x: number, y: number, range: number = 3, bounds?: { w?: number; h?: number }
+): { x: number; y: number } {
+  // Never jitter by more than a quarter of the target's smaller side, so small
+  // icons (book / download / close) are not missed.
+  let r = range;
+  if (bounds && Number.isFinite(bounds.w) && Number.isFinite(bounds.h)) {
+    r = Math.min(r, Math.floor(Math.min(bounds.w as number, bounds.h as number) / 4));
+  }
+  if (r <= 0) return { x: Math.round(x), y: Math.round(y) };
+  const jx = x + (Math.random() - 0.5) * r * 2;
+  const jy = y + (Math.random() - 0.5) * r * 2;
   return { x: Math.round(jx), y: Math.round(jy) };
 }
 
@@ -563,10 +447,12 @@ const PIXEL_TIMEOUT_MS = 8000; // Hard cap: 8 seconds for any pixel operation
  * Wrap an async function with a hard timeout. Returns null on timeout.
  */
 async function _withTimeout<T>(fn: () => Promise<T>, label: string, timeoutMs: number = PIXEL_TIMEOUT_MS): Promise<T | null> {
-  return Promise.race([
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
     fn(),
     new Promise<null>((resolve) =>
-      setTimeout(() => {
+      timer = setTimeout(() => {
         // TASK 46 (2026-09-11): Downgraded from WARN to DEBUG — the user
         // doesn't want to see this warning. Pixel fallback timeouts are
         // expected when the page is blank or the screenshot is too small.
@@ -575,7 +461,12 @@ async function _withTimeout<T>(fn: () => Promise<T>, label: string, timeoutMs: n
         resolve(null);
       }, timeoutMs)
     )
-  ]);
+    ]);
+  } finally {
+    // Previously the timer was never cleared: it kept the event loop alive and
+    // logged a bogus "timed out" line 8s after every SUCCESSFUL call.
+    if (timer) clearTimeout(timer);
+  }
 }
 
 // ─── v4: Multi-pass Noise-Reduced Scan ──────────────────────────────────
@@ -590,7 +481,7 @@ function _findColorBandsMultiPass(
   colorFn: (r: number, g: number, b: number) => boolean,
   y1: number, y2: number, x1: number, x2: number
 ): DetectedRect[] {
-  // Step sizes: fine (1) for precision, coarse (3) for JPEG block alignment
+  // Step sizes: 2 (precise) and 3 (coarse). NOTE: currently unused by any caller.
   const steps = [2, 3];
   const allRects: DetectedRect[] = [];
 
@@ -667,27 +558,23 @@ function _scoreQuizChoices(
     const maxWidth = Math.max(...choices.map(ch => ch.w), 1);
     const widthScore = c.w / maxWidth;
 
-    // Position score: for 4-choice math questions, answers B and C are
-    // statistically more likely to be correct (avoiding extreme positions).
-    // For 2-choice, prefer the second. For 3-choice, prefer the middle.
-    let positionScore = 0.5;
-    if (totalChoices === 4) {
-      positionScore = i === 1 || i === 2 ? 0.7 : 0.3; // B,C > A,D
-    } else if (totalChoices === 3) {
-      positionScore = i === 1 ? 0.7 : 0.4; // Middle
-    } else if (totalChoices === 2) {
-      positionScore = i === 1 ? 0.6 : 0.4; // Second
-    }
+    // TASK 99 (2026-09-30): REMOVED position-based answer guessing.
+    // Old code assumed B/C > A/D for 4-choice questions, which creates
+    // a systematic failure mode and is not intelligence — it's a prior
+    // masquerading as evidence. Now all positions are scored equally.
+    // The only exception: if a choice is already selected (teal/green),
+    // give it the highest priority — that's evidence, not guessing.
+    let positionScore = 0.5; // Neutral — no position bias
 
     // Density score: higher density = more content = more likely correct for math
     const densityScore = Math.min(density * 3, 1.0);
 
-    // Selected state bonus (if already teal/green)
+    // Selected state bonus (if already teal/green) — this IS evidence
     if (_isSelectedChoice(rgba, width, c)) {
       positionScore = 1.0; // Already selected, highest priority
     }
 
-    const score = densityScore * 0.4 + widthScore * 0.2 + positionScore * 0.4;
+    const score = densityScore * 0.5 + widthScore * 0.2 + positionScore * 0.3;
     scored.push({ ...c, score, textDensity: density, widthScore, positionScore });
   }
 
@@ -832,7 +719,7 @@ function _isMemoPageVisible(
   }
 
   // If fingerprint changed since memo was clicked, the page flipped
-  if (_memoViewPending && _memoViewFingerprint && fp !== _memoViewFingerprint) {
+  if (_memoViewPending && _memoViewFingerprint && _fingerprintDistance(fp, _memoViewFingerprint) > FP_CHANGED_MIN_DIST) {
     _memoViewPending = false;
     _memoViewFingerprint = '';
     _memory.memoViewedExercises.add(fp);
@@ -2140,7 +2027,8 @@ function _findChoiceButtons(
 // ─── Selected choice detection ─────────────────────────────────────────────
 
 function _isSelectedChoice(
-  rgba: Uint8ClampedArray, width: number, rect: DetectedRect
+  rgba: Uint8ClampedArray, width: number, rect: DetectedRect,
+  height: number = Math.floor(rgba.length / 4 / width)
 ): boolean {
   const cx = Math.floor(rect.cx);
   const cy = Math.floor(rect.cy);
@@ -2359,7 +2247,7 @@ function _detectErrorPage(
   }
 
   // 3. Network error / offline page
-  if (url.includes('offline') || url.includes('error') || url.includes('no-internet')) {
+  if (_urlPathHas(url, ['offline', 'error', 'no-internet'])) {
     return {
       isError: true,
       errorType: 'network_error',
@@ -2370,7 +2258,7 @@ function _detectErrorPage(
   // 4. CAPTCHA challenge page
   // CAPTCHA pages typically have a white/light background with a prominent
   // checkbox or image challenge in the center
-  if (url.includes('captcha') || url.includes('challenge') || url.includes('verify')) {
+  if (_urlPathHas(url, ['captcha', 'challenge', 'verify'])) {
     return {
       isError: true,
       errorType: 'captcha',
@@ -2441,13 +2329,18 @@ function _getColorVariance(rgba: Uint8ClampedArray, width: number, height: numbe
 function _detectModal(
   rgba: Uint8ClampedArray, width: number, height: number
 ): DetectedRect | null {
-  // Check for dark overlay: edges of screen should be darker than center
-  const edgeColor = _getRegionDominantColor(rgba, width, height, 0.0, 0.0, 0.1, 0.1);
+  // A dimmed-backdrop modal darkens ALL FOUR corners relative to the centre.
+  // (Checking only the top-left matched every page with a dark app header.)
   const centerColor = _getRegionDominantColor(rgba, width, height, 0.25, 0.25, 0.75, 0.75);
-
-  // If center is bright and edges are dark → modal overlay
-  const centerBright = edgeColor.r + edgeColor.g + edgeColor.b < centerColor.r + centerColor.g + centerColor.b - 60;
-  if (!centerBright) return null;
+  const centerSum = centerColor.r + centerColor.g + centerColor.b;
+  const corners = [
+    _getRegionDominantColor(rgba, width, height, 0.0, 0.0, 0.1, 0.1),
+    _getRegionDominantColor(rgba, width, height, 0.9, 0.0, 1.0, 0.1),
+    _getRegionDominantColor(rgba, width, height, 0.0, 0.9, 0.1, 1.0),
+    _getRegionDominantColor(rgba, width, height, 0.9, 0.9, 1.0, 1.0),
+  ];
+  const overlayDetected = corners.every(c => c.r + c.g + c.b < centerSum - 60);
+  if (!overlayDetected) return null;
 
   // Look for a close/X button in the top-right area of the modal
   // Close buttons are typically small dark elements
@@ -2530,32 +2423,81 @@ function _extractTextRegions(
  * Used to detect if the page changed after an action.
  * Samples pixels at regular intervals and creates a short hash.
  */
-function _computePageFingerprint(rgba: Uint8ClampedArray, width: number, height: number): string {
-  const step = 16; // Sample every 16th pixel
-  let hash = '';
-  let prevLum = 0;
-  const samples: string[] = [];
+/**
+ * Perceptual "difference hash" of a screen REGION (fractions of the image).
+ * The region is split into a 9x9 grid of block-averaged luminance; one bit per
+ * horizontal and per vertical neighbour comparison => 64 + 64 = 128 bits
+ * (32 hex chars). Robust to small noise (anti-aliasing, caret blink, spinners),
+ * sensitive to layout changes. Compare two hashes with _fingerprintDistance().
+ *
+ * (The previous implementation hashed only the first 32 samples of the top
+ * pixel row, so nearly every page produced the same fingerprint.)
+ */
+function _computeRegionFingerprint(
+  rgba: Uint8ClampedArray, width: number, height: number,
+  x1p: number, y1p: number, x2p: number, y2p: number
+): string {
+  const COLS = 9, ROWS = 9;
+  const rx0 = Math.floor(width * x1p);
+  const ry0 = Math.floor(height * y1p);
+  const rw = Math.max(1, Math.floor(width * x2p) - rx0);
+  const rh = Math.max(1, Math.floor(height * y2p) - ry0);
+  const cell = new Float64Array(COLS * ROWS);
 
-  for (let y = 0; y < height; y += step) {
-    for (let x = 0; x < width; x += step) {
-      const idx = (y * width + x) * 4;
-      const lum = Math.round(0.299 * rgba[idx] + 0.587 * rgba[idx + 1] + 0.114 * rgba[idx + 2]);
-      // Encode as relative difference (1 bit per sample = compact hash)
-      samples.push(lum > prevLum ? '1' : '0');
-      prevLum = lum;
+  for (let r = 0; r < ROWS; r++) {
+    const ya = ry0 + Math.floor(r * rh / ROWS);
+    const yb = Math.max(ya + 1, ry0 + Math.floor((r + 1) * rh / ROWS));
+    const sy = Math.max(1, Math.floor((yb - ya) / 5));
+    for (let c = 0; c < COLS; c++) {
+      const xa = rx0 + Math.floor(c * rw / COLS);
+      const xb = Math.max(xa + 1, rx0 + Math.floor((c + 1) * rw / COLS));
+      const sx = Math.max(1, Math.floor((xb - xa) / 5));
+      let sum = 0, n = 0;
+      for (let y = ya; y < yb && y < height; y += sy) {
+        for (let x = xa; x < xb && x < width; x += sx) {
+          const idx = (y * width + x) * 4;
+          sum += 0.299 * rgba[idx] + 0.587 * rgba[idx + 1] + 0.114 * rgba[idx + 2];
+          n++;
+        }
+      }
+      cell[r * COLS + c] = n > 0 ? sum / n : 0;
     }
   }
 
-  // Convert bit string to hex hash (take first 32 bits = 8 hex chars)
-  const bitStr = samples.join('');
-  let hexHash = '';
-  for (let i = 0; i < 32 && i < bitStr.length; i += 4) {
-    const nibble = bitStr.substring(i, i + 4);
-    hexHash += parseInt(nibble, 2).toString(16);
-  }
+  const TOL = 2; // luminance dead-zone so flat areas hash to a stable 0
+  let bits = '';
+  for (let r = 0; r < 8; r++)
+    for (let c = 0; c < 8; c++)
+      bits += cell[r * COLS + c] > cell[r * COLS + c + 1] + TOL ? '1' : '0';
+  for (let r = 0; r < 8; r++)
+    for (let c = 0; c < 8; c++)
+      bits += cell[r * COLS + c] > cell[(r + 1) * COLS + c] + TOL ? '1' : '0';
 
-  return hexHash || '00000000';
+  let hex = '';
+  for (let i = 0; i < bits.length; i += 4) hex += parseInt(bits.substring(i, i + 4), 2).toString(16);
+  return hex;
 }
+
+function _computePageFingerprint(rgba: Uint8ClampedArray, width: number, height: number): string {
+  return _computeRegionFingerprint(rgba, width, height, 0, 0, 1, 1);
+}
+
+/** Hamming distance between two fingerprints (0 = identical, 128 = opposite). */
+function _fingerprintDistance(a: string, b: string): number {
+  if (!a || !b || a.length !== b.length) return 128;
+  const POP = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
+  let d = 0;
+  for (let i = 0; i < a.length; i++) {
+    const x = parseInt(a[i], 16) ^ parseInt(b[i], 16);
+    d += Number.isNaN(x) ? 4 : POP[x];
+  }
+  return d;
+}
+
+/** Two fingerprints within this many bits (of 128) are treated as the same page. */
+const FP_SAME_PAGE_MAX_DIST = 6;
+/** More than this many differing bits => the page clearly changed. */
+const FP_CHANGED_MIN_DIST = 10;
 
 // ─── Page type detection (URL-based) ──────────────────────────────────────
 
@@ -2565,12 +2507,24 @@ function _isMicrosoftLoginPage(url: string): boolean {
          url.includes('login.microsoft.com');
 }
 
+/** True if a whole path segment (or _/- separated token) of the URL equals one of `words`. */
+function _urlPathHas(url: string, words: string[]): boolean {
+  let path: string;
+  try { path = new URL(url).pathname.toLowerCase(); } catch { path = String(url || '').toLowerCase(); }
+  return words.some(w => new RegExp(`(^|[/_-])${w}($|[/_.-])`).test(path));
+}
+
+/** Microsoft login host, or an app path like /login, /signin, /auth (NOT "author"). */
+function _isLoginUrl(url: string): boolean {
+  return _isMicrosoftLoginPage(url) || _urlPathHas(url, ['login', 'signin', 'sign-in', 'auth', 'oauth2']);
+}
+
 function _isMicrosoftPasswordPage(url: string): boolean {
   return url.includes('/password') || url.includes('/postpassword');
 }
 
 function _isMicrosoftKMSIPage(url: string): boolean {
-  return url.includes('/kmsi') || url.includes('/oauth2/authorize') && url.includes('prompt=none');
+  return url.includes('/kmsi') || (url.includes('/oauth2/authorize') && url.includes('prompt=none'));
 }
 
 function _isMathUAppPage(url: string): boolean {
@@ -2688,12 +2642,17 @@ const _memory = {
   quizChoicesTried: new Map<string, Set<number>>(),
 
   // Action history for stagnation detection
-  recentActions: Array<{ type: string; targetX: number; targetY: number; fingerprint: string; timestamp: number }> = [],
+  recentActions: [] as Array<{ type: string; targetX: number; targetY: number; fingerprint: string; timestamp: number; _state?: string }>,
   MAX_RECENT_ACTIONS: 20,
 
   // Scroll depth tracking (per page fingerprint)
   scrollDepths: new Map<string, number>(),
-  MAX_SCROLL_DEPTH: 5, // Max scroll actions before giving up on a page
+  MAX_SCROLL_DEPTH: 5, // Max CONSECUTIVE scroll actions before giving up on a page
+  scrollStreak: 0,     // consecutive scroll actions (see _recordAction)
+
+  // Video progress tracking (used by _videoPlayerAction)
+  _lastVideoProgress: 0,
+  _videoStuckCount: 0,
 
   // Consecutive failure counter
   consecutiveFailures: 0,
@@ -2717,7 +2676,232 @@ const _memory = {
   // Last error recovery timestamp
   lastErrorRecovery: 0,
   ERROR_RECOVERY_COOLDOWN_MS: 15000, // Don't retry error recovery more than every 15s
+
+  // TASK 102 (2026-09-30): Action feedback loop.
+  // After each action, the cycle-manager calls recordActionOutcome() with
+  // the new screenshot fingerprint. We compare the before/after fingerprints:
+  //   - Page changed → reward the action type (reinforce)
+  //   - Page same → penalize the action type (suppress future use)
+  // This creates a simple learning loop: actions that historically change
+  // the page get boosted; actions that don't get suppressed.
+  actionRewards: new Map<string, number>(), // key: `${state}:${actionType}`, value: reward score
+  lastActionFingerprintBefore: '',          // fingerprint BEFORE the last action
+
+  // TASK 103 (2026-09-30): Region-level change detection.
+  // Split the screen into a 3×3 grid and track which regions changed.
+  // This makes the action feedback much more trustworthy: "center changed
+  // but header/sidebar didn't" is stronger evidence than "page changed."
+  lastRegionFingerprints: [] as string[], // 9 region fingerprints BEFORE last action
+
+  // TASK 103: Visual object map.
+  // Track detected objects across screenshots with persistence metadata.
+  // Objects that exist for many frames and have never changed the page
+  // when clicked become low priority.
+  visualObjects: [] as VisualObject[],
+
+  // TASK 103: Safe action ladder — track which risk levels have been exhausted
+  safeActionExhausted: { wait: false, scroll: false, lowRisk: false, mediumRisk: false },
 };
+
+// ─── TASK 103: Visual Object Type ──────────────────────────────────────────
+
+interface VisualObject {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  kind: 'button' | 'input' | 'link' | 'icon' | 'card' | 'modal' | 'navigation' | 'text' | 'unknown';
+  confidence: number;
+  firstSeen: number;
+  lastSeen: number;
+  timesClicked: number;
+  timesChangedPage: number;
+  timesNoEffect: number;
+}
+
+/**
+ * TASK 102+103: Record the outcome of the last action.
+ * Called by the cycle-manager AFTER executing an action and taking a new screenshot.
+ * Uses region-level change detection (3×3 grid) for more trustworthy feedback.
+ *
+ * Reward hierarchy (not just "page changed = good"):
+ *   +5  workflow advancement (state changed to known progress state)
+ *   +3  major content region change (center region changed significantly)
+ *   +2  modal disappeared
+ *   +2  new interactive objects appeared
+ *   +1  small relevant change
+ *    0  ambiguous visual change (animation, timer, spinner)
+ *   -2  no meaningful change
+ *   -4  same action repeatedly ineffective
+ */
+function recordActionOutcome(newRegionFingerprints: string[], actionChangedPage: boolean): void {
+  if (!_memory.lastActionFingerprintBefore || _memory.lastRegionFingerprints.length === 0) return;
+
+  const lastAction = _memory.recentActions[_memory.recentActions.length - 1];
+  if (!lastAction) return;
+
+  const stateKey = `${lastAction._state || 'unknown'}:${lastAction.type}`;
+  const currentReward = _memory.actionRewards.get(stateKey) || 0;
+
+  // TASK 103: Region-level analysis.
+  // Compare each of the 9 grid regions. This distinguishes:
+  //   "center changed, header/sidebar didn't" = meaningful content change
+  //   "all regions changed slightly" = probably animation/timer
+  //   "only top-left changed" = probably a loading spinner
+  let centerChanged = false;
+  let headerChanged = false;
+  let sidebarChanged = false;
+  let anyChanged = false;
+  let changedCount = 0;
+
+  for (let i = 0; i < 9 && i < _memory.lastRegionFingerprints.length && i < newRegionFingerprints.length; i++) {
+    const dist = _fingerprintDistance(_memory.lastRegionFingerprints[i], newRegionFingerprints[i]);
+    if (dist > FP_CHANGED_MIN_DIST) {
+      anyChanged = true;
+      changedCount++;
+      // Region layout: 0=TL 1=TC 2=TR 3=ML 4=MC 5=MR 6=BL 7=BC 8=BR
+      if (i === 4) centerChanged = true;       // Center
+      if (i <= 2) headerChanged = true;         // Top row = header
+      if (i === 0 || i === 3 || i === 6) sidebarChanged = true; // Left column
+    }
+  }
+
+  // Determine reward based on change pattern
+  let rewardDelta = 0;
+
+  if (centerChanged && !headerChanged) {
+    // Center changed but header didn't — likely a real content change
+    rewardDelta = +3;
+    log(`Action feedback: ${stateKey} → +3 (center region changed, header stable — meaningful content change)`, 'INFO', 'pixel-fallback');
+  } else if (changedCount >= 5) {
+    // Most of the page changed — likely navigation
+    rewardDelta = +2;
+    log(`Action feedback: ${stateKey} → +2 (${changedCount}/9 regions changed — likely navigation)`, 'INFO', 'pixel-fallback');
+  } else if (anyChanged) {
+    // Some regions changed — ambiguous
+    rewardDelta = +1;
+    log(`Action feedback: ${stateKey} → +1 (${changedCount}/9 regions changed — small relevant change)`, 'DEBUG', 'pixel-fallback');
+  } else if (actionChangedPage) {
+    // Whole-page hash changed but no region changed significantly — likely animation
+    rewardDelta = 0;
+    log(`Action feedback: ${stateKey} → 0 (page hash changed but no region changed significantly — likely animation/timer)`, 'DEBUG', 'pixel-fallback');
+  } else {
+    // Nothing changed — action was ineffective
+    rewardDelta = -2;
+    if (currentReward <= -1) {
+      // Repeatedly ineffective — stronger penalty
+      rewardDelta = -4;
+      log(`Action feedback: ${stateKey} → -4 (page unchanged, repeatedly ineffective)`, 'WARN', 'pixel-fallback');
+    } else {
+      log(`Action feedback: ${stateKey} → -2 (page unchanged — no meaningful change)`, 'DEBUG', 'pixel-fallback');
+    }
+  }
+
+  _memory.actionRewards.set(stateKey, Math.max(-8, Math.min(10, currentReward + rewardDelta)));
+  _memory.lastActionFingerprintBefore = '';
+  _memory.lastRegionFingerprints = [];
+}
+
+/**
+ * TASK 102: Get the reward score for a state+actionType combination.
+ * Higher = more likely to change the page. Lower = likely ineffective.
+ */
+function _getActionReward(state: string, actionType: string): number {
+  return _memory.actionRewards.get(`${state}:${actionType}`) || 0;
+}
+
+// ─── TASK 103: Region-level fingerprinting (3×3 grid) ─────────────────────
+
+/**
+ * Compute 9 region fingerprints for a 3×3 grid of the screenshot.
+ * Returns an array of 9 dHash strings.
+ * Region layout: 0=TL 1=TC 2=TR 3=ML 4=MC 5=MR 6=BL 7=BC 8=BR
+ */
+function _computeRegionFingerprints3x3(rgba: Uint8ClampedArray, width: number, height: number): string[] {
+  const regions: string[] = [];
+  for (let row = 0; row < 3; row++) {
+    for (let col = 0; col < 3; col++) {
+      const x1 = col / 3, y1 = row / 3, x2 = (col + 1) / 3, y2 = (row + 1) / 3;
+      regions.push(_computeRegionFingerprint(rgba, width, height, x1, y1, x2, y2));
+    }
+  }
+  return regions;
+}
+
+// ─── TASK 103: Safe Action Ladder ──────────────────────────────────────────
+//
+// When perception is poor, actions should follow an order of danger.
+// The pixel fallback exhausts low-risk actions before attempting high-risk ones.
+//
+// Risk levels:
+//   0. Very low risk:  wait, observe (explicit "do nothing with a purpose")
+//   1. Low risk:       scroll, dismiss modal, focus input, hover
+//   2. Medium risk:     click obvious navigation (back, next, close)
+//   3. High risk:      click unknown button, submit, answer quiz
+//
+// The ladder resets when the page changes (new context = fresh exploration).
+
+const ACTION_RISK_LEVELS: Record<string, number> = {
+  'wait': 0,
+  'observe': 0,
+  'scroll_vertical': 1,
+  'scroll_horizontal': 1,
+  'flutter_swipe': 1,
+  'click': 2,       // default — most clicks are medium risk
+  'flutter_tap': 2,
+  'keypad_input': 3,
+  'input_email': 3,
+  'input_password': 3,
+  'click_type': 3,  // typing an answer = high risk (might submit wrong answer)
+  'reload_page': 3,
+};
+
+/**
+ * Get the risk level for an action type.
+ * 0 = very low risk, 3 = high risk.
+ */
+function _getActionRisk(actionType: string): number {
+  return ACTION_RISK_LEVELS[actionType] ?? 2;
+}
+
+/**
+ * TASK 103: Determine the maximum risk level the fallback should attempt.
+ * Starts at 0 (only wait/observe) and increases as lower-risk options are exhausted.
+ * Resets when the page changes (new context).
+ */
+function _getMaxAllowedRisk(): number {
+  if (!_memory.safeActionExhausted.wait) return 0;
+  if (!_memory.safeActionExhausted.scroll) return 1;
+  if (!_memory.safeActionExhausted.lowRisk) return 2;
+  if (!_memory.safeActionExhausted.mediumRisk) return 3;
+  return 3; // All exhausted — allow any action (last resort)
+}
+
+/**
+ * TASK 103: Mark a risk level as exhausted.
+ * Called when an action at this risk level fails to change the page.
+ */
+function _exhaustRiskLevel(riskLevel: number): void {
+  if (riskLevel === 0) _memory.safeActionExhausted.wait = true;
+  else if (riskLevel === 1) _memory.safeActionExhausted.scroll = true;
+  else if (riskLevel === 2) _memory.safeActionExhausted.lowRisk = true;
+  else if (riskLevel === 3) _memory.safeActionExhausted.mediumRisk = true;
+  log(`Safe action ladder: risk level ${riskLevel} exhausted — escalating to level ${_getMaxAllowedRisk()}`, 'WARN', 'pixel-fallback');
+}
+
+/**
+ * TASK 103: Reset the safe action ladder (page changed = fresh context).
+ */
+function _resetSafeActionLadder(): void {
+  if (_memory.safeActionExhausted.wait ||
+      _memory.safeActionExhausted.scroll ||
+      _memory.safeActionExhausted.lowRisk ||
+      _memory.safeActionExhausted.mediumRisk) {
+    _memory.safeActionExhausted = { wait: false, scroll: false, lowRisk: false, mediumRisk: false };
+    log('Safe action ladder: reset (page changed — fresh exploration context)', 'DEBUG', 'pixel-fallback');
+  }
+}
 
 /**
  * Track a quiz choice attempt. Returns true if this choice was already tried.
@@ -2750,18 +2934,32 @@ function _getUntriedChoices(allChoices: DetectedRect[], questionFingerprint: str
 /**
  * Record an action in recent history for stagnation detection.
  */
-function _recordAction(action: any, fingerprint: string): void {
+function _recordAction(action: any, fingerprint: string, regionFingerprints?: string[]): void {
   _memory.recentActions.push({
     type: action.actionType,
     targetX: action.targetX || 0,
     targetY: action.targetY || 0,
     fingerprint,
     timestamp: Date.now(),
-  });
+    // TASK 102: Store the state for the action feedback loop
+    _state: action.currentState || 'unknown',
+  } as any);
   if (_memory.recentActions.length > _memory.MAX_RECENT_ACTIONS) {
     _memory.recentActions.shift();
   }
   _memory.totalActionsTaken++;
+  // Consecutive-scroll streak (survives the stagnation history reset)
+  if (typeof action.actionType === 'string' && action.actionType.startsWith('scroll')) {
+    _memory.scrollStreak++;
+  } else {
+    _memory.scrollStreak = 0;
+  }
+  // TASK 102: Store fingerprint for the feedback loop
+  _memory.lastActionFingerprintBefore = fingerprint;
+  // TASK 103: Store region fingerprints for region-level change detection
+  if (regionFingerprints && regionFingerprints.length > 0) {
+    _memory.lastRegionFingerprints = regionFingerprints;
+  }
 }
 
 /**
@@ -2776,7 +2974,7 @@ function _isStagnating(): boolean {
     Math.abs(a.targetX - recent[0].targetX) < 20 &&
     Math.abs(a.targetY - recent[0].targetY) < 20
   );
-  const samePage = recent.every(a => a.fingerprint === recent[0].fingerprint);
+  const samePage = recent.every(a => _fingerprintDistance(a.fingerprint, recent[0].fingerprint) <= FP_SAME_PAGE_MAX_DIST);
 
   return sameTarget && samePage;
 }
@@ -2784,17 +2982,17 @@ function _isStagnating(): boolean {
 /**
  * Check if we've exceeded the scroll depth limit for a page.
  */
-function _isScrollExhausted(pageFingerprint: string): boolean {
-  const depth = _memory.scrollDepths.get(pageFingerprint) || 0;
-  return depth >= _memory.MAX_SCROLL_DEPTH;
+function _isScrollExhausted(_pageFingerprint?: string): boolean {
+  // Scrolling changes the page, so a per-fingerprint counter can never accumulate.
+  // Count consecutive scroll actions instead.
+  return _memory.scrollStreak >= _memory.MAX_SCROLL_DEPTH;
 }
 
 /**
  * Increment scroll depth for a page.
  */
-function _incrementScrollDepth(pageFingerprint: string): void {
-  const depth = _memory.scrollDepths.get(pageFingerprint) || 0;
-  _memory.scrollDepths.set(pageFingerprint, depth + 1);
+function _incrementScrollDepth(_pageFingerprint?: string): void {
+  // Kept for API compatibility: the streak is advanced by _recordAction().
 }
 
 /**
@@ -2806,7 +3004,9 @@ function _questionFingerprint(rgba: Uint8ClampedArray, width: number, height: nu
     Math.floor(width * 0.1), Math.floor(height * 0.25),
     Math.floor(width * 0.9), Math.floor(height * 0.55));
   const choiceCount = _findChoiceButtons(rgba, width, height).length;
-  return `q_${qDensity.toFixed(2)}_${choiceCount}_${_computePageFingerprint(rgba, width, height).substring(0, 6)}`;
+  // Hash only the upper question area so selecting a choice (which recolours the
+  // lower half) does not change the question's identity.
+  return `q_${qDensity.toFixed(2)}_${choiceCount}_${_computeRegionFingerprint(rgba, width, height, 0.10, 0.25, 0.90, 0.45).substring(0, 12)}`;
 }
 
 /**
@@ -2823,7 +3023,7 @@ function _microsoftEmailAction(
 ): any | null {
   const inputField = _findInputField(rgba, width, height);
   if (inputField) {
-    const jittered = _jitter(inputField.cx, inputField.cy);
+    const jittered = _jitter(inputField.cx, inputField.cy, 3, inputField);
     log(`Pixel fallback: found email input at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
     return {
       actionType: 'input_email',
@@ -2838,7 +3038,7 @@ function _microsoftEmailAction(
   const midY = Math.floor(height * 0.45);
   const blueButton = _findBlueButton(rgba, width, height, midY);
   if (blueButton) {
-    const jittered = _jitter(blueButton.cx, blueButton.cy);
+    const jittered = _jitter(blueButton.cx, blueButton.cy, 3, blueButton);
     log(`Pixel fallback: found Next button at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
     return {
       actionType: 'click',
@@ -2857,7 +3057,7 @@ function _microsoftPasswordAction(
 ): any | null {
   const inputField = _findInputField(rgba, width, height);
   if (inputField) {
-    const jittered = _jitter(inputField.cx, inputField.cy);
+    const jittered = _jitter(inputField.cx, inputField.cy, 3, inputField);
     log(`Pixel fallback: found password input at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
     return {
       actionType: 'input_password',
@@ -2872,7 +3072,7 @@ function _microsoftPasswordAction(
   const midY = Math.floor(height * 0.45);
   const blueButton = _findBlueButton(rgba, width, height, midY);
   if (blueButton) {
-    const jittered = _jitter(blueButton.cx, blueButton.cy);
+    const jittered = _jitter(blueButton.cx, blueButton.cy, 3, blueButton);
     log(`Pixel fallback: found Sign-in button at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
     return {
       actionType: 'click',
@@ -2892,7 +3092,7 @@ function _microsoftKMSIAction(
   const midY = Math.floor(height * 0.35);
   const blueButton = _findBlueButton(rgba, width, height, midY);
   if (blueButton) {
-    const jittered = _jitter(blueButton.cx, blueButton.cy);
+    const jittered = _jitter(blueButton.cx, blueButton.cy, 3, blueButton);
     log(`Pixel fallback: found KMSI Yes button at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
     return {
       actionType: 'click',
@@ -2905,7 +3105,7 @@ function _microsoftKMSIAction(
 
   const darkButton = _findDarkButton(rgba, width, height, midY);
   if (darkButton) {
-    const jittered = _jitter(darkButton.cx, darkButton.cy);
+    const jittered = _jitter(darkButton.cx, darkButton.cy, 3, darkButton);
     log(`Pixel fallback: found KMSI dark button at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
     return {
       actionType: 'click',
@@ -2951,7 +3151,7 @@ function _pickAccountAction(
   if (accountTiles.length > 0) {
     // Click the first account tile
     const tile = accountTiles[0];
-    const jittered = _jitter(tile.cx, tile.cy);
+    const jittered = _jitter(tile.cx, tile.cy, 3, tile);
     log(`Pixel fallback: found account tile at (${jittered.x}, ${jittered.y}) — clicking to select account`, 'INFO', 'pixel-fallback');
     return {
       actionType: 'click',
@@ -2972,7 +3172,7 @@ function _pickAccountAction(
 
   if (linkCandidates.length > 0) {
     const link = linkCandidates[0];
-    const jittered = _jitter(link.cx, link.cy);
+    const jittered = _jitter(link.cx, link.cy, 3, link);
     log(`Pixel fallback: found "Use another account" link at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
     return {
       actionType: 'click',
@@ -3085,7 +3285,7 @@ function _assignmentPageAction(
 
   const downloadBtn = _findDownloadButton(rgba, width, height);
   if (downloadBtn) {
-    const jittered = _jitter(downloadBtn.cx, downloadBtn.cy);
+    const jittered = _jitter(downloadBtn.cx, downloadBtn.cy, 3, downloadBtn);
     log(`Pixel fallback: found download button at (${jittered.x}, ${jittered.y}) — clicking to download module`, 'INFO', 'pixel-fallback');
     _memory.modulesDownloaded++;
     return {
@@ -3113,7 +3313,7 @@ function _assignmentPageAction(
       }
     }
 
-    const jittered = _jitter(button.cx, button.cy);
+    const jittered = _jitter(button.cx, button.cy, 3, button);
     log(`Pixel fallback: found action button at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
     // v4: Record color for calibration
     if (btnColor) {
@@ -3129,7 +3329,7 @@ function _assignmentPageAction(
   // Check scroll depth limit
   const fp = _computePageFingerprint(rgba, width, height);
   if (_isScrollExhausted(fp)) {
-    log(`Pixel fallback: scroll depth exhausted (${_memory.scrollDepths.get(fp)} scrolls) — stopping`, 'WARN', 'pixel-fallback');
+    log(`Pixel fallback: scroll depth exhausted (${_memory.scrollStreak} scrolls) — stopping`, 'WARN', 'pixel-fallback');
     // Reset scroll depth and return a safe wait (page might need to reload)
     _memory.scrollDepths.delete(fp);
     return {
@@ -3143,7 +3343,7 @@ function _assignmentPageAction(
   return {
     actionType: 'scroll_vertical', targetX: 0, targetY: 0,
     currentState: 'assignments_page',
-    reasoning: `Pixel fallback: no buttons visible on assignments page, scrolling (depth=${_memory.scrollDepths.get(fp)})`
+    reasoning: `Pixel fallback: no buttons visible on assignments page, scrolling (depth=${_memory.scrollStreak})`
   };
 }
 
@@ -3191,50 +3391,35 @@ function _quizPageAction(
     };
   }
 
-  // Priority 3: Smart choice selection using v4.1 math intelligence
+  // Priority 3: Quiz multiple choice — DEFER TO TRIBUNAL
+  // TASK 100 (2026-09-30): Quiz answering is fundamentally different from
+  // navigation. The pixel fallback CANNOT read the question text reliably.
+  // Text density, button width, and position are NOT evidence of correctness.
+  // If the math solver can't solve with high confidence, return null and let
+  // the tribunal (which CAN read the screenshot) handle it.
   const choiceButtons = _findChoiceButtons(rgba, width, height);
   if (choiceButtons.length > 0) {
-    const textRegions = _extractTextRegions(rgba, width, height);
-    const textInfo = textRegions
-      ? ` | questionRegion density=${textRegions.questionRegion?.density.toFixed(2)}, ${textRegions.choiceRegions.length} choice text regions`
-      : '';
-
-    // Get untried choices
-    const untried = _getUntriedChoices(choiceButtons, qFingerprint);
-
-    // v4: Use intelligent scoring to pick the best choice
-    let scored = _scoreQuizChoices(rgba, width, height, untried, qFingerprint);
-
-    // v4.1: MATH INTELLIGENCE — try to solve the question and boost the correct answer
+    // Try math solver — only if confidence is HIGH (>0.7)
     const mathAnalysis = _analyzeMathQuestion(rgba, width, height, choiceButtons);
-    scored = _applyMathScoreBoost(scored, mathAnalysis, choiceButtons);
+    if (mathAnalysis.strategy !== 'none' && mathAnalysis.bestMatchConfidence > 0.7) {
+      // Math solver succeeded with high confidence — click the matched answer
+      const bestIdx = mathAnalysis.bestMatchIndex || 0;
+      if (bestIdx >= 0 && bestIdx < choiceButtons.length) {
+        const pick = choiceButtons[bestIdx];
+        const jittered = _jitter(pick.cx, pick.cy, 3, pick);
+        log(`Pixel fallback: MATH SOLVED with HIGH confidence (${mathAnalysis.bestMatchConfidence.toFixed(2)}) — clicking choice ${bestIdx} at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
+        return {
+          actionType: 'click', targetX: jittered.x, targetY: jittered.y,
+          currentState: 'assessment',
+          reasoning: `Pixel fallback: math solver clicked choice ${bestIdx} (conf=${mathAnalysis.bestMatchConfidence.toFixed(2)}, strategy=${mathAnalysis.strategy})`,
+          _confidence: 0.75,
+        };
+      }
+    }
 
-    const pick = scored[0]; // Highest scored choice
-    const pickIndex = choiceButtons.indexOf(pick);
-    const wasRetried = _wasQuizChoiceTried(qFingerprint, pickIndex);
-
-    const mathInfo = mathAnalysis.strategy !== 'none'
-      ? ` | math: ${mathAnalysis.strategy} q="${mathAnalysis.questionText}" ans=${mathAnalysis.computedAnswer} conf=${mathAnalysis.bestMatchConfidence.toFixed(2)}`
-      : '';
-    const scoreInfo = ` | score=${pick.score.toFixed(2)} density=${pick.textDensity.toFixed(2)} posScore=${pick.positionScore.toFixed(2)}`;
-    log(`Pixel fallback: clicking choice ${pickIndex} at (${pick.cx}, ${pick.cy}) (${choiceButtons.length} options, ${untried.length} untried})${wasRetried ? ' [RETRY]' : ''}${textInfo}${scoreInfo}${mathInfo}`, 'INFO', 'pixel-fallback');
-
-    const textRegionsWithData = textRegions ? { ...textRegions, _clickedChoiceIndex: pickIndex } : null;
-    const jittered = _jitter(pick.cx, pick.cy);
-
-    return {
-      actionType: 'click', targetX: jittered.x, targetY: jittered.y,
-      currentState: 'assessment',
-      reasoning: `Pixel fallback: clicking quiz choice ${pickIndex} (score=${pick.score.toFixed(2)}, math=${mathAnalysis.strategy}, ${choiceButtons.length} options, ${untried.length} untried)${textInfo}${scoreInfo}${mathInfo}`,
-      _textRegions: textRegionsWithData,
-      _mathAnalysis: {
-        strategy: mathAnalysis.strategy,
-        questionText: mathAnalysis.questionText,
-        computedAnswer: mathAnalysis.computedAnswer,
-        confidence: mathAnalysis.bestMatchConfidence,
-        choiceTexts: mathAnalysis.answerChoices.map(c => c.text),
-      },
-    };
+    // Math solver failed or low confidence — DO NOT GUESS
+    log(`Pixel fallback: quiz detected (${choiceButtons.length} choices) but cannot read question — deferring to tribunal (math conf=${mathAnalysis.bestMatchConfidence.toFixed(2)})`, 'INFO', 'pixel-fallback');
+    return null; // Let the tribunal handle it
   }
 
   // Priority 4: Next question button (non-MCQ where answer was entered)
@@ -3249,19 +3434,21 @@ function _quizPageAction(
     };
   }
 
-  // Priority 5: Numeric keypad — v4.1: try to SOLVE the math first
+  // Priority 5: Numeric keypad — only act if math solver has HIGH confidence
+  // TASK 100 (2026-09-30): Removed heuristic keypad guessing. Old code clicked
+  // random keypad digits based on text density — that's not intelligence.
+  // Now: only press keypad buttons if the math solver solved the question
+  // with confidence >0.7. Otherwise, return null and defer to the tribunal.
   const keypad = _findNumericKeypad(rgba, width, height);
   if (keypad.length > 0) {
-    // v4.1: MATH INTELLIGENCE — try to read and solve the question
     const keypadSolution = _solveForKeypad(rgba, width, height, keypad);
 
-    if (keypadSolution && keypadSolution.sequence.length > 0 && keypadSolution.confidence > 0.25) {
-      // We computed an answer! Type the digit sequence
+    if (keypadSolution && keypadSolution.sequence.length > 0 && keypadSolution.confidence > 0.7) {
+      // Math solver succeeded with HIGH confidence — type the answer
       const firstKey = keypadSolution.sequence[0];
-      const jittered = _jitter(firstKey.cx, firstKey.cy);
-      log(`Pixel fallback: MATH SOLVED! answer=${keypadSolution.answer}, sequence has ${keypadSolution.sequence.length} keys, clicking first "${firstKey.probableDigit}" at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
+      const jittered = _jitter(firstKey.cx, firstKey.cy, 3, firstKey);
+      log(`Pixel fallback: MATH SOLVED (conf=${keypadSolution.confidence.toFixed(2)} > 0.7) — answer=${keypadSolution.answer}, clicking first key "${firstKey.probableDigit}" at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
 
-      // Build the full keypad sequence for cycle-manager to execute
       const keypadSequence = keypadSolution.sequence.map(k => ({
         digit: k.probableDigit,
         x: k.cx,
@@ -3276,51 +3463,30 @@ function _quizPageAction(
         reasoning: `Pixel fallback: MATH SOLVED answer=${keypadSolution.answer} (conf=${keypadSolution.confidence.toFixed(2)}, ${keypadSequence.length} keys)`,
         keypadSequence,
         value: keypadSolution.answer,
+        _confidence: 0.75,
       };
     }
 
-    // Fallback: v4 heuristic keypad strategy
-    const qDensity = _getTextDensityInRegion(rgba, width, height,
-      Math.floor(width * 0.1), Math.floor(height * 0.25),
-      Math.floor(width * 0.9), Math.floor(height * 0.55));
-
-    let targetKeys: typeof keypad;
-    if (qDensity > 0.12) {
-      targetKeys = keypad.filter(k => k.probableDigit === '0' || k.probableDigit === '1' || k.probableDigit === '2');
-      if (targetKeys.length === 0) targetKeys = keypad.slice(0, 3);
-    } else {
-      targetKeys = keypad;
-    }
-
-    const recentlyTried = _memory.recentActions
-      .filter(a => a.type === 'click' && a.targetY > height * 0.5 && a.targetY < height * 0.85)
-      .slice(-3);
-    const pick = targetKeys.find(k =>
-      !recentlyTried.some(a => Math.abs(a.targetX - k.cx) < 20 && Math.abs(a.targetY - k.cy) < 20)
-    ) || targetKeys[0];
-
-    const jittered = _jitter(pick.cx, pick.cy);
-    log(`Pixel fallback: found numeric keypad with ${keypad.length} keys, clicking digit "${pick.probableDigit}" at (${jittered.x}, ${jittered.y}) (qDensity=${qDensity.toFixed(2)}, math solver failed/low conf)`, 'INFO', 'pixel-fallback');
-    return {
-      actionType: 'click', targetX: jittered.x, targetY: jittered.y,
-      currentState: 'assessment',
-      reasoning: `Pixel fallback: clicking keypad digit "${pick.probableDigit}" (${keypad.length} keys detected, qDensity=${qDensity.toFixed(2)}, math solver unavailable)`
-    };
+    // Math solver failed or low confidence — DO NOT GUESS
+    log(`Pixel fallback: keypad detected (${keypad.length} keys) but cannot solve question — deferring to tribunal (math conf=${keypadSolution?.confidence.toFixed(2) || 'N/A'})`, 'INFO', 'pixel-fallback');
+    return null;
   }
 
   // Priority 6: Input field (algebraic answer)
-  // v4: Use keyboard type for text entry instead of just clicking
+  // TASK 99 (2026-09-30): Don't manufacture a default answer.
+  // A pixel fallback that cannot read the question should not guess "0".
+  // Instead, just click the input field to focus it, and let the tribunal
+  // (which CAN read the screenshot) decide what to type.
+  // If the tribunal is unavailable (provider drought), the session-
+  // preservation swipe will keep the session alive until providers recover.
   const inputField = _findInputField(rgba, width, height);
   if (inputField) {
-    const jittered = _jitter(inputField.cx, inputField.cy);
-    log(`Pixel fallback: found quiz input field at (${jittered.x}, ${jittered.y}) — will click then type`, 'INFO', 'pixel-fallback');
+    const jittered = _jitter(inputField.cx, inputField.cy, 3, inputField);
+    log(`Pixel fallback: found quiz input field at (${jittered.x}, ${jittered.y}) — clicking to focus (NOT typing a guessed answer — will defer to tribunal for actual answer)`, 'INFO', 'pixel-fallback');
     return {
-      actionType: 'click_type', targetX: jittered.x, targetY: jittered.y,
+      actionType: 'click', targetX: jittered.x, targetY: jittered.y,
       currentState: 'assessment',
-      reasoning: 'Pixel fallback: found quiz answer input field — clicking to focus, then typing placeholder answer',
-      // Hint for cycle-manager: after clicking, type a simple answer
-      _typeAfterClick: true,
-      _typeValue: '0', // Default answer; upstream math verifier may override
+      reasoning: 'Pixel fallback: found quiz answer input field — clicking to focus. NOT typing a default answer — the tribunal should decide what to type.',
     };
   }
 
@@ -3368,6 +3534,7 @@ function _videoPlayerAction(
     const videoProgress = _detectVideoProgress(rgba, width, height);
     if (videoProgress) {
       _memory._lastVideoProgress = videoProgress.progress;
+      if (videoProgress.isPlaying) _memory._videoStuckCount = 0;
       if (!videoProgress.isPlaying && elapsed > 5000) {
         // Video is at 0% or 100% after 5s — might be stuck or finished early
         log(`Pixel fallback: video progress=${(videoProgress.progress * 100).toFixed(0)}% at ${Math.floor(elapsed / 1000)}s — ${videoProgress.progress >= 0.99 ? 'appears complete' : 'might be stuck/buffering'}`, 'WARN', 'pixel-fallback');
@@ -3378,7 +3545,7 @@ function _videoPlayerAction(
           _memory._videoStuckCount = 0;
           if (backButtons.length > 0) {
             const btn = backButtons[0];
-            const jittered = _jitter(btn.cx, btn.cy);
+            const jittered = _jitter(btn.cx, btn.cy, 3, btn);
             log(`Pixel fallback: video done (progress=${(videoProgress.progress * 100).toFixed(0)}%), clicking back at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
             return {
               actionType: 'click', targetX: jittered.x, targetY: jittered.y,
@@ -3405,7 +3572,7 @@ function _videoPlayerAction(
 
     if (backButtons.length > 0) {
       const btn = backButtons[0];
-      const jittered = _jitter(btn.cx, btn.cy);
+      const jittered = _jitter(btn.cx, btn.cy, 3, btn);
       log(`Pixel fallback: video watch complete (${VIDEO_WATCH_DURATION_MS / 1000}s), clicking back button at (${jittered.x}, ${jittered.y}) to dismiss`, 'INFO', 'pixel-fallback');
       return {
         actionType: 'click', targetX: jittered.x, targetY: jittered.y,
@@ -3445,7 +3612,7 @@ function _exercisePageAction(
       // Memo is now visible — look for Next button
       const greenButton = _findGreenButton(rgba, width, height);
       if (greenButton) {
-        const jittered = _jitter(greenButton.cx, greenButton.cy);
+        const jittered = _jitter(greenButton.cx, greenButton.cy, 3, greenButton);
         log(`Pixel fallback: memo viewed, clicking Next at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
         _memory.exercisesCompleted++;
         return {
@@ -3493,7 +3660,7 @@ function _exercisePageAction(
 
   if (allBookCandidates.length > 0) {
     const book = allBookCandidates[allBookCandidates.length - 1];
-    const jittered = _jitter(book.cx, book.cy);
+    const jittered = _jitter(book.cx, book.cy, 3, book);
     _markMemoViewPending();
     log(`Pixel fallback: found open book icon at (${jittered.x}, ${jittered.y}) — clicking to view memo`, 'INFO', 'pixel-fallback');
     return {
@@ -3513,7 +3680,7 @@ function _exercisePageAction(
 
   if (anyCandidates.length > 0) {
     const candidate = anyCandidates[anyCandidates.length - 1];
-    const jittered = _jitter(candidate.cx, candidate.cy);
+    const jittered = _jitter(candidate.cx, candidate.cy, 3, candidate);
     _markMemoViewPending();
     log(`Pixel fallback: found possible book icon candidate at (${jittered.x}, ${jittered.y}) — clicking to view memo`, 'INFO', 'pixel-fallback');
     return {
@@ -3662,7 +3829,37 @@ async function generatePixelFallbackAction(
   // to completion — the cycle-manager's own timeout will catch truly stuck
   // calls, but pixel analysis itself (once the screenshot is captured) is
   // pure CPU and finishes in <100ms.
-  return _generatePixelFallbackActionInner(page, currentState, preDecoded);
+  _lastDecodedWidth = 0;
+  const action = await _generatePixelFallbackActionInner(page, currentState, preDecoded);
+  return _toViewportCoords(page, action);
+}
+
+// ─── Screenshot → viewport coordinate scaling ────────────────────────────
+
+/** Width (px) of the screenshot used for the current call; set by _getDecodedScreenshot. */
+let _lastDecodedWidth = 0;
+
+/** Set PIXEL_FALLBACK_SCALE_COORDS=0 if the caller already converts coordinates itself. */
+const SCALE_TO_VIEWPORT = process.env.PIXEL_FALLBACK_SCALE_COORDS !== '0';
+
+/**
+ * Screenshot pixels equal CSS pixels only when deviceScaleFactor is 1 (or the
+ * screenshot was not resized). If the image width differs from the viewport
+ * width, scale the click target into viewport coordinates. No-op otherwise.
+ */
+function _toViewportCoords(page: any, action: any): any {
+  try {
+    if (!SCALE_TO_VIEWPORT || !action || !_lastDecodedWidth) return action;
+    const vp = page?.viewportSize?.();
+    if (!vp || !vp.width) return action;
+    const scale = vp.width / _lastDecodedWidth;
+    if (Math.abs(scale - 1) < 0.02) return action;
+    if (typeof action.targetX === 'number') action.targetX = Math.round(action.targetX * scale);
+    if (typeof action.targetY === 'number') action.targetY = Math.round(action.targetY * scale);
+    action._coordScale = scale;
+    log(`Pixel fallback: scaled target by ${scale.toFixed(3)} (screenshot ${_lastDecodedWidth}px → viewport ${vp.width}px)`, 'DEBUG', 'pixel-fallback');
+  } catch { /* never let coordinate scaling break an action */ }
+  return action;
 }
 
 async function _generatePixelFallbackActionInner(
@@ -3675,7 +3872,7 @@ async function _generatePixelFallbackActionInner(
     const now = Date.now();
 
     // ── Login flow guard ──
-    if (_isMicrosoftLoginPage(url) || url.includes('login') || url.includes('signin') || url.includes('auth')) {
+    if (_isLoginUrl(url)) {
       log('Pixel fallback: on login page — forcing login-only mode', 'DEBUG', 'pixel-fallback');
       const decoded = await _getDecodedScreenshot(page, preDecoded);
       if (!decoded) return null;
@@ -3737,10 +3934,54 @@ async function _generatePixelFallbackActionInner(
 
     const { width, height, rgba } = decoded;
     const fingerprint = _computePageFingerprint(rgba, width, height);
+    // TASK 103: Also compute 3×3 region fingerprints for change detection
+    const regionFingerprints = _computeRegionFingerprints3x3(rgba, width, height);
 
-    log(`Pixel fallback: analyzing ${width}x${height} image (${fingerprint})` +
-        (currentState ? ` [currentState=${currentState}]` : '') +
-        ` [${_getProgressSummary()}]`, 'DEBUG', 'pixel-fallback');
+    // TASK 103: If the page fingerprint changed since last call, reset the safe action ladder
+    if (_memory.lastActionFingerprintBefore && _fingerprintDistance(fingerprint, _memory.lastActionFingerprintBefore) > FP_CHANGED_MIN_DIST) {
+      _resetSafeActionLadder();
+    }
+
+    // TASK 102 (2026-09-30): Image quality gate.
+    // Refuse to act on screenshots that are too small or have insufficient
+    // contrast. A 50x50 image or a completely flat page has no useful
+    // visual evidence — acting on it would be guessing.
+    if (width < 200 || height < 150) {
+      log(`Pixel fallback: screenshot too small (${width}x${height}) — refusing to act (insufficient visual evidence)`, 'WARN', 'pixel-fallback');
+      _memory.consecutiveFailures++;
+      return null;
+    }
+
+    // Compute contrast (std dev of luminance across sampled pixels)
+    let lumSum = 0, lumSqSum = 0, sampleCount = 0;
+    const step = Math.max(1, Math.floor(Math.sqrt((width * height) / 500))); // ~500 samples
+    for (let y = 0; y < height; y += step) {
+      for (let x = 0; x < width; x += step) {
+        const idx = (y * width + x) * 4;
+        const lum = 0.299 * rgba[idx] + 0.587 * rgba[idx + 1] + 0.114 * rgba[idx + 2];
+        lumSum += lum;
+        lumSqSum += lum * lum;
+        sampleCount++;
+      }
+    }
+    if (sampleCount > 0) {
+      const mean = lumSum / sampleCount;
+      const variance = (lumSqSum / sampleCount) - (mean * mean);
+      const stdDev = Math.sqrt(Math.max(0, variance));
+      if (stdDev < 3) {
+        // Near-zero variance = blank/flat page — no visual evidence
+        log(`Pixel fallback: screenshot has near-zero contrast (stdDev=${stdDev.toFixed(1)}) — page is blank or flat, refusing to act`, 'WARN', 'pixel-fallback');
+        _memory.consecutiveFailures++;
+        return null;
+      }
+      log(`Pixel fallback: analyzing ${width}x${height} image (${fingerprint}) contrast=${stdDev.toFixed(1)}` +
+          (currentState ? ` [currentState=${currentState}]` : '') +
+          ` [${_getProgressSummary()}]`, 'DEBUG', 'pixel-fallback');
+    } else {
+      log(`Pixel fallback: analyzing ${width}x${height} image (${fingerprint})` +
+          (currentState ? ` [currentState=${currentState}]` : '') +
+          ` [${_getProgressSummary()}]`, 'DEBUG', 'pixel-fallback');
+    }
 
     // ── Error page detection ──
     const errorCheck = _detectErrorPage(rgba, width, height, url);
@@ -3769,29 +4010,31 @@ async function _generatePixelFallbackActionInner(
         currentState: currentState || 'unknown',
         reasoning: 'Pixel fallback: modal/overlay detected — clicking close button'
       };
-      _recordAction(action, fingerprint);
+      _recordAction(action, fingerprint, regionFingerprints);
       return action;
     }
 
     // ── Stagnation detection ──
     if (_isStagnating()) {
       log(`Pixel fallback: stagnation detected — same action repeated 3x on same page (${fingerprint})`, 'WARN', 'pixel-fallback');
-      // Clear recent actions to break the loop
+      // Decide BEFORE clearing history, then clear to break the loop
+      const scrollExhausted = _isScrollExhausted(fingerprint);
       _memory.recentActions.length = 0;
       // Try a different strategy: scroll or reload
-      if (_isScrollExhausted(fingerprint)) {
+      if (scrollExhausted) {
         return {
           actionType: 'reload_page', targetX: 0, targetY: 0,
           currentState: currentState || 'unknown',
           reasoning: `Pixel fallback: stagnation + scroll exhausted — reloading page (${_getProgressSummary()})`
         };
       }
-      _incrementScrollDepth(fingerprint);
-      return {
+      const scrollAction = {
         actionType: 'scroll_vertical', targetX: 0, targetY: 0,
         currentState: currentState || 'unknown',
         reasoning: `Pixel fallback: stagnation break — scrolling to find new content`
       };
+      _recordAction(scrollAction, fingerprint); // keeps the scroll streak accurate
+      return scrollAction;
     }
 
     // ── Generate candidate action ──
@@ -3831,17 +4074,92 @@ async function _generatePixelFallbackActionInner(
     }
 
     // ── State-awareness filter ──
+    // TASK 98 (2026-09-29): The state compatibility check MUST actually block.
+    // If the pixel fallback detects a different state than the tribunal, the
+    // action is rejected — period. No exceptions for uncertain states.
+    // The old Task 97 change accepted actions on uncertain states, which
+    // defeated the purpose of the check — the action "went through" even
+    // when the log said it was incompatible.
     if (action && currentState) {
       if (!_isActionStateCompatible(action, currentState)) {
         log(`Pixel fallback: action ${action.actionType} (detected state=${action.currentState}) ` +
-            `is NOT compatible with actual currentState=${currentState} — rejected`, 'WARN', 'pixel-fallback');
+            `is NOT compatible with actual currentState=${currentState} — BLOCKED`, 'WARN', 'pixel-fallback');
         _memory.consecutiveFailures++;
         return null;
       }
     }
 
     if (action) {
-      _recordAction(action, fingerprint);
+      // TASK 100 (2026-09-30): Evidence-based confidence scoring.
+      // Replaced string-based confidence (checking reasoning text) with
+      // evidence-based scoring that reflects actual detection quality.
+      //
+      // Confidence is determined by:
+      //   1. Whether the action came from a high-evidence detector
+      //      (login button, modal, download button = geometry + color)
+      //      or a low-evidence detector (quiz, keypad = guessing)
+      //   2. Whether the page fingerprint is known (previously seen)
+      //   3. Stagnation penalty (same page, no progress)
+      //   4. Consecutive failure penalty
+      //
+      // Navigation actions (modal, login, download, next button) get
+      // HIGH confidence because they're based on clear visual geometry.
+      // Answering actions (quiz choices, keypad) get LOW confidence
+      // because they can't read the question.
+      if (!action._confidence) {
+        let confidence = 0.5; // Base
+
+        // Navigation actions = HIGH confidence (geometry-based detection)
+        if (action.currentState === 'mathu_login' ||
+            action.currentState === 'microsoft_email_input' ||
+            action.currentState === 'error_recovery') {
+          confidence = 0.8; // Login/error recovery = strong visual evidence
+        } else if (action.reasoning?.includes('modal') ||
+                   action.reasoning?.includes('download') ||
+                   action.reasoning?.includes('Next') ||
+                   action.reasoning?.includes('Submit') ||
+                   action.reasoning?.includes('Done')) {
+          confidence = 0.7; // Navigation buttons = good visual evidence
+        } else if (action.reasoning?.includes('video') ||
+                   action.reasoning?.includes('back') ||
+                   action.reasoning?.includes('close')) {
+          confidence = 0.65; // Media controls = medium-high
+        }
+
+        // Answering actions = LOW confidence (can't read question)
+        // These should only appear if math solver succeeded with high conf
+        // (which sets _confidence directly). If we reach here for an
+        // assessment action, it means no confident math solve happened.
+        if (action.currentState === 'assessment') {
+          confidence = 0.3; // Low — we can't verify the answer is correct
+        }
+
+        // Penalize for stagnation
+        if (_isStagnating()) {
+          confidence *= 0.5;
+        }
+
+        // Penalize for consecutive failures
+        if (_memory.consecutiveFailures > 2) {
+          confidence *= 0.7;
+        }
+
+        // TASK 102: Incorporate action feedback loop reward.
+        // Actions that historically changed the page get boosted;
+        // actions that didn't change the page get suppressed.
+        const reward = _getActionReward(action.currentState || 'unknown', action.actionType);
+        if (reward > 0) {
+          confidence = Math.min(0.95, confidence + reward * 0.05); // +0.05 per success
+        } else if (reward < 0) {
+          confidence = Math.max(0.1, confidence + reward * 0.1); // -0.1 per failure (stronger penalty)
+        }
+
+        action._confidence = Math.max(0.1, Math.min(0.95, confidence));
+        action._confidenceSource = 'pixel-fallback';
+        action._actionReward = reward;
+      }
+
+      _recordAction(action, fingerprint, regionFingerprints);
       _memory.consecutiveFailures = 0;
     } else {
       _memory.consecutiveFailures++;
@@ -3864,6 +4182,7 @@ async function _getDecodedScreenshot(
   preDecoded?: { width: number; height: number; rgba: Uint8ClampedArray } | null
 ): Promise<{ width: number; height: number; rgba: Uint8ClampedArray } | null> {
   if (preDecoded && preDecoded.rgba && preDecoded.width > 0 && preDecoded.height > 0) {
+    _lastDecodedWidth = preDecoded.width;
     return preDecoded;
   }
 
@@ -3875,16 +4194,19 @@ async function _getDecodedScreenshot(
   // This is safe for pixel analysis because we just need the pixels, not
   // perfect font rendering.
   let screenshotBuffer: Buffer | null = null;
+  let client: any = null;
   try {
-    const client = await page.context().newCDPSession(page);
+    client = await page.context().newCDPSession(page);
     const result = await client.send('Page.captureScreenshot', { format: 'png' });
-    try { await client.detach(); } catch {}
     if (result?.data) {
       screenshotBuffer = Buffer.from(result.data, 'base64');
     }
   } catch {
     // CDP failed — fall back to Playwright screenshot (may timeout on fonts)
     screenshotBuffer = await page.screenshot({ type: 'png', fullPage: false, timeout: 5000, animations: 'disabled' }).catch(() => null);
+  } finally {
+    // Always detach: previously a failed send() leaked the session.
+    if (client) { try { await client.detach(); } catch {} }
   }
   if (!screenshotBuffer || screenshotBuffer.length < 100) {
     log('Pixel fallback: screenshot failed or empty', 'DEBUG', 'pixel-fallback');
@@ -3897,6 +4219,7 @@ async function _getDecodedScreenshot(
     return null;
   }
 
+  _lastDecodedWidth = decoded.width;
   return decoded;
 }
 
@@ -4019,9 +4342,11 @@ function _isScoreScreenByPixels(rgba: Uint8ClampedArray, width: number, height: 
 
 module.exports = {
   generatePixelFallbackAction,
+  // TASK 102: Action feedback loop — called by cycle-manager after action execution
+  recordActionOutcome,
   // Decode utilities
   _decodePNG,
-  _decodeJPEG,
+
   _decodeScreenshot,
   // Element finders
   _findInputField,
@@ -4058,6 +4383,11 @@ module.exports = {
   _detectErrorPage,
   _detectModal,
   _computePageFingerprint,
+  _computeRegionFingerprint,
+  _fingerprintDistance,
+  _isLoginUrl,
+  _urlPathHas,
+  _toViewportCoords,
   _isStagnating,
   _getProgressSummary,
   // v4 additions (SMART BRAIN)
