@@ -1141,7 +1141,12 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     // paint the UI. This function polls the page using pixel-variance detection
     // until content appears or the timeout expires.
     // Returns true if page rendered, false if still blank after timeout.
-    async function _waitForRenderedPage(pg: any, timeoutMs: number = 15000): Promise<boolean> {
+    //
+    // TASK 96 (2026-09-29): Increased from 15s to 30s.
+    // The Flutter Web app sometimes takes >15s to render on Render free tier
+    // (slow CPU, shared resources). 15s was too short — the bot gave up and
+    // declared the page blank before Flutter finished initializing.
+    async function _waitForRenderedPage(pg: any, timeoutMs: number = 30000): Promise<boolean> {
       try {
         const authGuard = getDep('authGuard');
         if (typeof authGuard?._isPageBlank !== 'function') return true;
@@ -3485,6 +3490,25 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // Stagnation recovery & module tracking
       if (recoverIfStuck) await recoverIfStuck(page, screenshot, action);
       if (trackModuleProgress) await trackModuleProgress(page, base64);
+
+      // TASK 102+103 (2026-09-30): Action feedback loop with region-level change detection.
+      // Tell the pixel fallback whether the last action changed the page.
+      // The pixel fallback stores region fingerprints BEFORE the action;
+      // we pass the new screenshot hash for comparison. If the page changed,
+      // the pixel fallback's recordActionOutcome will also check region-level
+      // changes to distinguish meaningful content change from animation/timer.
+      try {
+        const pixelMod = require('./pixel-fallback');
+        if (pixelMod?.recordActionOutcome) {
+          const pageChanged = previousScreenshotHash !== null && screenshotHash !== previousScreenshotHash;
+          // Pass empty region fingerprints — the cycle manager doesn't have them.
+          // The pixel fallback will fall back to the whole-page hash comparison
+          // for the actionChangedPage boolean, and use its stored region
+          // fingerprints for the region-level analysis.
+          pixelMod.recordActionOutcome([], pageChanged);
+        }
+      } catch { /* non-critical */ }
+
       // ── Memory: release screenshot + base64 after ALL consumers ──
       // This is the last place either is used in the loop iteration.
       // Nulling frees ~20-60KB (base64) + ~15-25KB (raw Buffer) immediately.
