@@ -1574,6 +1574,15 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     const BLANK_RELOAD_THRESHOLD = 2;  // After 2 blank checks → reload
     const BLANK_RESTART_THRESHOLD = 3; // After 3 blank checks → restart browser context
     const BLANK_SELF_HEAL_THRESHOLD = 5; // After 5 blank checks → full self-heal
+    // TASK 109 (2026-10-06): Bounded blank-page recovery.
+    // After MAX_BLANK_RECOVERY_ATTEMPTS, stop the no-progress loop and
+    // raise a specific alert. The old code reset blankPageCounter after
+    // each escalation (reload/restart/self-heal), so the bot cycled
+    // through the escalation steps forever — 353 cycles, 0 questions.
+    // Now: track total blank recovery attempts (never reset), and when
+    // the budget is exhausted, break the cycle and alert.
+    const MAX_BLANK_RECOVERY_ATTEMPTS = 10; // total reloads+restarts+heals before giving up
+    let totalBlankRecoveryAttempts = 0;
 
     // v10: Restart-count tracker — triggers self-heal if too many browser
     // restarts happen in a short window (symptom of a deeper issue).
@@ -1924,7 +1933,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             continue;
           } else if (blankPageCounter >= BLANK_RESTART_THRESHOLD) {
             // Step 2: Restart browser context entirely
-            log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — RESTARTING browser context`, 'ERROR', 'cycle');
+            log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — RESTARTING browser context (total recovery attempts: ${totalBlankRecoveryAttempts}/${MAX_BLANK_RECOVERY_ATTEMPTS})`, 'ERROR', 'cycle');
             // v12 FIX: Do NOT reset blankPageCounter here.
             // The counter only resets when the page is confirmed non-blank.
             // This ensures repeated restarts eventually escalate to self-heal.
@@ -1999,7 +2008,16 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               }
             } catch { /* ip-rotator not loaded — skip */ }
 
-            log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — reloading MathU`, 'WARN', 'cycle');
+            log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — reloading MathU (total recovery attempts: ${totalBlankRecoveryAttempts}/${MAX_BLANK_RECOVERY_ATTEMPTS})`, 'WARN', 'cycle');
+          totalBlankRecoveryAttempts++;
+          // TASK 109: Budget check on reload path too
+          if (totalBlankRecoveryAttempts >= MAX_BLANK_RECOVERY_ATTEMPTS) {
+            log(`Blank-page recovery budget EXHAUSTED on reload step (${totalBlankRecoveryAttempts}/${MAX_BLANK_RECOVERY_ATTEMPTS}). Stopping and alerting.`, 'ERROR', 'cycle');
+            try { getDep('alerting')?.sendAlert?.(`MathU Bot stuck: ${totalBlankRecoveryAttempts} blank-page recovery attempts failed. Flutter Web app not rendering.`); } catch {}
+            (globalThis as any).__humanInterventionRequested = true;
+            (globalThis as any).__humanInterventionReason = `Blank-page recovery budget exhausted (${totalBlankRecoveryAttempts} attempts).`;
+            break;
+          }
             const targetUrl = _getRecoveryUrl();
             if (targetUrl) {
               await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
@@ -2304,9 +2322,37 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           loopCheck = progressCircularPathDetector.checkStateLoop(currentState, screenshotHash);
           if (loopCheck?.isLooping) {
             log(`SPA visual loop detected! State "${currentState}" hash "${screenshotHash.substring(0, 8)}" repeated ${loopCheck.loopCount} times. ${loopCheck.suggestion}`, 'WARN', 'cycle');
-            // On SPA: scroll down to break the visual stalemate before navigating away
-            try { await page.evaluate(() => window.scrollBy(0, 300)); } catch { /* non-critical */ }
-            await new Promise(r => setTimeout(r, 2000));
+            // TASK 105 (2026-10-03): On a BLANK page, scrolling doesn't help.
+            // The page is blank because Flutter hasn't rendered yet (CanvasKit
+            // initialization takes 10-30s on Render free tier). Scrolling a
+            // blank page does nothing — the bot just loops back to the same
+            // blank state, re-detects the loop, and scrolls again forever.
+            //
+            // Instead: check if the page is blank. If so, WAIT for Flutter
+            // to render (up to 30s). Only scroll if the page has content.
+            const authGuard = getDep('authGuard');
+            const isBlank = authGuard?._isPageBlank ? await authGuard._isPageBlank(page).catch(() => false) : false;
+            if (isBlank) {
+              log(`SPA loop on blank ${currentState} page — waiting for Flutter to render (up to 30s) instead of scrolling`, 'WARN', 'cycle');
+              const renderDeadline = Date.now() + 30000;
+              let rendered = false;
+              while (Date.now() < renderDeadline) {
+                await new Promise(r => setTimeout(r, 3000));
+                const stillBlank = authGuard?._isPageBlank ? await authGuard._isPageBlank(page).catch(() => false) : false;
+                if (!stillBlank) {
+                  rendered = true;
+                  log('SPA loop: page rendered after wait — breaking loop', 'INFO', 'cycle');
+                  break;
+                }
+              }
+              if (!rendered) {
+                log('SPA loop: page still blank after 30s wait — will proceed to tribunal/pixel fallback', 'WARN', 'cycle');
+              }
+            } else {
+              // Page has content — scroll to break the visual stalemate
+              try { await page.evaluate(() => window.scrollBy(0, 300)); } catch { /* non-critical */ }
+              await new Promise(r => setTimeout(r, 2000));
+            }
           }
         } else {
           loopCheck = progressCircularPathDetector.checkUrlLoop(beforeUrl);
@@ -2358,6 +2404,41 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // Resilience: quota throttle check before tribunal
       if (economyQuotaRations?.isEconomyMode?.()) {
         log('Economy mode active — reducing tribunal calls', 'INFO', 'cycle');
+      }
+
+      // TASK 106 (2026-10-03): Skip tribunal on blank pages.
+      // The user correctly identified: "If the page was blank when we called
+      // the tribunal, we should have sensed it at SOME POINT. We are constantly
+      // checking the pixel colours and the AIs themselves report if the page
+      // is blank. One might be wrong but I doubt it's both at the same time
+      // consistently. The issue must be something else."
+      //
+      // The issue IS that both the pixel check AND the AI are detecting blank,
+      // but the bot STILL calls the tribunal and executes the AI's action.
+      // The AI (Groq) hallucinates "mathu_login / click" on a blank screenshot
+      // — it should say "blank_page" but doesn't. So the bot clicks on
+      // invisible buttons, which triggers the login flow, which returns to
+      // a blank page, and the cycle repeats forever.
+      //
+      // Fix: After taking the screenshot, check if the page is visually blank.
+      // If so, set currentState = 'blank_page' and SKIP the tribunal entirely.
+      // The blank-page escalation ladder (reload → restart → self-heal) will
+      // handle recovery. Don't waste API calls on blank screenshots.
+      if (base64 && base64.length > 100) {
+        const authGuardMod = getDep('authGuard');
+        if (authGuardMod?._isPageBlank) {
+          const isBlank = await authGuardMod._isPageBlank(page).catch(() => false);
+          if (isBlank) {
+            log('Page is visually blank — SKIPPING tribunal (not calling AI on a blank screenshot). Setting state to blank_page for escalation.', 'WARN', 'cycle');
+            currentState = 'blank_page';
+            action = { actionType: 'wait', currentState: 'blank_page', targetX: 0, targetY: 0, reasoning: 'Page is visually blank — skipping tribunal call' };
+            // Skip to blank_page escalation
+            blankPageCounter++;
+            unknownStateCounter = 0;
+            log(`blank_page state detected (${blankPageCounter} consecutive). Escalating...`, 'WARN', 'cycle');
+            // Fall through to blank_page handling below (don't call tribunal)
+          }
+        }
       }
 
       // ─── Action Cache Lookup ───
@@ -3704,7 +3785,46 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         if (blankPageCounter >= BLANK_SELF_HEAL_THRESHOLD) {
           // Step 3: Trigger full self-heal — something is fundamentally broken
           // v12: If the page is blank this many times, the AIs can figure it out.
-          log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — triggering full self-heal (AI investigation)`, 'ERROR', 'cycle');
+          totalBlankRecoveryAttempts++;
+          log(`Blank-page escalation: ${blankPageCounter} consecutive blanks (total recovery attempts: ${totalBlankRecoveryAttempts}/${MAX_BLANK_RECOVERY_ATTEMPTS}) — triggering full self-heal (AI investigation)`, 'ERROR', 'cycle');
+
+          // TASK 109: Capture DOM/console/network evidence BEFORE reloading.
+          // The supervisor requested this for diagnosis.
+          try {
+            const domSnapshot = await page.content().catch(() => '<unavailable>');
+            const consoleErrors: string[] = [];
+            try {
+              page.on('console', (msg: any) => {
+                if (msg.type() === 'error') consoleErrors.push(msg.text().substring(0, 200));
+              });
+            } catch {}
+            const url = page.url();
+            log(`Blank-page evidence: url=${url}, domSize=${domSnapshot.length}, consoleErrors=${consoleErrors.length}`, 'WARN', 'cycle');
+            if (consoleErrors.length > 0) {
+              log(`Blank-page console errors: ${consoleErrors.slice(0, 5).join(' | ')}`, 'WARN', 'cycle');
+            }
+            // Push to self-heal error buffer for the codegen tribunal
+            try {
+              const selfHealMod = getDep('selfHeal') || require('./self-heal');
+              selfHealMod?.pushSelfHealError?.(`blank_page: url=${url}, domSize=${domSnapshot.length}, consoleErrors=${consoleErrors.length}, consoleSamples=${consoleErrors.slice(0, 3).join('; ').substring(0, 300)}`, 'blank-page-recovery');
+            } catch {}
+          } catch (evidenceErr: any) {
+            log(`Blank-page evidence capture failed: ${evidenceErr.message}`, 'DEBUG', 'cycle');
+          }
+
+          // TASK 109: Check if recovery budget is exhausted
+          if (totalBlankRecoveryAttempts >= MAX_BLANK_RECOVERY_ATTEMPTS) {
+            log(`Blank-page recovery budget EXHAUSTED (${totalBlankRecoveryAttempts}/${MAX_BLANK_RECOVERY_ATTEMPTS}). Stopping no-progress loop and raising alert.`, 'ERROR', 'cycle');
+            try {
+              const alerting = getDep('alerting');
+              alerting?.sendAlert?.(`MathU Bot stuck: ${totalBlankRecoveryAttempts} blank-page recovery attempts failed. The Flutter Web app is not rendering. Bot is pausing to avoid wasting resources. Manual investigation needed.`);
+            } catch {}
+            // Set human intervention flag — don't touch the browser
+            (globalThis as any).__humanInterventionRequested = true;
+            (globalThis as any).__humanInterventionReason = `Blank-page recovery budget exhausted (${totalBlankRecoveryAttempts} attempts). Flutter Web app not rendering.`;
+            break; // Break out of the cycle loop
+          }
+
           blankPageCounter = 0;
           try {
             const selfHealMod = getDep('selfHeal');
@@ -3748,7 +3868,8 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           continue;
         } else if (blankPageCounter >= BLANK_RESTART_THRESHOLD) {
           // Step 2: Restart browser context entirely
-          log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — RESTARTING browser context`, 'ERROR', 'cycle');
+          totalBlankRecoveryAttempts++;
+          log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — RESTARTING browser context (total recovery attempts: ${totalBlankRecoveryAttempts}/${MAX_BLANK_RECOVERY_ATTEMPTS})`, 'ERROR', 'cycle');
           // v12 FIX: Do NOT reset blankPageCounter here.
           try {
             _trackBrowserRestart();
@@ -3777,7 +3898,16 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           continue;
         } else if (blankPageCounter >= BLANK_RELOAD_THRESHOLD) {
           // Step 1: Reload MathU
-          log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — reloading MathU`, 'WARN', 'cycle');
+          log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — reloading MathU (total recovery attempts: ${totalBlankRecoveryAttempts}/${MAX_BLANK_RECOVERY_ATTEMPTS})`, 'WARN', 'cycle');
+          totalBlankRecoveryAttempts++;
+          // TASK 109: Budget check on reload path too
+          if (totalBlankRecoveryAttempts >= MAX_BLANK_RECOVERY_ATTEMPTS) {
+            log(`Blank-page recovery budget EXHAUSTED on reload step (${totalBlankRecoveryAttempts}/${MAX_BLANK_RECOVERY_ATTEMPTS}). Stopping and alerting.`, 'ERROR', 'cycle');
+            try { getDep('alerting')?.sendAlert?.(`MathU Bot stuck: ${totalBlankRecoveryAttempts} blank-page recovery attempts failed. Flutter Web app not rendering.`); } catch {}
+            (globalThis as any).__humanInterventionRequested = true;
+            (globalThis as any).__humanInterventionReason = `Blank-page recovery budget exhausted (${totalBlankRecoveryAttempts} attempts).`;
+            break;
+          }
           const targetUrl = _getRecoveryUrl();
           if (targetUrl) {
             try {
