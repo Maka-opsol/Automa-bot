@@ -17,8 +17,12 @@ function _getLogger() { if (!_logger) _logger = require('./logger'); return _log
 async function fetchWithTimeout(url: any, options: any = {}, timeoutMs?: number) {
   const config = _getConfig();
   const effectiveTimeout = timeoutMs ?? config.REQUEST_TIMEOUT_MS ?? 30000;
+  // TASK 108 (2026-10-03): If timeout is 0, don't set a timer at all.
+  // This allows codegen providers to run without any fetch-level timeout.
+  // The caller's own signal (if any) still controls abort.
+  const useTimeout = effectiveTimeout > 0;
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
+  const timeoutId = useTimeout ? setTimeout(() => controller.abort(), effectiveTimeout) : null;
   let externalAbortHandler;
   if (options.signal) { 
     externalAbortHandler = () => controller.abort(); 
@@ -27,7 +31,7 @@ async function fetchWithTimeout(url: any, options: any = {}, timeoutMs?: number)
     if (options.signal.aborted) { controller.abort(); }
   }
   if (!nativeFetch) {
-    clearTimeout(timeoutId);
+    if (timeoutId) clearTimeout(timeoutId);
     if (options.signal && externalAbortHandler) { options.signal.removeEventListener('abort', externalAbortHandler); }
     throw new Error('No fetch implementation available (Node ≥ 20.6.0 required)');
   }
@@ -35,7 +39,7 @@ async function fetchWithTimeout(url: any, options: any = {}, timeoutMs?: number)
     const response = await nativeFetch(url, { ...options, signal: controller.signal });
     return response;
   } finally { 
-    clearTimeout(timeoutId); 
+    if (timeoutId) clearTimeout(timeoutId); 
     if (options.signal && externalAbortHandler) { options.signal.removeEventListener('abort', externalAbortHandler); }
   }
 }
