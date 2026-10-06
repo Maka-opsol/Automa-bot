@@ -35,6 +35,13 @@ function _getClient(apiKey: string): any {
     _client = new OpenAI({
       baseURL: 'https://api.voidai.app/v1',
       apiKey: apiKey,
+      // TASK 108 (2026-10-03): Disable SDK-level timeout and retries.
+      // Codegen tribunals should NOT time out (user's explicit request).
+      // The SDK's default 60s timeout kills long code generation responses.
+      // The SDK's default 2 retries conflict with our own retry loop in
+      // callVoidAICodeGenWithModel (would double the retry count).
+      timeout: 0,       // 0 = no timeout (wait forever)
+      maxRetries: 0,    // 0 = no SDK retries (we handle retries ourselves)
     });
     (_client as any)._apiKey = apiKey;
   }
@@ -68,33 +75,66 @@ async function callVoidAICodeGenWithModel(prompt: any, signal: any, modelSlug: a
   const client = _getClient(apiKey);
 
   let content: string;
-  try {
-    const response = await client.chat.completions.create({
-      model: modelSlug,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1,
-      max_tokens: 2048,
-    }, { signal });
-    content = response.choices[0].message.content ?? '';
-  } catch (err: any) {
-    // TASK 79 (2026-09-25): Include more context in error messages.
-    // The OpenAI SDK sometimes throws errors with very short messages
-    // (e.g., just "5" for a 500 error). Include status, code, and type
-    // for better debugging.
-    const status = err?.status || err?.statusCode || '';
-    const code = err?.error?.code || err?.code || '';
-    const type = err?.error?.type || err?.type || '';
-    const detail = err?.error?.message || err?.message || String(err);
-    const parts: string[] = [`VoidAI ${modelSlug}`];
-    if (status) parts.push(`HTTP ${status}`);
-    if (code) parts.push(`code=${code}`);
-    if (type) parts.push(`type=${type}`);
-    parts.push(detail);
-    throw new Error(parts.join(': '));
+  let lastErr: any = null;
+  const maxRetries = 2;
+
+  // TASK 107 (2026-10-03): Retry on HTTP 500 errors.
+  // VoidAI's gpt-5.3-codex and claude-haiku-4-5 models intermittently return
+  // HTTP 500 (server-side errors). These are transient — retrying with a
+  // short delay often succeeds. The old code threw immediately on any error,
+  // wasting the entire codegen tribunal round.
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await client.chat.completions.create({
+        model: modelSlug,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.1,
+        max_tokens: 2048,
+      }, { signal });
+      content = response.choices[0].message.content ?? '';
+
+      // Success — break out of retry loop
+      if (content && content.trim().length > 0) {
+        break;
+      }
+      // Empty response — treat as error and retry
+      lastErr = new Error(`VoidAI ${modelSlug} empty response`);
+    } catch (err: any) {
+      lastErr = err;
+      const status = err?.status || err?.statusCode || 0;
+      const errMsg = String(err?.message || err || '');
+
+      // Only retry on 500 (server error) or network errors
+      const isRetryable = status === 500 || status === 502 || status === 503 ||
+        errMsg.includes('request_failed') || errMsg.includes('ETIMEDOUT') ||
+        errMsg.includes('ECONNRESET') || errMsg.includes('fetch failed');
+
+      if (!isRetryable || attempt === maxRetries) {
+        // Non-retryable error or max retries exhausted — throw with context
+        const code = err?.error?.code || err?.code || '';
+        const type = err?.error?.type || err?.type || '';
+        const detail = err?.error?.message || err?.message || String(err);
+        const parts: string[] = [`VoidAI ${modelSlug}`];
+        if (status) parts.push(`HTTP ${status}`);
+        if (code) parts.push(`code=${code}`);
+        if (type) parts.push(`type=${type}`);
+        parts.push(detail);
+        if (attempt > 0) parts.push(`(after ${attempt + 1} attempts)`);
+        throw new Error(parts.join(': '));
+      }
+
+      // Retryable — wait before next attempt
+      const backoffMs = 1000 * (attempt + 1); // 1s, 2s
+      try {
+        const { log } = require('./logger');
+        log(`VoidAI/${modelSlug}: HTTP ${status} on attempt ${attempt + 1}/${maxRetries + 1} — retrying in ${backoffMs}ms`, 'WARN', 'voidai');
+      } catch {}
+      await new Promise(r => setTimeout(r, backoffMs));
+    }
   }
 
   if (!content || content.trim().length === 0) {
-    throw new Error(`VoidAI ${modelSlug} empty response`);
+    throw lastErr || new Error(`VoidAI ${modelSlug} empty response after ${maxRetries + 1} attempts`);
   }
 
   // Debug log: first 200 chars of raw response (helps diagnose parse failures)
