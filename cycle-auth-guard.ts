@@ -661,18 +661,16 @@ async function ensureAuthenticated(page: any) {
     const preRefreshBlank = await _isPageBlank(page);
     if (preRefreshBlank) {
       (page as any)._authBlankPage = true;
-      // TASK 97 (2026-09-29): Don't re-authenticate on blank pages!
+      // TASK 97+105 (2026-09-29 / 2026-10-03): Don't re-authenticate on blank pages!
       // The blank page is NOT a session expiry — it's Flutter still rendering.
-      // Re-authenticating every time the page is blank causes a login loop:
-      //   1. Page loads → blank (Flutter initializing)
-      //   2. Auth guard sees blank → "session invalid" → login flow
-      //   3. Login flow completes → returns to app → blank again
-      //   4. Repeat every 2 minutes, burning all provider quota on login clicks
+      // Re-authenticating every time the page is blank causes a login loop.
       //
-      // Instead: wait for the page to render (up to 30s), then re-check.
-      // Only re-authenticate if the page is STILL blank after 30s.
-      log('SPA session check: page is blank — waiting for Flutter to render before re-auth (up to 30s)...', 'WARN', 'auth-guard');
-      const renderDeadline = Date.now() + 30000;
+      // Wait for the page to render (up to 60s — Flutter on Render free tier
+      // can take 30-45s to initialize CanvasKit). If still blank after 60s,
+      // try a page.reload() — the Flutter app may have crashed during init.
+      // Only re-authenticate if the page is STILL blank after reload.
+      log('SPA session check: page is blank — waiting for Flutter to render (up to 60s)...', 'WARN', 'auth-guard');
+      const renderDeadline = Date.now() + 60000;
       let rendered = false;
       while (Date.now() < renderDeadline) {
         await new Promise(r => setTimeout(r, 3000));
@@ -685,7 +683,30 @@ async function ensureAuthenticated(page: any) {
         }
       }
       if (!rendered) {
-        log('SPA session check: page still blank after 30s wait — proceeding with re-auth', 'WARN', 'auth-guard');
+        // TASK 105: Page still blank after 60s — try reloading before re-auth.
+        // The Flutter app may have crashed during CanvasKit initialization.
+        // A reload gives it a fresh chance to render.
+        log('SPA session check: page still blank after 60s wait — trying page.reload() before re-auth', 'WARN', 'auth-guard');
+        try {
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+          // Wait another 30s after reload
+          const reloadDeadline = Date.now() + 30000;
+          while (Date.now() < reloadDeadline) {
+            await new Promise(r => setTimeout(r, 3000));
+            const stillBlank = await _isPageBlank(page);
+            if (!stillBlank) {
+              rendered = true;
+              log('SPA session check: page rendered after reload — session is valid, skipping re-auth', 'INFO', 'auth-guard');
+              authAttempts = 0;
+              return page;
+            }
+          }
+        } catch (reloadErr: any) {
+          log(`SPA session check: reload failed: ${reloadErr.message}`, 'WARN', 'auth-guard');
+        }
+        if (!rendered) {
+          log('SPA session check: page still blank after 60s + reload — proceeding with re-auth', 'WARN', 'auth-guard');
+        }
       }
     }
     log('SPA session invalid, attempting re-auth (no URL change)...', 'WARN', 'auth-guard');
