@@ -27,6 +27,10 @@ function _getClient(apiKey: string): any {
     _client = new OpenAI({
       baseURL: 'https://api.bazaarlink.ai/v1',
       apiKey: apiKey,
+      // TASK 108 (2026-10-03): Disable SDK-level timeout and retries.
+      // Codegen tribunals should NOT time out (user's explicit request).
+      timeout: 0,       // 0 = no timeout (wait forever)
+      maxRetries: 0,    // 0 = no SDK retries
     });
     (_client as any)._apiKey = apiKey;
   }
@@ -75,7 +79,13 @@ async function callBazaarLinkCodeGenWithModel(prompt: any, signal: any, modelSlu
     if (err?.status === 429 || String(err?.message || '').includes('429')) {
       _getLimiter().recordUsage();
     }
-    throw new Error(`BazaarLink ${modelSlug}: ${err.message || err}`);
+    // TASK 107 (2026-10-03): Include more context in error messages.
+    const status = err?.status || err?.statusCode || '';
+    const detail = err?.error?.message || err?.message || String(err);
+    const parts: string[] = [`BazaarLink ${modelSlug}`];
+    if (status) parts.push(`HTTP ${status}`);
+    parts.push(detail);
+    throw new Error(parts.join(': '));
   }
 
   if (!content || content.trim().length === 0) {
