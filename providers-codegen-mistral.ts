@@ -93,12 +93,14 @@ async function callMistralCodeGen(prompt: any, signal: any) {
     // forces the top-level to be an object — causing Mistral to
     // double-escape the array into a string value.
   };
+  // TASK 108 (2026-10-03): Pass timeout=0 to disable fetchWithTimeout's
+  // default 30s timeout. Codegen tribunals should NOT time out.
   const response = await fetchWithTimeout('https://api.mistral.ai/v1/chat/completions', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
     signal
-  });
+  }, 0); // 0 = no timeout (wait forever for code generation)
   if (!response.ok) {
     const errorText = sanitizeErrorText(await response.text());
     throw new Error(`Mistral HTTP ${response.status}: ${errorText}`);
