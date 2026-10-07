@@ -83,8 +83,13 @@ async function fetchWithTimeout(url: any, options: any = {}, timeoutMs?: number)
     // Inline fallback if utils-fetch unavailable
     const config = require('./get-config');
     const effectiveTimeout = timeoutMs ?? config.REQUEST_TIMEOUT_MS ?? 30000;
+    // TASK 110 (2026-10-06): Handle timeout=0 as "no timeout" in the
+    // inline fallback too (the utils-fetch version already handles this,
+    // but the inline fallback didn't — causing codegen requests to time out
+    // at 30s when utils-fetch wasn't loaded).
+    const useTimeout = effectiveTimeout > 0;
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
+    const timeoutId = useTimeout ? setTimeout(() => controller.abort(), effectiveTimeout) : null;
     let externalAbortHandler;
     if (options.signal) {
       externalAbortHandler = () => controller.abort();
@@ -95,7 +100,7 @@ async function fetchWithTimeout(url: any, options: any = {}, timeoutMs?: number)
       const response = await _nativeFetch(url, { ...options, signal: controller.signal });
       return response;
     } finally {
-      clearTimeout(timeoutId);
+      if (timeoutId) clearTimeout(timeoutId);
       if (options.signal && externalAbortHandler) { options.signal.removeEventListener('abort', externalAbortHandler); }
     }
   }
@@ -600,17 +605,22 @@ async function safeCall(
     }
   }
 
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => {
-      abortController.abort();
-      reject(new Error(`${label} timed out after ${timeoutMs}ms${url ? ` (${url})` : ''}`));
-    }, timeoutMs);
-  });
+  // TASK 110 (2026-10-06): If timeoutMs is 0 or Infinity, don't set a timer.
+  // This allows codegen provider calls (which use safeCall) to run without
+  // any timeout. The old code always set a 120s timer — "Request timed out"
+  // errors in the codegen tribunal were caused by this timer firing.
+  const useTimeout = timeoutMs > 0 && timeoutMs !== Infinity;
+
+  const timeoutPromise = useTimeout
+    ? new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          abortController.abort();
+          reject(new Error(`${label} timed out after ${timeoutMs}ms${url ? ` (${url})` : ''}`));
+        }, timeoutMs);
+      })
+    : new Promise<never>(() => {}); // never resolves — no timeout
 
   // Start fn(signal) so we can attach a catch handler if timeout wins the race.
-  // Without this, when the timeout fires first, fn()'s promise keeps running
-  // in the background — if it later rejects (e.g. Array.from corruption),
-  // that rejection is unhandled and crashes the process.
   const fnPromise = fn(signal);
 
   try {
@@ -621,8 +631,6 @@ async function safeCall(
     return result;
   } catch (err: any) {
     log(`${label} failed: ${err.message || err}`, 'WARN', 'base');
-    // If we timed out, fnPromise is still in flight. Attach a silent catch
-    // to prevent UNHANDLED_REJECTION if it later rejects.
     fnPromise.catch(() => {});
     throw err;
   } finally {
