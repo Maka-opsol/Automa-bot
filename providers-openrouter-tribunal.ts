@@ -29,18 +29,28 @@ function _getRegistry() { if (!_registry) _registry = require('./providers-regis
  * When specific fallback models keep failing, we stop bothering with them
  * entirely. openrouter/free auto-routes anyway — no point naming specific
  * models if they all die. Fatigue resets on any success or after 10 min.
+ *
+ * TASK 112 (2026-10-08): Check daily limit BEFORE wasting API calls.
+ * If X-RateLimit-Remaining is 0, the daily free-model quota is exhausted.
+ * No point making 4+ API calls that will all 429. Check the limit first,
+ * and if exhausted, throw immediately with OPENROUTER_DAILY_LIMIT so the
+ * cycle manager can park until midnight.
  */
 let _fallbackFatigueCount = 0;
 let _fallbackFatigueResetTimer: any = null;
 const FALLBACK_FATIGUE_THRESHOLD = 3;         // 3 specific-model failures → skip them
 const FALLBACK_FATIGUE_RESET_MS = 10 * 60 * 1000;
 
+// TASK 112: Track daily limit exhaustion
+let _dailyLimitExhausted = false;
+let _dailyLimitResetTime = 0;
+
 /* ── openrouter/free retry config ───────────────────────────────────────────
  * openrouter/free gets way more chances than any specific model.
  * It auto-routes to whatever's healthy — it'll work eventually.
  */
-const OR_FREE_RETRIES = 0;                    // TASK 47: no retries — was 3 (4 total attempts)
-const OR_FREE_BASE_DELAY = 2000;              // 2s → 4s → 8s backoff (unused with 0 retries)
+const OR_FREE_RETRIES = 3;                    // retries (4 total attempts: 1 + 3)
+const OR_FREE_BASE_DELAY = 2000;              // 2s → 4s → 8s backoff
 
 /** Record a specific-model failure. Returns true when fatigue threshold is hit. */
 function _recordFallbackFailure(): boolean {
@@ -103,6 +113,22 @@ function OpenRouterTribunalProvider() {
     const log = _getLogger().log;
     const hasImage = !!base64Image;
     const isFatigued = _isFallbackFatigued();
+
+    // TASK 112: Check daily limit BEFORE making any API calls.
+    // If the daily limit is exhausted, throw immediately — don't waste
+    // time on 4+ API calls that will all 429. The cycle manager handles
+    // OPENROUTER_DAILY_LIMIT by parking until midnight.
+    if (_dailyLimitExhausted) {
+      if (Date.now() < _dailyLimitResetTime) {
+        const remainingMin = Math.round((_dailyLimitResetTime - Date.now()) / 60000);
+        log(`OpenRouter: daily limit exhausted — skipping all API calls (${remainingMin}min until reset)`, 'WARN', 'openrouter');
+        throw new Error(`OPENROUTER_DAILY_LIMIT: ${remainingMin}min until reset`);
+      } else {
+        // Reset time passed — clear the flag
+        _dailyLimitExhausted = false;
+        log('OpenRouter: daily limit reset time passed — clearing flag, resuming API calls', 'INFO', 'openrouter');
+      }
+    }
 
     /**
      * Try a single model with retries. Must live here to capture
@@ -172,7 +198,7 @@ function OpenRouterTribunalProvider() {
                 endpoint, apiKey, m, base64Image, prompt, 'OpenRouter',
                 { signal }
               ),
-              { providerName: 'OpenRouter', maxRetries: 0, baseDelay: 1000, signal }
+              { providerName: 'OpenRouter', maxRetries: 1, baseDelay: 1000, signal }
             );
             // Specific model worked — but openrouter/free is still king
             _resetFallbackFatigue();
@@ -267,4 +293,16 @@ async function waitForOpenRouterBudget(): Promise<void> {
   });
 }
 
-module.exports = { OpenRouterTribunalProvider, waitForOpenRouterBudget, _fallbackFatigueCount: () => _fallbackFatigueCount };
+/**
+ * TASK 112: Set the daily limit exhaustion flag.
+ * Called by providers-base.ts when a 429 "free-models-per-day" error is received.
+ * @param resetTime - epoch milliseconds when the daily quota resets
+ */
+function _setDailyLimitExhausted(resetTime: number): void {
+  _dailyLimitExhausted = true;
+  _dailyLimitResetTime = resetTime;
+  const { log } = require('./logger');
+  log(`OpenRouter: daily limit flag SET — will skip all API calls until ${new Date(resetTime).toISOString()} (${Math.round((resetTime - Date.now()) / 60000)}min)`, 'WARN', 'openrouter');
+}
+
+module.exports = { OpenRouterTribunalProvider, waitForOpenRouterBudget, _fallbackFatigueCount: () => _fallbackFatigueCount, _setDailyLimitExhausted };
