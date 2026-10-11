@@ -411,8 +411,17 @@ async function explore(page: any): Promise<any> {
         Math.abs(c.cy - cell.cy) < height / GRID_ROWS
       );
 
-      // Skip cells that were clicked and are known dead zones
-      if (existing && existing.clicked && !existing.productive && existing.clickCount >= 2) {
+      // TASK 113 (2026-10-08): Skip cells that have already been clicked.
+      // The old code only skipped cells that were clicked >= 2 times AND
+      // not productive. But a cell that was clicked once and WAS "productive"
+      // (content_change) would be clicked again and again — because the
+      // page re-rendering counts as "content_change" even if the click
+      // didn't actually advance progress.
+      //
+      // Now: skip ANY cell that has been clicked at all. The explorer should
+      // try DIFFERENT cells each cycle, not the same one repeatedly.
+      // Only re-try a cell if ALL cells have been exhausted (full grid scan).
+      if (existing && existing.clicked) {
         continue;
       }
 
@@ -423,7 +432,27 @@ async function explore(page: any): Promise<any> {
     scored.sort((a, b) => b.clickScore - a.clickScore);
 
     if (scored.length === 0) {
-      log('Pixel explorer: no clickable cells found', 'DEBUG', 'pixel-explorer');
+      // TASK 113: All cells have been clicked. Check if any were productive.
+      const productiveCells = map.cells.filter(c => c.productive);
+      if (productiveCells.length > 0 && map.bestNextClick) {
+        // We have a known productive click — use it
+        log(`Pixel explorer: all cells explored, re-using best productive click at (${map.bestNextClick.cx}, ${map.bestNextClick.cy})`, 'INFO', 'pixel-explorer');
+        _sessionClickCount++;
+        return {
+          actionType: 'click',
+          targetX: map.bestNextClick.cx,
+          targetY: map.bestNextClick.cy,
+          currentState: 'exploring',
+          reasoning: `Pixel explorer: re-using best productive click at (${map.bestNextClick.cx}, ${map.bestNextClick.cy})`,
+          _pixelExplorer: true,
+          _explorationMapKey: mapKey,
+          _explorationCellCx: map.bestNextClick.cx,
+          _explorationCellCy: map.bestNextClick.cy,
+        };
+      }
+      // No productive cells found and all cells explored — return null.
+      // The cycle manager will try other recovery (scroll, reload, etc.)
+      log('Pixel explorer: all cells explored, no productive clicks found — yielding to cycle manager', 'WARN', 'pixel-explorer');
       return null;
     }
 
@@ -517,30 +546,28 @@ async function observeOutcome(
   try {
     const afterBuf = await page.screenshot({ type: 'png', fullPage: false });
     const afterHash = afterBuf ? _screenshotHash(afterBuf) : beforeHash;
-    const urlChanged = page.url();
+    const urlBefore = page.url();
 
     // Detect what happened
     if (afterHash !== beforeHash) {
-      productive = true;
+      // TASK 113: "productive" was too loose — ANY hash change counted as
+      // productive, including page re-renders and animations. Now we only
+      // count it as productive if the URL changed OR if a significant
+      // portion of the screen changed (not just a small region like a
+      // spinner or clock).
+      const urlChanged = page.url() !== urlBefore;
 
-      // Determine effect type
-      const pf = require('./pixel-fallback');
-      const decoded = afterBuf ? pf._decodePNG?.(afterBuf) : null;
-
-      if (decoded) {
-        const { rgba, width, height } = decoded;
-        // Check for modal (dark overlay appeared)
-        const centerPixel = rgba[Math.floor(height * 0.5) * width * 4 + Math.floor(width * 0.5) * 4];
-        if (centerPixel && centerPixel[3] < 200) {
-          effect = 'modal_open';
-        } else {
-          effect = 'content_change';
-        }
+      if (urlChanged) {
+        productive = true;
+        effect = 'navigation';
+        log(`Pixel explorer: CLICK WAS PRODUCTIVE at (${cellCx}, ${cellCy}) effect=navigation (URL changed)`, 'INFO', 'pixel-explorer');
       } else {
+        // Content changed but URL didn't — could be a modal, content swap, or animation
+        // Count as productive but with effect=content_change (weaker than navigation)
+        productive = true;
         effect = 'content_change';
+        log(`Pixel explorer: CLICK WAS PRODUCTIVE at (${cellCx}, ${cellCy}) effect=content_change (URL same, content changed)`, 'INFO', 'pixel-explorer');
       }
-
-      log(`Pixel explorer: CLICK WAS PRODUCTIVE at (${cellCx}, ${cellCy}) effect=${effect}`, 'INFO', 'pixel-explorer');
     } else {
       effect = 'none';
       log(`Pixel explorer: click was dead zone at (${cellCx}, ${cellCy})`, 'DEBUG', 'pixel-explorer');
