@@ -34,7 +34,31 @@ function NvidiaProvider() {
     );
 
     if (options.validate === false) return rawContent;
-    return validateActionResponse(extractJSON(rawContent, 'NVIDIA'), 'NVIDIA');
+    // TASK 117 (2026-10-11): NVIDIA's llama-3.2-11b-vision-instruct model
+    // sometimes returns plain text instead of JSON. The extractJSON function
+    // fails with "no JSON object found." Try to extract JSON from the text
+    // response before giving up.
+    let parsed = extractJSON(rawContent, 'NVIDIA');
+    if (!parsed) {
+      // The response was plain text, not JSON. NVIDIA models sometimes
+      // return markdown/explanation instead of structured JSON.
+      // Try to find a JSON block in the text.
+      const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        try {
+          parsed = JSON.parse(jsonMatch[0]);
+        } catch {}
+      }
+      if (!parsed) {
+        // No JSON found. Return a structured action based on the text response.
+        // The model is describing what it sees — convert it to a "wait" action
+        // so the tribunal can try other providers.
+        const log = require('./logger').log;
+        log(`NVIDIA: no JSON in response, returning wait. Preview: ${rawContent.substring(0, 100)}`, 'WARN', 'nvidia');
+        return { actionType: 'wait', currentState: 'unknown', reasoning: `NVIDIA text response (no JSON): ${rawContent.substring(0, 200)}`, targetX: 0, targetY: 0 };
+      }
+    }
+    return validateActionResponse(parsed, 'NVIDIA');
   };
 }
 
