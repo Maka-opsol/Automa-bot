@@ -196,8 +196,21 @@ async function listAvailableModels(): Promise<string[]> {
  * Get the best available Groq VISION model.
  * Uses listAvailableModels() and picks the first vision-capable model.
  * Only falls back to text-only if NO vision models are available.
+ *
+ * TASK 111 (2026-10-08): Prefer known working models over auto-discovered ones.
+ * The SDK auto-discovery returns ALL Groq models including text-only ones
+ * like openai/gpt-oss-120b. We need to prefer VISION models.
+ * If the config already has a working model (e.g., llama-3.3-70b-versatile),
+ * don't override it with auto-discovery — only use auto-discovery when the
+ * config model is missing or set to 'auto'.
  */
 async function getBestModel(): Promise<string> {
+  // First: check if config has a specific model (not 'auto')
+  const config = getProviderConfig('Groq');
+  if (config?.model && config.model !== 'auto') {
+    return config.model;
+  }
+
   const models = await listAvailableModels();
 
   // Find the first vision-capable model
