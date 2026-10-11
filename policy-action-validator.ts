@@ -87,16 +87,19 @@ const STATE_ACTION_WHITELIST: Record<string, string[]> = {
   'mathu_login': [
     'click', 'flutter_tap', 'double_click',
     'input_email', 'input_password',
+    'flutter_swipe', 'scroll_vertical', 'scroll_horizontal',
     'wait', 'navigate', 'reload_browser', 'reload_page',
   ],
   'microsoft_email_input': [
     'click', 'flutter_tap', 'double_click',
     'input_email', 'input_password',
+    'flutter_swipe', 'scroll_vertical', 'scroll_horizontal',
     'wait', 'navigate', 'reload_browser', 'reload_page',
   ],
   'advlearn_login': [
     'click', 'flutter_tap', 'double_click',
     'input_email', 'input_password',
+    'flutter_swipe', 'scroll_vertical', 'scroll_horizontal',
     'wait', 'navigate', 'reload_browser', 'reload_page',
   ],
   'captcha': [
