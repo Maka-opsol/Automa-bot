@@ -231,6 +231,28 @@ async function callChatCompletionWithRollback(
 
   if (!response.ok) {
     const errorText = sanitizeErrorText(await response.text().catch(() => 'Unknown error'));
+
+    // TASK 112 (2026-10-08): Detect OpenRouter daily limit exhaustion.
+    // When X-RateLimit-Remaining is 0, the free-model daily quota is used up.
+    // Extract the reset time from the error response and cache it so we
+    // don't waste more API calls that will all 429.
+    if (providerName === 'OpenRouter' && response.status === 429 &&
+        errorText.includes('free-models-per-day')) {
+      // Try to extract X-RateLimit-Reset from the error text
+      const resetMatch = errorText.match(/X-RateLimit-Reset["']?:\s*["']?(\d+)/);
+      if (resetMatch && resetMatch[1]) {
+        const resetTime = parseInt(resetMatch[1], 10);
+        // Set the OpenRouter tribunal's daily limit flags
+        try {
+          const orMod = require('./providers-openrouter-tribunal');
+          if (orMod?._setDailyLimitExhausted) {
+            orMod._setDailyLimitExhausted(resetTime);
+          }
+        } catch {}
+        log(`OpenRouter: daily limit exhausted — free-models-per-day=0. Reset at ${new Date(resetTime).toISOString()}. Will skip API calls until reset.`, 'WARN', 'base');
+      }
+    }
+
     throw new Error(`HTTP_ERROR_${response.status}: ${errorText}`);
   }
 
