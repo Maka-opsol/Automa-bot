@@ -1535,6 +1535,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     let _appErrorCount = 0; // BUG FIX (2026-09-07): Track consecutive app_error states for browser relaunch
     let consecutiveTribunalFailures = 0;
     let unknownStateCounter = 0; // Counts consecutive 'unknown' currentState results
+    let _exploringWaitCount = 0; // TASK 115: Counts consecutive "exploring/wait" — trust AI once, then fallback
     let _humanInterventionLogged = false; // Task 35: Track if we've already logged the pause message
     // TASK 58 (2026-09-11): Track whether the AI has submitted an answer on
     // the current question. Multiple-choice questions are answered by clicking
@@ -3315,6 +3316,17 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             authGuardForUrl.notifyLastKnownGoodUrl(page.url());
           }
         } catch (e: any) { /* non-critical — auth-guard not available */ }
+
+        // TASK 116 (2026-10-08): If the pixel fallback detected a specific
+        // state while the current state was "exploring", and the action
+        // succeeded (page changed), promote the detected state to current.
+        // This means: pixel fallback said "this is a video_player" while
+        // the tribunal said "exploring" → if the click changed the page,
+        // the pixel fallback was RIGHT → update currentState to video_player.
+        if (action._promoteState) {
+          log(`State promotion: ${currentState} → ${action._promoteState} (pixel fallback detected state, action succeeded)`, 'INFO', 'cycle');
+          currentState = action._promoteState;
+        }
       }
 
       // ─── Pixel Calibration Sampling ───
@@ -3668,25 +3680,65 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       }
 
       // ─────────────────────────────────────────────────────────────────────
-      // TASK 45 (2026-09-10): Validate "exploration" state — require proof.
-      // The AI must prove that the page doesn't match ANY known state before
-      // setting currentState to "exploration". If the reasoning is too short
-      // or doesn't mention "Not" for at least 3 known states, reject it
-      // and treat as "unknown" instead (which triggers the unknown-state
-      // escalation ladder: pixel fallback → reload → restart).
+      // TASK 114+115 (2026-10-08): If the state is "exploring" or
+      // "exploration" after the tribunal:
+      //   - First wait: trust the AI. The page might be loading.
+      //   - Second wait: don't trust it anymore — try pixel fallback.
       // ─────────────────────────────────────────────────────────────────────
-      if (action?.currentState === 'exploration') {
-        const reasoning = String(action?.reasoning || '');
-        // Count how many "Not <state>" patterns the AI mentioned
-        const notCount = (reasoning.match(/\bnot\s+\w+/gi) || []).length;
-        const reasoningLength = reasoning.length;
-        if (notCount < 3 || reasoningLength < 50) {
-          log(`Exploration state rejected — reasoning lacks proof (notCount=${notCount}, len=${reasoningLength}). Converting to 'unknown' for escalation. Reasoning: "${reasoning.substring(0, 100)}"`, 'WARN', 'cycle');
-          action.currentState = 'unknown';
-          // Don't change actionType — let the unknown-state handler deal with it
+      if (action?.currentState === 'exploring' || action?.currentState === 'exploration') {
+        if (action.actionType === 'wait') {
+          _exploringWaitCount++;
+          if (_exploringWaitCount <= 1) {
+            // First wait — trust the AI. The page might genuinely be loading.
+            log(`State is ${action.currentState} with action=wait (#${_exploringWaitCount}) — trusting AI (page may be loading)`, 'INFO', 'cycle');
+          } else {
+            // Second+ wait — AI is stuck. Try pixel fallback, then explorer, then scroll.
+            log(`State is ${action.currentState} with action=wait (#${_exploringWaitCount}) — AI stuck, trying pixel fallback`, 'WARN', 'cycle');
+            _exploringWaitCount = 0; // reset for next time state changes
+            try {
+              const fallbackAction = await getFallbackAction(page, currentState || undefined);
+              if (fallbackAction && fallbackAction.actionType && fallbackAction.actionType !== 'wait') {
+                log(`Pixel fallback provided action for exploring state: ${fallbackAction.actionType} at (${fallbackAction.targetX}, ${fallbackAction.targetY})`, 'INFO', 'cycle');
+                action = fallbackAction;
+              } else {
+                // Pixel fallback returned null or wait — try pixel-explorer
+                try {
+                  const pixelExplorer = require('./pixel-explorer');
+                  const explorerAction = await pixelExplorer.explore(page);
+                  if (explorerAction && explorerAction.actionType && explorerAction.actionType !== 'wait') {
+                    log(`Pixel explorer provided action for exploring state: ${explorerAction.actionType} at (${explorerAction.targetX}, ${explorerAction.targetY})`, 'INFO', 'cycle');
+                    action = explorerAction;
+                  } else {
+                    // Pixel explorer also failed — scroll to reveal new content
+                    log('All fallbacks failed on exploring state — scrolling to reveal new content', 'WARN', 'cycle');
+                    action = {
+                      actionType: 'scroll_vertical',
+                      targetX: 0.5, targetY: 0.7, targetX2: 0.5, targetY2: 0.3,
+                      currentState: 'exploring',
+                      reasoning: 'Scrolling to reveal new content — all detection methods failed',
+                    };
+                  }
+                } catch (expErr: any) {
+                  log(`Pixel explorer failed on exploring state: ${expErr.message || expErr}`, 'DEBUG', 'cycle');
+                  action = {
+                    actionType: 'scroll_vertical',
+                    targetX: 0.5, targetY: 0.7, targetX2: 0.5, targetY2: 0.3,
+                    currentState: 'exploring',
+                    reasoning: 'Scrolling to reveal new content — pixel explorer unavailable',
+                  };
+                }
+              }
+            } catch (fbErr: any) {
+              log(`Pixel fallback failed on exploring state: ${fbErr.message || fbErr}`, 'DEBUG', 'cycle');
+            }
+          }
         } else {
-          log(`Exploration state accepted — AI provided proof (${notCount} "Not" mentions, ${reasoningLength} chars).`, 'DEBUG', 'cycle');
+          // Tribunal returned a non-wait action (click, scroll, etc.) — reset counter
+          _exploringWaitCount = 0;
         }
+      } else {
+        // State is not exploring — reset counter
+        _exploringWaitCount = 0;
       }
 
       // Unknown state escape hatch — prevents 75s × N death spiral
