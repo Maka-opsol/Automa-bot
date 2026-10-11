@@ -85,14 +85,16 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'NVIDIA': {
     endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions',
-    // TASK 67: meta/llama-3.3-70b-instruct is EOL (410 Gone since 2026-08-26).
-    // meta/llama-3.1-70b-instruct is ALSO EOL (same date).
-    // Use meta/llama-3.1-8b-instruct (smaller but still available on free tier).
-    model: 'meta/llama-3.1-8b-instruct',
+    // TASK 111 (2026-10-08): meta/llama-3.1-8b-instruct is ALSO EOL (410 Gone).
+    // Available models confirmed from NVIDIA API (Oct 2026):
+    //   meta/llama-3.2-11b-vision-instruct (vision-capable!)
+    //   meta/llama-3.2-90b-vision-instruct (vision-capable, larger)
+    // Using llama-3.2-11b-vision-instruct — it's vision-capable and available.
+    model: 'meta/llama-3.2-11b-vision-instruct',
     envKeys: ['NVIDIA_API_KEY'],
     visionCapable: true,
     fallbackModels: [
-      'nvidia/llama-3.1-nemotron-70b-instruct',
+      'meta/llama-3.2-90b-vision-instruct',
     ],
   },
   'Cloudflare': {
@@ -182,14 +184,15 @@ function loadDynamicModels() {
       DYNAMIC_MODELS = parsed;
       _log(`Loaded ${Object.keys(parsed).length} dynamic models from DB`, 'DEBUG', 'config-loader');
     }
-    // TASK 67: Clear stale DB models that point to EOL/decommissioned models.
+    // TASK 67+111: Clear stale DB models that point to EOL/decommissioned models.
     const STALE_MODELS = [
       'qwen/qwen3.6-27b',
       'qwen/qwen3.8-27b',
       'llama-3.2-11b-vision-preview',
       'meta/llama-3.3-70b-instruct',
       'meta/llama-3.1-70b-instruct',
-      'meta/llama-3.2-11b-vision-instruct',
+      // TASK 111: llama-3.1-8b-instruct is ALSO EOL (410 Gone Oct 2026)
+      'meta/llama-3.1-8b-instruct',
       'gemini-1.5-flash',
       'gemini-2.0-flash',
       'gemini-2.5-pro',
