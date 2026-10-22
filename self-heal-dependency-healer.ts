@@ -40,8 +40,11 @@ const CRITICAL_BINARIES = {
     label: 'sharp (image processing)',
   },
   'onnxruntime-node': {
+    // TASK 124 (2026-10-22): Use require.resolve() instead of require() —
+    // onnxruntime-node is a ~100MB+ native module. Loading it just to check
+    // if it exists wastes memory and causes OOM on Render free tier.
     check: () => {
-      try { require('onnxruntime-node'); return true; } catch (e: any) { return false; }
+      try { require.resolve('onnxruntime-node'); return true; } catch (e: any) { return false; }
     },
     required: false,
     label: 'onnxruntime-node (ML inference)',
