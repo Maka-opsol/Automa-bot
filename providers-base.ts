@@ -131,7 +131,7 @@ async function callChatCompletionWithRollback(
   base64Image: any,
   prompt: any,
   providerName: string,
-  options: { signal?: any; maxTokens?: number; temperature?: number; responseFormat?: any } = {}
+  options: { signal?: any; maxTokens?: number; temperature?: number; responseFormat?: any; systemMessage?: string } = {}
 ): Promise<string> {
   const log = _getLog().log;
 
@@ -146,9 +146,20 @@ async function callChatCompletionWithRollback(
     userContent = typeof prompt === 'string' ? prompt : String(prompt);
   }
 
+  // TASK 117 (2026-10-11): Build messages array with optional system message.
+  // Some smaller models (e.g., NVIDIA's llama-3.2-11b-vision-instruct) don't
+  // follow JSON-output instructions when they're buried in the user message.
+  // A dedicated system message with the JSON instruction significantly
+  // improves compliance.
+  const messages: any[] = [];
+  if (options.systemMessage && typeof options.systemMessage === 'string' && options.systemMessage.length > 0) {
+    messages.push({ role: 'system', content: options.systemMessage });
+  }
+  messages.push({ role: 'user', content: userContent });
+
   const payload: any = {
     model,
-    messages: [{ role: 'user', content: userContent }],
+    messages,
     max_tokens: options.maxTokens || 4096,
     temperature: options.temperature ?? 0.1,
   };
@@ -404,7 +415,29 @@ function extractJSON(rawContent: string, providerName?: string): any {
     }
   }
 
-  // 5. Nothing found — log the full response for debugging
+  // 5. TASK 127 (2026-10-22): Last-resort — find ALL { ... } blocks (including
+  // nested) and try each one. Some small models (NVIDIA llama-3.2-11b-vision)
+  // write chain-of-thought reasoning ("**Step 1:** ... **Step 2:** ...")
+  // BEFORE finally outputting the JSON action. The brace-depth tracker above
+  // only finds TOP-LEVEL blocks — but if the reasoning contains inline JSON-like
+  // fragments, we miss the actual action JSON at the end.
+  // This step uses a greedy regex to find ALL potential JSON objects and tries
+  // each one, preferring those with actionType.
+  const allJsonLike = rawContent.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g);
+  if (allJsonLike && allJsonLike.length > 0) {
+    // Try from LAST to FIRST — the actual action JSON is usually at the end
+    // (after the reasoning steps)
+    for (let i = allJsonLike.length - 1; i >= 0; i--) {
+      const candidate = _tryParseJSON(allJsonLike[i]);
+      if (!candidate) continue;
+      if (candidate.actionType) return candidate;
+      if (candidate.action && typeof candidate.action === 'object' && candidate.action.actionType) {
+        return candidate.action;
+      }
+    }
+  }
+
+  // 6. Nothing found — log the full response for debugging
   const preview = rawContent.length > 500
     ? rawContent.substring(0, 500) + `... [truncated, total ${rawContent.length} chars]`
     : rawContent;
