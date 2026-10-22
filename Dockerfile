@@ -34,13 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # We install with --no-cache-dir and --break-system-packages (Python 3.11+
 # on Debian Bookworm requires this flag for system pip installs).
 # Also install torch CPU-only to keep the image small (no CUDA needed).
-RUN pip3 install --no-cache-dir --break-system-packages \
-    pix2text \
-    2>&1 | tail -5 \
-    ; pip3 install --no-cache-dir --break-system-packages \
-    torch --index-url https://download.pytorch.org/whl/cpu \
-    2>&1 | tail -5 \
-    ; true
+RUN pip3 install --no-cache-dir --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu && \
+    pip3 install --no-cache-dir --break-system-packages pix2text
 
 WORKDIR /app
 
