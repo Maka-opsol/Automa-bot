@@ -701,16 +701,29 @@ function _detectVideoProgress(
  */
 let _memoViewPending = false;
 let _memoViewFingerprint: string = '';
+let _memoViewStartTime: number = 0;
+const MEMO_VIEW_TIMEOUT_MS = 15000; // 15 seconds max wait for memo page
 
 function _markMemoViewPending(): void {
   _memoViewPending = true;
   _memoViewFingerprint = '';
+  _memoViewStartTime = Date.now();
 }
 
 function _isMemoPageVisible(
   rgba: Uint8ClampedArray, width: number, height: number
 ): boolean {
   const fp = _computePageFingerprint(rgba, width, height);
+
+  // TASK 121 (2026-10-21): Hard timeout — if we've been waiting >15s, give up
+  // and assume the memo was either shown or won't show. Prevents infinite loop.
+  if (_memoViewPending && _memoViewStartTime > 0 && (Date.now() - _memoViewStartTime) > MEMO_VIEW_TIMEOUT_MS) {
+    _memoViewPending = false;
+    _memoViewFingerprint = '';
+    _memoViewStartTime = 0;
+    log('Pixel fallback: memo view hard timeout (15s elapsed) — assuming memo was shown', 'WARN', 'pixel-fallback');
+    return true;
+  }
 
   // First call after marking pending: record the fingerprint (pre-memo state)
   if (_memoViewPending && !_memoViewFingerprint) {
@@ -722,6 +735,7 @@ function _isMemoPageVisible(
   if (_memoViewPending && _memoViewFingerprint && _fingerprintDistance(fp, _memoViewFingerprint) > FP_CHANGED_MIN_DIST) {
     _memoViewPending = false;
     _memoViewFingerprint = '';
+    _memoViewStartTime = 0;
     _memory.memoViewedExercises.add(fp);
     log('Pixel fallback: memo page detected (fingerprint changed after book icon click)', 'INFO', 'pixel-fallback');
     return true;
@@ -734,6 +748,7 @@ function _isMemoPageVisible(
     if (lastBookClick && Date.now() - lastBookClick.timestamp > 15000) {
       _memoViewPending = false;
       _memoViewFingerprint = '';
+      _memoViewStartTime = 0;
       log('Pixel fallback: memo view timeout (15s) — assuming memo was shown', 'WARN', 'pixel-fallback');
       return true;
     }
@@ -4074,18 +4089,43 @@ async function _generatePixelFallbackActionInner(
     }
 
     // ── State-awareness filter ──
-    // TASK 98 (2026-09-29): The state compatibility check MUST actually block.
-    // If the pixel fallback detects a different state than the tribunal, the
-    // action is rejected — period. No exceptions for uncertain states.
-    // The old Task 97 change accepted actions on uncertain states, which
-    // defeated the purpose of the check — the action "went through" even
-    // when the log said it was incompatible.
+    // TASK 116 (2026-10-08): When the current state is "exploring" or
+    // "exploration", the pixel fallback should be ALLOWED to detect and
+    // execute actions for ANY listed state. If it detects a specific
+    // state (e.g., video_player, mathu_login, assignments_page), that
+    // detection is MORE reliable than the tribunal's "exploring" label.
+    //
+    // The action should be executed, and if it succeeds (changes the page),
+    // the detected state becomes the new current state.
+    //
+    // Only block actions when the current state is a SPECIFIC known state
+    // (not exploring/unknown) and the pixel fallback detects an incompatible
+    // state. For example: if the tribunal says "assessment" and the pixel
+    // fallback detects "mathu_login", that's a real conflict — block it.
     if (action && currentState) {
-      if (!_isActionStateCompatible(action, currentState)) {
-        log(`Pixel fallback: action ${action.actionType} (detected state=${action.currentState}) ` +
-            `is NOT compatible with actual currentState=${currentState} — BLOCKED`, 'WARN', 'pixel-fallback');
-        _memory.consecutiveFailures++;
-        return null;
+      const isCurrentStateUncertain = currentState === 'exploring' ||
+        currentState === 'exploration' ||
+        currentState === 'unknown' ||
+        currentState === 'error' ||
+        currentState === 'loading';
+
+      if (!isCurrentStateUncertain) {
+        // Current state is specific — enforce compatibility
+        if (!_isActionStateCompatible(action, currentState)) {
+          log(`Pixel fallback: action ${action.actionType} (detected state=${action.currentState}) ` +
+              `is NOT compatible with actual currentState=${currentState} — BLOCKED`, 'WARN', 'pixel-fallback');
+          _memory.consecutiveFailures++;
+          return null;
+        }
+      } else {
+        // Current state is exploring/unknown — pixel fallback detected a
+        // specific state. This is MORE reliable than "exploring."
+        // Execute the action and flag it to update the current state.
+        if (action.currentState && action.currentState !== 'exploring' &&
+            action.currentState !== 'exploration' && action.currentState !== 'unknown') {
+          log(`Pixel fallback: detected ${action.currentState} while state was ${currentState} — executing action and promoting detected state`, 'INFO', 'pixel-fallback');
+          action._promoteState = action.currentState; // Signal to cycle-manager to update currentState
+        }
       }
     }
 
