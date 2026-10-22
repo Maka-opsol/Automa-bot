@@ -383,7 +383,7 @@ function isBlankImage(base64Image: string): boolean {
 // TRIBUNAL EXECUTION
 // ===============================================================================
 
-async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = null, signal: any = null) {
+async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = null, signal: any = null, mathContext?: { problemType?: string; problemText?: string; cachedSolution?: string; cachedSteps?: string[]; wolframSolution?: string; } | null) {
   const { log } = _getLogger();
 
   // ── Blank image guard ──
@@ -427,7 +427,38 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   let mapHint = '';
   if (uiMap) { mapHint = `\nUI MAP (from exploration): ${JSON.stringify(uiMap).substring(0, 500)}\nUse this map to guide actions.\n`; }
   const urlHint = pageUrl ? `\nCURRENT PAGE URL: ${pageUrl}\nUse this URL as an additional hint for state detection.\n` : '';
-  const fullPrompt = `${getSystemPrompt()}${urlHint}${mapHint}\n${getUserInstruction()}`;
+
+  // TASK 121 (2026-10-21): Inject math context into the prompt.
+  // The cycle manager extracts problem text from the page (via bodyText)
+  // BEFORE calling the tribunal, classifies the problem type, and looks
+  // up the solution cache. Pass this context to the AI so it can actually
+  // SOLVE the problem instead of guessing based on the screenshot alone.
+  let mathHint = '';
+  if (mathContext) {
+    const parts: string[] = [];
+    if (mathContext.problemType && mathContext.problemType !== 'UNKNOWN') {
+      parts.push(`[MATH PROBLEM TYPE: ${mathContext.problemType}]`);
+    }
+    if (mathContext.problemText && mathContext.problemText.trim().length > 0) {
+      // Truncate to keep prompt under token limits
+      const trimmed = mathContext.problemText.trim().substring(0, 1500);
+      parts.push(`[OCR TEXT]: ${trimmed}`);
+    }
+    if (mathContext.cachedSolution && mathContext.cachedSolution.trim().length > 0) {
+      parts.push(`[CACHED SOLUTION (verified before, reuse)]: ${mathContext.cachedSolution.trim().substring(0, 500)}`);
+    }
+    if (mathContext.wolframSolution && mathContext.wolframSolution.trim().length > 0) {
+      parts.push(`[WOLFRAM ALPHA SOLUTION (computed, high confidence)]: ${mathContext.wolframSolution.trim().substring(0, 500)}`);
+    }
+    if (mathContext.cachedSteps && Array.isArray(mathContext.cachedSteps) && mathContext.cachedSteps.length > 0) {
+      parts.push(`[SOLUTION STEPS]: ${mathContext.cachedSteps.join(' | ').substring(0, 500)}`);
+    }
+    if (parts.length > 0) {
+      mathHint = '\n' + parts.join('\n') + '\nUse this information to determine the correct answer. For keypad_input, set keypadSequence to the digits of the answer. For click on multiple-choice, click the choice that matches the correct answer.\n';
+    }
+  }
+
+  const fullPrompt = `${getSystemPrompt()}${urlHint}${mapHint}${mathHint}\n${getUserInstruction()}`;
 
   const providerNames = providers.map((p: any) => `${p.name}(${(p.healthScore || 0).toFixed(2)})`).join(', ');
   log(`Tribunal: consulting ${providers.length} provider(s) [${providerNames}]`, 'INFO', 'tribunal');
@@ -590,6 +621,14 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   log(`Tribunal success: ${valid.length}/${providers.length} (${Math.round(successRate * 100)}%)`, 'INFO', 'tribunal');
   if (successRate < 0.25 && providers.length >= 3) {
     log('Majority of providers unavailable - proceeding with surviving votes', 'WARN', 'tribunal');
+    // TASK 117 (2026-10-11): When the majority of providers are unavailable
+    // (rate-limited, 503, etc.), switch to sequential mode for the next cycle.
+    // This conserves free-tier API quota by trying providers one at a time
+    // instead of calling all 7 in parallel (where 5+ will just 429/503).
+    // Only trigger if we're NOT already in sequential mode (avoid redundant triggers).
+    if (!_isSequentialMode()) {
+      triggerSequentialMode(`tribunal success rate ${Math.round(successRate * 100)}% (< 25%) — ${valid.length}/${providers.length} providers responded`);
+    }
   }
 
   // --- Compute vote weights (P12) ---
