@@ -23,19 +23,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxfixes3 libxext6 libxi6 libxtst6 \
     libxcursor1 libxss1 libdbus-1-3 libexpat1 \
     libglib2.0-0 \
-    python3 python3-pip make g++ \
+    python3 make g++ \
     curl \
     xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
-# TASK 121 (2026-10-21): Install Pix2Text for math OCR.
-# Pix2Text provides accurate OCR for math equations and formulas — far
-# better than the 5x7 pixel template fallback in pixel-fallback.ts.
-# We install with --no-cache-dir and --break-system-packages (Python 3.11+
-# on Debian Bookworm requires this flag for system pip installs).
-# Also install torch CPU-only to keep the image small (no CUDA needed).
-RUN pip3 install --no-cache-dir --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu && \
-    pip3 install --no-cache-dir --break-system-packages pix2text
+# TASK 126 (2026-10-22): REMOVED Pix2Text and torch entirely.
+# Pix2Text + torch CPU wheels take 30-60+ minutes to install on Render's
+# free tier build environment, causing deployment timeouts.
+# The bot doesn't critically need Pix2Text — it has multiple other OCR paths:
+#   1. page.evaluate(() => document.body.innerText) — extracts text from
+#      the DOM directly (Flutter Web renders text in the DOM)
+#   2. Cloud vision providers (Groq, NVIDIA, z.ai, etc.) can read math
+#      from screenshots
+#   3. Wolfram solver can solve problems from text
+# Removing pix2text + torch saves ~2GB+ of image space and prevents build
+# timeouts. Python3 is still installed (needed by other potential scripts)
+# but no pip packages are installed.
+# If Pix2Text is needed in the future, install it as a separate optional
+# build stage or use a pre-built image.
 
 WORKDIR /app
 
@@ -142,4 +148,4 @@ HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
 # 448MB V8 + ~100-150MB Chromium RSS = 548-598MB total, which EXCEEDS the
 # 512MB container limit → kernel OOM killer fires. 384MB V8 + 128MB for
 # Chromium/OS = 512MB, fitting within the container.
-CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; exec node --expose-gc --max-old-space-size=384 --import tsx render-free-plan.ts"].
+CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; exec node --expose-gc --max-old-space-size=384 --import tsx render-free-plan.ts"]
