@@ -898,6 +898,128 @@ async function _saveActionToCache(
 
 let _solutionCache: any = null;
 function _getSolutionCache() { if (!_solutionCache) { try { _solutionCache = require('./math-solution-cache'); } catch { _solutionCache = null; } } return _solutionCache; }
+let _wolframService: any = null;
+function _getWolframService() { if (!_wolframService) { try { _wolframService = require('./services-wolfram'); } catch { _wolframService = null; } } return _wolframService; }
+
+// ─── TASK 121 (2026-10-21): Math Context Builder ────────────────────────────
+//
+// Extracts problem text from the page (via bodyText or Pix2Tex OCR),
+// classifies the problem type, looks up the solution cache, and optionally
+// calls Wolfram Alpha for a fresh solution. Returns a context object that
+// gets injected into the tribunal prompt so the AI can actually SOLVE the
+// problem instead of guessing from the screenshot alone.
+//
+// This runs BEFORE the tribunal call, so the AI has all this context when
+// deciding the next action.
+const QUESTION_STATES = new Set([
+  'question', 'question_page', 'exercise_info', 'exercise_memo',
+  'assessment', 'answering', 'mathu_question',
+]);
+
+async function _buildMathContext(
+  page: any,
+  currentState: string,
+  base64Image: string,
+  log: (msg: string, level?: string, mod?: string) => void
+): Promise<{ problemType?: string; problemText?: string; cachedSolution?: string; cachedSteps?: string[]; wolframSolution?: string; } | null> {
+  // Only build math context on question-related states
+  if (!currentState || !QUESTION_STATES.has(currentState)) {
+    return null;
+  }
+
+  const ctx: { problemType?: string; problemText?: string; cachedSolution?: string; cachedSteps?: string[]; wolframSolution?: string; } = {};
+
+  try {
+    // Step 1: Extract problem text from the page
+    let problemText = '';
+    try {
+      const bodyText = await page.evaluate(() => document.body?.innerText || '');
+      if (bodyText && bodyText.length > 20) {
+        problemText = bodyText.substring(0, 2000);
+      }
+    } catch {}
+
+    if (!problemText) {
+      // Try Pix2Tex OCR as fallback
+      try {
+        const pix2tex = _getPix2tex();
+        if (pix2tex) {
+          const p2tResult = await pix2tex.ocrMath(base64Image);
+          if (p2tResult.text && p2tResult.text.length > 5) {
+            problemText = p2tResult.text.substring(0, 1500);
+            log(`Math context: Pix2Tex OCR got ${problemText.length} chars`, 'DEBUG', 'cycle');
+          }
+        }
+      } catch {}
+    }
+
+    if (!problemText) {
+      return null; // No text to work with
+    }
+
+    ctx.problemText = problemText;
+
+    // Step 2: Classify the problem type
+    try {
+      const classifier = _getProblemClassifier();
+      if (classifier) {
+        const classification = classifier.classifyProblem(problemText);
+        if (classification && classification.type && classification.type !== 'UNKNOWN') {
+          ctx.problemType = classification.type;
+          log(`Math context: classified as ${classification.type} (conf=${classification.confidence}%)`, 'DEBUG', 'cycle');
+        }
+      }
+    } catch {}
+
+    // Step 3: Look up solution cache for an exact match
+    try {
+      const solutionCache = _getSolutionCache();
+      if (solutionCache && problemText) {
+        const cacheResult = solutionCache.lookup(problemText);
+        if (cacheResult.type === 'exact' && cacheResult.solution) {
+          const sol = cacheResult.solution;
+          ctx.cachedSolution = sol.solution;
+          if (sol.steps && Array.isArray(sol.steps)) {
+            ctx.cachedSteps = sol.steps;
+          }
+          log(`Math context: solution cache EXACT HIT (type=${sol.problemType})`, 'INFO', 'cycle');
+        }
+      }
+    } catch {}
+
+    // Step 4: If no cached solution, try Wolfram Alpha solver
+    if (!ctx.cachedSolution) {
+      try {
+        const wolfram = _getWolframService();
+        if (wolfram && wolfram.solveProblem) {
+          // Only call Wolfram if we have a problem type (saves API budget)
+          if (ctx.problemType && ctx.problemType !== 'UNKNOWN') {
+            const wolframResult = await wolfram.solveProblem(problemText);
+            if (wolframResult && wolframResult.solution) {
+              ctx.wolframSolution = wolframResult.solution;
+              log(`Math context: Wolfram solved (${ctx.problemType}) → ${wolframResult.solution.substring(0, 60)}`, 'INFO', 'cycle');
+            }
+          }
+        }
+      } catch (e: any) {
+        log(`Math context: Wolfram solver failed: ${e.message || e}`, 'DEBUG', 'cycle');
+      }
+    }
+  } catch (e: any) {
+    log(`Math context build error: ${e.message || e}`, 'WARN', 'cycle');
+    return null;
+  }
+
+  // Return null if we didn't find any useful context
+  if (!ctx.problemType && !ctx.problemText && !ctx.cachedSolution && !ctx.wolframSolution) {
+    return null;
+  }
+
+  return ctx;
+}
+
+let _pix2texService: any = null;
+function _getPix2tex() { if (!_pix2texService) { try { _pix2texService = require('./services-pix2tex'); } catch { _pix2texService = null; } } return _pix2texService; }
 let _tmpGuardian: any = null;
 function _getTmpGuardian() { if (!_tmpGuardian) { try { _tmpGuardian = require('./longevity-tmp-guardian'); } catch { _tmpGuardian = null; } } return _tmpGuardian; }
 let _coldStart: any = null;
@@ -1325,7 +1447,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           }
 
           log(`Navigation attempt ${_navAttempt}/${MAX_NAV_ATTEMPTS} [${_mode}]: ${targetUrl}`, 'INFO', 'cycle');
-          await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          // TASK 123 (2026-10-22): Use 'load' instead of 'domcontentloaded'
+          // — 'load' waits for all resources (JS, CSS, images) including
+          // Flutter's CanvasKit bundle. 'domcontentloaded' fires before the
+          // Flutter app has initialized, causing false "blank page" detections.
+          await page.goto(targetUrl, { waitUntil: 'load', timeout: 45000 });
           _initialNavOk = true;
           _navAttemptOutcomes.push({ attempt: _navAttempt, mode: _mode, ok: true });
           log(`Navigation attempt ${_navAttempt} succeeded [${_mode}].`, 'INFO', 'cycle');
@@ -1405,8 +1531,13 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         origExit(137);
       }
 
-      log('Fresh start: waiting for Flutter canvas to render...', 'INFO', 'cycle');
-      await _waitForRenderedPage(page, 20000);
+      log(`Fresh start: waiting for Flutter canvas to render...`, 'INFO', 'cycle');
+      // TASK 123 (2026-10-22): Increased from 20s to 60s.
+      // The Flutter Web app takes 30-60s to render on Render's free tier
+      // (slow CPU, shared resources). 20s was too short — the bot declared
+      // the page blank before Flutter finished initializing, then looped
+      // forever relaunching browsers and never making progress.
+      await _waitForRenderedPage(page, 60000);
 
       // ─────────────────────────────────────────────────────────────────────
       // PERSISTENT-BLANK-AFTER-NAV BROWSER-PROGRESS FAILURE (Task 29)
@@ -1491,14 +1622,27 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           // navigation gets a bad response but a retry gets the real page.
           try {
             log('Attempting one page.reload() to recover from persistent blank...', 'WARN', 'cycle');
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 });
-            await new Promise(r => setTimeout(r, 5000));
+            // TASK 123 (2026-10-22): Use 'load' instead of 'domcontentloaded'
+            // for the reload — 'load' waits for all resources (including
+            // Flutter's CanvasKit JS bundle) to finish loading. Also increased
+            // the post-reload wait from 5s to 15s to give Flutter time to paint.
+            await page.reload({ waitUntil: 'load', timeout: 30000 });
+            await new Promise(r => setTimeout(r, 15000));
             // Check again
             const authGuard = getDep('authGuard');
             if (typeof authGuard?._isPageBlank === 'function') {
               const stillBlank = await authGuard._isPageBlank(page);
               if (stillBlank) {
-                log('Page still blank after reload — falling through to cycle. Blank-page escalation will handle it.', 'WARN', 'cycle');
+                // TASK 123: Try waiting even longer — Flutter Web can take
+                // 30-60s to render on Render's free tier. Don't give up yet.
+                log('Page still blank after reload + 15s — waiting 30 more seconds for Flutter...', 'WARN', 'cycle');
+                await new Promise(r => setTimeout(r, 30000));
+                const stillBlank2 = await authGuard._isPageBlank(page);
+                if (stillBlank2) {
+                  log('Page still blank after reload + 45s — falling through to cycle. Blank-page escalation will handle it.', 'WARN', 'cycle');
+                } else {
+                  log('Page recovered after extended wait — proceeding with cycle.', 'INFO', 'cycle');
+                }
               } else {
                 log('Page recovered after reload — proceeding with cycle.', 'INFO', 'cycle');
               }
@@ -2564,7 +2708,27 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               log('determineNextAction not available — using fallback action', 'WARN', 'cycle');
               action = await getFallbackAction(page, currentState || undefined);
             } else {
-              action = await determineNextAction(base64, page.url(), explorationMode ? explorationMap : null);
+              // TASK 121 (2026-10-21): Pre-extract math context BEFORE calling tribunal.
+              // The vision AI gets problem type + OCR text + cached solution + Wolfram
+              // solution in its prompt — so it can actually SOLVE the problem instead
+              // of guessing based on the screenshot alone.
+              const mathContext: { problemType?: string; problemText?: string; cachedSolution?: string; cachedSteps?: string[]; wolframSolution?: string; } | null = await _buildMathContext(page, currentState || '', base64, log).catch((e: any) => {
+                log(`Math context build failed: ${e.message || e}`, 'DEBUG', 'cycle');
+                return null;
+              });
+
+              action = await determineNextAction(base64, page.url(), explorationMode ? explorationMap : null, mathContext);
+
+              // Attach math context to action for downstream consumers (math-verify, cache)
+              if (mathContext && action) {
+                if (mathContext.problemType) action._problemType = mathContext.problemType;
+                if (mathContext.problemText) action._problemText = mathContext.problemText;
+                if (mathContext.cachedSolution) {
+                  action._cachedSolution = mathContext.cachedSolution;
+                  action._cacheHit = 'exact';
+                }
+                if (mathContext.wolframSolution) action._wolframSolution = mathContext.wolframSolution;
+              }
             }
 
             // TASK 89 (2026-09-25): Force GC after tribunal — the tribunal call
@@ -2826,7 +2990,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // ─── Module Download Flow Detection (Response 3) ───
       // Before executing, check if this action is a download button click.
       // If so, record the pre-download screenshot hash and set state.
-      const isDownloadClick = action.actionType === 'click' &&
+      // TASK 122 (2026-10-21): Also match 'flutter_tap' — the prompt tells the AI
+      // to use flutter_tap for the download button (it's a Flutter widget), but
+      // the old check only matched 'click' literally, so the download-wait
+      // polling loop never fired when the AI correctly used flutter_tap.
+      const isDownloadClick = (action.actionType === 'click' || action.actionType === 'flutter_tap') &&
         (action.currentState === 'module_downloading' ||
          (action.reasoning && action.reasoning.includes('download')));
 
@@ -2979,7 +3147,26 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         // For keypad/input actions: verify the typed value
         // For click actions on assessment: verify using text regions from pixel fallback
         let answerValue = action.value || action.keypadSequence?.map((k: any) => k.digit || k.label || '').join('') || '';
-        let problemContext = action.reasoning || '';
+        // TASK 121 (2026-10-21): Use real problem text (from _buildMathContext or
+        // bodyText) instead of action.reasoning. The reasoning was the AI's
+        // description of what it sees — using it as "problem context" for the
+        // math verifier is tautological (verifying the AI's answer against the
+        // AI's own description). Now we use the actual page text extracted
+        // before the tribunal call.
+        let problemContext = action._problemText || '';
+        if (!problemContext) {
+          // Fallback: extract body text now if we didn't pre-extract it
+          try {
+            const bodyTextNow = await page.evaluate(() => document.body?.innerText || '');
+            if (bodyTextNow && bodyTextNow.length > 20) {
+              problemContext = bodyTextNow.substring(0, 2000);
+            }
+          } catch {}
+        }
+        if (!problemContext && action.reasoning) {
+          // Last resort: use reasoning (better than nothing)
+          problemContext = action.reasoning;
+        }
 
         // Response 5: For click actions with _textRegions (pixel fallback MCQ),
         // try to construct a verification context from the text region metadata.
@@ -4599,4 +4786,20 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
   }
 }
 
-module.exports = { runCycle, requestStop, isOrParked: () => _orParked, _injectDependencies, restoreCycleState: _restoreCycleState };
+// TASK 122 (2026-10-21): Expose setHumanInterventionRequested so the action
+// executor can request human intervention when critical env vars are missing
+// (e.g., MICROSOFT_EMAIL/PASSWORD). Without this, the bot silently loops.
+function setHumanInterventionRequested(reason: string): void {
+  (globalThis as any).__humanInterventionRequested = true;
+  (globalThis as any).__humanInterventionReason = reason;
+  (globalThis as any).__humanInterventionSince = Date.now();
+  try { log(`Human intervention requested: ${reason}`, 'ERROR', 'cycle'); } catch {}
+  try {
+    const alerting = require('./alerting');
+    if (alerting?.sendAlert) {
+      alerting.sendAlert(`🚨 Human intervention required: ${reason}`, 'ERROR');
+    }
+  } catch {}
+}
+
+module.exports = { runCycle, requestStop, isOrParked: () => _orParked, _injectDependencies, restoreCycleState: _restoreCycleState, setHumanInterventionRequested };
