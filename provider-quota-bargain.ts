@@ -21,13 +21,31 @@ function getLogError(): (msg: string, err: Error, ctx?: any) => void {
 let onnx: any = null;
 let sharp: any = null;
 
-function _loadOptionalDeps() {
+// TASK 124 (2026-10-22): Made ONNX loading LAZY — don't load at module
+// require time. onnxruntime-node is a ~100MB+ native module. Loading it
+// just to check if it exists wastes memory and causes OOM on Render.
+// Now onnx is only loaded when actually needed (when the quota bargain
+// module is actually called to do inference).
+function _ensureOnnx() {
   const log = getLog();
-  if (!onnx) { try { onnx = require('onnxruntime-node'); } catch (e: any) { log('onnxruntime-node not available (optional)', 'INFO', 'quota'); } }
-  if (!sharp) { try { sharp = require('sharp'); } catch (e: any) { log('sharp not available (optional)', 'INFO', 'quota'); } }
+  if (!onnx) {
+    try {
+      onnx = require('onnxruntime-node');
+      log('onnxruntime-node loaded (lazy — only loaded when needed)', 'DEBUG', 'quota');
+    } catch (e: any) {
+      log('onnxruntime-node not available (optional)', 'INFO', 'quota');
+    }
+  }
 }
 
-_loadOptionalDeps();
+function _ensureSharp() {
+  const log = getLog();
+  if (!sharp) {
+    try { sharp = require('sharp'); } catch (e: any) { log('sharp not available (optional)', 'INFO', 'quota'); }
+  }
+}
+
+// TASK 124: Don't call _loadOptionalDeps() at module load time.
 
 class QuotaBargainManager {
   budgets: Map<string, number>;
@@ -133,8 +151,11 @@ class QuotaBargainManager {
     } catch (e: any) { logError('Bargain hunter failed', e as Error); return []; }
   }
 
-  async initLocalONNX() { 
+  async initLocalONNX() {
     const log = getLog();
+    // TASK 124: Lazy-load onnx and sharp only when actually needed
+    _ensureOnnx();
+    _ensureSharp();
     if (!onnx || !sharp) {
       log('Local ONNX fallback skipped (onnxruntime or sharp not installed)', 'INFO', 'quota');
       return;
