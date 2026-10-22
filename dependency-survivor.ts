@@ -46,10 +46,23 @@ class DependencySurvivor {
     catch (e: any) { log('⚠️ Sharp not available. Screenshot compression disabled.', 'WARN', 'deps'); }
 
     // Check optional heavy deps gracefully
+    // TASK 124 (2026-10-22): Use require.resolve() instead of require() to
+    // check if the module EXISTS without loading it into memory.
+    // onnxruntime-node is a ~100MB+ native module that's loaded by require()
+    // but NEVER actually used (ENABLE_LOCAL_VLM=false in the Dockerfile).
+    // Loading it every cycle consumed ~100MB of heap, leaving only ~284MB
+    // for Chromium + Flutter Web + tribunal calls — causing OOM kills.
+    // Now we just check if the module is installed (require.resolve) without
+    // actually loading it. The bot only needs onnxruntime when
+    // CONFIG.ENABLE_LOCAL_VLM is true, which is false on Render free tier.
     const optionalDeps = ['onnxruntime-node', '@xenova/transformers'];
     for (const dep of optionalDeps) {
-      try { require(dep); log(`✅ ${dep} loaded.`, 'DEBUG', 'deps'); }
-      catch (e: any) { log(`ℹ️ ${dep} not available (optional - some features disabled).`, 'INFO', 'deps'); }
+      try {
+        require.resolve(dep);
+        log(`✅ ${dep} available (not loaded — saves memory).`, 'DEBUG', 'deps');
+      } catch (e: any) {
+        log(`ℹ️ ${dep} not available (optional - some features disabled).`, 'INFO', 'deps');
+      }
     }
 
     log('✅ Dependency survivor check passed.', 'INFO', 'deps');
