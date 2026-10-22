@@ -172,7 +172,7 @@ class BrowserManager {
   setDprScale(scale: number) {  this.dprScale = scale; }
   getMetrics() {  return { ...browserMetrics }; }
 
-  async launch() { 
+  async launch() {
     this._ensureConfig();
     const log = getLog();
     if (this.launching) {
@@ -187,6 +187,25 @@ class BrowserManager {
           }
         }, 100);
       });
+    }
+    // TASK 123 (2026-10-22): REUSE EXISTING BROWSER IF ALIVE.
+    // The cycle manager calls launch() at the start of every cycle, but
+    // Task 87 says "protect browser at all costs — keep browser open
+    // between cycles." The old code always called cleanup() which killed
+    // the existing browser, defeating the purpose of keeping it open.
+    // Now we check if the browser is still connected and the page is valid
+    // — if so, return the existing page WITHOUT relaunching.
+    try {
+      if (this.browserInstance && this.browserInstance.isConnected() && this.pageInstance) {
+        // Verify the page is still functional (not closed/disconnected)
+        const pageUrl = this.pageInstance.url();
+        if (pageUrl && !pageUrl.includes('chrome-error')) {
+          log(`Reusing existing browser (page at ${pageUrl.substring(0, 60)}) — skipping relaunch (Task 87: protect browser)`, 'DEBUG', 'browser');
+          return this.pageInstance;
+        }
+      }
+    } catch (e: any) {
+      log(`Reuse check failed: ${e.message} — proceeding with fresh launch`, 'DEBUG', 'browser');
     }
     this.launching = true;
     this._intentionalClose = false;
