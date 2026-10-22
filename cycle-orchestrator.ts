@@ -45,16 +45,28 @@ function getRandomStartupDelay() {
 // This function returns the current hour in the configured timezone
 // (CONFIG.TIMEZONE, default 'Africa/Johannesburg' = SAST UTC+2), so the
 // allowed-hours check matches the user's intent.
+//
+// TASK 123 (2026-10-22): Fixed hour=24 bug. The toLocaleString with
+// hour: 'numeric', hour12: false returns "24" for midnight (00:00) in some
+// ICU configurations. getHours() returns 0-23, but toLocaleString can return
+// "24" — which breaks the allowed-hours check. Now we use hour: '2-digit'
+// and normalize "24" to "0".
 function _getCurrentHourInTimezone(): number {
   const CONFIG = getCONFIG();
   const tz = CONFIG.TIMEZONE || process.env.TZ || 'Africa/Johannesburg';
   try {
     const hourStr = new Date().toLocaleString('en-US', {
       timeZone: tz,
-      hour: 'numeric',
+      hour: '2-digit',
       hour12: false,
     });
-    return parseInt(hourStr, 10);
+    let hour = parseInt(hourStr.replace(/\D/g, ''), 10);
+    // TASK 123: Some ICU versions return "24" for midnight instead of "00".
+    // Normalize to 0-23 range.
+    if (isNaN(hour) || hour < 0) hour = new Date().getHours();
+    if (hour >= 24) hour = hour - 24;
+    if (hour < 0) hour = 0;
+    return hour;
   } catch {
     // Invalid timezone string — fall back to server-local hour.
     return new Date().getHours();
