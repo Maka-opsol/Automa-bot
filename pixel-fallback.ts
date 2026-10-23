@@ -3558,16 +3558,17 @@ function _videoPlayerAction(
           _resetVideoTimer();
           _memory.videosWatched++;
           _memory._videoStuckCount = 0;
-          if (backButtons.length > 0) {
-            const btn = backButtons[0];
-            const jittered = _jitter(btn.cx, btn.cy, 3, btn);
-            log(`Pixel fallback: video done (progress=${(videoProgress.progress * 100).toFixed(0)}%), clicking back at (${jittered.x}, ${jittered.y})`, 'INFO', 'pixel-fallback');
-            return {
-              actionType: 'click', targetX: jittered.x, targetY: jittered.y,
-              currentState: 'video_player',
-              reasoning: `Pixel fallback: video progress ${videoProgress.progress >= 0.99 ? 'complete' : 'stuck'} (${(videoProgress.progress * 100).toFixed(0)}%), dismissing`
-            };
-          }
+          // TASK 131: flutter_tap top-left corner (white X button)
+          const closeX2 = Math.floor(width * 0.05);
+          const closeY2 = Math.floor(height * 0.05);
+          const jittered2 = _jitter(closeX2, closeY2, 3);
+          log(`Pixel fallback: video done (progress=${(videoProgress.progress * 100).toFixed(0)}%), flutter_tap top-left X at (${jittered2.x}, ${jittered2.y})`, 'INFO', 'pixel-fallback');
+          return {
+            actionType: 'flutter_tap', targetX: jittered2.x, targetY: jittered2.y,
+            currentState: 'video_player',
+            reasoning: `Pixel fallback: video progress ${videoProgress.progress >= 0.99 ? 'complete' : 'stuck'} (${(videoProgress.progress * 100).toFixed(0)}%), flutter_tap top-left X to dismiss`,
+            repeatable: true,
+          };
         }
         _memory._videoStuckCount = (_memory._videoStuckCount || 0) + 1;
       }
@@ -3585,37 +3586,99 @@ function _videoPlayerAction(
     _resetVideoTimer();
     _memory.videosWatched++;
 
-    if (backButtons.length > 0) {
-      const btn = backButtons[0];
-      const jittered = _jitter(btn.cx, btn.cy, 3, btn);
-      log(`Pixel fallback: video watch complete (${VIDEO_WATCH_DURATION_MS / 1000}s), clicking back button at (${jittered.x}, ${jittered.y}) to dismiss`, 'INFO', 'pixel-fallback');
-      return {
-        actionType: 'click', targetX: jittered.x, targetY: jittered.y,
-        currentState: 'video_player',
-        reasoning: `Pixel fallback: video watch complete (${VIDEO_WATCH_DURATION_MS / 1000}s), clicking back/close to dismiss`
-      };
-    }
-
-    const clickX = Math.floor((backX1 + backX2) / 2);
-    const clickY = Math.floor((backY1 + backY2) / 2);
-    log(`Pixel fallback: video watch complete, clicking back arrow area (${clickX}, ${clickY}) to dismiss`, 'INFO', 'pixel-fallback');
+    // TASK 131 (2026-10-22): The video close button is a WHITE X in the
+    // top-left corner. Most video backgrounds are also white, so the X is
+    // invisible to pixel detection (dark button scan finds nothing).
+    // Fix: Don't try to detect the X — just flutter_tap the top-left corner
+    // directly. The X is ALWAYS at approximately (5%, 5%) of the viewport.
+    // Use flutter_tap (not click) because this is a Flutter widget.
+    const closeX = Math.floor(width * 0.05);
+    const closeY = Math.floor(height * 0.05);
+    const jittered = _jitter(closeX, closeY, 3);
+    log(`Pixel fallback: video watch complete (${VIDEO_WATCH_DURATION_MS / 1000}s), flutter_tap top-left corner (${jittered.x}, ${jittered.y}) to close white X button`, 'INFO', 'pixel-fallback');
     return {
-      actionType: 'click', targetX: clickX, targetY: clickY,
+      actionType: 'flutter_tap', targetX: jittered.x, targetY: jittered.y,
       currentState: 'video_player',
-      reasoning: `Pixel fallback: video watch complete (${VIDEO_WATCH_DURATION_MS / 1000}s), clicking back arrow area to dismiss`
+      reasoning: `Pixel fallback: video watch complete (${VIDEO_WATCH_DURATION_MS / 1000}s), flutter_tap top-left X button to dismiss (white X on white bg — not pixel-detectable)`,
+      repeatable: true,
+      skipExactMatch: false,
     };
   }
 
   _resetVideoTimer();
-    const centerX = Math.floor(width / 2);
-    const centerY = Math.floor(height / 2);
-    const jittered = _jitter(centerX, centerY, 5);
-    log(`Pixel fallback: video thumbnail visible, clicking center (${jittered.x}, ${jittered.y}) to open video`, 'INFO', 'pixel-fallback');
-    return {
-      actionType: 'click', targetX: jittered.x, targetY: jittered.y,
-      currentState: 'video_player',
-      reasoning: 'Pixel fallback: video thumbnail/poster visible, clicking to open video player'
-    };
+    // TASK 130 (2026-10-22): The old code clicked the CENTER of the screen
+    // whenever it thought a "video thumbnail" was visible — but this triggers
+    // on EVERY page that has any centered content (login buttons, module cards,
+    // etc.). Now we ONLY click if we can detect an actual play button overlay
+    // (a circular shape with a triangle/play icon in the center area).
+    // If no play button detected, return null — let the cycle manager handle it.
+    const playButton = _detectPlayButton(rgba, width, height);
+    if (playButton) {
+      const jittered = _jitter(playButton.x, playButton.y, 5);
+      log(`Pixel fallback: play button detected at (${jittered.x}, ${jittered.y}), clicking to open video`, 'INFO', 'pixel-fallback');
+      return {
+        actionType: 'click', targetX: jittered.x, targetY: jittered.y,
+        currentState: 'video_player',
+        reasoning: 'Pixel fallback: play button overlay detected on video thumbnail'
+      };
+    }
+    // No play button detected — don't click randomly. Return null so the cycle
+    // manager can try other approaches (scroll, pixel-explorer, etc.).
+    log('Pixel fallback: no video play button detected — not clicking center', 'DEBUG', 'pixel-fallback');
+    return null;
+}
+
+// TASK 130: Detect a play button overlay (circular shape with a play triangle).
+// A play button is typically:
+// - A circle or rounded rectangle in the center area of the screen
+// - Has a contrasting color (white circle on dark video, or dark circle on light)
+// - Is roughly 40-100px in diameter
+// This prevents false positives on login pages and other non-video screens.
+function _detectPlayButton(
+  rgba: Uint8ClampedArray, width: number, height: number
+): { x: number; y: number } | null {
+  const centerX = Math.floor(width / 2);
+  const centerY = Math.floor(height / 2);
+  // Search in the center 40% of the screen for a circular bright/dark region
+  const searchX1 = Math.floor(width * 0.3);
+  const searchX2 = Math.floor(width * 0.7);
+  const searchY1 = Math.floor(height * 0.25);
+  const searchY2 = Math.floor(height * 0.75);
+
+  // Sample a grid of points and look for a cluster of contrasting pixels
+  // that forms a circular shape (play button overlay)
+  let bestCluster: { x: number; y: number; score: number } = { x: centerX, y: centerY, score: 0 };
+
+  for (let y = searchY1; y < searchY2; y += 8) {
+    for (let x = searchX1; x < searchX2; x += 8) {
+      const idx = (y * width + x) * 4;
+      const r = rgba[idx], g = rgba[idx + 1], b = rgba[idx + 2];
+      // Check if this pixel is significantly brighter or darker than surroundings
+      let contrastScore = 0;
+      // Check 8 surrounding points at distance 20px
+      for (let dy = -20; dy <= 20; dy += 10) {
+        for (let dx = -20; dx <= 20; dx += 10) {
+          if (dx === 0 && dy === 0) continue;
+          const sx = x + dx, sy = y + dy;
+          if (sx < 0 || sx >= width || sy < 0 || sy >= height) continue;
+          const sidx = (sy * width + sx) * 4;
+          const sr = rgba[sidx], sg = rgba[sidx + 1], sb = rgba[sidx + 2];
+          const diff = Math.abs(r - sr) + Math.abs(g - sg) + Math.abs(b - sb);
+          if (diff > 100) contrastScore++;
+        }
+      }
+      if (contrastScore > bestCluster.score) {
+        bestCluster = { x, y, score: contrastScore };
+      }
+    }
+  }
+
+  // Only return a play button if the contrast score is high enough
+  // (a real play button has high contrast against the video background)
+  if (bestCluster.score >= 15) {
+    return { x: bestCluster.x, y: bestCluster.y };
+  }
+  return null;
 }
 
 function _exercisePageAction(
