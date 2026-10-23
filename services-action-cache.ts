@@ -328,15 +328,24 @@ function _parseCompositeHash(composite: string): { byte: string | null; pixel: s
 let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 
-// TASK 80 (2026-09-25): Hardcoded state ban check.
+// TASK 80+130 (2026-10-22): Hardcoded state ban check.
 // The user is tired of exploring state entries "messing everything up".
 // This is the ULTIMATE safety net — regardless of what the cycle manager
 // says, the action cache module itself refuses to serve or store entries
 // for any state containing 'explor' (case-insensitive).
-// This check runs in lookup(), lookupAsync(), save(), and _findSimilarLocalHit().
+// TASK 130: Also ban 'error' and 'unknown' states — caching wait/error
+// actions and serving them later causes the bot to repeat the same failed
+// action forever. The logs showed "Action cache SAVE: sig=mathu_lo type=wait
+// state=error" — this cached error action was then served on subsequent
+// cycles, preventing the bot from trying a real action.
 function _isStateBanned(state: string | null | undefined): boolean {
   if (!state) return false;
-  return state.toLowerCase().includes('explor');
+  const lower = state.toLowerCase();
+  return lower.includes('explor') ||
+         lower === 'error' ||
+         lower === 'unknown' ||
+         lower === 'blank_page' ||
+         lower === 'blank';
 }
 
 function _getConfig() {
