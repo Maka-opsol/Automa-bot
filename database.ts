@@ -263,6 +263,7 @@ let insertModule: any, selectModule: any, getAllModules: any;
 let insertProgress: any, getRecentProgress: any, insertTemplate: any;
 let selectTemplate: any, listTemplates: any, updateTemplateHit: any;
 let upsertProvider: any, selectProvider: any, listProviders: any;
+let deleteProvider: any = null;
 let upsertCalibration: any, selectCalibration: any;
 let upsertLastState: any, selectLastState: any;
 let insertPatch: any, getRecentPatches: any, updateProviderStats: any;
@@ -424,6 +425,14 @@ module.exports = {
   get upsertProvider() { return upsertProvider; },
   get selectProvider() { return selectProvider; },
   get listProviders() { return listProviders; },
+  get deleteProvider() {
+    // TASK 130: Add deleteProvider so stale model names can be cleared
+    if (!deleteProvider) {
+      try { deleteProvider = db.prepare('DELETE FROM provider_registry WHERE provider_name = ?'); }
+      catch { deleteProvider = null; }
+    }
+    return deleteProvider;
+  },
   get upsertCalibration() { return upsertCalibration; },
   get selectCalibration() { return selectCalibration; },
   get upsertLastState() { return upsertLastState; },
