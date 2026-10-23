@@ -521,7 +521,11 @@ async function investigatePage() {
     const _appUrl = String(config.APP_URL || 'https://app.mathu.co.za').replace(/\/+$/, '');
     const _investigateUrl = `${_appUrl}/assignments`;
     try {
-      await page.goto(_investigateUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      // TASK 130 (2026-10-22): Use 'load' instead of 'domcontentloaded' and
+      // increase timeout to 60s. Flutter Web takes 30-60s to render on
+      // Render's free tier — the old 30s 'domcontentloaded' timeout was
+      // causing every self-heal investigation to fail with "Timeout 30000ms exceeded".
+      await page.goto(_investigateUrl, { waitUntil: 'load', timeout: 60000 });
     } catch (navErr: any) {
       const _msg = String(navErr?.message || navErr);
       log(`Investigation navigation to ${_investigateUrl} failed: ${_msg.substring(0, 200)}`, 'WARN', 'self-heal');
