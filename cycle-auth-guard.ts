@@ -472,9 +472,29 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
     }
 
     // Pixel check confirmed the page is NOT visually blank.
-    // We're on the last-known-good origin AND the page has rendered pixels,
-    // so the session is valid. Update the tracker with the current URL so
-    // subsequent checks compare against the freshest known-good location.
+    // TASK 133 (2026-10-23): Check if we're actually on the LOGIN page.
+    // The MathU login page has rendered content ("Sign in with Microsoft" button)
+    // but the user is NOT logged in. The old code treated any non-blank page on
+    // the app origin as "session valid" — which meant the bot thought it was
+    // logged in when it was actually on the login page. This caused an infinite
+    // login loop: click Sign in → Microsoft redirects back → "session valid" →
+    // tribunal sees login page → click Sign in again.
+    try {
+      const bodyText = await page.evaluate(() => document.body?.innerText || '');
+      const lowerText = bodyText.toLowerCase();
+      // Detect MathU login page indicators
+      const isLoginPage = lowerText.includes('sign in with microsoft') ||
+                          lowerText.includes('sign in with apple') ||
+                          lowerText.includes('sign in with phone') ||
+                          (lowerText.includes('sign in') && lowerText.length < 500);
+      if (isLoginPage) {
+        log('SPA check: Page has content but shows LOGIN page ("Sign in with Microsoft") — session NOT valid', 'WARN', 'auth-guard');
+        return false;
+      }
+    } catch {}
+
+    // We're on the last-known-good origin AND the page has rendered pixels
+    // AND it's not the login page, so the session is valid.
     log('SPA check: Page has rendered content on known origin — session valid', 'DEBUG', 'auth-guard');
     notifyLastKnownGoodUrl(url);
     return true;
@@ -634,12 +654,42 @@ async function ensureAuthenticated(page: any) {
   // settling, or the login might have failed and needs to be retried by the
   // tribunal. Either way, return the page as-is — NO URL changes.
   if (isLoginInProgress() && _isOnKnownAppOrigin(url)) {
-    log('Login flow returned to app origin — clearing flag, returning page to tribunal (NO refreshSession, NO URL change)', 'INFO', 'auth-guard');
-    notifyLoginCompleted();
-    notifyLastKnownGoodUrl(url);
-    authAttempts = 0;
-    (page as any)._authBlankPage = false;
-    return page;
+    // TASK 133 (2026-10-23): Don't just assume login completed because we're
+    // back on the app origin. The Microsoft login might have bounced back
+    // WITHOUT authenticating (e.g., the bot never entered email/password, or
+    // the login failed). Check if we're on the LOGIN page — if so, the login
+    // did NOT complete, and we should NOT clear the login flag.
+    try {
+      const bodyText = await page.evaluate(() => document.body?.innerText || '');
+      const lowerText = bodyText.toLowerCase();
+      const isLoginPage = lowerText.includes('sign in with microsoft') ||
+                           lowerText.includes('sign in with apple') ||
+                           (lowerText.includes('sign in') && lowerText.length < 500);
+      if (isLoginPage) {
+        // We're BACK on the login page — the login FAILED (bounced back without auth)
+        // Don't clear the login flag, don't return the page as "login complete".
+        // Fall through to Rule 3 which will detect session is invalid (login page)
+        // and let the tribunal try again.
+        log('Login flow returned to app origin but page shows LOGIN — login did NOT complete, falling through to re-auth', 'WARN', 'auth-guard');
+        notifyLoginCompleted(); // Clear the flag so we can retry
+        // Fall through to Rule 3 — _isSpaSessionValid will return false (login page)
+      } else {
+        log('Login flow returned to app origin — login appears successful, clearing flag, returning page to tribunal (NO refreshSession, NO URL change)', 'INFO', 'auth-guard');
+        notifyLoginCompleted();
+        notifyLastKnownGoodUrl(url);
+        authAttempts = 0;
+        (page as any)._authBlankPage = false;
+        return page;
+      }
+    } catch {
+      // Can't check page content — assume login completed
+      log('Login flow returned to app origin — clearing flag, returning page to tribunal (NO refreshSession, NO URL change)', 'INFO', 'auth-guard');
+      notifyLoginCompleted();
+      notifyLastKnownGoodUrl(url);
+      authAttempts = 0;
+      (page as any)._authBlankPage = false;
+      return page;
+    }
   }
 
   // ── Rule 3: SPA-aware session validation (read-only, no URL changes) ──
