@@ -30,20 +30,20 @@ const PROVIDER_QUERIES = {
   'Groq': 'Groq llama-3.3-70b versatile vision model', // fallback web search query
   'GitHub GPT': 'GitHub Models Azure OpenAI gpt-4o-mini',
   'z.ai': 'z.ai GLM-4.6V-Flash model',
-  'Agnes': 'Agnes AI 2.0 flash model',
-  'NVIDIA': 'NVIDIA NIM llama-3.1-8b-instruct',
+  'Agnes': 'Agnes AI 2.5 flash model',
+  'NVIDIA': 'NVIDIA NIM llama-3.2-11b-vision-instruct',
   'Cloudflare': 'Cloudflare Workers AI llama-4-scout',
   'Cerebras': 'Cerebras gemma model fast inference',
-  'Gemini': 'Gemini 1.5 flash model',
+  'Gemini': 'Gemini 2.5 flash model', // TASK 130: was '1.5 flash' — deprecated
 };
 
 /** Default model names when web search fails */
 const PROVIDER_DEFAULTS: Record<string, string> = {
-  'Groq': 'llama-3.3-70b-versatile',
+  'Groq': 'meta-llama/llama-4-scout-17b-16e-instruct', // TASK 130: vision-capable
   'GitHub GPT': 'gpt-4o-mini',
   'z.ai': 'GLM-4.6V-Flash',
-  'Agnes': 'agnes-2.0-flash',
-  'NVIDIA': 'meta/llama-3.1-8b-instruct',
+  'Agnes': 'agnes-2.5-flash', // TASK 130: was agnes-2.0-flash (decommissioned)
+  'NVIDIA': 'meta/llama-3.2-11b-vision-instruct', // TASK 130: was llama-3.1-8b-instruct (EOL)
   'Cloudflare': '@cf/meta/llama-4-scout-17b-16e-instruct',
   'Cerebras': 'gemma-4-31b',
   'Gemini': 'gemini-2.5-flash',
