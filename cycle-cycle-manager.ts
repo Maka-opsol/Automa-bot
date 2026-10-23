@@ -4417,8 +4417,93 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
           // TRIGGER: 2+ avenues agree -> full self-heal, no gates
           if (stuckVotes >= ZERO_PROGRESS_VOTES_NEEDED) {
+            // TASK 134 (2026-10-23): Before triggering self-heal, give the
+            // fallbacks (pixel-fallback, pixel-explorer) ONE MORE CHANCE with
+            // full control. If the fallbacks make progress (page changes,
+            // state changes, URL changes), reset the zero-progress timer and
+            // SKIP the self-heal. Self-heal is destructive (patches code,
+            // restarts the process) — it should only fire if the fallbacks
+            // ALSO can't make progress.
+            log(`ZERO PROGRESS detected (${avenues.join(', ')}). Giving fallbacks one last chance before self-heal...`, 'WARN', 'cycle');
+
+            let _fallbackMadeProgress = false;
+            try {
+              // Take a "before" screenshot hash to compare
+              const beforeUrl = page.url();
+              let beforeHash = '';
+              try {
+                const beforeShot = await page.screenshot({ type: 'jpeg', quality: 10, timeout: 8000 }).catch(() => null);
+                if (beforeShot) beforeHash = require('crypto').createHash('md5').update(beforeShot).digest('hex');
+              } catch {}
+
+              // Run pixel-fallback with FULL CONTROL (bypass state checks)
+              // TASK 134: Use BOTH the providers-fallback getFallbackAction
+              // AND the pixel-fallback generatePixelFallbackAction.
+              const pixelFallbackMod = (() => { try { return require('./pixel-fallback'); } catch { return null; } })();
+              const providersFallbackMod = (() => { try { return require('./providers-fallback'); } catch { return null; } })();
+
+              let fbAction: any = null;
+
+              // Try providers-fallback first (includes session-preservation swipe)
+              if (providersFallbackMod?.getFallbackAction) {
+                log('Zero-progress: running providers-fallback with full control...', 'INFO', 'cycle');
+                try {
+                  fbAction = await providersFallbackMod.getFallbackAction(page, currentState || undefined);
+                } catch (e: any) {
+                  log(`Zero-progress: providers-fallback error: ${e.message}`, 'WARN', 'cycle');
+                }
+              }
+
+              // If providers-fallback returned wait/error, try pixel-fallback directly
+              if ((!fbAction || fbAction.actionType === 'wait' || fbAction.currentState === 'error') && pixelFallbackMod?.generatePixelFallbackAction) {
+                log('Zero-progress: providers-fallback returned wait — trying pixel-fallback directly...', 'INFO', 'cycle');
+                try {
+                  const pfAction = await pixelFallbackMod.generatePixelFallbackAction(page, currentState || undefined);
+                  if (pfAction && pfAction.actionType && pfAction.actionType !== 'wait') {
+                    fbAction = pfAction;
+                  }
+                } catch (e: any) {
+                  log(`Zero-progress: pixel-fallback error: ${e.message}`, 'WARN', 'cycle');
+                }
+              }
+
+              if (fbAction && fbAction.actionType && fbAction.actionType !== 'wait') {
+                log(`Zero-progress: fallback returned ${fbAction.actionType} on state ${fbAction.currentState || currentState} — executing`, 'INFO', 'cycle');
+                if (executeAction) {
+                  await executeAction(page, fbAction, { toAbsolute: (x: number, y: number) => ({ x: Math.floor(x * (page.viewportSize?.width || 1280)), y: Math.floor(y * (page.viewportSize?.height || 720)) }) });
+                }
+                await new Promise(r => setTimeout(r, 3000)); // wait for page to settle
+
+                // Check if the page changed (progress!)
+                const afterUrl = page.url();
+                let afterHash = '';
+                try {
+                  const afterShot = await page.screenshot({ type: 'jpeg', quality: 10, timeout: 8000 }).catch(() => null);
+                  if (afterShot) afterHash = require('crypto').createHash('md5').update(afterShot).digest('hex');
+                } catch {}
+
+                if (afterUrl !== beforeUrl || (afterHash && beforeHash && afterHash !== beforeHash)) {
+                  _fallbackMadeProgress = true;
+                  log(`Zero-progress: fallback MADE PROGRESS! URL changed (${beforeUrl} → ${afterUrl}) or screenshot changed. Resetting zero-progress timer, SKIPPING self-heal.`, 'INFO', 'cycle');
+                  lastProgressTime = Date.now();
+                  _zeroProgressHealTriggered = false;
+                } else {
+                  log('Zero-progress: fallback did NOT change the page — proceeding to self-heal', 'WARN', 'cycle');
+                }
+              } else {
+                log('Zero-progress: all fallbacks returned wait/null — proceeding to self-heal', 'WARN', 'cycle');
+              }
+            } catch (fbOuterErr: any) {
+              log(`Zero-progress: fallback pre-heal error: ${fbOuterErr.message} — proceeding to self-heal`, 'WARN', 'cycle');
+            }
+
+            // If the fallback made progress, SKIP self-heal and continue the cycle
+            if (_fallbackMadeProgress) {
+              continue;
+            }
+
             _zeroProgressHealTriggered = true;
-            const errMsg = `ZERO PROGRESS for 20+ minutes (${avenues.join(', ')}). Triggering full self-heal directly.`;
+            const errMsg = `ZERO PROGRESS for 20+ minutes (${avenues.join(', ')}). Fallbacks also failed. Triggering full self-heal directly.`;
             log(errMsg, 'ERROR', 'cycle');
 
             _recordErrorForDesperation('E_ZERO_PROGRESS');
