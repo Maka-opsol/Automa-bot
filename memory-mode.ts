@@ -1268,10 +1268,14 @@ function init(): void {
         _log('Detected recent OOM kill — starting in MEMORY PROTECTION mode', 'WARN');
       }
     } else {
-      // v4: Default to memory_protection. Full power requires self-heal session
-      // or manual dashboard switch. This is the safe default on 512MB.
-      _applyMode('memory_protection', 'init_default_safe').catch(() => {});
-      _log('Starting in MEMORY PROTECTION mode (safe default). Full power requires self-heal session or manual switch.', 'INFO');
+      // TASK 135 (2026-10-23): Default to full_power. With Task 124's fix
+      // (onnxruntime-node no longer loaded at startup), the baseline heap is
+      // only ~48MB — there's plenty of headroom for all modules. Starting in
+      // MEMORY PROTECTION mode was disabling 20 heavy modules unnecessarily,
+      // making the bot weaker from the start. If OOM happens later, the
+      // heap guardian will shed memory dynamically.
+      _applyMode('full_power', 'init_default_full_power').catch(() => {});
+      _log('Starting in FULL POWER mode (Task 135: baseline heap is low enough after onnxruntime fix)', 'INFO');
     }
   } catch (e: any) {
     _applyMode('memory_protection', 'init_fallback').catch(() => {});
