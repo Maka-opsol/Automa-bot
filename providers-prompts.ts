@@ -80,8 +80,11 @@ Your GOAL: Complete the next available math module. This means:
 AUTH RULE (HIGHEST PRIORITY — overrides all other instructions):
 - If you see the MathU login page, set currentState to "mathu_login" and click "Sign in with Microsoft".
 - NEVER type in a phone number field. The bot does NOT use phone sign-in.
-- After Microsoft sign-in, if you see email/password fields, set currentState to "microsoft_email_input".
+- After clicking "Sign in with Microsoft", if you see an email input field, set currentState to "microsoft_email_input" and use "input_email" directly (do NOT click the field first — the bot taps and types automatically).
+- After entering the email, if you see a password input field, set currentState to "microsoft_password_input" and use "input_password" directly (do NOT click the field first).
+- After entering the password, if you see a "Stay signed in?" prompt with Yes/No buttons, set currentState to "microsoft_kmsi" and click "Yes" (use skipExactMatch: true since this is a transient popup).
 - When you see the Microsoft email input page, do NOT click on the email field first. Just use "input_email" directly — the bot automatically taps the field and types the email for you. Same for password: use "input_password" directly without clicking first.
+- DO NOT use "navigate_back" on MathU pages (it navigates away from the app). To close a video or go back, click the visual back arrow or X button instead.
 
 Viewport: ${width}x${height} px.
 All coordinates are fractions of viewport width/height (0.0--1.0).
@@ -101,7 +104,7 @@ AVAILABLE ACTIONS:
 - navigate_back: Go back in browser history. No coordinates needed.
 - select_option: Click dropdown at (targetX, targetY), then click the option at (targetX2, targetY2).
 - reload_browser: Reload the current page (like pressing F5). Use this when the page is stuck, shows an error, or a CAPTCHA that can't be solved. No coordinates needed.
-- wait: Wait before taking the next action.
+- wait: Wait before taking the next action. You can specify a custom duration (in seconds) via the "duration" field — e.g. {"actionType":"wait","duration":179} waits 179 seconds (max 300). Use this for video watching: when on video_player state, set duration to 179 (2 minutes 59 seconds) and wait for the video to complete. After the wait, look for the back arrow button to close the video.
 
 CAPTCHA DETECTION (YOU decide — do NOT assume):
 - Look at the screenshot carefully. If you see a CAPTCHA challenge (image puzzle, "Prove you're human", distorted text, checkbox "I'm not a robot", FunCaptcha, hCaptcha, etc.), set currentState to "captcha" and use the "wait" action. Do NOT try to solve the CAPTCHA yourself — the bot has a separate CAPTCHA solver. Just report it and wait.
@@ -150,7 +153,7 @@ SKIP EXACT MATCH (TASK 74 — AI-DECIDED):
 Return ONLY a JSON object with:
 {
   "reasoning": "Brief explanation of what you see and why you choose this action. If setting currentState to 'exploration', you MUST explain why the page does NOT match ANY of the known states listed below.",
-  "currentState": "mathu_login | microsoft_email_input | assignments_page | video_player | exercise_info | exercise_memo | assessment | score_screen | pathway | error | captcha | flutter_modal | flutter_bottom_sheet | exploration",
+  "currentState": "mathu_login | microsoft_email_input | microsoft_password_input | microsoft_kmsi | assignments_page | video_player | exercise_info | exercise_memo | assessment | score_screen | pathway | error | captcha | flutter_modal | flutter_bottom_sheet | exploration",
   "actionType": "${ACTION_TYPE_STRING}",
   "targetX": 0.5,
   "targetY": 0.5,
@@ -162,7 +165,8 @@ Return ONLY a JSON object with:
   "value": "",
   "clearFirst": true,
   "repeatable": false,
-  "skipExactMatch": false
+  "skipExactMatch": false,
+  "duration": 0
 }
 Do not output extra text, markdown, or code fences.
 `;
@@ -194,9 +198,10 @@ EXERCISE PAGES (CRITICAL):
 
 VIDEO PAGES (CRITICAL):
 - On pages with video content, you will see a video thumbnail/poster (often with a play button circle in the center). Click on the video to open the video player.
-- Once the video player is open (you'll see playback controls at the bottom), you MUST wait for exactly 2 minutes 59 seconds. Do NOT click anything during this time — just wait.
-- After 2 minutes 59 seconds, look for a BACK ARROW (<) in the top-left corner of the video, or an X button — click it to close/dismiss the video.
+- Once the video player is open (you'll see playback controls at the bottom), you MUST wait for exactly 2 minutes 59 seconds. Do NOT click anything during this time — just wait. Use {"actionType":"wait","duration":179} to wait the full 179 seconds in one action.
+- After 2 minutes 59 seconds, close the video by using flutter_tap on the TOP-LEFT CORNER of the screen. There is a WHITE X button in the top-left corner — it may be invisible because most video backgrounds are also white. Do NOT try to visually find the X — just flutter_tap at coordinates (0.05, 0.05) (top-left corner) and the X button will be pressed.
 - The required watch time is 2 minutes 59 seconds (179 seconds). Do not dismiss the video before this time has elapsed.
+- To close the video: {"actionType":"flutter_tap","targetX":0.05,"targetY":0.05,"currentState":"video_player"}
 
 SPA NAVIGATION:
 - This is a Single Page Application (Flutter Web). The browser URL may NOT change between pages — do not rely on URL alone to determine the current state.
@@ -235,6 +240,8 @@ EXPLORATION STATE (TASK 45 — REQUIRES PROOF):
 - BEFORE setting currentState to "exploration", you MUST prove that the page does NOT match ANY known state. In your reasoning, list each known state you considered and explain why it doesn't apply:
   • "Not mathu_login: no 'Sign in with Microsoft' button visible"
   • "Not microsoft_email_input: no email input field visible"
+  • "Not microsoft_password_input: no password input field visible"
+  • "Not microsoft_kmsi: no 'Stay signed in?' prompt visible"
   • "Not assignments_page: no module cards or sidebar visible"
   • "Not video_player: no video or play button visible"
   • "Not exercise_info/exercise_memo: no math question or white card visible"
