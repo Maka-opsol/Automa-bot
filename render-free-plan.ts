@@ -158,7 +158,7 @@ if (!process.env.MEMORY_RESTART_THRESHOLD_MB) process.env.MEMORY_RESTART_THRESHO
 
 // Post-set consistency guard
 (function ensureMemoryThresholdConsistency() {
-  const maxMem = parseInt(process.env.MAX_MEMORY_MB || '448', 10);
+  const maxMem = parseInt(process.env.MAX_MEMORY_MB || '400', 10);
   const restartThr = parseInt(process.env.MEMORY_RESTART_THRESHOLD_MB || '0', 10);
   const warnThr = parseInt(process.env.MEMORY_WARNING_THRESHOLD_MB || '0', 10);
   if (restartThr > 0 && restartThr >= maxMem) {
@@ -1221,6 +1221,18 @@ try {
   // ═══════════════════════════════════════════════════════════════════════
   // START THE DAEMON (non-blocking — runs in background)
   // ═══════════════════════════════════════════════════════════════════════
+
+  // TASK 135 (2026-10-23): Disable the proxy on Render. The ProxyScrape ZA
+  // proxies are delivering blank pages (std=0.0) — they can't handle the
+  // Flutter Web CanvasKit bundle download. Render's own IP is fine for
+  // accessing MathU. The proxy just adds latency and breaks pages.
+  try {
+    const ipRotator = require('./network-ip-rotator');
+    if (typeof ipRotator.bypassProxy === 'function') {
+      ipRotator.bypassProxy('Render free tier — proxy delivers blank pages, using direct connection');
+      log('Proxy DISABLED on startup — using direct connection (Task 135: proxy delivers blank pages)', 'INFO', 'render-free-plan');
+    }
+  } catch { /* ip-rotator not loaded */ }
 
   log('Starting daemon loop (background, all features)...', 'INFO', 'render-free-plan');
   startDaemon().catch(err => {
