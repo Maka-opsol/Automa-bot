@@ -341,11 +341,25 @@ function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function _isStateBanned(state: string | null | undefined): boolean {
   if (!state) return false;
   const lower = state.toLowerCase();
+  // TASK 135 (2026-10-23): Only ban 'explor' states (exploration/exploring)
+  // and 'error' states. Don't ban 'unknown' — 'unknown' just means the AI
+  // couldn't classify the state, but the action might still be correct
+  // (e.g., a click on a button). Banning 'unknown' was too aggressive and
+  // prevented valid cached actions from being served.
   return lower.includes('explor') ||
          lower === 'error' ||
-         lower === 'unknown' ||
          lower === 'blank_page' ||
          lower === 'blank';
+}
+
+function _banReason(state: string | null | undefined): string {
+  if (!state) return 'no state';
+  const lower = state.toLowerCase();
+  if (lower.includes('explor')) return `state='${state}' contains 'explor'`;
+  if (lower === 'error') return `state='${state}' is 'error'`;
+  if (lower === 'blank_page') return `state='${state}' is 'blank_page'`;
+  if (lower === 'blank') return `state='${state}' is 'blank'`;
+  return `state='${state}'`;
 }
 
 function _getConfig() {
@@ -596,7 +610,7 @@ function _findSimilarLocalHit(targetSig: string): {
 
   // TASK 80 (2026-09-25): Hardcoded ban check for similar match too.
   if (_isStateBanned(target.state)) {
-    log(`Action cache similar match REJECTED (hardcoded ban): state='${target.state}' contains 'explor'`, 'DEBUG', 'action-cache');
+    log(`Action cache similar match REJECTED (hardcoded ban): ${_banReason(target.state)}`, 'DEBUG', 'action-cache');
     return null;
   }
 
@@ -785,7 +799,7 @@ async function lookupAsync(contextSignature: string, currentBase64Screenshot?: s
   // cycle-manager flag.
   const _parsedTarget = _parseSignature(contextSignature);
   if (_parsedTarget && _isStateBanned(_parsedTarget.state)) {
-    log(`Action cache lookup REJECTED (hardcoded ban): state='${_parsedTarget.state}' contains 'explor'`, 'DEBUG', 'action-cache');
+    log(`Action cache lookup REJECTED (hardcoded ban): ${_banReason(_parsedTarget.state)}`, 'DEBUG', 'action-cache');
     return null;
   }
 
@@ -866,7 +880,7 @@ function lookup(contextSignature: string, currentBase64Screenshot?: string | nul
   // entries for any state containing 'explor'.
   const _parsedTarget = _parseSignature(contextSignature);
   if (_parsedTarget && _isStateBanned(_parsedTarget.state)) {
-    log(`Action cache lookup REJECTED (hardcoded ban): state='${_parsedTarget.state}' contains 'explor'`, 'DEBUG', 'action-cache');
+    log(`Action cache lookup REJECTED (hardcoded ban): ${_banReason(_parsedTarget.state)}`, 'DEBUG', 'action-cache');
     return null;
   }
 
@@ -990,7 +1004,7 @@ async function save(
   // _isCacheExcluded check is bypassed, this prevents the entry from being
   // written to the DB.
   if (_isStateBanned(action.currentState)) {
-    log(`Action cache save REJECTED (hardcoded ban): state='${action.currentState}' contains 'explor'`, 'DEBUG', 'action-cache');
+    log(`Action cache save REJECTED (hardcoded ban): ${_banReason(action.currentState)}`, 'DEBUG', 'action-cache');
     return;
   }
 
