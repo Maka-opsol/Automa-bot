@@ -59,14 +59,18 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'Groq': {
     endpoint: null,  // Uses groq-sdk (not raw HTTP)
-    // TASK 67: Groq model names don't use 'qwen/' prefix.
-    // qwen/qwen3.6-27b → 404. Use llama-3.3-70b-versatile (confirmed working).
-    model: 'llama-3.3-70b-versatile',
+    // TASK 117 (2026-10-11): llama-3.3-70b-versatile is TEXT-ONLY (no vision).
+    // The bot needs vision to analyze MathU screenshots. Use llama-4-scout
+    // (vision-capable) as the primary model. getBestModel() will also
+    // auto-discover vision models via the SDK if this one 404s.
+    // Previous: llama-3.3-70b-versatile (text-only, useless for tribunal)
+    model: 'meta-llama/llama-4-scout-17b-16e-instruct',
     envKeys: ['GROQ_API_KEY'],
     visionCapable: true,
     fallbackModels: [
-      'llama-3.1-8b-instant',
-      'llama3-70b-8192',
+      'llama-3.2-90b-vision-preview',
+      'llama-3.2-11b-vision-preview',
+      'llama-3.3-70b-versatile', // text-only fallback (last resort)
     ],
   },
   'z.ai': {
@@ -78,10 +82,23 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'Agnes': {
     endpoint: 'https://apihub.agnes-ai.com/v1/chat/completions',
-    model: 'agnes-2.0-flash',
+    // TASK 117+118 (2026-10-12): Updated based on the actual Agnes model list
+    // (screenshot from user). The old agnes-2.0-flash was decommissioned → 503.
+    // The Agnes platform now has these TEXT models:
+    //   agnes-2.5-flash, agnes-2.5-pro, agnes-3.0-flash, agnes-3.0-flash-max
+    // And IMAGE models (image generation, NOT image understanding):
+    //   agnes-image-2.0-flash, agnes-image-2.1-flash, agnes-image-2.5-flash
+    // The bot needs vision (image INPUT/understanding). The TEXT models are
+    // multimodal and accept image_url content parts (OpenAI-compatible).
+    // Using agnes-2.5-flash as primary (proven, stable) with newer 3.0 as fallbacks.
+    model: 'agnes-2.5-flash',
     envKeys: ['AGNES_API_KEY'],
     visionCapable: true,
-    fallbackModels: [],
+    fallbackModels: [
+      'agnes-3.0-flash',
+      'agnes-3.0-flash-max',
+      'agnes-2.5-pro',
+    ],
   },
   'NVIDIA': {
     endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions',
@@ -184,7 +201,7 @@ function loadDynamicModels() {
       DYNAMIC_MODELS = parsed;
       _log(`Loaded ${Object.keys(parsed).length} dynamic models from DB`, 'DEBUG', 'config-loader');
     }
-    // TASK 67+111: Clear stale DB models that point to EOL/decommissioned models.
+    // TASK 67+111+117: Clear stale DB models that point to EOL/decommissioned models.
     const STALE_MODELS = [
       'qwen/qwen3.6-27b',
       'qwen/qwen3.8-27b',
@@ -198,6 +215,24 @@ function loadDynamicModels() {
       'gemini-2.5-pro',
       '@cf/moonshotai/kimi-k2.5',
       '@cf/meta/llama-3.2-11b-vision',
+      // TASK 117 (2026-10-11): openai/gpt-oss-120b is a text-only model with
+      // a 200k TPD limit that was auto-discovered and stored in the DB.
+      // It's NOT vision-capable — the bot needs vision to analyze screenshots.
+      // Clear it so getBestModel() can find a proper vision model.
+      'openai/gpt-oss-120b',
+      'openai/gpt-oss-20b',
+      // TASK 118 (2026-10-12): agnes-2.0-flash decommissioned on the Agnes
+      // platform — returns 503 "No available channel for model agnes-2.0-flash".
+      // Replaced by agnes-2.5-flash.
+      'agnes-2.0-flash',
+      // TASK 118 (2026-10-12): gpt-4o-mini was a wrong guess — Agnes platform
+      // uses its own native model names, not OpenAI model names.
+      'gpt-4o-mini',
+      // TASK 130 (2026-10-22): gemini-1.5-flash-001 is also deprecated (404).
+      // The Gemini provider was still using this old model name from the DB.
+      'gemini-1.5-flash-001',
+      'gemini-1.5-flash',
+      'gemini-1.5-pro',
     ];
     let clearedCount = 0;
     for (const providerName of Object.keys(DYNAMIC_MODELS)) {
@@ -212,6 +247,38 @@ function loadDynamicModels() {
       _log(`Cleared ${clearedCount} stale dynamic models from DB. Saving updated config.`, 'INFO', 'config-loader');
       saveDynamicModels();
     }
+
+    // TASK 130 (2026-10-22): Also clear stale models from the `providers` DB table.
+    // The getProviderConfig() function reads from the `providers` table FIRST,
+    // before checking DYNAMIC_MODELS or DEFAULTS. If the DB has old model names
+    // (e.g., agnes-2.0-flash, meta/llama-3.1-8b-instruct, gemini-1.5-flash-001),
+    // those are returned instead of the correct DEFAULTS — causing 410/404/503
+    // errors on every provider call.
+    // Fix: iterate all known providers and clear any whose DB model is stale.
+    try {
+      const db2 = _deps.database ?? require('./database');
+      const knownProviders = Object.keys(DEFAULTS);
+      let providersCleared = 0;
+      for (const providerName of knownProviders) {
+        try {
+          const row = db2.selectProvider?.get(providerName);
+          if (row && row.model && STALE_MODELS.includes(row.model)) {
+            _log(`Clearing stale DB provider model for ${providerName}: ${row.model} (decommissioned/EOL) — will use DEFAULTS instead`, 'WARN', 'config-loader');
+            // Delete the stale row so getProviderConfig falls through to DEFAULTS
+            db2.deleteProvider?.run?.(providerName);
+            // Fallback: upsert with the DEFAULT model
+            const def = DEFAULTS[providerName];
+            if (def) {
+              db2.upsertProvider?.run(providerName, def.endpoint || null, def.model, Date.now(), '[]', 0, 0, 0, Date.now());
+            }
+            providersCleared++;
+          }
+        } catch {}
+      }
+      if (providersCleared > 0) {
+        _log(`Cleared ${providersCleared} stale provider models from providers table. They now use DEFAULTS.`, 'INFO', 'config-loader');
+      }
+    } catch (e2: any) { _log(`Provider table cleanup error: ${e2.message}`, 'WARN', 'config-loader'); }
   } catch (e: any) { _logError('Failed to load dynamic models', e); }
 }
 
