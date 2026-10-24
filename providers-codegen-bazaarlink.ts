@@ -20,6 +20,13 @@ function _getLimiter() {
   return _limiter;
 }
 
+// TASK 140 (2026-10-24): BazaarLink daily limit tracking
+// When BazaarLink returns 429 "daily limit of 60 free-model requests",
+// ALL BazaarLink models are exhausted. Skip them all until the flag is cleared.
+// The flag clears automatically on process restart (new day = new session).
+let _bazaarlinkDailyLimitExhausted = false;
+function isBazaarlinkDailyLimitExhausted() { return _bazaarlinkDailyLimitExhausted; }
+
 // ─── Lazy client instance (reuses same client across calls) ──────
 let _client: any = null;
 function _getClient(apiKey: string): any {
@@ -73,13 +80,18 @@ async function callBazaarLinkCodeGenWithModel(prompt: any, signal: any, modelSlu
     content = response.choices[0].message.content ?? '';
   } catch (err: any) {
     // On 429, record 1 usage (same as success) to keep the counter accurate.
-    // The isExhausted() pre-check in the tribunal will naturally stop
-    // calling when the budget is truly exhausted. Using recordUsage()
-    // instead of forceExhaust() avoids over-counting: previously forceExhaust
-    // added 5 per 429, and with 3 concurrent models all getting 429 that
-    // burned 15 per tribunal round (50 budget in ~4 rounds with only ~12 actual requests).
     if (err?.status === 429 || String(err?.message || '').includes('429')) {
       _getLimiter().recordUsage();
+      // TASK 140 (2026-10-24): Detect BazaarLink daily limit exhaustion.
+      // "You have reached the daily limit of 60 free-model requests"
+      // When this happens, ALL BazaarLink models are exhausted — skip them all.
+      const errMsg = String(err?.error?.message || err?.message || '');
+      if (errMsg.includes('daily limit') || errMsg.includes('reached the daily limit')) {
+        _bazaarlinkDailyLimitExhausted = true;
+        const resetMatch = errMsg.match(/resets at (\d{2}:\d{2}) UTC/);
+        const resetTime = resetMatch ? resetMatch[1] : '00:00 UTC';
+        log(`BazaarLink: daily limit exhausted (resets at ${resetTime}) — skipping all BazaarLink models for this session`, 'WARN', 'bazaarlink');
+      }
     }
     // TASK 107 (2026-10-03): Include more context in error messages.
     const status = err?.status || err?.statusCode || '';
@@ -145,5 +157,6 @@ module.exports = {
   callBazaarLinkCodeGen,
   callBazaarLinkCodeGenWithModel,
   getBazaarLinkModels,
+  isBazaarlinkDailyLimitExhausted,
   _injectDependencies,
 };
