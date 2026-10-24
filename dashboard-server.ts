@@ -1472,12 +1472,12 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
                   const sandboxResult = sandbox.executePatchInSandbox(file, patch);
                   if (!sandboxResult.safe) {
                     updatePatchStatus(patchId, 'sandbox_audit', 'rejected', {
-                      reason: sandboxResult.reason,
-                      details: sandboxResult.details,
+                      reason: sandboxResult.reason || sandboxResult.error || 'Unknown rejection',
+                      details: sandboxResult.details || sandboxResult.error || null,
                     });
                     return; // STOP — patch rejected
                   }
-                  updatePatchStatus(patchId, 'sandbox_audit', 'passed', sandboxResult.reason || 'All checks passed');
+                  updatePatchStatus(patchId, 'sandbox_audit', 'passed', sandboxResult.reason || sandboxResult.error || 'All checks passed');
                 } catch (sandboxErr) {
                   updatePatchStatus(patchId, 'sandbox_audit', 'rejected', { reason: 'Sandbox error: ' + sandboxErr.message });
                   return;
