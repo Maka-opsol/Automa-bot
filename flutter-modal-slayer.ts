@@ -31,7 +31,13 @@ class FlutterModalSlayer {
       log('✅ Sent Escape key to dismiss modal.', 'INFO', 'modal');
       await sleep(500);
       return true;
-    } catch (e: any) { logError('Modal slayer failed', e); return false; }
+    } catch (e: any) {
+      // TASK 138 (2026-10-24): This is non-critical — the browser might be
+      // closed or the page might be navigating. Don't log as ERROR — it spams
+      // the logs with "Modal slayer failed" on every browser disconnect.
+      log(`Modal slayer skipped (non-critical): ${e.message?.substring(0, 80) || e}`, 'DEBUG', 'modal');
+      return false;
+    }
   }
 }
 
