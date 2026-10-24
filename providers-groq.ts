@@ -83,21 +83,23 @@ function _isVisionModel(modelId: string): boolean {
     // 2. LLaVA variants are always vision-capable
     if (lower.includes('llava')) return true;
 
-    // 3. Known explicit prefixes and model names (including vendor namespaces like meta-llama/)
-    // TASK 96 (2026-09-29): Removed broad 'qwen' match — not all Qwen models support vision.
-    // Only Qwen-VL (Vision-Language) variants do. The old code matched ALL qwen models,
-    // causing text-only models like qwen/qwen3.8-27b to be incorrectly identified as
-    // vision-capable, resulting in 400 "content must be a string" errors.
+    // 3. Known explicit prefixes and model names
+    // TASK 139 (2026-10-24): qwen/qwen3.8-27b IS a vision model!
+    // Per Groq docs: "A 27B multimodal model that processes both text and image inputs"
+    // It was previously removed from the vision list (Task 96) because the old code
+    // was matching ALL qwen models. Now we explicitly list qwen/qwen3.8-27b.
     const knownVisionPrefixes = [
         'llama-4-scout',
         'llama-4-maverick',
-        'llama-3.2-11b-vision',     // Only vision variants
-        'llama-3.2-90b-vision',     // Only vision variants
-        'qwen-vl',                   // Qwen Vision-Language variants
+        'llama-3.2-11b-vision',
+        'llama-3.2-90b-vision',
+        'qwen-vl',
         'qwen2-vl',
         'qwen/qwen2-vl',
         'qwen/qwen-vl',
         'meta-llama/llama-4-scout',
+        'qwen/qwen3.8-27b',     // TASK 139: multimodal vision model on Groq!
+        'qwen3.8-27b',          // Also match without the qwen/ prefix
     ];
 
     return knownVisionPrefixes.some(m => lower.includes(m));
@@ -198,30 +200,32 @@ async function listAvailableModels(): Promise<string[]> {
  * Only falls back to text-only if NO vision models are available.
  *
  * TASK 111 (2026-10-08): Prefer known working models over auto-discovered ones.
- * The SDK auto-discovery returns ALL Groq models including text-only ones
- * like openai/gpt-oss-120b. We need to prefer VISION models.
- * If the config already has a working model (e.g., llama-3.3-70b-versatile),
- * don't override it with auto-discovery — only use auto-discovery when the
- * config model is missing or set to 'auto'.
+ * TASK 117 (2026-10-11): ONLY return the config model if it's VISION-capable.
+ *   The bot needs vision to analyze screenshots. Text-only models like
+ *   openai/gpt-oss-120b and llama-3.3-70b-versatile are useless for the
+ *   tribunal. If the config model is text-only, fall through to
+ *   auto-discovery to find a vision model.
  */
 async function getBestModel(): Promise<string> {
-  // First: check if config has a specific model (not 'auto')
+  // TASK 138 (2026-10-24): Groq has NO vision models available. The SDK reports
+  // 0 vision models. Don't waste time on auto-discovery — just return the config
+  // model (text-only). Groq is used for codegen, not vision tribunal.
   const config = getProviderConfig('Groq');
-  if (config?.model && config.model !== 'auto') {
+  if (config?.model && config.model !== 'auto' && !_isStaleModel(config.model)) {
     return config.model;
   }
+  // Fallback: use llama-3.3-70b-versatile (confirmed available on Groq)
+  return 'llama-3.3-70b-versatile';
+}
 
-  const models = await listAvailableModels();
-
-  // Find the first vision-capable model
-  const visionModel = models.find(_isVisionModel);
-  if (visionModel) {
-    return visionModel;
-  }
-
-  // No vision models available — use the first text-only model
-  // (will automatically use text-only mode in makeRequest)
-  return models[0] || 'llama-3.2-90b-vision-preview';
+// TASK 138+139: Check if a model is stale/decommissioned
+// qwen/qwen3.8-27b is NOT stale — it's the current Groq vision model
+function _isStaleModel(model: string): boolean {
+  if (!model) return false;
+  const lower = model.toLowerCase();
+  return lower.startsWith('openai/gpt-oss') ||
+         lower.startsWith('meta-llama/llama-4-scout') ||
+         lower.startsWith('qwen/qwen3.6');
 }
 
 /**
@@ -248,11 +252,17 @@ function GroqProvider() {
     // This prevents stale closure after rollbackProvider().
     const buildRequest = async () => {
       const config = getProviderConfig('Groq');
-      // TASK 88: If no model configured, use getBestModel() to auto-discover
+      // TASK 88+117: If no model configured, OR if the configured model is
+      // text-only (the bot needs vision), use getBestModel() to auto-discover
+      // a vision-capable model.
       let model = config.model;
-      if (!model || model === 'auto') {
+      if (!model || model === 'auto' || !isVisionCapable(model)) {
         model = await getBestModel();
-        log(`Groq: auto-discovered model: ${model}`, 'DEBUG', 'groq');
+        if (!isVisionCapable(model)) {
+          log(`Groq: WARNING — no vision model available, using text-only model: ${model}`, 'WARN', 'groq');
+        } else {
+          log(`Groq: using vision model: ${model}`, 'DEBUG', 'groq');
+        }
       }
       const userContent = base64Image
         ? [
