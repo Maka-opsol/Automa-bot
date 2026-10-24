@@ -211,8 +211,15 @@ function withTimeout(signal: any, timeoutMs: number): AbortController {
 function discoverModels() {
   // BazaarLink models (codegen primary — 50 free req/day)
   const bl = _getBL();
-  const blModels = bl?.getBazaarLinkModels?.() || [];
   const hasBazaarLink = !!getCONFIG().BAZAARLINK_API_KEY && !!bl;
+
+  // TASK 140 (2026-10-24): Check if BazaarLink daily limit is exhausted.
+  // If so, skip ALL BazaarLink models (not just individual ones).
+  const blDailyLimitExhausted = bl?.isBazaarlinkDailyLimitExhausted?.() || false;
+  if (blDailyLimitExhausted) {
+    log('BazaarLink: daily limit exhausted — skipping ALL BazaarLink models for this session', 'WARN', 'codegen');
+  }
+  const blModels = (hasBazaarLink && !blDailyLimitExhausted) ? (bl?.getBazaarLinkModels?.() || []) : [];
 
   // VoidAI models (codegen — uses OpenAI SDK with api.voidai.app baseURL)
   const voidMod = _getVoid();
