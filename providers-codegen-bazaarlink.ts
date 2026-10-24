@@ -27,11 +27,11 @@ function _getClient(apiKey: string): any {
     _client = new OpenAI({
       baseURL: 'https://api.bazaarlink.ai/v1',
       apiKey: apiKey,
-      // TASK 108+110 (2026-10-06): Disable SDK-level timeout and retries.
+      // TASK 108+110+130 (2026-10-22): Disable SDK-level timeout and retries.
       // Codegen tribunals should NOT time out (user's explicit request).
-      // NOTE: OpenAI SDK treats timeout: 0 as "use default" (60s), NOT
-      // "no timeout." Must use Infinity to actually disable.
-      timeout: Infinity, // no timeout (wait forever for code generation)
+      // TASK 130: OpenAI SDK rejects `Infinity` with "timeout must be an integer"
+      // Use a very large integer (24 hours) instead.
+      timeout: 86400000, // 24 hours — effectively no timeout
       maxRetries: 0,     // no SDK retries
     });
     (_client as any)._apiKey = apiKey;
