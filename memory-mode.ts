@@ -1253,19 +1253,28 @@ function init(): void {
       _applyMode('memory_protection', sanitizeReason(persisted.reason || 'persist_restore')).catch(() => {});
       _log('Restored MEMORY PROTECTION mode from persistent storage', 'INFO');
     } else if (persisted.current === 'minimum') {
-      // Clear the stale minimum mode and boot in memory_protection instead
-      _log('Persisted MINIMUM mode detected but IGNORED (was stuck in death loop). Booting in MEMORY PROTECTION mode instead.', 'WARN');
-      try { persistConfig.setMode('memory_protection', 'stale_minimum_cleared'); } catch {}
-      _applyMode('memory_protection', 'stale_minimum_cleared').catch(() => {});
+      // Clear the stale minimum mode and boot in full_power instead
+      _log('Persisted MINIMUM mode detected but IGNORED (was stuck in death loop). Booting in FULL POWER mode instead.', 'WARN');
+      try { persistConfig.setMode('full_power', 'stale_minimum_cleared'); } catch {}
+      _applyMode('full_power', 'stale_minimum_cleared').catch(() => {});
     } else if (persistConfig.wasRecentlyOOMKilled()) {
-      // Check OOM kill count — if very high, go straight to minimum
+      // TASK 142 (2026-10-24): Only go to memory_protection on ACTUAL OOM kills,
+      // not just unexpected restarts. wasRecentlyOOMKilled() returns true for any
+      // unexpected restart (including deploys). With oomKillsFromDB=0, there's
+      // no actual OOM — start in full_power instead.
       const oomCount = _getStoredOOMCount();
       if (oomCount >= MINIMUM_MODE_OOM_KILL_THRESHOLD) {
         _applyMode('minimum', `boot_oom_count:${oomCount}`).catch(() => {});
         _log(`Detected ${oomCount} recent OOM kills — starting in MINIMUM mode`, 'ERROR');
-      } else {
+      } else if (oomCount > 0) {
         _applyMode('memory_protection', 'auto:OOM_kill_recovery').catch(() => {});
-        _log('Detected recent OOM kill — starting in MEMORY PROTECTION mode', 'WARN');
+        _log(`Detected ${oomCount} recent OOM kill(s) — starting in MEMORY PROTECTION mode`, 'WARN');
+      } else {
+        // TASK 142: oomCount=0 but wasRecentlyOOMKilled returned true — this is
+        // just an unexpected restart (e.g., deploy), NOT an OOM kill. Start in
+        // full_power — the baseline heap is only ~48MB after the onnxruntime fix.
+        _applyMode('full_power', 'init_no_actual_oom').catch(() => {});
+        _log('Unexpected restart detected but NO actual OOM kills (oomCount=0) — starting in FULL POWER mode', 'INFO');
       }
     } else {
       // TASK 135 (2026-10-23): Default to full_power. With Task 124's fix
