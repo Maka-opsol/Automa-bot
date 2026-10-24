@@ -1,0 +1,193 @@
+'use strict';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// pixel-fallback.ts — Pure pixel-based page analysis & action generation v4
+// ═══════════════════════════════════════════════════════════════════════════
+// When ALL AI providers fail AND DOM is empty (Flutter canvas) AND semantics
+// return nothing, this module falls back to raw screenshot pixel analysis.
+// TREAT THIS AS THE BOT'S PRIMARY BRAIN — it may be all it has.
+//
+// ENHANCEMENTS in v3:
+//   - (JPEG decode was later REMOVED in Task 99 — PNG input only, see _decodeScreenshot)
+//   - Page-change fingerprinting (know if actions actually changed the page)
+//   - Stagnation detection (stop repeating the same failed action)
+//   - Smart quiz choice strategy (remember choices tried, avoid repeats)
+//   - Error/crash page detection (browser error pages, white screens)
+//   - Modal/overlay detection and dismissal
+//   - Consecutive failure safety valve (switch to safe recovery)
+//   - Scroll-depth memory (avoid infinite scroll loops)
+//   - Progress tracking (questions answered, modules completed)
+//   - Accept pre-decoded screenshots (avoid redundant screenshot())
+//
+// ENHANCEMENTS in v4 (SMART BRAIN):
+//   - Adaptive color calibration: learns actual button colors from successful
+//     clicks, adapts if MathU changes its color scheme between sessions
+//   - Intelligent quiz answering: uses text density heuristics to prefer
+//     longer/more-detailed choices (likely correct for math answers)
+//   - Multi-pass scan with noise reduction: improved detection on JPEG-coarse
+//     data by scanning at multiple step sizes and merging results
+//   - Video progress bar detection: verifies video is actually playing vs
+//     stuck/buffering by checking progress bar fill percentage
+//   - Assignment completion awareness: detects already-completed modules
+//     (green checkmarks, faded buttons) and skips them
+//   - Internal timeout safety: every public function wrapped in a hard timeout
+//     so pixel-fallback never blocks the cycle manager
+//   - Pathway navigation intelligence: detects breadcrumb navigation and
+//     module lists to move purposefully through the curriculum
+//   - Keyboard-based text entry: uses page.keyboard for email/password input
+//     instead of just clicking (more reliable on mobile viewports)
+//   - Login flow hardening: detects "Pick an account" and "Use another
+//     account" intermediate screens, handles password reset redirects
+//   - Exercise memo flip detection: after clicking book icon, waits for
+//     the memo page to appear before allowing Next (prevents premature advance)
+//   - Safe coordinate jitter: adds small random offsets to prevent UI
+//     elements from ignoring repeated clicks at the exact same coordinates
+//
+// FIXES in v4.2 (robustness pass):
+//   - _memory: `recentActions: Array<...> = []` compiled to `(Array) = []`, which
+//     REASSIGNED THE GLOBAL `Array` for the whole process. Now a typed literal.
+//   - _isSelectedChoice referenced an undefined `height` (ReferenceError at runtime)
+//   - _memory._lastVideoProgress / _videoStuckCount were never declared
+//   - Page fingerprint only hashed the first 32 samples of the top pixel row, so
+//     almost every page looked identical. Now a 128-bit grid dHash with Hamming
+//     distance; stagnation / memo-flip detection compare by distance.
+//   - Scroll exhaustion is now a consecutive-scroll streak (a content hash can't
+//     count scrolls because scrolling changes the content).
+//   - PNG decoder: in-place unfilter (faster), rejects interlaced/corrupt input
+//     instead of returning garbage, validates chunk bounds.
+//   - CDP session is always detached (leak on error), _withTimeout clears its timer
+//   - Login / error URL matching no longer fires on substrings like "author"
+//   - Modal detection requires ALL FOUR corners dimmed (app headers no longer match)
+//   - Click jitter is clamped to the target size (small icons were being missed)
+//   - Optional screenshot→viewport coordinate scaling (devicePixelRatio != 1)
+//
+// LOGIN FLOW HANDLED:
+//   1. MathU redirects to Microsoft login (login.microsoftonline.com)
+//      → detects email input field → types email → clicks Next
+//   2. Microsoft redirects to ADVLEARN password page
+//      → detects password input field → types password → clicks Sign in
+//   3. "Stay signed in?" prompt
+//      → clicks Yes/Stay signed in button
+//   4. "Use another account" option
+//      → detects and clicks if needed
+//   5. Various intermediate screens (Continue, etc.)
+//
+// APP PAGES HANDLED:
+//   - Assignments: finds download arrow buttons, then Start/Watch/Redo blue buttons
+//   - Module download: detects download arrow icon on module cards, clicks to download
+//   - Module topics: detects expanded module content with topic buttons
+//   - Quiz: finds Done/Submit teal-green buttons, numeric keypad
+//   - Exercise: MUST click open book icon (top-right of card) to view memo BEFORE
+//     clicking Next — the app requires viewing the memo before proceeding.
+//     Detects the book icon as a small blue element in the top-right of the white card.
+//   - Score screen: finds Continue to pathway button
+//   - Video player: clicks video to open it, watches for exactly 2 minutes 59 seconds,
+//     then finds back/X button to dismiss.
+//
+// Detection methods:
+//   - URL pattern matching (primary for Microsoft auth pages)
+//   - Background color analysis (blue = Microsoft/assignment, mint = quiz)
+//   - Pixel region scanning for white input fields, blue buttons, green buttons
+//   - Aspect ratio filtering for shape classification
+//   - Page fingerprinting for change detection
+//
+// No external dependencies — uses only Node.js built-ins (zlib, Buffer, crypto).
+// Memory: ~4 MB for a 1280×720 RGBA decode. CPU: ~20-30ms total.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const zlib = require('zlib');
+const { log } = require('./logger');
+
+// ─── Screenshot decode (PNG only — JPEG decoder removed in Task 99) ──────
+
+/**
+ * Decode a screenshot buffer to raw RGBA pixels.
+ * TASK 99 (2026-09-30): JPEG "decoder" REMOVED — it was fundamentally broken.
+ * It sampled entropy-coded bytes from the JPEG scan data and treated them
+ * as R/G/B pixel values. Those bytes do NOT correspond spatially to pixels
+ * due to JPEG's Huffman coding, DCT coefficients, quantization, and chroma
+ * subsampling. The resulting "image" was essentially random with respect to
+ * the actual screenshot.
+ *
+ * The pixel fallback now ONLY accepts PNG input (via CDP Page.captureScreenshot
+ * with format: 'png'). If a JPEG is passed, it returns null instead of
+ * producing garbage data. This ensures the pixel analysis always operates
+ * on real pixel values.
+ */
+function _decodeScreenshot(buffer: Buffer): { width: number; height: number; rgba: Uint8ClampedArray; format: string } | null {
+  // Only accept PNG — JPEG "decoding" was removed (see comment above)
+  const png = _decodePNG(buffer);
+  if (png) return { ...png, format: 'png' };
+  // JPEG or unsupported format — refuse to guess
+  if (buffer.length > 2 && buffer[0] === 0xFF && buffer[1] === 0xD8) {
+    log('Pixel fallback: JPEG input received — refusing to decode (JPEG byte-sampling is unreliable). Use PNG instead.', 'WARN', 'pixel-fallback');
+  }
+  return null;
+}
+
+
+// ─── PNG Decoder (minimal, RGBA 8-bit only) ───────────────────────────────
+
+function _paethPredictor(a: number, b: number, c: number): number {
+  const p = a + b - c;
+  const pa = Math.abs(p - a);
+  const pb = Math.abs(p - b);
+  const pc = Math.abs(p - c);
+  if (pa <= pb && pa <= pc) return a;
+  if (pb <= pc) return b;
+  return c;
+}
+
+function _decodePNG(buffer: Buffer): { width: number; height: number; rgba: Uint8ClampedArray } | null {
+  try {
+    if (buffer.length < 33 ||
+        buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4E ||
+        buffer[3] !== 0x47 || buffer[4] !== 0x0D || buffer[5] !== 0x0A ||
+        buffer[6] !== 0x1A || buffer[7] !== 0x0A) {
+      return null;
+    }
+
+    let width = 0, height = 0, colorType = 0, bitDepth = 0, interlace = 0;
+    const idatChunks: Buffer[] = [];
+    let offset = 8;
+
+    while (offset + 12 <= buffer.length) {
+      const chunkLen = buffer.readUInt32BE(offset);
+      // Corrupt / truncated chunk: stop instead of silently reading past the end
+      if (chunkLen > buffer.length - offset - 12) break;
+      const chunkType = buffer.toString('ascii', offset + 4, offset + 8);
+
+      if (chunkType === 'IHDR' && chunkLen >= 13) {
+        width = buffer.readUInt32BE(offset + 8);
+        height = buffer.readUInt32BE(offset + 12);
+        bitDepth = buffer[offset + 16];
+        colorType = buffer[offset + 17];
+        interlace = buffer[offset + 20];
+      } else if (chunkType === 'IDAT') {
+        idatChunks.push(buffer.subarray(offset + 8, offset + 8 + chunkLen));
+      } else if (chunkType === 'IEND') {
+        break;
+      }
+
+      offset += 12 + chunkLen;
+    }
+
+    if (width === 0 || height === 0 || width > 4096 || height > 4096) return null;
+    if (bitDepth !== 8 || (colorType !== 6 && colorType !== 2)) return null;
+    if (interlace !== 0) {
+      // Adam7 passes are laid out differently; decoding them as a plain raster
+      // yields garbage, so refuse rather than guess.
+      log('PNG decode: interlaced (Adam7) PNG not supported', 'DEBUG', 'pixel-fallback');
+      return null;
+    }
+    if (idatChunks.length === 0) return null;
+
+    const channels = colorType === 6 ? 4 : 3;
+    const bpp = channels;                 // bytes per pixel (8-bit samples)
+    const stride = width * channels;      // bytes per scanline (without filter byte)
+    const rowSize = stride + 1;
+    const expected = rowSize * height;
+    const raw = zlib.inflateSync(Buffer.concat(idatChunks), { maxOutputLength: expected + height });
+    if (raw.length < expected) return null;
+
+    // Reverse the PNG scanline filters IN PLACE. Row y-1 is already unfiltered
