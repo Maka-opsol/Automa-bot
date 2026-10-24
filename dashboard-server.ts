@@ -1980,6 +1980,51 @@ function getDashboardHTML(): string {
       <div class="log-viewer" id="logViewer">Loading...</div>
     </div>
   </div>
+
+  <!-- TASK 143: Patch Submission -->
+  <div class="card full-width">
+    <div class="card-header">
+      <span>Submit Patch</span>
+      <button class="btn sm" onclick="loadPatchableFiles()">Load Files</button>
+    </div>
+    <div class="card-body">
+      <div style="margin-bottom:12px; padding:10px; background:rgba(255,255,255,0.05); border-radius:6px; font-size:13px; color:#aaa;">
+        <strong style="color:#4fc3f7;">How to submit a patch:</strong><br>
+        1. Click "Load Files" to see all patchable .ts files.<br>
+        2. Select the file you want to patch from the dropdown.<br>
+        3. Paste the <strong>complete file content</strong> (not a diff) into the text area below.<br>
+        4. Add a short description of what the patch does.<br>
+        5. Click "Submit Patch".<br><br>
+        <strong style="color:#ffb74d;">⚠ Safety:</strong> The patch will be run through the sandbox auditor (checks for malicious code, path traversal, syntax errors, etc.).
+        If it passes, the patch is applied locally AND pushed to GitHub (which triggers a Render redeploy).<br><br>
+        <strong style="color:#81c784;">Format:</strong> Full file content only (not unified diffs). The patch replaces the entire file.<br>
+        Max size: 50KB. The original file is backed up to /tmp/patch-backups/ before applying.
+      </div>
+      <div style="display:flex; gap:8px; margin-bottom:8px; align-items:center;">
+        <label style="min-width:80px; font-size:13px;">File:</label>
+        <select id="patchFileSelect" style="flex:1; background:#1a1a2e; color:#e0e0e0; border:1px solid #333; padding:6px; border-radius:4px;">
+          <option value="">-- Select a file (or type manually below) --</option>
+        </select>
+      </div>
+      <div style="display:flex; gap:8px; margin-bottom:8px; align-items:center;">
+        <label style="min-width:80px; font-size:13px;">Or type:</label>
+        <input type="text" id="patchFileInput" placeholder="e.g. providers-groq.ts" style="flex:1; background:#1a1a2e; color:#e0e0e0; border:1px solid #333; padding:6px; border-radius:4px;">
+      </div>
+      <div style="display:flex; gap:8px; margin-bottom:8px; align-items:center;">
+        <label style="min-width:80px; font-size:13px;">Description:</label>
+        <input type="text" id="patchDescription" placeholder="What does this patch fix?" style="flex:1; background:#1a1a2e; color:#e0e0e0; border:1px solid #333; padding:6px; border-radius:4px;">
+      </div>
+      <div style="margin-bottom:8px;">
+        <label style="font-size:13px; display:block; margin-bottom:4px;">Patch (full file content):</label>
+        <textarea id="patchContent" rows="20" placeholder="// Paste the COMPLETE file content here (not a diff)&#10;// Example:&#10;&#10;'use strict';&#10;&#10;const { extractJSON } = require('./providers-base');&#10;&#10;// ... your code ...&#10;&#10;module.exports = { ... };" style="width:100%; background:#0d1117; color:#e0e0e0; border:1px solid #333; padding:8px; border-radius:4px; font-family: 'Courier New', monospace; font-size:13px; resize:vertical;"></textarea>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <button class="btn" style="background:#4caf50;" onclick="submitPatch()">Submit Patch</button>
+        <button class="btn sm" onclick="document.getElementById('patchContent').value=''" style="background:#f44336;">Clear</button>
+        <span id="patchStatus" style="font-size:13px; color:#aaa; align-self:center;"></span>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div class="toast-container" id="toastContainer"></div>
@@ -2503,6 +2548,77 @@ async function refreshAll() {
   setInterval(refreshLogs, 10000);
   setInterval(refreshRawResponses, 2000);
 })();
+
+// ── TASK 143: Patch Submission Functions ──
+async function loadPatchableFiles() {
+  try {
+    const r = await api('/api/patch/files');
+    const select = document.getElementById('patchFileSelect');
+    if (select && r.files) {
+      select.innerHTML = '<option value="">-- Select a file --</option>';
+      r.files.forEach((f) => {
+        const opt = document.createElement('option');
+        opt.value = f;
+        opt.textContent = f;
+        select.appendChild(opt);
+      });
+      toast('Loaded ' + r.count + ' patchable files', 'info');
+    }
+  } catch (e) {
+    toast('Failed to load files: ' + e.message, 'error');
+  }
+}
+
+async function submitPatch() {
+  const select = document.getElementById('patchFileSelect');
+  const input = document.getElementById('patchFileInput');
+  const desc = document.getElementById('patchDescription');
+  const content = document.getElementById('patchContent');
+  const status = document.getElementById('patchStatus');
+
+  const file = (select?.value || input?.value || '').trim();
+  const patch = content?.value || '';
+  const description = desc?.value || '';
+
+  if (!file) { toast('Please select or type a file name', 'error'); return; }
+  if (!patch || patch.length < 5) { toast('Patch content is too short (min 5 chars)', 'error'); return; }
+  if (patch.length > 50000) { toast('Patch is too large (max 50KB)', 'error'); return; }
+
+  if (status) status.textContent = 'Submitting...';
+  if (status) status.style.color = '#ffb74d';
+
+  try {
+    const r = await api('/api/patch/submit', {
+      method: 'POST',
+      body: JSON.stringify({ file, patch, description }),
+    });
+
+    if (r.ok) {
+      let msg = '✅ Patch applied to ' + r.file + ' (' + r.size + ' bytes)';
+      if (r.github) {
+        if (r.github.pushed) {
+          msg += ' | GitHub: ' + r.github.method + ' ✅';
+        } else {
+          msg += ' | GitHub: ' + r.github.details + ' ⚠';
+        }
+      }
+      toast(msg, 'success');
+      if (status) { status.textContent = msg; status.style.color = '#4caf50'; }
+    } else {
+      toast('❌ ' + (r.error || 'Patch rejected'), 'error');
+      if (status) { status.textContent = r.error || 'Rejected'; status.style.color = '#f44336'; }
+    }
+  } catch (e) {
+    toast('❌ Error: ' + e.message, 'error');
+    if (status) { status.textContent = 'Error: ' + e.message; status.style.color = '#f44336'; }
+  }
+}
+
+// Sync select → input
+document.getElementById('patchFileSelect')?.addEventListener('change', function() {
+  const input = document.getElementById('patchFileInput');
+  if (input) input.value = this.value;
+});
 </script>
 </body>
 </html>`;
