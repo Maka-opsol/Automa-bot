@@ -1229,7 +1229,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
     // Resilience: use browser-phoenix multi-tier launch if available
     page = await safeBrowserRetry(async (p: any) => {
       if (authenticate) await authenticate(p);
-      if (checkpoint && checkpoint.url) { await p.goto(checkpoint.url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}); }
+      if (checkpoint && checkpoint.url) { await p.goto(checkpoint.url, { waitUntil: 'load', timeout: 120000 }).catch(() => {}); }
       return p;
     });
 
@@ -1330,7 +1330,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const newPage = await safeBrowserRetry(async (p: any) => {
         if (authenticate) await authenticate(p);
         const targetUrl = _getRecoveryUrl();
-        if (targetUrl) { await p.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}); }
+        if (targetUrl) { await p.goto(targetUrl, { waitUntil: 'load', timeout: 120000 }).catch(() => {}); }
         return p;
       });
       browserLastRestart = Date.now();
@@ -1626,7 +1626,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             // for the reload — 'load' waits for all resources (including
             // Flutter's CanvasKit JS bundle) to finish loading. Also increased
             // the post-reload wait from 5s to 15s to give Flutter time to paint.
-            await page.reload({ waitUntil: 'load', timeout: 30000 });
+            await page.reload({ waitUntil: 'load', timeout: 120000 });
             await new Promise(r => setTimeout(r, 15000));
             // Check again
             const authGuard = getDep('authGuard');
@@ -2057,7 +2057,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 await network.setupInterception(page);
                 _networkSetup = true;
               }
-              await page.goto(_getRecoveryUrl(), { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await page.goto(_getRecoveryUrl(), { waitUntil: 'load', timeout: 120000 });
               await new Promise(r => setTimeout(r, 8000));
               if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
             } catch (restartErr: any) {
@@ -2077,38 +2077,17 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             lastScreenshotChangeTime = Date.now();
             continue;
           } else if (blankPageCounter >= BLANK_RESTART_THRESHOLD) {
-            // Step 2: Restart browser context entirely
-            log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — RESTARTING browser context (total recovery attempts: ${totalBlankRecoveryAttempts}/${MAX_BLANK_RECOVERY_ATTEMPTS})`, 'ERROR', 'cycle');
-            // v12 FIX: Do NOT reset blankPageCounter here.
-            // The counter only resets when the page is confirmed non-blank.
-            // This ensures repeated restarts eventually escalate to self-heal.
+            // TASK 137 (2026-10-24): DON'T restart browser — just reload the page.
+            // The blank page is a NETWORK issue, not a browser issue. Closing the
+            // browser defeats Task 87 (protect browser at all costs) and wastes
+            // 20+ seconds relaunching Chromium.
+            log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — reloading page (NOT closing browser per Task 137)`, 'WARN', 'cycle');
             try {
-              _trackBrowserRestart();
-              await closeBrowser?.();
-              _networkSetup = false;
-              page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
-              if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
-                await network.setupInterception(page);
-                _networkSetup = true;
-              }
-              await page.goto(_getRecoveryUrl(), { waitUntil: 'domcontentloaded', timeout: 30000 });
-              await new Promise(r => setTimeout(r, 8000));
+              await page.goto(_getRecoveryUrl(), { waitUntil: 'load', timeout: 120000 });
+              await new Promise(r => setTimeout(r, 10000));
               if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
-            } catch (restartErr: any) {
-              log(`Blank-page browser restart failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
-              // Browser is dead — attempt recovery via withBrowserRetry before next cycle
-              try {
-                _networkSetup = false;
-                page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
-                if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
-                  await network.setupInterception(page);
-                  _networkSetup = true;
-                }
-                log('Blank-page restart: recovery via withBrowserRetry succeeded', 'INFO', 'cycle');
-              } catch (recoveryErr: any) {
-                log(`Blank-page restart: recovery also failed: ${recoveryErr.message || recoveryErr} — will break cycle`, 'ERROR', 'cycle');
-                break;
-              }
+            } catch (reloadErr: any) {
+              log(`Blank-page reload failed: ${reloadErr.message || reloadErr} — will retry next cycle`, 'WARN', 'cycle');
             }
             lastScreenshotChangeTime = Date.now();
             continue;
@@ -2165,7 +2144,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           }
             const targetUrl = _getRecoveryUrl();
             if (targetUrl) {
-              await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+              await page.goto(targetUrl, { waitUntil: 'load', timeout: 120000 }).catch(() => {});
               await new Promise(r => setTimeout(r, 8000));
               if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
             }
@@ -2213,7 +2192,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           log(`Fast DOM check: detected app error text "${errorText}" — reloading to recover`, 'WARN', 'cycle');
           if (targetUrl) {
             try {
-              await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+              await page.goto(targetUrl, { waitUntil: 'load', timeout: 120000 }).catch(() => {});
               await new Promise(r => setTimeout(r, 8000));
               if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
             } catch {}
@@ -2273,7 +2252,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           if (isBlank) {
             log('Blank-page guard: still blank after retries — reloading page', 'WARN', 'cycle');
             try {
-              await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+              await page.reload({ waitUntil: 'load', timeout: 120000 });
               // Wait extra for Flutter to render after reload
               await new Promise(r => setTimeout(r, 5000));
               if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
@@ -2368,7 +2347,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         // Stage 2: reload page once and retry via CDP (bypasses font wait)
         if (!recovered) {
           try {
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+            await page.reload({ waitUntil: 'load', timeout: 120000 });
             await _waitForRenderedPage(page, 8000);
           } catch (reloadErr: any) {
             log(`Page reload during screenshot recovery failed: ${reloadErr?.message || reloadErr}`, 'WARN', 'cycle');
@@ -2509,7 +2488,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             // about:blank → tribunal sees blank → error/wait → circular path
             // detected on about:blank → navigate to about:blank → repeat.
             const recoveryUrl = _getRecoveryUrl();
-            await page.goto(recoveryUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+            await page.goto(recoveryUrl, { waitUntil: 'load', timeout: 120000 }).catch(() => {});
           }
         }
       }
@@ -3276,41 +3255,34 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           // Navigate after self-heal
           if (targetUrl) {
             try {
-              await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+              await page.goto(targetUrl, { waitUntil: 'load', timeout: 120000 }).catch(() => {});
               await new Promise(r => setTimeout(r, 8000));
               if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
             } catch {}
           }
         } else if (blankPageCounter >= BLANK_RESTART_THRESHOLD) {
-          // Step 2: Restart browser
-          log(`blank_page early exit: ${blankPageCounter} consecutive blanks — RESTARTING browser context`, 'ERROR', 'cycle');
-          // v12: Do NOT reset blankPageCounter
+          // Step 2: Reload page (DON'T restart browser — Task 87: protect browser)
+          // TASK 137 (2026-10-24): The old code closed the browser and relaunched
+          // — this defeats Task 87 (protect browser at all costs). The blank page
+          // is a NETWORK issue (ERR_CONNECTION_RESET), not a browser issue.
+          // Fix: Just reload the page with a longer timeout. If that fails,
+          // navigate to the app URL fresh (without closing the browser).
+          log(`blank_page early exit: ${blankPageCounter} consecutive blanks — reloading page (NOT closing browser per Task 87)`, 'WARN', 'cycle');
           try {
-            _trackBrowserRestart();
-            await closeBrowser?.();
-            _networkSetup = false;
-            page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
-            if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
-              await network.setupInterception(page);
-              _networkSetup = true;
-            }
-            await page.goto(_getRecoveryUrl(), { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await new Promise(r => setTimeout(r, 8000));
+            await page.goto(_getRecoveryUrl(), { waitUntil: 'load', timeout: 120000 });
+            await new Promise(r => setTimeout(r, 10000)); // wait 10s for Flutter
             if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
-          } catch (restartErr: any) {
-            log(`blank_page browser restart failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
-            try {
-              _networkSetup = false;
-              page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
-              if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) { await network.setupInterception(page); _networkSetup = true; }
-            } catch { break; }
+          } catch (reloadErr: any) {
+            log(`blank_page reload failed: ${reloadErr.message || reloadErr} — will retry next cycle`, 'WARN', 'cycle');
+            // Don't close browser, don't break — just continue the cycle
+            // The next cycle will try again with the same browser
           }
         } else if (blankPageCounter >= BLANK_RELOAD_THRESHOLD) {
           // Step 1: Reload MathU
           log(`blank_page early exit: ${blankPageCounter} consecutive blanks — reloading MathU`, 'WARN', 'cycle');
           if (targetUrl) {
             try {
-              await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+              await page.goto(targetUrl, { waitUntil: 'load', timeout: 120000 }).catch(() => {});
               await new Promise(r => setTimeout(r, 8000));
               if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
             } catch {}
@@ -3320,7 +3292,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           log(`blank_page early exit: skipping 75s wait, navigating to ${targetUrl}`, 'INFO', 'cycle');
           if (targetUrl) {
             try {
-              await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
+              await page.goto(targetUrl, { waitUntil: 'load', timeout: 120000 }).catch((e: any) => {
                 log(`blank_page early exit: navigation failed: ${e.message || e}`, 'WARN', 'cycle');
               });
               await new Promise(r => setTimeout(r, 8000));
@@ -3371,7 +3343,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         log(`Reloading to recover from app error.`, 'WARN', 'cycle');
         if (targetUrl) {
           try {
-            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
+            await page.goto(targetUrl, { waitUntil: 'load', timeout: 120000 }).catch((e: any) => {
               log(`App error recovery: navigation failed: ${e.message || e}`, 'WARN', 'cycle');
             });
             await new Promise(r => setTimeout(r, 8000));
@@ -3381,7 +3353,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           }
         } else {
           try {
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+            await page.reload({ waitUntil: 'load', timeout: 120000 }).catch(() => {});
             await new Promise(r => setTimeout(r, 8000));
             if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
           } catch {}
@@ -3973,7 +3945,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             const sendAlert = require('./alerting').sendAlert;
             // TASK 61: Removed alert — routine event.
           } catch { /* non-critical */ }
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+          await page.reload({ waitUntil: 'load', timeout: 120000 }).catch(() => {});
           lastScreenshotChangeTime = Date.now();
           continue;
         }
@@ -3997,11 +3969,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           // Pixel fallback didn't help — fall back to reload
           try {
             const currentUrl = page.url();
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+            await page.reload({ waitUntil: 'load', timeout: 120000 }).catch(() => {});
             // If still on same page after reload, try navigating to BASE_URL
             if (page.url() === currentUrl && CONFIG.BASE_URL) {
               log('Reload didn\'t change page, navigating to BASE_URL.', 'WARN', 'cycle');
-              await page.goto(CONFIG.BASE_URL, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+              await page.goto(CONFIG.BASE_URL, { waitUntil: 'load', timeout: 120000 }).catch(() => {});
             }
           } catch (reloadErr: any) {
             log(`Page reload failed: ${reloadErr.message || reloadErr}`, 'WARN', 'cycle');
@@ -4089,7 +4061,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               await network.setupInterception(page);
               _networkSetup = true;
             }
-            await page.goto(_getRecoveryUrl(), { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.goto(_getRecoveryUrl(), { waitUntil: 'load', timeout: 120000 });
             await new Promise(r => setTimeout(r, 8000));
             if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
           } catch (restartErr: any) {
@@ -4106,32 +4078,15 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           lastScreenshotChangeTime = Date.now();
           continue;
         } else if (blankPageCounter >= BLANK_RESTART_THRESHOLD) {
-          // Step 2: Restart browser context entirely
+          // TASK 137 (2026-10-24): DON'T restart browser — just reload the page.
           totalBlankRecoveryAttempts++;
-          log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — RESTARTING browser context (total recovery attempts: ${totalBlankRecoveryAttempts}/${MAX_BLANK_RECOVERY_ATTEMPTS})`, 'ERROR', 'cycle');
-          // v12 FIX: Do NOT reset blankPageCounter here.
+          log(`Blank-page escalation: ${blankPageCounter} consecutive blanks — reloading page (NOT closing browser per Task 137) (total recovery attempts: ${totalBlankRecoveryAttempts}/${MAX_BLANK_RECOVERY_ATTEMPTS})`, 'WARN', 'cycle');
           try {
-            _trackBrowserRestart();
-            await closeBrowser?.();
-            _networkSetup = false;
-            page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
-            if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) {
-              await network.setupInterception(page);
-              _networkSetup = true;
-            }
-            await page.goto(_getRecoveryUrl(), { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await new Promise(r => setTimeout(r, 8000));
+            await page.goto(_getRecoveryUrl(), { waitUntil: 'load', timeout: 120000 });
+            await new Promise(r => setTimeout(r, 10000));
             if (stabilityWaiter) await stabilityWaiter.waitForStable(page);
-          } catch (restartErr: any) {
-            log(`Blank-page browser restart failed: ${restartErr.message || restartErr}`, 'ERROR', 'cycle');
-            try {
-              _networkSetup = false;
-              page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
-              if (CONFIG.ENABLE_NETWORK_INTERCEPT && network) { await network.setupInterception(page); _networkSetup = true; }
-            } catch (recoveryErr: any) {
-              log(`Blank-page tribunal restart: recovery also failed: ${recoveryErr.message || recoveryErr} — will break cycle`, 'ERROR', 'cycle');
-              break;
-            }
+          } catch (reloadErr: any) {
+            log(`Blank-page reload failed: ${reloadErr.message || reloadErr} — will retry next cycle`, 'WARN', 'cycle');
           }
           lastScreenshotChangeTime = Date.now();
           continue;
@@ -4150,7 +4105,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           const targetUrl = _getRecoveryUrl();
           if (targetUrl) {
             try {
-              await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
+              await page.goto(targetUrl, { waitUntil: 'load', timeout: 120000 }).catch((e: any) => {
                 log(`blank_page reload failed: ${e.message || e}`, 'WARN', 'cycle');
               });
               await new Promise(r => setTimeout(r, 8000));
@@ -4167,7 +4122,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         if (targetUrl) {
           try {
             log(`blank_page escape (step ${blankPageCounter}): navigating to ${targetUrl}`, 'INFO', 'cycle');
-            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
+            await page.goto(targetUrl, { waitUntil: 'load', timeout: 120000 }).catch((e: any) => {
               log(`blank_page escape: navigation failed: ${e.message || e}`, 'WARN', 'cycle');
             });
             await new Promise(r => setTimeout(r, 8000));
@@ -4224,7 +4179,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             const sendAlert = require('./alerting').sendAlert;
             // TASK 61: Removed alert — routine event.
           } catch { /* non-critical */ }
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+          await page.reload({ waitUntil: 'load', timeout: 120000 }).catch(() => {});
           lastScreenshotChangeTime = Date.now();
           continue;
         }
@@ -4328,7 +4283,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         const persistConfig = require('./persistent-config');
         if (persistConfig.isStateBanned(currentState)) {
           log(`State '${currentState}' is banned via dashboard — forcing page reload to escape`, 'WARN', 'cycle');
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+          await page.reload({ waitUntil: 'load', timeout: 120000 }).catch(() => {});
           currentState = 'assignments_page'; // Reset to safe state
           continue; // Re-evaluate on next iteration
         }
@@ -4583,7 +4538,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
             // Force a page reload after heal to break any visual loop
             try {
-              await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+              await page.reload({ waitUntil: 'load', timeout: 120000 }).catch(() => {});
               lastScreenshotChangeTime = Date.now();
             } catch {}
           }
