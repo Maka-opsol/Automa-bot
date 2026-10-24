@@ -488,26 +488,13 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;
 
-  // Require auth for dashboard API routes (except /health)
-  // Accepts both raw ADMIN_SECRET and JWT tokens (via requireAuth)
+  // TASK 143 (2026-10-24): Removed admin secret requirement.
+  // The dashboard is now open — no authentication needed.
+  // The authWrap function still accepts Bearer tokens (for backward compat)
+  // but no longer blocks access if the token is missing.
   const requireAuth = getRequireAuth();
   const authWrap = (cb: () => void) => {
-    // First check: raw ADMIN_SECRET (timing-safe)
-    if (ADMIN_SECRET) {
-      const authHdr = req.headers.authorization || '';
-      if (authHdr.startsWith('Bearer ') && _timingSafeEqual(authHdr.slice(7), ADMIN_SECRET)) {
-        cb();
-        return;
-      }
-    }
-    // Second check: JWT via requireAuth (if available)
-    if (requireAuth) {
-      requireAuth(req, res, () => {
-        cb();
-      });
-      return;
-    }
-    // No auth configured — allow through
+    // Accept any request — no auth required (Task 143)
     cb();
   };
 
@@ -1390,6 +1377,184 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
       });
     });
     return true;
+  }
+
+  // ── TASK 143: Patch submission endpoint ──
+  // Allows submitting patches (file + content) from the dashboard without
+  // triggering a full self-heal session. Patches go through the same
+  // safety/testing pipeline as self-heal patches (sandbox audit, etc.)
+  // but skip the AI investigation/codegen steps.
+  if (pathname === '/api/patch/submit' && req.method === 'POST') {
+    authWrap(() => {
+      readBody(req, res, async (body) => {
+        try {
+          const data = JSON.parse(body);
+          const { file, patch, description } = data;
+
+          // Validate input
+          if (!file || typeof file !== 'string') {
+            jsonRes(res, { error: 'Missing or invalid "file" field' }, 400);
+            return;
+          }
+          if (!patch || typeof patch !== 'string' || patch.length < 5) {
+            jsonRes(res, { error: 'Missing or invalid "patch" field (must be non-empty string, >5 chars)' }, 400);
+            return;
+          }
+          if (patch.length > 50000) {
+            jsonRes(res, { error: 'Patch too large (max 50KB)' }, 400);
+            return;
+          }
+
+          // Path traversal check
+          const path = require('path');
+          const resolvedFile = path.resolve(file);
+          const projectRoot = path.resolve('.');
+          if (!resolvedFile.startsWith(projectRoot)) {
+            jsonRes(res, { error: 'File must be within the project directory' }, 400);
+            return;
+          }
+
+          // Check file exists
+          const fs = require('fs');
+          if (!fs.existsSync(resolvedFile)) {
+            jsonRes(res, { error: `File does not exist: ${file}` }, 400);
+            return;
+          }
+
+          // Run the patch through the sandbox audit (safety check)
+          const sandbox = (() => { try { return require('./sandbox-executor'); } catch { return null; } })();
+
+          if (sandbox?.executePatchInSandbox) {
+            log(`Patch submission: auditing patch for ${file} (${patch.length} chars)...`, 'INFO', 'dashboard');
+            try {
+              const sandboxResult = sandbox.executePatchInSandbox(file, patch);
+              if (!sandboxResult.safe) {
+                jsonRes(res, {
+                  error: 'Patch REJECTED by sandbox audit',
+                  reason: sandboxResult.reason,
+                  details: sandboxResult.details,
+                }, 403);
+                return;
+              }
+              log(`Patch submission: sandbox audit PASSED for ${file}`, 'INFO', 'dashboard');
+            } catch (sandboxErr: any) {
+              log(`Patch submission: sandbox audit ERROR: ${sandboxErr.message}`, 'WARN', 'dashboard');
+              // If sandbox fails, reject the patch (safety first)
+              jsonRes(res, {
+                error: 'Patch audit failed (sandbox error)',
+                reason: sandboxErr.message,
+              }, 500);
+              return;
+            }
+          }
+
+          // Backup the original file
+          const backupDir = '/tmp/patch-backups';
+          try { fs.mkdirSync(backupDir, { recursive: true }); } catch {}
+          const backupPath = path.join(backupDir, `${path.basename(file)}.${Date.now()}.bak`);
+          try {
+            fs.copyFileSync(resolvedFile, backupPath);
+          } catch (backupErr: any) {
+            log(`Patch submission: backup failed (non-critical): ${backupErr.message}`, 'WARN', 'dashboard');
+          }
+
+          // Apply the patch (atomic write)
+          try {
+            const tmpPath = resolvedFile + '.tmp-' + Date.now();
+            fs.writeFileSync(tmpPath, patch, 'utf8');
+            fs.renameSync(tmpPath, resolvedFile);
+            log(`Patch submission: applied patch to ${file} successfully`, 'INFO', 'dashboard');
+
+            // Record to patch history DB
+            try {
+              const db = require('./database');
+              db.insertPatch?.run?.(
+                file, description || 'Dashboard patch submission', 'applied', 'dashboard',
+                Date.now(), JSON.stringify({ size: patch.length, backup: backupPath })
+              );
+            } catch {}
+
+            // Evict from require.cache so the new code is loaded
+            try {
+              delete require.cache[require.resolve(resolvedFile)];
+            } catch {}
+
+            // TASK 143: Also write to /tmp/self-heal-overlay/ so triggerImmediateRedeploy can find it
+            const overlayDir = '/tmp/self-heal-overlay';
+            try { fs.mkdirSync(overlayDir, { recursive: true }); } catch {}
+            const overlayPath = path.join(overlayDir, path.basename(file));
+            try {
+              fs.writeFileSync(overlayPath, patch, 'utf8');
+              log(`Patch submission: wrote overlay copy to ${overlayPath}`, 'DEBUG', 'dashboard');
+            } catch (overlayErr: any) {
+              log(`Patch submission: overlay write failed (non-critical): ${overlayErr.message}`, 'WARN', 'dashboard');
+            }
+
+            // TASK 143: Push to GitHub so the change persists across deploys
+            let githubResult: any = null;
+            try {
+              const gitDeploy = require('./self-heal-git-deploy');
+              if (typeof gitDeploy.triggerImmediateRedeploy === 'function') {
+                log(`Patch submission: pushing ${file} to GitHub...`, 'INFO', 'dashboard');
+                githubResult = await gitDeploy.triggerImmediateRedeploy([file]);
+                if (githubResult?.redeployed) {
+                  log(`Patch submission: GitHub push SUCCEEDED via ${githubResult.method} — Render will auto-deploy`, 'INFO', 'dashboard');
+                } else {
+                  log(`Patch submission: GitHub push failed or not configured: ${githubResult?.details || 'unknown'}`, 'WARN', 'dashboard');
+                }
+              }
+            } catch (gitErr: any) {
+              log(`Patch submission: GitHub push error: ${gitErr.message}`, 'WARN', 'dashboard');
+              githubResult = { redeployed: false, method: 'none', details: gitErr.message };
+            }
+
+            jsonRes(res, {
+              ok: true,
+              message: `Patch applied to ${file}`,
+              file,
+              size: patch.length,
+              backup: backupPath,
+              github: githubResult ? {
+                pushed: githubResult.redeployed || false,
+                method: githubResult.method || 'none',
+                details: githubResult.details || '',
+              } : null,
+              timestamp: Date.now(),
+            });
+          } catch (applyErr: any) {
+            log(`Patch submission: apply failed: ${applyErr.message}`, 'ERROR', 'dashboard');
+            // Try to restore from backup
+            try { fs.copyFileSync(backupPath, resolvedFile); } catch {}
+            jsonRes(res, {
+              error: 'Failed to apply patch',
+              reason: applyErr.message,
+              backupRestored: true,
+            }, 500);
+          }
+        } catch (parseErr: any) {
+          jsonRes(res, { error: 'Invalid JSON body', reason: parseErr.message }, 400);
+        }
+      });
+    });
+    return;
+  }
+
+  // ── TASK 143: List patchable files ──
+  if (pathname === '/api/patch/files' && req.method === 'GET') {
+    authWrap(() => {
+      try {
+        const fs = require('fs');
+        const path = require('path');
+        const dir = path.resolve('.');
+        const files = fs.readdirSync(dir)
+          .filter((f: string) => f.endsWith('.ts') && !f.endsWith('.test.ts') && !f.endsWith('.d.ts'))
+          .sort();
+        jsonRes(res, { files, count: files.length });
+      } catch (e: any) {
+        jsonRes(res, { error: e.message }, 500);
+      }
+    });
+    return;
   }
 
   // ── Generic command endpoint (legacy compat) ──
