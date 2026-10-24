@@ -1393,9 +1393,12 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const _navAttemptOutcomes: Array<{ attempt: number; mode: string; ok: boolean; errorType?: string; message?: string }> = [];
 
       for (let _navAttempt = 1; _navAttempt <= MAX_NAV_ATTEMPTS && !_initialNavOk; _navAttempt++) {
-        const _mode = _navAttempt === 1 ? 'proxy' : _navAttempt === 2 ? 'rotated' : 'direct';
+        // TASK 140 (2026-10-24): If proxy is already disabled (e.g., by bypassProxy
+        // on startup), skip directly to direct mode. Don't waste time trying proxy.
+        const _proxyAlreadyDisabled = (globalThis as any).__proxyDisabled === true;
+        const _mode = (_proxyAlreadyDisabled || _navAttempt === 3) ? 'direct' : _navAttempt === 1 ? 'proxy' : 'rotated';
         try {
-          if (_navAttempt > 1) {
+          if (_navAttempt > 1 && !_proxyAlreadyDisabled) {
             // Before retrying: relaunch browser with fresh context.
             // Attempt 2: rotate to a different validated proxy.
             // Attempt 3: bypass proxy entirely (direct connection).
@@ -1405,8 +1408,6 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 const newProxy = await ipRotator.rotateToValidatedProxy(5);
                 if (!newProxy) {
                   log('Attempt 2: no validated proxy available — skipping to direct connection.', 'WARN', 'cycle');
-                  // Skip directly to attempt 3 (direct)
-                  // BUG FIX (2026-09-09): Use bypassProxy() to fully shut down proxy
                   if (typeof ipRotator.bypassProxy === 'function') {
                     ipRotator.bypassProxy('no validated proxy available (attempt 2)');
                   } else {
@@ -1417,7 +1418,6 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
                 }
               }
               if (_navAttempt === 3) {
-                // Bypass proxy entirely.
                 if (typeof ipRotator.bypassProxy === 'function') {
                   ipRotator.bypassProxy('navigation failed with proxy attempts 1+2');
                 } else {
