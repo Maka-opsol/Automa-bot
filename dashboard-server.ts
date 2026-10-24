@@ -186,7 +186,7 @@ if (!(globalThis as any).__getLatestScreenshot) (globalThis as any).__getLatestS
 // ── Helper: read JSON body from request ──
 function readBody(req: any, res: any, cb: (body: string) => void) {
   let body = '';
-  const MAX = 1 * 1024 * 1024;
+  const MAX = 5 * 1024 * 1024; // TASK 144: 5MB (was 1MB — too small for large patches)
   let tooLarge = false;
   req.on('data', (chunk: any) => {
     if (body.length > MAX) {
@@ -195,7 +195,27 @@ function readBody(req: any, res: any, cb: (body: string) => void) {
     }
     body += chunk;
   });
-  req.on('end', () => { if (!tooLarge) cb(body); });
+  req.on('end', () => {
+    if (!tooLarge) {
+      // TASK 144: Handle async callbacks — if cb returns a Promise, catch errors
+      try {
+        const result = cb(body);
+        if (result && typeof result.then === 'function') {
+          result.catch((err: any) => {
+            log('readBody async error: ' + (err.message || err), 'ERROR', 'dashboard');
+            if (!res.headersSent) {
+              jsonRes(res, { error: 'Internal error: ' + (err.message || String(err)) }, 500);
+            }
+          });
+        }
+      } catch (syncErr) {
+        log('readBody sync error: ' + (syncErr.message || syncErr), 'ERROR', 'dashboard');
+        if (!res.headersSent) {
+          jsonRes(res, { error: 'Internal error: ' + (syncErr.message || String(syncErr)) }, 500);
+        }
+      }
+    }
+  });
 }
 
 // ── Helper: JSON response ──
@@ -1413,9 +1433,9 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
             jsonRes(res, { error: 'Missing or invalid "patch" field (must be non-empty string, >5 chars)', patchId, status: _patchStatus[patchId] }, 400);
             return;
           }
-          if (patch.length > 50000) {
-            updatePatchStatus(patchId, 'validation', 'rejected', 'Patch too large (max 50KB)');
-            jsonRes(res, { error: 'Patch too large (max 50KB)', patchId, status: _patchStatus[patchId] }, 400);
+          if (patch.length > 500000) {
+            updatePatchStatus(patchId, 'validation', 'rejected', 'Patch too large (max 500KB)');
+            jsonRes(res, { error: 'Patch too large (max 500KB)', patchId, status: _patchStatus[patchId] }, 400);
             return;
           }
           updatePatchStatus(patchId, 'validation', 'passed', { file, size: patch.length });
@@ -2659,7 +2679,7 @@ async function submitPatch() {
 
   if (!file) { toast('Please select or type a file name', 'error'); return; }
   if (!patch || patch.length < 5) { toast('Patch content is too short (min 5 chars)', 'error'); return; }
-  if (patch.length > 50000) { toast('Patch is too large (max 50KB)', 'error'); return; }
+  if (patch.length > 500000) { toast('Patch is too large (max 500KB)', 'error'); return; }
 
   if (statusEl) statusEl.textContent = 'Submitting...';
   if (statusEl) statusEl.style.color = '#ffb74d';
@@ -2669,6 +2689,12 @@ async function submitPatch() {
       method: 'POST',
       body: JSON.stringify({ file: file, patch: patch, description: description }),
     });
+
+    if (!r) {
+      toast('Error: No response from server (check logs)', 'error');
+      if (statusEl) { statusEl.textContent = 'No response'; statusEl.style.color = '#f44336'; }
+      return;
+    }
 
     if (r.ok && r.patchId) {
       toast('Patch queued: ' + r.patchId, 'info');
