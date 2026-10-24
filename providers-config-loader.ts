@@ -59,18 +59,16 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'Groq': {
     endpoint: null,  // Uses groq-sdk (not raw HTTP)
-    // TASK 117 (2026-10-11): llama-3.3-70b-versatile is TEXT-ONLY (no vision).
-    // The bot needs vision to analyze MathU screenshots. Use llama-4-scout
-    // (vision-capable) as the primary model. getBestModel() will also
-    // auto-discover vision models via the SDK if this one 404s.
-    // Previous: llama-3.3-70b-versatile (text-only, useless for tribunal)
-    model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+    // TASK 139 (2026-10-24): qwen/qwen3.8-27b is a VISION model (multimodal)!
+    // Per Groq docs: "A 27B multimodal model that processes both text and image
+    // inputs, with thinking and instruct modes, tunable reasoning effort, tool
+    // use, and JSON mode." Context window: 131K tokens, 3 images per request.
+    model: 'qwen/qwen3.8-27b',
     envKeys: ['GROQ_API_KEY'],
     visionCapable: true,
     fallbackModels: [
-      'llama-3.2-90b-vision-preview',
-      'llama-3.2-11b-vision-preview',
-      'llama-3.3-70b-versatile', // text-only fallback (last resort)
+      'llama-3.3-70b-versatile',
+      'llama-3.1-8b-instant',
     ],
   },
   'z.ai': {
@@ -506,20 +504,54 @@ function _getDb() {
   return _deps.database ?? require('./database');
 }
 
+// TASK 136 (2026-10-23): REVERTED HARDCODED_MODELS — the DB is the source of
+// truth again. The _isStaleModel() check below is kept as a safety net.
+// Stale models that should NEVER be used (even if the DB has them)
+const STALE_MODEL_PREFIXES = [
+  'meta/llama-3.1-8b-instruct',     // EOL 410
+  'meta-llama/llama-4-scout-17b',   // TASK 138: 404 on Groq (no access)
+  'agnes-2.0-flash',                 // decommissioned 500
+  'gemini-1.5-flash',                // deprecated 404
+  'gemini-2.0-flash',                // deprecated
+  'openai/gpt-oss-120b',             // text-only, not vision
+  'openai/gpt-oss-20b',              // text-only
+  'qwen/qwen3.6-27b',                // deprecated
+  // TASK 139: qwen/qwen3.8-27b is NOT stale — it's a VISION model!
+];
+
+function _isStaleModel(model: string): boolean {
+  if (!model) return false;
+  const lower = model.toLowerCase();
+  return STALE_MODEL_PREFIXES.some(prefix => lower.startsWith(prefix.toLowerCase()));
+}
+
 function getProviderConfig(providerName: string): { endpoint: string | null; model: string; disabled?: boolean; disabledReason?: string } {
+  // TASK 136 (2026-10-23): REVERTED the HARDCODED_MODELS override from Task 132.
+  // The hardcoded models were too aggressive — they prevented the DB from being
+  // the source of truth, and some hardcoded models were wrong (e.g., Groq's
+  // llama-4-scout isn't always available). The DB cleanup from Task 130 is
+  // sufficient — it clears stale models and uses DEFAULTS.
+  // Kept the _isStaleModel() check as a safety net — if the DB still has a
+  // stale model (e.g., Turso restored it), it falls through to DEFAULTS.
   try {
     loadDynamicModels();
     const db = _getDb();
     const row = db.selectProvider?.get(providerName);
-    if (row && row.model) {
+    if (row && row.model && !_isStaleModel(row.model)) {
       return { endpoint: row.endpoint || null, model: row.model };
+    }
+    // If the DB model IS stale, fall through to DEFAULTS
+    if (row && row.model && _isStaleModel(row.model)) {
+      _log(`getProviderConfig: DB has stale model '${row.model}' for ${providerName} — using DEFAULTS instead`, 'WARN', 'config-loader');
     }
   } catch (e: any) { _logError(`getProviderConfig DB error for ${providerName}`, e); }
 
   // Check dynamic models
   if (DYNAMIC_MODELS[providerName]) {
     const d = DYNAMIC_MODELS[providerName];
-    return { endpoint: d.endpoint || null, model: d.model };
+    if (!_isStaleModel(d.model)) {
+      return { endpoint: d.endpoint || null, model: d.model };
+    }
   }
 
   // Fall back to DEFAULTS
