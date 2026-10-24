@@ -1379,11 +1379,18 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
-  // ── TASK 143: Patch submission endpoint ──
-  // Allows submitting patches (file + content) from the dashboard without
-  // triggering a full self-heal session. Patches go through the same
-  // safety/testing pipeline as self-heal patches (sandbox audit, etc.)
-  // but skip the AI investigation/codegen steps.
+  // ── TASK 144: Patch submission with full pipeline tracking ──
+  // Stores patch status in memory for polling. Each stage is tracked.
+  const _patchStatus: Record<string, any> = {};
+
+  function updatePatchStatus(patchId: string, stage: string, status: string, details?: any) {
+    if (!_patchStatus[patchId]) _patchStatus[patchId] = { id: patchId, stages: [], createdAt: Date.now() };
+    _patchStatus[patchId].stages.push({ stage, status, details: details || null, timestamp: Date.now() });
+    _patchStatus[patchId].currentStage = stage;
+    _patchStatus[patchId].currentStatus = status;
+    log('Patch ' + patchId + ' → ' + stage + ': ' + status + (details ? ' — ' + (typeof details === 'string' ? details : JSON.stringify(details)) : ''), 'INFO', 'dashboard');
+  }
+
   if (pathname === '/api/patch/submit' && req.method === 'POST') {
     authWrap(() => {
       readBody(req, res, async (body) => {
@@ -1391,150 +1398,211 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           const data = JSON.parse(body);
           const { file, patch, description } = data;
 
+          // Generate patch ID
+          const patchId = 'patch-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8);
+          updatePatchStatus(patchId, 'validation', 'pending');
+
           // Validate input
           if (!file || typeof file !== 'string') {
-            jsonRes(res, { error: 'Missing or invalid "file" field' }, 400);
+            updatePatchStatus(patchId, 'validation', 'rejected', 'Missing or invalid "file" field');
+            jsonRes(res, { error: 'Missing or invalid "file" field', patchId, status: _patchStatus[patchId] }, 400);
             return;
           }
           if (!patch || typeof patch !== 'string' || patch.length < 5) {
-            jsonRes(res, { error: 'Missing or invalid "patch" field (must be non-empty string, >5 chars)' }, 400);
+            updatePatchStatus(patchId, 'validation', 'rejected', 'Patch content too short (min 5 chars)');
+            jsonRes(res, { error: 'Missing or invalid "patch" field (must be non-empty string, >5 chars)', patchId, status: _patchStatus[patchId] }, 400);
             return;
           }
           if (patch.length > 50000) {
-            jsonRes(res, { error: 'Patch too large (max 50KB)' }, 400);
+            updatePatchStatus(patchId, 'validation', 'rejected', 'Patch too large (max 50KB)');
+            jsonRes(res, { error: 'Patch too large (max 50KB)', patchId, status: _patchStatus[patchId] }, 400);
             return;
           }
+          updatePatchStatus(patchId, 'validation', 'passed', { file, size: patch.length });
 
           // Path traversal check
+          updatePatchStatus(patchId, 'path_check', 'pending');
           const path = require('path');
           const resolvedFile = path.resolve(file);
           const projectRoot = path.resolve('.');
           if (!resolvedFile.startsWith(projectRoot)) {
-            jsonRes(res, { error: 'File must be within the project directory' }, 400);
+            updatePatchStatus(patchId, 'path_check', 'rejected', 'File must be within the project directory');
+            jsonRes(res, { error: 'File must be within the project directory', patchId, status: _patchStatus[patchId] }, 400);
             return;
           }
-
-          // Check file exists
           const fs = require('fs');
           if (!fs.existsSync(resolvedFile)) {
-            jsonRes(res, { error: `File does not exist: ${file}` }, 400);
+            updatePatchStatus(patchId, 'path_check', 'rejected', 'File does not exist: ' + file);
+            jsonRes(res, { error: 'File does not exist: ' + file, patchId, status: _patchStatus[patchId] }, 400);
             return;
           }
+          updatePatchStatus(patchId, 'path_check', 'passed', resolvedFile);
 
-          // Run the patch through the sandbox audit (safety check)
-          const sandbox = (() => { try { return require('./sandbox-executor'); } catch { return null; } })();
+          // Return the patch ID immediately — client polls for status
+          jsonRes(res, { ok: true, patchId, message: 'Patch queued for processing. Poll /api/patch/status/' + patchId + ' for updates.' });
 
-          if (sandbox?.executePatchInSandbox) {
-            log(`Patch submission: auditing patch for ${file} (${patch.length} chars)...`, 'INFO', 'dashboard');
+          // ── Async pipeline (runs after response is sent) ──
+          (async () => {
             try {
-              const sandboxResult = sandbox.executePatchInSandbox(file, patch);
-              if (!sandboxResult.safe) {
-                jsonRes(res, {
-                  error: 'Patch REJECTED by sandbox audit',
-                  reason: sandboxResult.reason,
-                  details: sandboxResult.details,
-                }, 403);
-                return;
-              }
-              log(`Patch submission: sandbox audit PASSED for ${file}`, 'INFO', 'dashboard');
-            } catch (sandboxErr: any) {
-              log(`Patch submission: sandbox audit ERROR: ${sandboxErr.message}`, 'WARN', 'dashboard');
-              // If sandbox fails, reject the patch (safety first)
-              jsonRes(res, {
-                error: 'Patch audit failed (sandbox error)',
-                reason: sandboxErr.message,
-              }, 500);
-              return;
-            }
-          }
-
-          // Backup the original file
-          const backupDir = '/tmp/patch-backups';
-          try { fs.mkdirSync(backupDir, { recursive: true }); } catch {}
-          const backupPath = path.join(backupDir, `${path.basename(file)}.${Date.now()}.bak`);
-          try {
-            fs.copyFileSync(resolvedFile, backupPath);
-          } catch (backupErr: any) {
-            log(`Patch submission: backup failed (non-critical): ${backupErr.message}`, 'WARN', 'dashboard');
-          }
-
-          // Apply the patch (atomic write)
-          try {
-            const tmpPath = resolvedFile + '.tmp-' + Date.now();
-            fs.writeFileSync(tmpPath, patch, 'utf8');
-            fs.renameSync(tmpPath, resolvedFile);
-            log(`Patch submission: applied patch to ${file} successfully`, 'INFO', 'dashboard');
-
-            // Record to patch history DB
-            try {
-              const db = require('./database');
-              db.insertPatch?.run?.(
-                file, description || 'Dashboard patch submission', 'applied', 'dashboard',
-                Date.now(), JSON.stringify({ size: patch.length, backup: backupPath })
-              );
-            } catch {}
-
-            // Evict from require.cache so the new code is loaded
-            try {
-              delete require.cache[require.resolve(resolvedFile)];
-            } catch {}
-
-            // TASK 143: Also write to /tmp/self-heal-overlay/ so triggerImmediateRedeploy can find it
-            const overlayDir = '/tmp/self-heal-overlay';
-            try { fs.mkdirSync(overlayDir, { recursive: true }); } catch {}
-            const overlayPath = path.join(overlayDir, path.basename(file));
-            try {
-              fs.writeFileSync(overlayPath, patch, 'utf8');
-              log(`Patch submission: wrote overlay copy to ${overlayPath}`, 'DEBUG', 'dashboard');
-            } catch (overlayErr: any) {
-              log(`Patch submission: overlay write failed (non-critical): ${overlayErr.message}`, 'WARN', 'dashboard');
-            }
-
-            // TASK 143: Push to GitHub so the change persists across deploys
-            let githubResult: any = null;
-            try {
-              const gitDeploy = require('./self-heal-git-deploy');
-              if (typeof gitDeploy.triggerImmediateRedeploy === 'function') {
-                log(`Patch submission: pushing ${file} to GitHub...`, 'INFO', 'dashboard');
-                githubResult = await gitDeploy.triggerImmediateRedeploy([file]);
-                if (githubResult?.redeployed) {
-                  log(`Patch submission: GitHub push SUCCEEDED via ${githubResult.method} — Render will auto-deploy`, 'INFO', 'dashboard');
-                } else {
-                  log(`Patch submission: GitHub push failed or not configured: ${githubResult?.details || 'unknown'}`, 'WARN', 'dashboard');
+              // Stage 1: Sandbox Audit
+              updatePatchStatus(patchId, 'sandbox_audit', 'pending');
+              const sandbox = (() => { try { return require('./sandbox-executor'); } catch { return null; } })();
+              if (sandbox && sandbox.executePatchInSandbox) {
+                try {
+                  const sandboxResult = sandbox.executePatchInSandbox(file, patch);
+                  if (!sandboxResult.safe) {
+                    updatePatchStatus(patchId, 'sandbox_audit', 'rejected', {
+                      reason: sandboxResult.reason,
+                      details: sandboxResult.details,
+                    });
+                    return; // STOP — patch rejected
+                  }
+                  updatePatchStatus(patchId, 'sandbox_audit', 'passed', sandboxResult.reason || 'All checks passed');
+                } catch (sandboxErr) {
+                  updatePatchStatus(patchId, 'sandbox_audit', 'rejected', { reason: 'Sandbox error: ' + sandboxErr.message });
+                  return;
                 }
+              } else {
+                updatePatchStatus(patchId, 'sandbox_audit', 'skipped', 'Sandbox module not available');
               }
-            } catch (gitErr: any) {
-              log(`Patch submission: GitHub push error: ${gitErr.message}`, 'WARN', 'dashboard');
-              githubResult = { redeployed: false, method: 'none', details: gitErr.message };
-            }
 
-            jsonRes(res, {
-              ok: true,
-              message: `Patch applied to ${file}`,
-              file,
-              size: patch.length,
-              backup: backupPath,
-              github: githubResult ? {
-                pushed: githubResult.redeployed || false,
-                method: githubResult.method || 'none',
-                details: githubResult.details || '',
-              } : null,
-              timestamp: Date.now(),
-            });
-          } catch (applyErr: any) {
-            log(`Patch submission: apply failed: ${applyErr.message}`, 'ERROR', 'dashboard');
-            // Try to restore from backup
-            try { fs.copyFileSync(backupPath, resolvedFile); } catch {}
-            jsonRes(res, {
-              error: 'Failed to apply patch',
-              reason: applyErr.message,
-              backupRestored: true,
-            }, 500);
-          }
-        } catch (parseErr: any) {
+              // Stage 2: AI Advisory (auditor)
+              updatePatchStatus(patchId, 'ai_advisory', 'pending');
+              try {
+                const auditor = (() => { try { return require('./self-heal-auditor'); } catch { return null; } })();
+                if (auditor && auditor.auditPatch) {
+                  const auditResult = await auditor.auditPatch(file, patch, description || 'Dashboard patch');
+                  if (auditResult && !auditResult.safe) {
+                    updatePatchStatus(patchId, 'ai_advisory', 'rejected', {
+                      reason: auditResult.reason || 'AI advisor rejected the patch',
+                      votes: auditResult.votes || [],
+                    });
+                    return; // STOP — AI advisor rejected
+                  }
+                  updatePatchStatus(patchId, 'ai_advisory', 'passed', {
+                    reason: auditResult ? (auditResult.reason || 'Approved by AI advisor') : 'AI advisor module not available',
+                    votes: auditResult ? (auditResult.votes || []) : [],
+                  });
+                } else {
+                  updatePatchStatus(patchId, 'ai_advisory', 'skipped', 'AI auditor module not available');
+                }
+              } catch (auditErr) {
+                updatePatchStatus(patchId, 'ai_advisory', 'skipped', 'AI auditor error: ' + auditErr.message);
+              }
+
+              // Stage 3: Backup
+              updatePatchStatus(patchId, 'backup', 'pending');
+              const backupDir = '/tmp/patch-backups';
+              try { fs.mkdirSync(backupDir, { recursive: true }); } catch {}
+              const backupPath = path.join(backupDir, path.basename(file) + '.' + Date.now() + '.bak');
+              try {
+                fs.copyFileSync(resolvedFile, backupPath);
+                updatePatchStatus(patchId, 'backup', 'passed', { backupPath });
+              } catch (backupErr) {
+                updatePatchStatus(patchId, 'backup', 'warning', 'Backup failed (non-critical): ' + backupErr.message);
+              }
+
+              // Stage 4: Apply locally
+              updatePatchStatus(patchId, 'apply_local', 'pending');
+              try {
+                const tmpPath = resolvedFile + '.tmp-' + Date.now();
+                fs.writeFileSync(tmpPath, patch, 'utf8');
+                fs.renameSync(tmpPath, resolvedFile);
+                updatePatchStatus(patchId, 'apply_local', 'passed', { file, size: patch.length });
+
+                // Evict from require.cache
+                try { delete require.cache[require.resolve(resolvedFile)]; } catch {}
+              } catch (applyErr) {
+                updatePatchStatus(patchId, 'apply_local', 'failed', applyErr.message);
+                try { fs.copyFileSync(backupPath, resolvedFile); } catch {}
+                return; // STOP
+              }
+
+              // Stage 5: Record to DB
+              updatePatchStatus(patchId, 'db_record', 'pending');
+              try {
+                const db = require('./database');
+                db.insertPatch && db.insertPatch.run && db.insertPatch.run(
+                  file, description || 'Dashboard patch submission', 'applied', 'dashboard',
+                  Date.now(), JSON.stringify({ size: patch.length, backup: backupPath, patchId })
+                );
+                updatePatchStatus(patchId, 'db_record', 'passed');
+              } catch (dbErr) {
+                updatePatchStatus(patchId, 'db_record', 'warning', 'DB record failed (non-critical): ' + dbErr.message);
+              }
+
+              // Stage 6: Write overlay for git deploy
+              updatePatchStatus(patchId, 'overlay_write', 'pending');
+              const overlayDir = '/tmp/self-heal-overlay';
+              try { fs.mkdirSync(overlayDir, { recursive: true }); } catch {}
+              const overlayPath = path.join(overlayDir, path.basename(file));
+              try {
+                fs.writeFileSync(overlayPath, patch, 'utf8');
+                updatePatchStatus(patchId, 'overlay_write', 'passed', { overlayPath });
+              } catch (overlayErr) {
+                updatePatchStatus(patchId, 'overlay_write', 'warning', 'Overlay write failed (non-critical): ' + overlayErr.message);
+              }
+
+              // Stage 7: Push to GitHub
+              updatePatchStatus(patchId, 'github_push', 'pending');
+              try {
+                const gitDeploy = require('./self-heal-git-deploy');
+                if (typeof gitDeploy.triggerImmediateRedeploy === 'function') {
+                  const githubResult = await gitDeploy.triggerImmediateRedeploy([file]);
+                  if (githubResult && githubResult.redeployed) {
+                    updatePatchStatus(patchId, 'github_push', 'passed', {
+                      method: githubResult.method,
+                      details: githubResult.details,
+                      files: githubResult.files,
+                    });
+                  } else {
+                    updatePatchStatus(patchId, 'github_push', 'failed', {
+                      method: githubResult ? githubResult.method : 'none',
+                      details: githubResult ? githubResult.details : 'No result',
+                    });
+                  }
+                } else {
+                  updatePatchStatus(patchId, 'github_push', 'skipped', 'Git deploy module not available');
+                }
+              } catch (gitErr) {
+                updatePatchStatus(patchId, 'github_push', 'failed', 'GitHub push error: ' + gitErr.message);
+              }
+
+              // Final status
+              updatePatchStatus(patchId, 'complete', 'done', { file, size: patch.length, backup: backupPath });
+
+            } catch (pipelineErr) {
+              updatePatchStatus(patchId, 'error', 'failed', pipelineErr.message);
+            }
+          })();
+
+        } catch (parseErr) {
           jsonRes(res, { error: 'Invalid JSON body', reason: parseErr.message }, 400);
         }
       });
+    });
+    return;
+  }
+
+  // ── TASK 144: Patch status polling endpoint ──
+  if (pathname.startsWith('/api/patch/status/') && req.method === 'GET') {
+    authWrap(() => {
+      const patchId = pathname.replace('/api/patch/status/', '');
+      const status = _patchStatus[patchId];
+      if (!status) {
+        jsonRes(res, { error: 'Patch ID not found: ' + patchId }, 404);
+      } else {
+        jsonRes(res, status);
+      }
+    });
+    return;
+  }
+
+  // ── TASK 144: List recent patches ──
+  if (pathname === '/api/patch/list' && req.method === 'GET') {
+    authWrap(() => {
+      const patches = Object.values(_patchStatus).slice(-20).reverse();
+      jsonRes(res, { patches, count: patches.length });
     });
     return;
   }
@@ -2022,6 +2090,15 @@ function getDashboardHTML(): string {
         <button class="btn" style="background:#4caf50;" onclick="submitPatch()">Submit Patch</button>
         <button class="btn sm" onclick="document.getElementById('patchContent').value=''" style="background:#f44336;">Clear</button>
         <span id="patchStatus" style="font-size:13px; color:#aaa; align-self:center;"></span>
+      </div>
+      <!-- TASK 144: Pipeline Tracker -->
+      <div id="patchPipeline" style="margin-top:12px; display:none;">
+        <div style="font-size:13px; font-weight:bold; margin-bottom:8px; color:#4fc3f7;">Patch Pipeline Tracker <span id="patchIdLabel" style="font-weight:normal; color:#aaa; font-size:11px;"></span></div>
+        <div id="pipelineStages" style="font-size:13px; line-height:2;"></div>
+        <div id="patchRejectionReason" style="display:none; margin-top:8px; padding:10px; background:rgba(244,67,54,0.1); border:1px solid #f44336; border-radius:4px; font-size:13px;">
+          <strong style="color:#f44336;">Rejection Reason:</strong>
+          <div id="rejectionDetails" style="margin-top:4px; color:#e57373;"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -2570,48 +2647,150 @@ async function loadPatchableFiles() {
 }
 
 async function submitPatch() {
-  const select = document.getElementById('patchFileSelect');
-  const input = document.getElementById('patchFileInput');
-  const desc = document.getElementById('patchDescription');
-  const content = document.getElementById('patchContent');
-  const status = document.getElementById('patchStatus');
+  var select = document.getElementById('patchFileSelect');
+  var input = document.getElementById('patchFileInput');
+  var desc = document.getElementById('patchDescription');
+  var content = document.getElementById('patchContent');
+  var statusEl = document.getElementById('patchStatus');
 
-  const file = (select?.value || input?.value || '').trim();
-  const patch = content?.value || '';
-  const description = desc?.value || '';
+  var file = (select && select.value || input && input.value || '').trim();
+  var patch = content ? content.value : '';
+  var description = desc ? desc.value : '';
 
   if (!file) { toast('Please select or type a file name', 'error'); return; }
   if (!patch || patch.length < 5) { toast('Patch content is too short (min 5 chars)', 'error'); return; }
   if (patch.length > 50000) { toast('Patch is too large (max 50KB)', 'error'); return; }
 
-  if (status) status.textContent = 'Submitting...';
-  if (status) status.style.color = '#ffb74d';
+  if (statusEl) statusEl.textContent = 'Submitting...';
+  if (statusEl) statusEl.style.color = '#ffb74d';
 
   try {
-    const r = await api('/api/patch/submit', {
+    var r = await api('/api/patch/submit', {
       method: 'POST',
-      body: JSON.stringify({ file, patch, description }),
+      body: JSON.stringify({ file: file, patch: patch, description: description }),
     });
 
-    if (r.ok) {
-      let msg = '✅ Patch applied to ' + r.file + ' (' + r.size + ' bytes)';
-      if (r.github) {
-        if (r.github.pushed) {
-          msg += ' | GitHub: ' + r.github.method + ' ✅';
-        } else {
-          msg += ' | GitHub: ' + r.github.details + ' ⚠';
-        }
-      }
-      toast(msg, 'success');
-      if (status) { status.textContent = msg; status.style.color = '#4caf50'; }
+    if (r.ok && r.patchId) {
+      toast('Patch queued: ' + r.patchId, 'info');
+      if (statusEl) { statusEl.textContent = 'Processing...'; statusEl.style.color = '#ffb74d'; }
+      // Start polling for status
+      pollPatchStatus(r.patchId);
     } else {
-      toast('❌ ' + (r.error || 'Patch rejected'), 'error');
-      if (status) { status.textContent = r.error || 'Rejected'; status.style.color = '#f44336'; }
+      toast('Error: ' + (r.error || 'Unknown error'), 'error');
+      if (statusEl) { statusEl.textContent = r.error || 'Error'; statusEl.style.color = '#f44336'; }
     }
   } catch (e) {
-    toast('❌ Error: ' + e.message, 'error');
-    if (status) { status.textContent = 'Error: ' + e.message; status.style.color = '#f44336'; }
+    toast('Error: ' + e.message, 'error');
+    if (statusEl) { statusEl.textContent = 'Error: ' + e.message; statusEl.style.color = '#f44336'; }
   }
+}
+
+var _patchPollTimer = null;
+function pollPatchStatus(patchId) {
+  var pipeline = document.getElementById('patchPipeline');
+  var stagesEl = document.getElementById('pipelineStages');
+  var idLabel = document.getElementById('patchIdLabel');
+  var rejBox = document.getElementById('patchRejectionReason');
+  var rejDetails = document.getElementById('rejectionDetails');
+  var statusEl = document.getElementById('patchStatus');
+
+  if (pipeline) pipeline.style.display = 'block';
+  if (idLabel) idLabel.textContent = '(' + patchId + ')';
+  if (rejBox) rejBox.style.display = 'none';
+
+  if (_patchPollTimer) clearInterval(_patchPollTimer);
+
+  _patchPollTimer = setInterval(async function() {
+    try {
+      var r = await api('/api/patch/status/' + patchId);
+      if (!r || !r.stages) return;
+
+      var stageLabels = {
+        validation: 'Input Validation',
+        path_check: 'Path Traversal Check',
+        sandbox_audit: 'Sandbox Audit',
+        ai_advisory: 'AI Advisory',
+        backup: 'File Backup',
+        apply_local: 'Apply Locally',
+        db_record: 'DB Recording',
+        overlay_write: 'Overlay Write',
+        github_push: 'GitHub Push',
+        complete: 'Complete',
+        error: 'Error',
+      };
+
+      var statusIcons = {
+        pending: '<span style="color:#ffb74d;">\u23F3</span>',
+        passed: '<span style="color:#4caf50;">\u2705</span>',
+        rejected: '<span style="color:#f44336;">\u274C</span>',
+        failed: '<span style="color:#f44336;">\u274C</span>',
+        skipped: '<span style="color:#888;">\u23ED</span>',
+        warning: '<span style="color:#ffb74d;">\u26A0</span>',
+        done: '<span style="color:#4caf50;">\u2705</span>',
+      };
+
+      var html = '';
+      var hasRejection = false;
+      var rejectionInfo = '';
+
+      for (var i = 0; i < r.stages.length; i++) {
+        var s = r.stages[i];
+        var label = stageLabels[s.stage] || s.stage;
+        var icon = statusIcons[s.status] || '?';
+        var detail = '';
+        if (s.details) {
+          if (typeof s.details === 'string') {
+            detail = ' — ' + s.details;
+          } else {
+            if (s.details.reason) detail = ' — ' + s.details.reason;
+            if (s.details.backupPath) detail = ' — ' + s.details.backupPath;
+            if (s.details.method) detail = ' — ' + s.details.method;
+            if (s.details.file) detail = ' — ' + s.details.file + ' (' + (s.details.size||0) + ' bytes)';
+            if (s.details.votes && s.details.votes.length > 0) {
+              detail += ' (votes: ' + s.details.votes.length + ')';
+            }
+          }
+        }
+        html += '<div>' + icon + ' <strong>' + label + '</strong>: ' + s.status + detail + '</div>';
+
+        if (s.status === 'rejected' || s.status === 'failed') {
+          hasRejection = true;
+          rejectionInfo = detail;
+          if (s.details && s.details.reason) rejectionInfo = s.details.reason;
+          if (s.details && s.details.details) rejectionInfo += ' | ' + (typeof s.details.details === 'string' ? s.details.details : JSON.stringify(s.details.details));
+        }
+      }
+
+      if (stagesEl) stagesEl.innerHTML = html;
+
+      // Show rejection reason
+      if (hasRejection && rejBox) {
+        rejBox.style.display = 'block';
+        if (rejDetails) rejDetails.textContent = rejectionInfo;
+        if (statusEl) { statusEl.textContent = 'REJECTED'; statusEl.style.color = '#f44336'; }
+        clearInterval(_patchPollTimer);
+        _patchPollTimer = null;
+      }
+
+      // Check if complete
+      if (r.currentStage === 'complete' || r.currentStage === 'error') {
+        if (statusEl) {
+          if (r.currentStage === 'complete') {
+            statusEl.textContent = 'COMPLETE';
+            statusEl.style.color = '#4caf50';
+            toast('Patch pipeline complete!', 'success');
+          } else {
+            statusEl.textContent = 'FAILED';
+            statusEl.style.color = '#f44336';
+          }
+        }
+        clearInterval(_patchPollTimer);
+        _patchPollTimer = null;
+      }
+    } catch (pollErr) {
+      // Ignore poll errors — keep trying
+    }
+  }, 1500); // Poll every 1.5 seconds
 }
 
 // Sync select → input
