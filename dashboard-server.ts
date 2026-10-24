@@ -1469,7 +1469,7 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
               const sandbox = (() => { try { return require('./sandbox-executor'); } catch { return null; } })();
               if (sandbox && sandbox.executePatchInSandbox) {
                 try {
-                  const sandboxResult = sandbox.executePatchInSandbox(file, patch);
+                  const sandboxResult = await sandbox.executePatchInSandbox(file, patch);
                   if (!sandboxResult.safe) {
                     updatePatchStatus(patchId, 'sandbox_audit', 'rejected', {
                       reason: sandboxResult.reason || sandboxResult.error || 'Unknown rejection',
