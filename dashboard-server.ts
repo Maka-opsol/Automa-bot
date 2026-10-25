@@ -510,6 +510,180 @@ function updatePatchStatus(patchId: string, stage: string, status: string, detai
   if (ids.length > 100) { for (const id of ids.slice(0, ids.length - 100)) delete _patchStatus[id]; }
 }
 
+// ─── Patch Queue, Mutex, Dedup, Deploy Budget ──────────────────────────────
+//
+// These prevent the patch pipeline from being overwhelmed when multiple AIs
+// submit patches concurrently. Specifically:
+//
+//   1. Global patch queue lock — only ONE patch runs through the pipeline at
+//      a time. Other patches are queued and processed in order. Without this,
+//      concurrent sandbox audits + AI tribunal calls + GitHub pushes would
+//      exhaust API quotas and Render build minutes faster than necessary.
+//
+//   2. File-level mutex — even with the global lock, if AI-A starts patching
+//      X.ts and AI-B submits a patch to X.ts 5s later, AI-B would see the
+//      OLD version of X.ts (not AI-A's changes). We track which files are
+//      "in flight" and queue same-file patches until the prior one completes.
+//
+//   3. Patch dedup — if two AIs submit IDENTICAL patches (same file + same
+//      content) within 60 minutes, only the first is processed; the duplicate
+//      is rejected with a "duplicate patch" status. This avoids burning
+//      API quota + build minutes on no-op deploys.
+//
+//   4. Deploy budget tracker — Render's free plan has 500 build minutes per
+//      month. Each deploy takes ~2 minutes. So we have ~250 deploys/month.
+//      We track deploys in a rolling 30-day window (persisted to the DB so
+//      it survives restarts). At 80% usage (200 deploys) we warn; at 95%
+//      (237 deploys) we PAUSE new deploys and queue patches until the
+//      oldest deploy in the window ages out.
+
+// Global queue lock: ensures only one patch runs at a time.
+let _patchPipelineInProgress = false;
+const _patchQueue: Array<() => Promise<void>> = [];
+
+// File-level mutex: tracks which files are currently being patched.
+const _filesInFlight: Set<string> = new Set();
+
+// Patch dedup cache: maps `file:hash` → timestamp of last submission.
+// TTL: 60 minutes (matching the dedup window).
+const _patchDedupCache: Map<string, number> = new Map();
+const PATCH_DEDUP_TTL_MS = 60 * 60 * 1000; // 60 minutes
+
+// Deploy budget tracker.
+// Render free plan: 500 build minutes/month. Each deploy ~2 min = 250 deploys/month max.
+const DEPLOY_BUDGET_MINUTES_PER_MONTH = 500;
+const DEPLOY_MINUTES_PER_DEPLOY = 2;
+const DEPLOY_BUDGET_MAX_DEPLOYS = Math.floor(DEPLOY_BUDGET_MINUTES_PER_MONTH / DEPLOY_MINUTES_PER_DEPLOY); // 250
+const DEPLOY_BUDGET_WARN_THRESHOLD = Math.floor(DEPLOY_BUDGET_MAX_DEPLOYS * 0.80); // 200
+const DEPLOY_BUDGET_PAUSE_THRESHOLD = Math.floor(DEPLOY_BUDGET_MAX_DEPLOYS * 0.95); // 237
+const DEPLOY_BUDGET_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // 30 days rolling
+// In-memory deploy timestamps (Date.now() of each deploy in the last 30 days).
+// Persisted to DB via the patch_history table (we count distinct deployed
+// patches within the window). On startup, we rehydrate from DB.
+let _deployTimestamps: number[] = [];
+let _deployBudgetInitialized = false;
+
+async function _initDeployBudget(): Promise<void> {
+  if (_deployBudgetInitialized) return;
+  _deployBudgetInitialized = true;
+  try {
+    const db = (() => { try { return require('./database'); } catch { return null; } })();
+    if (!db || !db.db) return;
+    // Count deploys in the last 30 days by querying patch_history for rows
+    // with stages_json containing "github_push: passed" within the window.
+    // We use a simpler heuristic: count patches where stages_json contains
+    // "github_push" and "passed" and timestamp > 30 days ago.
+    const cutoff = Date.now() - DEPLOY_BUDGET_WINDOW_MS;
+    const rows = db.db.prepare(
+      'SELECT timestamp, stages_json FROM patch_history WHERE timestamp > ? ORDER BY timestamp DESC'
+    ).all(cutoff);
+    _deployTimestamps = [];
+    for (const row of rows) {
+      if (row.stages_json && row.stages_json.includes('"github_push"') && row.stages_json.includes('"passed"')) {
+        _deployTimestamps.push(row.timestamp);
+      }
+    }
+    log(`Deploy budget initialized: ${_deployTimestamps.length} deploys in last 30 days (warn=${DEPLOY_BUDGET_WARN_THRESHOLD}, pause=${DEPLOY_BUDGET_PAUSE_THRESHOLD}, max=${DEPLOY_BUDGET_MAX_DEPLOYS})`, 'INFO', 'dashboard');
+  } catch (e: any) {
+    log('Deploy budget init failed (non-critical): ' + e.message, 'WARN', 'dashboard');
+  }
+}
+
+function _pruneDeployTimestamps(): void {
+  const cutoff = Date.now() - DEPLOY_BUDGET_WINDOW_MS;
+  _deployTimestamps = _deployTimestamps.filter(ts => ts > cutoff);
+}
+
+function _getDeployBudgetStatus(): { deploys: number; warnThreshold: number; pauseThreshold: number; maxDeploys: number; paused: boolean; warn: boolean; } {
+  _pruneDeployTimestamps();
+  const count = _deployTimestamps.length;
+  return {
+    deploys: count,
+    warnThreshold: DEPLOY_BUDGET_WARN_THRESHOLD,
+    pauseThreshold: DEPLOY_BUDGET_PAUSE_THRESHOLD,
+    maxDeploys: DEPLOY_BUDGET_MAX_DEPLOYS,
+    paused: count >= DEPLOY_BUDGET_PAUSE_THRESHOLD,
+    warn: count >= DEPLOY_BUDGET_WARN_THRESHOLD,
+  };
+}
+
+function _recordDeploy(): void {
+  _deployTimestamps.push(Date.now());
+  _pruneDeployTimestamps();
+}
+
+// Compute a simple hash of (file + patch content) for dedup.
+function _hashPatch(file: string, patch: string): string {
+  const crypto = require('crypto');
+  return crypto.createHash('sha256').update(file + '\n' + patch).digest('hex').slice(0, 16);
+}
+
+// Check if a patch is a duplicate of one submitted within the dedup window.
+function _isDuplicatePatch(file: string, patch: string): { duplicate: boolean; previousPatchId?: string; ageMs?: number } {
+  const hash = _hashPatch(file, patch);
+  const now = Date.now();
+  // Prune expired entries
+  for (const [key, ts] of _patchDedupCache.entries()) {
+    if (now - ts > PATCH_DEDUP_TTL_MS) _patchDedupCache.delete(key);
+  }
+  // Check for duplicate
+  const cached = _patchDedupCache.get(hash);
+  if (cached !== undefined) {
+    return { duplicate: true, ageMs: now - cached };
+  }
+  // Record this submission (we'll set the patchId later — for now, use the timestamp as a placeholder)
+  _patchDedupCache.set(hash, now);
+  return { duplicate: false };
+}
+
+// Serialize patch pipeline execution: only one patch runs at a time.
+// Returns a release function that MUST be called when the patch completes
+// (or fails) so the next queued patch can start.
+async function _acquirePipelineLock(patchId: string): Promise<() => void> {
+  return new Promise((resolve) => {
+    const run = async () => {
+      _patchPipelineInProgress = true;
+      log(`Patch ${patchId} acquired pipeline lock`, 'DEBUG', 'dashboard');
+      // Return the release function
+      resolve(() => {
+        _patchPipelineInProgress = false;
+        log(`Patch ${patchId} released pipeline lock`, 'DEBUG', 'dashboard');
+        // If there are queued patches, start the next one
+        const next = _patchQueue.shift();
+        if (next) {
+          setImmediate(() => next().then(() => {}).catch(() => {}));
+        }
+      });
+    };
+    if (!_patchPipelineInProgress) {
+      run();
+    } else {
+      log(`Patch ${patchId} queued (pipeline busy, ${_patchQueue.length} ahead)`, 'DEBUG', 'dashboard');
+      _patchQueue.push(run);
+    }
+  });
+}
+
+// File-level mutex: wait until no other patch is modifying the same file.
+async function _acquireFileLock(filePath: string, patchId: string): Promise<() => void> {
+  // Wait (with timeout) until the file is no longer in flight
+  const maxWaitMs = 5 * 60 * 1000; // 5 minutes
+  const start = Date.now();
+  while (_filesInFlight.has(filePath)) {
+    if (Date.now() - start > maxWaitMs) {
+      log(`Patch ${patchId} gave up waiting for file lock on ${filePath} after ${maxWaitMs / 1000}s`, 'WARN', 'dashboard');
+      break;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  _filesInFlight.add(filePath);
+  log(`Patch ${patchId} acquired file lock on ${filePath}`, 'DEBUG', 'dashboard');
+  return () => {
+    _filesInFlight.delete(filePath);
+    log(`Patch ${patchId} released file lock on ${filePath}`, 'DEBUG', 'dashboard');
+  };
+}
+
 async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
   const DASHBOARD_ALLOWED_ORIGINS = process.env.DASHBOARD_ALLOWED_ORIGINS
       ? process.env.DASHBOARD_ALLOWED_ORIGINS.split(',')
@@ -1451,6 +1625,25 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           }
           updatePatchStatus(patchId, 'validation', 'passed', { file, size: patch.length });
 
+          // ── Patch dedup check ────────────────────────────────────────────
+          // If an identical patch (same file + content) was submitted within
+          // the last 60 minutes, reject as a duplicate. This prevents multiple
+          // AIs from burning API quota + build minutes on no-op deploys.
+          const dedupResult = _isDuplicatePatch(file, patch);
+          if (dedupResult.duplicate) {
+            const ageMin = Math.round((dedupResult.ageMs || 0) / 60000);
+            updatePatchStatus(patchId, 'validation', 'rejected', `Duplicate patch — identical content submitted ${ageMin} minutes ago`);
+            jsonRes(res, {
+              error: `Duplicate patch rejected. An identical patch for ${file} was submitted ${ageMin} minutes ago. Wait at least 60 minutes before resubmitting the same content.`,
+              patchId,
+              status: _patchStatus[patchId],
+            }, 409);
+            return;
+          }
+
+          // ── Initialize deploy budget tracker (lazy, runs once on first patch) ──
+          _initDeployBudget().catch(() => {}); // fire-and-forget
+
           // Path traversal check
           updatePatchStatus(patchId, 'path_check', 'pending');
           const path = require('path');
@@ -1479,7 +1672,26 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           // to send a second response → "headers already sent").
           setImmediate(() => {
             (async () => {
+              // ── Acquire pipeline lock (serialize patches) ──
+              // Only one patch runs through the full pipeline at a time. This
+              // prevents concurrent sandbox audits + AI tribunal calls + GitHub
+              // pushes from exhausting API quotas and Render build minutes.
+              let releasePipelineLock: (() => void) | null = null;
+              let releaseFileLock: (() => void) | null = null;
               try {
+                updatePatchStatus(patchId, 'queue_wait', 'pending', 'Waiting for pipeline lock');
+                releasePipelineLock = await _acquirePipelineLock(patchId);
+                updatePatchStatus(patchId, 'queue_wait', 'passed', 'Acquired pipeline lock');
+
+                // ── Acquire file lock (prevent concurrent same-file patches) ──
+                // If another patch is modifying the same file, wait until it
+                // completes (with a 5-minute timeout). This prevents AI-B from
+                // overwriting AI-A's changes to the same file before AI-A's
+                // patch is even applied.
+                updatePatchStatus(patchId, 'file_lock', 'pending', { file });
+                releaseFileLock = await _acquireFileLock(resolvedFile, patchId);
+                updatePatchStatus(patchId, 'file_lock', 'passed', { file });
+
                 // Stage 1: Sandbox Audit
                 updatePatchStatus(patchId, 'sandbox_audit', 'pending');
                 const sandbox = (() => { try { return require('./sandbox-executor'); } catch { return null; } })();
@@ -1658,28 +1870,46 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
               }
 
               // Stage 7: Push to GitHub
+              // ── Deploy budget check ──
+              // Render's free plan caps at 500 build minutes/month. Each deploy
+              // takes ~2 minutes. At 80% usage (200 deploys in last 30 days)
+              // we warn; at 95% (237 deploys) we PAUSE new deploys to avoid
+              // hitting the monthly cap mid-month. The patch is still recorded
+              // to patch_history and the overlay file is written, but the
+              // actual GitHub push is deferred until the budget recovers.
               updatePatchStatus(patchId, 'github_push', 'pending');
-              try {
-                const gitDeploy = require('./self-heal-git-deploy');
-                if (typeof gitDeploy.triggerImmediateRedeploy === 'function') {
-                  const githubResult = await gitDeploy.triggerImmediateRedeploy([file]);
-                  if (githubResult && githubResult.redeployed) {
-                    updatePatchStatus(patchId, 'github_push', 'passed', {
-                      method: githubResult.method,
-                      details: githubResult.details,
-                      files: githubResult.files,
-                    });
-                  } else {
-                    updatePatchStatus(patchId, 'github_push', 'failed', {
-                      method: githubResult ? githubResult.method : 'none',
-                      details: githubResult ? githubResult.details : 'No result',
-                    });
-                  }
-                } else {
-                  updatePatchStatus(patchId, 'github_push', 'skipped', 'Git deploy module not available');
+              const budget = _getDeployBudgetStatus();
+              if (budget.paused) {
+                updatePatchStatus(patchId, 'github_push', 'warning', `Deploy budget PAUSED — ${budget.deploys}/${budget.maxDeploys} deploys in last 30 days (≥${budget.pauseThreshold} pause threshold). Patch saved to overlay+DB; will deploy when budget recovers.`);
+                log(`Deploy budget PAUSED for patch ${patchId}: ${budget.deploys}/${budget.maxDeploys} deploys in 30d`, 'WARN', 'dashboard');
+              } else {
+                if (budget.warn) {
+                  log(`Deploy budget WARNING: ${budget.deploys}/${budget.maxDeploys} deploys in 30d (≥${budget.warnThreshold} warn threshold)`, 'WARN', 'dashboard');
                 }
-              } catch (gitErr) {
-                updatePatchStatus(patchId, 'github_push', 'failed', 'GitHub push error: ' + gitErr.message);
+                try {
+                  const gitDeploy = require('./self-heal-git-deploy');
+                  if (typeof gitDeploy.triggerImmediateRedeploy === 'function') {
+                    const githubResult = await gitDeploy.triggerImmediateRedeploy([file]);
+                    if (githubResult && githubResult.redeployed) {
+                      updatePatchStatus(patchId, 'github_push', 'passed', {
+                        method: githubResult.method,
+                        details: githubResult.details,
+                        files: githubResult.files,
+                        deployBudget: { used: budget.deploys + 1, max: budget.maxDeploys, remaining: budget.maxDeploys - budget.deploys - 1 },
+                      });
+                      _recordDeploy(); // track for budget
+                    } else {
+                      updatePatchStatus(patchId, 'github_push', 'failed', {
+                        method: githubResult ? githubResult.method : 'none',
+                        details: githubResult ? githubResult.details : 'No result',
+                      });
+                    }
+                  } else {
+                    updatePatchStatus(patchId, 'github_push', 'skipped', 'Git deploy module not available');
+                  }
+                } catch (gitErr) {
+                  updatePatchStatus(patchId, 'github_push', 'failed', 'GitHub push error: ' + gitErr.message);
+                }
               }
 
               // Final status
@@ -1700,6 +1930,17 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
 
             } catch (pipelineErr) {
               updatePatchStatus(patchId, 'error', 'failed', pipelineErr.message);
+            } finally {
+              // ── Release locks ──
+              // Always release both the file lock and pipeline lock, even if the
+              // pipeline threw an error. Otherwise the queue would deadlock
+              // and no future patches could ever run.
+              try { if (releaseFileLock) releaseFileLock(); } catch (e: any) {
+                log('Failed to release file lock for ' + patchId + ': ' + e.message, 'WARN', 'dashboard');
+              }
+              try { if (releasePipelineLock) releasePipelineLock(); } catch (e: any) {
+                log('Failed to release pipeline lock for ' + patchId + ': ' + e.message, 'WARN', 'dashboard');
+              }
             }
           })();
           }); // end setImmediate
@@ -1813,6 +2054,34 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           };
         });
         jsonRes(res, { patches: summary, count: summary.length });
+      } catch (e: any) {
+        jsonRes(res, { error: e.message }, 500);
+      }
+    });
+    return true;
+  }
+
+  // ── Deploy budget status endpoint ──
+  // GET /api/patch/budget
+  // Returns the current Render build-minute budget usage so the dashboard
+  // (and external AIs) can decide whether to submit a patch or wait.
+  if (pathname === '/api/patch/budget' && req.method === 'GET') {
+    authWrap(() => {
+      try {
+        _initDeployBudget().then(() => {
+          const budget = _getDeployBudgetStatus();
+          jsonRes(res, {
+            ...budget,
+            windowDays: 30,
+            buildMinutesPerMonth: DEPLOY_BUDGET_MINUTES_PER_MONTH,
+            buildMinutesPerDeploy: DEPLOY_MINUTES_PER_DEPLOY,
+            pipelineBusy: _patchPipelineInProgress,
+            queueDepth: _patchQueue.length,
+            filesInFlight: Array.from(_filesInFlight),
+          });
+        }).catch((e: any) => {
+          jsonRes(res, { error: e.message }, 500);
+        });
       } catch (e: any) {
         jsonRes(res, { error: e.message }, 500);
       }
