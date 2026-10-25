@@ -2095,7 +2095,7 @@ function getDashboardHTML(): string {
         <strong style="color:#ffb74d;">⚠ Safety:</strong> The patch will be run through the sandbox auditor (checks for malicious code, path traversal, syntax errors, etc.).
         If it passes, the patch is applied locally AND pushed to GitHub (which triggers a Render redeploy).<br><br>
         <strong style="color:#81c784;">Format:</strong> Full file content only (not unified diffs). The patch replaces the entire file.<br>
-        Max size: 50KB. The original file is backed up to /tmp/patch-backups/ before applying.
+        Max size: 500KB. The original file is backed up to /tmp/patch-backups/ before applying.
       </div>
       <div style="display:flex; gap:8px; margin-bottom:8px; align-items:center;">
         <label style="min-width:80px; font-size:13px;">File:</label>
