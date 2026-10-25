@@ -3035,7 +3035,7 @@ async function viewCurrentFile() {
     if (!r.exists) { toast('File does not exist: ' + file, 'error'); return; }
     _viewerCurrentFile = file;
     _viewerCurrentContent = r.content || '';
-    _viewerAllLines = _viewerCurrentContent.split('\n');
+    _viewerAllLines = _viewerCurrentContent.split('\\n');
     _viewerCurrentPage = 0;
     _viewerSearchMatches = [];
     _viewerSearchCursor = -1;
@@ -3262,8 +3262,8 @@ let _diffPreviewApproved = false;
 
 function _computeLineDiff(oldText, newText) {
   // Simple LCS-based line diff. Returns array of {type: 'unchanged'|'added'|'removed', oldLine?, newLine?, text}
-  const oldLines = (oldText || '').split('\n');
-  const newLines = (newText || '').split('\n');
+  const oldLines = (oldText || '').split('\\n');
+  const newLines = (newText || '').split('\\n');
   // Build LCS table
   const m = oldLines.length, n = newLines.length;
   // Cap table size to avoid OOM on very large files
@@ -3475,7 +3475,10 @@ async function loadPatchHistory() {
     r.patches.forEach((p) => {
       const desc = (p.description || '').slice(0, 80) + ((p.description || '').length > 80 ? '…' : '');
       const sizeKb = p.patch_size ? (p.patch_size / 1024).toFixed(1) + ' KB' : '-';
-      html += '<tr style="border-bottom:1px solid #2a2a3e; cursor:pointer;" onmouseover="this.style.background=\'#1f1f30\'" onmouseout="this.style.background=\'\'">';
+      // BUGFIX: Use HTML entities (#39;) for quotes inside onclick/onmouseover
+      // attribute values instead of \' escapes — the template literal processes
+      // \' as just ', breaking the JS string parser in the browser.
+      html += '<tr style="border-bottom:1px solid #2a2a3e; cursor:pointer;" onmouseover="this.style.background=&#39;#1f1f30&#39;" onmouseout="this.style.background=&#39;&#39;">';
       html += '<td style="padding:6px 8px; color:#aaa;">#' + p.id + '</td>';
       html += '<td style="padding:6px 8px; color:#aaa; font-family:monospace; font-size:11px;">' + _fmtTimestamp(p.timestamp) + '</td>';
       html += '<td style="padding:6px 8px; color:#e0e0e0; font-family:monospace; font-size:11px;">' + (p.file || '-') + '</td>';
@@ -3484,7 +3487,17 @@ async function loadPatchHistory() {
       html += '<td style="padding:6px 8px; color:#aaa; font-family:monospace; font-size:11px;">' + (p.branch || '-') + '</td>';
       html += '<td style="padding:6px 8px; color:#aaa; text-align:right;">' + sizeKb + '</td>';
       html += '<td style="padding:6px 8px; text-align:center; white-space:nowrap;">';
-      html += '<button class="btn sm" style="background:#3a3a5c; padding:3px 8px; font-size:11px;" onclick="event.stopPropagation(); viewPatchFromHistory(' + p.id + ', \'' + escapeHtml(p.file || '').replace(/'/g, "\\'") + '\')">View Patch</button>';
+      // BUGFIX: Previously used \' escape sequences inside the JS string that
+      // builds this HTML. But the entire HTML string is wrapped in a TypeScript
+      // template literal (backticks) in getDashboardHTML(), and template
+      // literals process \' as just ' — so the rendered JS string had unescaped
+      // single quotes that broke the JS parser, leaving the dashboard stuck
+      // on Loading.
+      // Fix: use JSON.stringify() to safely embed the filename as a JS-quoted
+      // string. JSON.stringify output is always V8-safe and doesn't depend on
+      // backslash escapes that conflict with the template literal.
+      const fileArg = JSON.stringify(p.file || '');
+      html += '<button class="btn sm" style="background:#3a3a5c; padding:3px 8px; font-size:11px;" onclick="event.stopPropagation(); viewPatchFromHistory(' + p.id + ', ' + fileArg + ')">View Patch</button>';
       html += ' <button class="btn sm" style="background:#2a4a3c; padding:3px 8px; font-size:11px;" onclick="event.stopPropagation(); reloadPatchFromHistory(' + p.id + ')" title="Load this patch into the Submit Patch form to re-apply or modify">Re-apply</button>';
       html += '</td>';
       html += '</tr>';
@@ -3624,7 +3637,7 @@ function _formatRejectionWithLineLinks(text) {
 function jumpToPatchLine(lineNum) {
   const ta = document.getElementById('patchContent');
   if (!ta) { toast('Patch textarea not found', 'error'); return; }
-  const lines = ta.value.split('\n');
+  const lines = ta.value.split('\\n');
   if (lineNum < 1 || lineNum > lines.length) {
     toast('Line ' + lineNum + ' is out of range (file has ' + lines.length + ' lines)', 'error');
     return;
