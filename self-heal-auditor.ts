@@ -519,7 +519,12 @@ async function auditPatch(patchText: any, signal: any, options?: { isNonCodegen?
   }
 
   // Optional: use sandbox content audit as additional pre-filter
-  const sandboxAudit = getAuditPatchContent()(patchText);
+  // Pass originalContent so context-aware skip works (auditPatchContent
+  // already supports skipping patterns that exist in the original file,
+  // but only if the caller passes the original — previously we were
+  // passing only patchText, so every blocked pattern in the patch was
+  // flagged as a violation, even if the original file already used it.
+  const sandboxAudit = getAuditPatchContent()(patchText, originalContent);
   if (!sandboxAudit.safe) {
     log(`Patch blocked by sandbox content audit: ${sandboxAudit.violations.length} violations`, 'WARN', 'auditor');
     return { safe: false, reason: `Sandbox content audit: ${sandboxAudit.violations.join('; ')}` };
@@ -583,8 +588,9 @@ async function auditPatchWithVotes(patchText: any, signal: any, options?: { isNo
     }
   }
 
-  // Sandbox content audit
-  const sandboxAudit = getAuditPatchContent()(patchText);
+  // Sandbox content audit (context-aware: pass originalContent so patterns
+  // already present in the original file are skipped)
+  const sandboxAudit = getAuditPatchContent()(patchText, originalContent);
   if (!sandboxAudit.safe) {
     return {
       safe: false, is_safe: false,
