@@ -358,19 +358,24 @@ async function auditPatchWithAI(patchText: any, signal: any, configOverride = nu
     : undefined;
   try {
     const prompt = isNonCodegen ? NON_CODEGEN_AUDITOR_PROMPT : AUDITOR_PROMPT;
-    // callChatCompletionWithRollback signature: (endpoint, apiKey, model, base64Image, prompt, providerName, options)
-    // The previous call site was missing the `providerName` argument and
-    // was passing `options` in its place, which silently broke the auditor
-    // once the broken `callChatCompletion` alias was removed from providers-base.
-    const response = await getCallChatCompletion()(
+    // callChatCompletionWithRollback returns the assistant's message content
+    // as a STRING (not the raw OpenAI-style response object). Previous code
+    // was treating the return value as the full response and reading
+    // response.choices[0].message.content, which is always undefined on a
+    // string — causing every audit to crash with "Empty auditor response".
+    const content = await getCallChatCompletion()(
       config.endpoint, config.apiKey, config.model, null,
       prompt + '\n\nPATCH TO AUDIT:\n' + patchText,
       config.provider || 'auditor',
       { responseFormat: { type: 'json_object' }, signal: safeSignal }
     );
-    const content = response.choices?.[0]?.message?.content;
-    if (!content) throw new Error('Empty auditor response');
-    const parsed = JSON.parse(content);
+    if (!content || typeof content !== 'string' || content.trim() === '') {
+      throw new Error('Empty auditor response');
+    }
+    // Some models wrap JSON in ```json ... ``` fences despite response_format.
+    // Strip those before parsing.
+    const trimmed = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+    const parsed = JSON.parse(trimmed);
     if (typeof parsed.is_safe !== 'boolean') throw new Error('Invalid auditor response format');
     return { ...parsed, provider: config.provider, model: config.model };
   } catch (err: any) {
