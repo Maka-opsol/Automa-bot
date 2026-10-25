@@ -394,17 +394,59 @@ async function auditPatchWithAI(patchText: any, signal: any, configOverride = nu
       userMessage += 'CURRENTLY APPROVED VERSION (evaluate the patch AGAINST this — patterns already present here are pre-approved and MUST NOT be flagged):\n```\n' + truncated + '\n```\n\n';
     }
     userMessage += 'PATCH TO AUDIT:\n```\n' + patchText + '\n```';
-    // callChatCompletionWithRollback returns the assistant's message content
-    // as a STRING (not the raw OpenAI-style response object). Previous code
-    // was treating the return value as the full response and reading
-    // response.choices[0].message.content, which is always undefined on a
-    // string — causing every audit to crash with "Empty auditor response".
-    const content = await getCallChatCompletion()(
-      config.endpoint, config.apiKey, config.model, null,
-      prompt + '\n\n' + userMessage,
-      config.provider || 'auditor',
-      { responseFormat: { type: 'json_object' }, signal: safeSignal }
-    );
+
+    // Helper: try the auditor call once. If it returns a 429 rate-limit error,
+    // parse the X-RateLimit-Reset header and wait until that time (with a
+    // 60s cap) before retrying ONCE. This lets us ride through OpenRouter's
+    // free-tier daily quota reset without immediately failing.
+    async function _callWithRateLimitRetry(): Promise<string> {
+      try {
+        return await getCallChatCompletion()(
+          config.endpoint, config.apiKey, config.model, null,
+          prompt + '\n\n' + userMessage,
+          config.provider || 'auditor',
+          { responseFormat: { type: 'json_object' }, signal: safeSignal }
+        );
+      } catch (err: any) {
+        const errMsg = String(err && err.message || err);
+        // Detect 429 rate-limit errors specifically (not other infra failures)
+        const isRateLimit =
+          /HTTP_ERROR_429/.test(errMsg) ||
+          /Rate limit exceeded/i.test(errMsg);
+        if (!isRateLimit) throw err;
+
+        // Try to parse the reset time from the error message.
+        // OpenRouter embeds X-RateLimit-Reset in the error JSON body
+        // (e.g. "X-RateLimit-Reset":"1792972800000").
+        const resetMatch = errMsg.match(/X-RateLimit-Reset["']?\s*[:=]\s*["']?(\d{10,})/);
+        let waitMs = 0;
+        if (resetMatch) {
+          const resetEpochMs = parseInt(resetMatch[1], 10);
+          if (Number.isFinite(resetEpochMs)) {
+            waitMs = Math.max(0, resetEpochMs - Date.now());
+          }
+        }
+        // Cap the wait at 60 seconds — if the reset is more than 60s away,
+        // the rate limit is probably a daily quota (not a short-term throttle),
+        // and waiting would block the dashboard for too long. In that case,
+        // skip the retry and let the fallback chain handle it.
+        if (waitMs === 0 || waitMs > 60000) {
+          log(`Auditor ${config.provider}/${config.model} rate-limited (reset in ${Math.round(waitMs / 1000)}s) — skipping retry, will fall back to next tier`, 'WARN', 'auditor');
+          throw err;
+        }
+        log(`Auditor ${config.provider}/${config.model} rate-limited — waiting ${Math.round(waitMs / 1000)}s for reset, then retrying once`, 'WARN', 'auditor');
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+        // Retry once
+        return await getCallChatCompletion()(
+          config.endpoint, config.apiKey, config.model, null,
+          prompt + '\n\n' + userMessage,
+          config.provider || 'auditor',
+          { responseFormat: { type: 'json_object' }, signal: safeSignal }
+        );
+      }
+    }
+
+    const content = await _callWithRateLimitRetry();
     if (!content || typeof content !== 'string' || content.trim() === '') {
       throw new Error('Empty auditor response');
     }
@@ -452,43 +494,166 @@ async function auditPatchWithAI(patchText: any, signal: any, configOverride = nu
 
 // ─── Tribunal Audit (multiple independent models) ───
 
+// ─── Fallback Chain for Auditor Configs ─────────────────────────────────────
+//
+// The user's request: if the primary advisory AIs (OpenRouter + Mistral) don't
+// work (rate-limited, down, etc.), fall back through this chain:
+//   1. Codegen models (these are designed for code, can do safety review too):
+//      - Mistral (already primary, but kept in fallback list as codegen-capable)
+//      - DeepSeek (if DEEPSEEK_CODE_API_KEY)
+//      - Qwen (if QWEN_CODE_API_KEY)
+//      - Bazaarlink (if BAZAARLINK_API_KEY)
+//      - VoidAI (if VOIDAI_API_KEY)
+//      - OpenRouter free (already primary)
+//   2. Groq (fast inference, qwen & llama models)
+//   3. Z.ai (z-ai-web-dev-sdk compatible)
+//   4. Whatever's left (Gemini, NVIDIA, Cloudflare, Cerebras, Agnes, GitHub-GPT)
+//
+// Each tier is tried in order; if EVERY model in a tier is skipped
+// (infrastructure failure), move to the next tier. We stop at the first tier
+// that returns at least one real verdict (is_safe: true/false).
+
+interface AuditorConfig {
+  provider: string;
+  model: string;
+  endpoint: string;
+  apiKey: string | null;
+}
+
+// Lookup a provider's auditor config by API key + endpoint.
+function _resolveAuditorConfig(provider: string): AuditorConfig | null {
+  const cfg = getCONFIG();
+  switch (provider) {
+    case 'openrouter':
+      if (!cfg.OPENROUTER_API_KEY) return null;
+      return { provider: 'openrouter', model: 'openrouter/free', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: cfg.OPENROUTER_API_KEY };
+    case 'mistral':
+      if (!cfg.MISTRAL_CODE_API_KEY) return null;
+      return { provider: 'mistral', model: 'codestral-latest', endpoint: 'https://api.mistral.ai/v1/chat/completions', apiKey: cfg.MISTRAL_CODE_API_KEY };
+    case 'deepseek':
+      if (!cfg.DEEPSEEK_CODE_API_KEY) return null;
+      return { provider: 'deepseek', model: 'deepseek-coder', endpoint: 'https://api.deepseek.com/v1/chat/completions', apiKey: cfg.DEEPSEEK_CODE_API_KEY };
+    case 'qwen':
+      if (!cfg.QWEN_CODE_API_KEY) return null;
+      return { provider: 'qwen', model: 'qwen-coder-plus', endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', apiKey: cfg.QWEN_CODE_API_KEY };
+    case 'bazaarlink':
+      if (!cfg.BAZAARLINK_API_KEY) return null;
+      return { provider: 'bazaarlink', model: 'bazaarlink-coder', endpoint: 'https://api.bazaarlink.ai/v1/chat/completions', apiKey: cfg.BAZAARLINK_API_KEY };
+    case 'voidai':
+      if (!cfg.VOIDAI_API_KEY) return null;
+      return { provider: 'voidai', model: 'voidai-coder', endpoint: 'https://api.voidai.app/v1/chat/completions', apiKey: cfg.VOIDAI_API_KEY };
+    case 'groq':
+      if (!cfg.GROQ_API_KEY) return null;
+      return { provider: 'groq', model: 'llama-3.3-70b-versatile', endpoint: 'https://api.groq.com/openai/v1/chat/completions', apiKey: cfg.GROQ_API_KEY };
+    case 'zai':
+      if (!cfg.ZAI_API_KEY) return null;
+      return { provider: 'zai', model: 'glm-4.6', endpoint: 'https://api.z.ai/api/paas/v4/chat/completions', apiKey: cfg.ZAI_API_KEY };
+    case 'gemini':
+      if (!cfg.GEMINI_API_KEY) return null;
+      return { provider: 'gemini', model: 'gemini-2.0-flash', endpoint: 'gemini-native', apiKey: cfg.GEMINI_API_KEY };
+    case 'nvidia':
+      if (!cfg.NVIDIA_API_KEY) return null;
+      return { provider: 'nvidia', model: 'meta/llama-3.1-70b-instruct', endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions', apiKey: cfg.NVIDIA_API_KEY };
+    case 'cloudflare':
+      if (!cfg.CF_API_KEY || !cfg.CF_ACCOUNT_ID) return null;
+      return { provider: 'cloudflare', model: '@cf/meta/llama-3.1-8b-instruct', endpoint: 'https://api.cloudflare.com/client/v4/accounts/' + cfg.CF_ACCOUNT_ID + '/ai/v1/chat/completions', apiKey: cfg.CF_API_KEY };
+    case 'cerebras':
+      if (!cfg.CEREBRAS_API_KEY) return null;
+      return { provider: 'cerebras', model: 'llama3.1-70b', endpoint: 'https://api.cerebras.ai/v1/chat/completions', apiKey: cfg.CEREBRAS_API_KEY };
+    case 'agnes':
+      if (!cfg.AGNES_API_KEY) return null;
+      return { provider: 'agnes', model: 'agnes-coder', endpoint: 'https://api.agnes.ai/v1/chat/completions', apiKey: cfg.AGNES_API_KEY };
+    case 'github':
+      if (!cfg.GITHUB_API_KEY) return null;
+      return { provider: 'github', model: 'gpt-4o-mini', endpoint: 'https://api.githubcopilot.com/chat/completions', apiKey: cfg.GITHUB_API_KEY };
+    default:
+      return null;
+  }
+}
+
+// The fallback chain — list of tiers, each tier is a list of provider names.
+// We try each tier in order; the first tier that yields at least one real
+// safety verdict wins. Within a tier, we run all configs in parallel.
+const AUDITOR_FALLBACK_TIERS: string[][] = [
+  // Tier 1: primary advisory models (best for safety review)
+  ['openrouter', 'mistral'],
+  // Tier 2: codegen models (designed for code, can do safety review)
+  ['deepseek', 'qwen', 'bazaarlink', 'voidai'],
+  // Tier 3: Groq (fast inference)
+  ['groq'],
+  // Tier 4: Z.ai
+  ['zai'],
+  // Tier 5: whatever's left (Gemini, NVIDIA, Cloudflare, Cerebras, Agnes, GitHub)
+  ['gemini', 'nvidia', 'cloudflare', 'cerebras', 'agnes', 'github'],
+];
+
 async function auditPatchWithTribunal(patchText: any, signal: any, options?: { isNonCodegen?: boolean; originalContent?: string }) {
   const isNonCodegen = options?.isNonCodegen || false;
   const originalContent = options?.originalContent;
 
-  // v2: Use more auditors and stricter thresholds for non-codegen patches
-  let auditorConfigs: Array<{ provider: string; model: string }>;
-  if (isNonCodegen) {
-    // Get all available auditors for non-codegen patches
-    const fullConfigs = getNonCodegenAuditorConfigs();
-    auditorConfigs = fullConfigs.map(c => ({ provider: c.provider, model: c.model }));
-    log(`Non-codegen audit: using ${auditorConfigs.length} auditors with strict mode`, 'INFO', 'auditor');
-  } else {
-    auditorConfigs = [
-      { provider: 'openrouter', model: 'openrouter/free' },
-      { provider: 'mistral', model: 'codestral-latest' },
-    ];
+  // Helper: run all configs in a single tier in parallel, return all results
+  // (including skipped verdicts so we can surface them).
+  async function runTier(providerNames: string[]): Promise<any[]> {
+    const configs: AuditorConfig[] = [];
+    for (const name of providerNames) {
+      const c = _resolveAuditorConfig(name);
+      if (c) configs.push(c);
+    }
+    if (configs.length === 0) return [];
+    const results: PromiseSettledResult<any>[] = await Promise.allSettled(
+      configs.map(c => auditPatchWithAI(patchText, signal, c, isNonCodegen, originalContent))
+    );
+    return results
+      .filter(r => r.status === 'fulfilled' && r.value)
+      // @ts-expect-error
+      .map(r => r.value);
   }
 
-  const results: PromiseSettledResult<any>[] = await Promise.allSettled(auditorConfigs.map(async ({ provider, model }) => {
-    let config = null;
-    if (provider === 'openrouter' && getCONFIG().OPENROUTER_API_KEY) {
-      config = { provider, model, endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: getCONFIG().OPENROUTER_API_KEY };
-    } else if (provider === 'mistral' && getCONFIG().MISTRAL_CODE_API_KEY) {
-      config = { provider, model, endpoint: 'https://api.mistral.ai/v1/chat/completions', apiKey: getCONFIG().MISTRAL_CODE_API_KEY };
-    } else if (provider === 'gemini' && getCONFIG().GEMINI_API_KEY) {
-      config = { provider, model, endpoint: 'gemini-native', apiKey: getCONFIG().GEMINI_API_KEY };
-    } else if (provider === 'groq' && getCONFIG().GROQ_API_KEY) {
-      config = { provider, model, endpoint: 'https://api.groq.com/openai/v1/chat/completions', apiKey: getCONFIG().GROQ_API_KEY };
+  // Walk through the fallback tiers in order. Stop at the first tier that
+  // yields at least one real safety verdict (not skipped).
+  // For non-codegen patches, we keep the original strict-tier behavior:
+  // run ALL tiers' configs together so we get a full supermajority vote.
+  let allResults: any[] = [];
+  let usedTier = -1;
+  if (isNonCodegen) {
+    // Non-codegen: run ALL configs across all tiers (stricter, more votes)
+    const allProviderNames = AUDITOR_FALLBACK_TIERS.flat();
+    allResults = await runTier(allProviderNames);
+    usedTier = -2; // sentinel: "all tiers combined"
+    log(`Non-codegen audit: ${allResults.length} auditors across all fallback tiers`, 'INFO', 'auditor');
+  } else {
+    // Normal: walk tiers in order, stop at first tier with real verdicts
+    for (let t = 0; t < AUDITOR_FALLBACK_TIERS.length; t++) {
+      const tier = AUDITOR_FALLBACK_TIERS[t];
+      const tierResults = await runTier(tier);
+      if (tierResults.length > 0) {
+        const realVerdicts = tierResults.filter(v => v && !v.skipped && v.is_safe !== null && v.is_safe !== undefined);
+        if (realVerdicts.length > 0) {
+          // This tier yielded at least one real verdict — use it
+          allResults = tierResults;
+          usedTier = t;
+          log(`Auditor tier ${t + 1} (${tier.join(', ')}) yielded ${realVerdicts.length}/${tierResults.length} real verdicts`, 'INFO', 'auditor');
+          break;
+        }
+        // All verdicts in this tier were skipped — record them for surfacing
+        // and continue to the next tier
+        allResults.push(...tierResults);
+        log(`Auditor tier ${t + 1} (${tier.join(', ')}) all skipped — trying next tier`, 'WARN', 'auditor');
+      }
     }
-    if (!config) return null;
-    return auditPatchWithAI(patchText as any, signal as any, config as any, isNonCodegen, originalContent);
-  }));
+  }
 
-  const allResults = results
-    .filter(r => r.status === 'fulfilled' && r.value)
-// @ts-expect-error
-    .map(r => r.value);
+  if (allResults.length === 0) {
+    // No auditor configs are available at all (no API keys configured)
+    log('No auditor configs available — failing safe', 'ERROR', 'auditor');
+    return {
+      safe: false,
+      is_safe: false,
+      reason: 'No auditor APIs are configured. Set at least one of: OPENROUTER_API_KEY, MISTRAL_CODE_API_KEY, GROQ_API_KEY, ZAI_API_KEY, GEMINI_API_KEY, etc.',
+      votes: [],
+      skipped: [],
+    };
+  }
 
   // BUGFIX: Filter out "skipped" verdicts (infrastructure failures like
   // 429 rate limit, 500 server error, network timeout). These are NOT safety
@@ -508,12 +673,17 @@ async function auditPatchWithTribunal(patchText: any, signal: any, options?: { i
   const total = votes.length;
 
   if (total === 0) {
-    // ALL auditors were skipped (infrastructure failure on every auditor) —
-    // fall back to a single AI call with default config. If that ALSO fails
-    // (likely, since the same rate limits apply), the auditor will return
-    // an "Auditor infrastructure failure" verdict that the dashboard surfaces.
-    log(`All ${allResults.length} auditors were skipped — falling back to default config audit`, 'WARN', 'auditor');
-    return auditPatchWithAI(patchText, signal, null, isNonCodegen, originalContent);
+    // ALL auditors (across ALL fallback tiers) were skipped — every provider
+    // is down or rate-limited. Surface the full skip list to the dashboard.
+    const skipReasons = skipped.map(s => `${s.provider}/${s.model}: ${(s.skip_reason || s.reason || 'unknown').slice(0, 100)}`).join('; ');
+    log(`All ${allResults.length} auditors across all fallback tiers were skipped — failing safe`, 'ERROR', 'auditor');
+    return {
+      safe: false,
+      is_safe: false,
+      reason: `All auditors failed (infrastructure). Skipped: ${skipReasons}`,
+      votes: [],
+      skipped,
+    };
   }
 
   // v2: Stricter threshold for non-codegen patches
