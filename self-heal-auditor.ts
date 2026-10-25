@@ -5,7 +5,7 @@ function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function getCONFIG(): Record<string, any> { return _deps.config || require('./get-config'); }
 function log(msg: string, level?: string, mod?: string) { _deps.logger?.log?.(msg, level, mod) ?? console.log(msg); }
 function logError(msg: string, err: Error, ctx?: any) { _deps.logger?.logError?.(msg, err, ctx) ?? console.error(msg, err); }
-function getCallChatCompletion() { return _deps.providersBase?.callChatCompletion || require('./providers-base').callChatCompletion; }
+function getCallChatCompletion() { return _deps.providersBase?.callChatCompletionWithRollback || require('./providers-base').callChatCompletionWithRollback; }
 function getGetActiveModel() { return _deps.database?.getActiveModel; }
 function getAuditPatchContent() { return _deps.sandboxExecutor?.auditPatchContent || require('./sandbox-executor').auditPatchContent; }
 
@@ -320,9 +320,14 @@ async function auditPatchWithAI(patchText: any, signal: any, configOverride = nu
   }
   try {
     const prompt = isNonCodegen ? NON_CODEGEN_AUDITOR_PROMPT : AUDITOR_PROMPT;
+    // callChatCompletionWithRollback signature: (endpoint, apiKey, model, base64Image, prompt, providerName, options)
+    // The previous call site was missing the `providerName` argument and
+    // was passing `options` in its place, which silently broke the auditor
+    // once the broken `callChatCompletion` alias was removed from providers-base.
     const response = await getCallChatCompletion()(
       config.endpoint, config.apiKey, config.model, null,
       prompt + '\n\nPATCH TO AUDIT:\n' + patchText,
+      config.provider || 'auditor',
       { responseFormat: { type: 'json_object' }, signal }
     );
     const content = response.choices?.[0]?.message?.content;
