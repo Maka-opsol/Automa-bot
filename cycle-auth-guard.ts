@@ -738,7 +738,7 @@ async function ensureAuthenticated(page: any) {
         // A reload gives it a fresh chance to render.
         log('SPA session check: page still blank after 60s wait — trying page.reload() before re-auth', 'WARN', 'auth-guard');
         try {
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+          await page.reload({ waitUntil: 'load', timeout: 120000 }).catch(() => {});
           // Wait another 30s after reload
           const reloadDeadline = Date.now() + 30000;
           while (Date.now() < reloadDeadline) {
@@ -866,18 +866,15 @@ async function ensureAuthenticated(page: any) {
     }
 
     const recoveryUrl = CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za';
-    log(`On Chrome error page (${url}, occurrence #${errorCount}) — navigating to ${recoveryUrl} (network/proxy error recovery)`, 'WARN', 'auth-guard');
+    log('On Chrome error page (' + url + ', occurrence #' + errorCount + ') — navigating to ' + recoveryUrl + ' (network/proxy error recovery)', 'WARN', 'auth-guard');
     try {
-      await page.goto(recoveryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.goto(recoveryUrl, { waitUntil: 'load', timeout: 120000 });
     } catch (e: any) {
-      log(`Recovery navigation to ${recoveryUrl} also failed: ${e.message}`, 'ERROR', 'auth-guard');
-      // If we can't navigate, close and relaunch the browser
-      try {
-        const browser = _deps.browser || {};
-        await browser.closeBrowser?.();
-        await new Promise(r => setTimeout(r, 2000));
-        await browser.launchBrowser?.();
-      } catch {}
+      log('Recovery navigation to ' + recoveryUrl + ' also failed: ' + e.message, 'ERROR', 'auth-guard');
+      // TASK 146: DON'T close and relaunch browser (defeats Task 87).
+      // Just wait 10s and let the next cycle retry. The network may recover.
+      log('Waiting 10s before next cycle retry (NOT closing browser per Task 87)...', 'WARN', 'auth-guard');
+      await new Promise(r => setTimeout(r, 10000));
     }
     return page;
   }
@@ -890,7 +887,7 @@ async function ensureAuthenticated(page: any) {
     const recoveryUrl = CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za';
     log(`On about:blank — navigating to ${recoveryUrl} (instead of returning blank page to tribunal)`, 'INFO', 'auth-guard');
     try {
-      await page.goto(recoveryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.goto(recoveryUrl, { waitUntil: 'load', timeout: 120000 });
     } catch (e: any) {
       log(`Navigation to ${recoveryUrl} failed: ${e.message}`, 'WARN', 'auth-guard');
     }
