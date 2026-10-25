@@ -58,22 +58,53 @@ const EXTENDED_FORBIDDEN_KEYWORDS = [
   'process.env.HOME', 'process.env.USER', 'process.env.PATH',
 ];
 
-function isObviouslyMalicious(patchText: any): boolean {
+/**
+ * Context-aware keyword scan: matches against the patch, but skips any
+ * pattern that ALSO appears in the original file content (when provided).
+ * This prevents false positives on patches to files that legitimately
+ * use `process.env`, `fs.readFile`, `require('fs')`, etc.
+ *
+ * Returns a structured result so callers can surface WHICH keywords
+ * matched — previously the message was just "Blocked by keyword scanner"
+ * with no way to debug.
+ */
+function isObviouslyMalicious(patchText: any, originalContent?: string): boolean {
+  return scanForKeywords(patchText, originalContent).matched.length > 0;
+}
+
+function scanForKeywords(patchText: any, originalContent?: string): { matched: string[] } {
+  if (!patchText || typeof patchText !== 'string') return { matched: [] };
   const lower = patchText.toLowerCase();
-  return FORBIDDEN_KEYWORDS.some(keyword => lower.includes(keyword.toLowerCase()));
+  const origLower = originalContent ? originalContent.toLowerCase() : '';
+  const matched: string[] = [];
+  for (const keyword of FORBIDDEN_KEYWORDS) {
+    const kw = keyword.toLowerCase();
+    if (lower.includes(kw)) {
+      // Skip if the pattern already exists in the original file — patching
+      // a file that already uses process.env / fs.readFile / etc. is fine.
+      if (origLower && origLower.includes(kw)) continue;
+      matched.push(keyword);
+    }
+  }
+  return { matched };
 }
 
 /**
  * v2: Extended keyword check for non-codegen patches.
  * Checks a broader set of dangerous patterns AND also validates
  * the structural integrity of the patch.
+ *
+ * Context-aware: skips keyword patterns already present in originalContent.
  */
-function isObviouslyMaliciousExtended(patchText: any): { malicious: boolean; reasons: string[] } {
+function isObviouslyMaliciousExtended(patchText: any, originalContent?: string): { malicious: boolean; reasons: string[] } {
   const lower = patchText.toLowerCase();
+  const origLower = originalContent ? originalContent.toLowerCase() : '';
   const reasons: string[] = [];
 
   for (const keyword of EXTENDED_FORBIDDEN_KEYWORDS) {
-    if (lower.includes(keyword.toLowerCase())) {
+    const kw = keyword.toLowerCase();
+    if (lower.includes(kw)) {
+      if (origLower && origLower.includes(kw)) continue;
       reasons.push(`Extended keyword: ${keyword}`);
     }
   }
@@ -450,18 +481,37 @@ async function auditPatchWithTribunal(patchText: any, signal: any, options?: { i
  *
  * v2: Accepts options.isNonCodegen for stricter validation.
  */
-async function auditPatch(patchText: any, signal: any, options?: { isNonCodegen?: boolean }) {
+async function auditPatch(patchText: any, signal: any, options?: { isNonCodegen?: boolean; filePath?: string; originalContent?: string }) {
   const isNonCodegen = options?.isNonCodegen || false;
 
-  // Fast keyword pre-filter
-  if (isObviouslyMalicious(patchText)) {
-    log('Patch blocked by keyword pre-filter.', 'WARN', 'auditor');
-    return { safe: false, reason: 'Blocked by keyword scanner' };
+  // Load original file content (if available) so the keyword scanner can
+  // skip patterns that already exist in the file — prevents false positives
+  // like rejecting a patch to a file that already uses process.env.
+  let originalContent: string | undefined = options?.originalContent;
+  if (!originalContent && options?.filePath) {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const resolved = path.isAbsolute(options.filePath)
+        ? path.normalize(options.filePath)
+        : path.resolve(process.cwd(), options.filePath);
+      if (fs.existsSync(resolved)) {
+        originalContent = fs.readFileSync(resolved, 'utf8');
+      }
+    } catch { /* original not available — scan without context */ }
+  }
+
+  // Fast keyword pre-filter (context-aware)
+  const scanResult = scanForKeywords(patchText, originalContent);
+  if (scanResult.matched.length > 0) {
+    const reason = `Blocked by keyword scanner: ${scanResult.matched.join(', ')}`;
+    log('Patch blocked by keyword pre-filter: ' + scanResult.matched.join(', '), 'WARN', 'auditor');
+    return { safe: false, reason };
   }
 
   // v2: Extended keyword check for non-codegen patches
   if (isNonCodegen) {
-    const extendedResult = isObviouslyMaliciousExtended(patchText);
+    const extendedResult = isObviouslyMaliciousExtended(patchText, originalContent);
     if (extendedResult.malicious) {
       log(`Patch blocked by EXTENDED keyword scanner (${extendedResult.reasons.length} issues): ${extendedResult.reasons.slice(0, 3).join('; ')}`, 'WARN', 'auditor');
       return { safe: false, reason: `Extended keyword scan: ${extendedResult.reasons.slice(0, 3).join('; ')}` };
@@ -489,21 +539,39 @@ async function auditPatch(patchText: any, signal: any, options?: { isNonCodegen?
  * Vote-collecting audit — used for RESTRICTED files.
  * v2: Accepts options.isNonCodegen for stricter validation.
  */
-async function auditPatchWithVotes(patchText: any, signal: any, options?: { isNonCodegen?: boolean }) {
+async function auditPatchWithVotes(patchText: any, signal: any, options?: { isNonCodegen?: boolean; filePath?: string; originalContent?: string }) {
   const isNonCodegen = options?.isNonCodegen || false;
 
-  // Keyword pre-filter
-  if (isObviouslyMalicious(patchText)) {
+  // Load original file content for context-aware scanning
+  let originalContent: string | undefined = options?.originalContent;
+  if (!originalContent && options?.filePath) {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const resolved = path.isAbsolute(options.filePath)
+        ? path.normalize(options.filePath)
+        : path.resolve(process.cwd(), options.filePath);
+      if (fs.existsSync(resolved)) {
+        originalContent = fs.readFileSync(resolved, 'utf8');
+      }
+    } catch { /* original not available */ }
+  }
+
+  // Keyword pre-filter (context-aware)
+  const scanResult = scanForKeywords(patchText, originalContent);
+  if (scanResult.matched.length > 0) {
     return {
       safe: false, is_safe: false,
-      reason: 'Blocked by keyword scanner',
-      votes: [{ auditor: 'keyword-filter', safe: false, reason: 'Forbidden keyword detected' }],
+      reason: `Blocked by keyword scanner: ${scanResult.matched.join(', ')}`,
+      votes: scanResult.matched.map(k => ({
+        auditor: 'keyword-filter', safe: false, reason: `Forbidden keyword: ${k}`,
+      })),
     };
   }
 
   // v2: Extended keyword check for non-codegen patches
   if (isNonCodegen) {
-    const extendedResult = isObviouslyMaliciousExtended(patchText);
+    const extendedResult = isObviouslyMaliciousExtended(patchText, originalContent);
     if (extendedResult.malicious) {
       return {
         safe: false, is_safe: false,
@@ -537,4 +605,4 @@ async function auditPatchWithVotes(patchText: any, signal: any, options?: { isNo
   };
 }
 
-module.exports = { auditPatch, auditPatchWithVotes, isObviouslyMalicious, isObviouslyMaliciousExtended, _injectDependencies };
+module.exports = { auditPatch, auditPatchWithVotes, isObviouslyMalicious, isObviouslyMaliciousExtended, scanForKeywords, _injectDependencies };
