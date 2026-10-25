@@ -493,6 +493,23 @@ function serveStaticFile(res: any, filePath: any, contentType: any) {
 // Returns false if the request didn't match any dashboard route.
 // ═══════════════════════════════════════════════════════════════════════
 
+// ── TASK 144: Patch submission status store ──
+// MUST live at module scope: it was previously declared inside
+// handleDashboardRequest, so every request got a fresh empty object and
+// GET /api/patch/status/:id always returned 404.
+const _patchStatus: Record<string, any> = {};
+
+function updatePatchStatus(patchId: string, stage: string, status: string, details?: any) {
+  if (!_patchStatus[patchId]) _patchStatus[patchId] = { id: patchId, stages: [], createdAt: Date.now() };
+  _patchStatus[patchId].stages.push({ stage, status, details: details || null, timestamp: Date.now() });
+  _patchStatus[patchId].currentStage = stage;
+  _patchStatus[patchId].currentStatus = status;
+  log('Patch ' + patchId + ' → ' + stage + ': ' + status + (details ? ' — ' + (typeof details === 'string' ? details : JSON.stringify(details)) : ''), 'INFO', 'dashboard');
+  // Keep memory bounded
+  const ids = Object.keys(_patchStatus);
+  if (ids.length > 100) { for (const id of ids.slice(0, ids.length - 100)) delete _patchStatus[id]; }
+}
+
 async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
   const DASHBOARD_ALLOWED_ORIGINS = process.env.DASHBOARD_ALLOWED_ORIGINS
       ? process.env.DASHBOARD_ALLOWED_ORIGINS.split(',')
@@ -1399,23 +1416,17 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
-  // ── TASK 144: Patch submission with full pipeline tracking ──
-  // Stores patch status in memory for polling. Each stage is tracked.
-  const _patchStatus: Record<string, any> = {};
-
-  function updatePatchStatus(patchId: string, stage: string, status: string, details?: any) {
-    if (!_patchStatus[patchId]) _patchStatus[patchId] = { id: patchId, stages: [], createdAt: Date.now() };
-    _patchStatus[patchId].stages.push({ stage, status, details: details || null, timestamp: Date.now() });
-    _patchStatus[patchId].currentStage = stage;
-    _patchStatus[patchId].currentStatus = status;
-    log('Patch ' + patchId + ' → ' + stage + ': ' + status + (details ? ' — ' + (typeof details === 'string' ? details : JSON.stringify(details)) : ''), 'INFO', 'dashboard');
-  }
+  // (Patch status store lives at module scope — see _patchStatus above handleDashboardRequest)
 
   if (pathname === '/api/patch/submit' && req.method === 'POST') {
     authWrap(() => {
       readBody(req, res, async (body) => {
+        let data: any;
+        try { data = JSON.parse(body); } catch (parseErr: any) {
+          jsonRes(res, { error: 'Invalid JSON body', reason: parseErr.message }, 400);
+          return;
+        }
         try {
-          const data = JSON.parse(body);
           const { file, patch, description } = data;
 
           // Generate patch ID
@@ -1605,12 +1616,13 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           // Send the response NOW — the pipeline runs in the background via setImmediate
           jsonRes(res, { ok: true, patchId: patchId, message: 'Patch queued for processing. Poll /api/patch/status/' + patchId + ' for updates.' });
 
-        } catch (parseErr) {
-          jsonRes(res, { error: 'Invalid JSON body', reason: parseErr.message }, 400);
+        } catch (submitErr: any) {
+          log('Patch submit error: ' + (submitErr.message || submitErr), 'ERROR', 'dashboard');
+          if (!res.headersSent) jsonRes(res, { error: 'Patch submit failed: ' + (submitErr.message || String(submitErr)) }, 500);
         }
       });
     });
-    return;
+    return true;
   }
 
   // ── TASK 144: Patch status polling endpoint ──
@@ -1624,7 +1636,7 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
         jsonRes(res, status);
       }
     });
-    return;
+    return true;
   }
 
   // ── TASK 144: List recent patches ──
@@ -1633,7 +1645,7 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
       const patches = Object.values(_patchStatus).slice(-20).reverse();
       jsonRes(res, { patches, count: patches.length });
     });
-    return;
+    return true;
   }
 
   // ── TASK 143: List patchable files ──
@@ -1651,7 +1663,7 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
         jsonRes(res, { error: e.message }, 500);
       }
     });
-    return;
+    return true;
   }
 
   // ── Generic command endpoint (legacy compat) ──
@@ -2702,6 +2714,12 @@ async function submitPatch() {
     if (!r) {
       toast('Error: No response from server (check logs)', 'error');
       if (statusEl) { statusEl.textContent = 'No response'; statusEl.style.color = '#f44336'; }
+      return;
+    }
+
+    if (typeof r === 'string') {
+      toast('Error: server returned non-JSON: ' + r.substring(0, 120), 'error');
+      if (statusEl) { statusEl.textContent = 'Server: ' + r.substring(0, 120); statusEl.style.color = '#f44336'; }
       return;
     }
 
