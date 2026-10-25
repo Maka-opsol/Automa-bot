@@ -628,49 +628,45 @@ async function executePatchInSandbox(patchText: string, filePath: string): Promi
   // For .ts files, vm.Script alone will reject TypeScript type annotations
   // (e.g. `let _deps: Record<string, any> = {}` → "Unexpected token ':'").
   // Transpile to JS first using esbuild (preferred) or typescript, then
-  // validate the JS output with vm.Script. If no transpiler is available,
-  // skip strict syntax validation and log a warning rather than block.
-  try {
-    let jsForValidation: string | null = patchText;
-    const isTypeScript = /\.tsx?$/i.test(filePath);
-    if (isTypeScript) {
-      let transpiled: string | null = null;
+  // validate the JS output with vm.Script. The transpiled JS is reused in
+  // Layer 6 so the isolated worker (which lives in /tmp/ and has no access
+  // to node_modules) doesn't need to re-transpile.
+  //
+  // If no transpiler is available, fall back to raw patchText — Layer 6's
+  // tsc --noEmit step will still catch real TS errors.
+  let transpiledJs: string | null = null;
+  const isTypeScript = /\.tsx?$/i.test(filePath);
+  if (isTypeScript) {
+    try {
+      const esbuild = require('esbuild');
+      const out = esbuild.transformSync(patchText, {
+        loader: filePath.endsWith('.tsx') ? 'tsx' : 'ts',
+        target: 'es2020',
+        format: 'cjs',
+      });
+      transpiledJs = out && out.code ? out.code : null;
+    } catch (esbuildErr) {
+      _log(`Sandbox: esbuild transpile failed for ${filePath}: ${esbuildErr.message}, trying typescript...`, 'DEBUG', 'sandbox-executor');
       try {
-        const esbuild = require('esbuild');
-        const out = esbuild.transformSync(patchText, {
-          loader: filePath.endsWith('.tsx') ? 'tsx' : 'ts',
-          target: 'es2020',
-          format: 'cjs',
+        const ts = require('typescript');
+        const result = ts.transpileModule(patchText, {
+          compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
+          fileName: path.basename(filePath),
         });
-        transpiled = out && out.code ? out.code : null;
-      } catch (esbuildErr) {
-        _log(`Sandbox: esbuild transpile failed for ${filePath}: ${esbuildErr.message}, trying typescript...`, 'DEBUG', 'sandbox-executor');
-        try {
-          const ts = require('typescript');
-          const result = ts.transpileModule(patchText, {
-            compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
-            fileName: path.basename(filePath),
-          });
-          transpiled = result && result.outputText ? result.outputText : null;
-        } catch (tsErr) {
-          _log(`Sandbox: typescript transpile also failed for ${filePath}: ${tsErr.message}`, 'WARN', 'sandbox-executor');
-        }
-      }
-      if (transpiled !== null) {
-        jsForValidation = transpiled;
-      } else {
-        _log(`Sandbox: No TS transpiler available — skipping strict syntax validation for ${filePath}`, 'WARN', 'sandbox-executor');
-        jsForValidation = null;
+        transpiledJs = result && result.outputText ? result.outputText : null;
+      } catch (tsErr) {
+        _log(`Sandbox: typescript transpile also failed for ${filePath}: ${tsErr.message}`, 'WARN', 'sandbox-executor');
       }
     }
-    if (jsForValidation !== null) {
-      new vm.Script(jsForValidation, { filename: path.basename(filePath), timeout: 3000 });
-    }
+  }
+  const jsForValidation: string = transpiledJs ?? patchText;
+  try {
+    new vm.Script(jsForValidation, { filename: path.basename(filePath), timeout: 3000 });
   } catch (e: any) {
     _log(`Sandbox: Syntax validation failed for ${filePath}: ${e.message}`, 'ERROR', 'sandbox-executor');
     return { safe: false, error: `Patch syntax validation failed: ${e.message}` };
   }
-  _log(`Sandbox: Syntax validation passed for ${filePath}`, 'INFO', 'sandbox-executor');
+  _log(`Sandbox: Syntax validation passed for ${filePath}${transpiledJs ? ' (after TS transpile)' : ''}`, 'INFO', 'sandbox-executor');
 
   // Layer 5: Size limit (prevent oversized patches)
   const MAX_PATCH_SIZE_BYTES = 500 * 1024; // 500KB
@@ -681,8 +677,14 @@ async function executePatchInSandbox(patchText: string, filePath: string): Promi
   // Layer 6: Runtime validation in an isolated child process (C2 fix)
   // This provides TRUE process isolation — the patch cannot access
   // the host application's state, memory, module cache, or globals.
+  // For .ts patches: pass the transpiled JS (the worker can't require esbuild
+  // from /tmp/), and skip tsc --noEmit in the worker since we already
+  // transpiled in the parent.
   _log(`Sandbox: Running isolated process validation for ${filePath}...`, 'INFO', 'sandbox-executor');
-  const isolatedResult = await executePatchInIsolatedProcess(patchText, filePath);
+  const isolatedResult = await executePatchInIsolatedProcess(
+    transpiledJs ?? patchText,
+    isTypeScript && transpiledJs ? filePath + '.js' : filePath,
+  );
   if (!isolatedResult.success) {
     _log(`Sandbox: Isolated process validation FAILED for ${filePath}: ${isolatedResult.error}`, 'ERROR', 'sandbox-executor');
     return { safe: false, error: `Isolated process validation failed: ${isolatedResult.error}` };
