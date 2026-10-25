@@ -197,15 +197,15 @@ function readBody(req: any, res: any, cb: (body: string) => void) {
   });
   req.on('end', () => {
     if (!tooLarge) {
-      // TASK 144: Handle async callbacks — if cb returns a Promise, catch errors
+      // TASK 145: Handle async callbacks. If cb returns a Promise, catch
+      // errors but DON'T try to send a response — the callback may have
+      // already sent one (e.g., patch endpoint sends response then starts
+      // background pipeline). Just log the error.
       try {
         const result = cb(body);
         if (result && typeof result.then === 'function') {
           result.catch((err: any) => {
-            log('readBody async error: ' + (err.message || err), 'ERROR', 'dashboard');
-            if (!res.headersSent) {
-              jsonRes(res, { error: 'Internal error: ' + (err.message || String(err)) }, 500);
-            }
+            log('readBody async callback error: ' + (err.message || err), 'ERROR', 'dashboard');
           });
         }
       } catch (syncErr) {
@@ -1458,15 +1458,20 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           }
           updatePatchStatus(patchId, 'path_check', 'passed', resolvedFile);
 
-          // Return the patch ID immediately — client polls for status
-          jsonRes(res, { ok: true, patchId, message: 'Patch queued for processing. Poll /api/patch/status/' + patchId + ' for updates.' });
-
-          // ── Async pipeline (runs after response is sent) ──
-          (async () => {
-            try {
-              // Stage 1: Sandbox Audit
-              updatePatchStatus(patchId, 'sandbox_audit', 'pending');
-              const sandbox = (() => { try { return require('./sandbox-executor'); } catch { return null; } })();
+          // ── Async pipeline (runs in background, NOT awaited) ──
+          // The response is sent AFTER starting the pipeline so the client
+          // gets the patchId immediately. The pipeline updates status in-memory
+          // which the client polls via GET /api/patch/status/:id
+          // TASK 145: Use setImmediate to ensure the response is sent BEFORE
+          // the pipeline starts. Also catch ALL errors inside the IIFE so
+          // they never escape to readBody's async handler (which would try
+          // to send a second response → "headers already sent").
+          setImmediate(() => {
+            (async () => {
+              try {
+                // Stage 1: Sandbox Audit
+                updatePatchStatus(patchId, 'sandbox_audit', 'pending');
+                const sandbox = (() => { try { return require('./sandbox-executor'); } catch { return null; } })();
               if (sandbox && sandbox.executePatchInSandbox) {
                 try {
                   const sandboxResult = await sandbox.executePatchInSandbox(file, patch);
@@ -1595,6 +1600,10 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
               updatePatchStatus(patchId, 'error', 'failed', pipelineErr.message);
             }
           })();
+          }); // end setImmediate
+
+          // Send the response NOW — the pipeline runs in the background via setImmediate
+          jsonRes(res, { ok: true, patchId: patchId, message: 'Patch queued for processing. Poll /api/patch/status/' + patchId + ' for updates.' });
 
         } catch (parseErr) {
           jsonRes(res, { error: 'Invalid JSON body', reason: parseErr.message }, 400);
