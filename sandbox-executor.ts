@@ -285,8 +285,10 @@ function isPatchableFile(filePath: string, opts: { requireApproval?: boolean } =
     return { allowed: true, requiresApproval: false };
   }
 
-  // Default: not allowed
-  return { allowed: false, reason: `File ${relativeName} is not in any allowed patching scope`, requiresApproval: false };
+  // Default: allowed (closed-blocklist model — only IMMUTABLE_FILES and
+  // RESTRICTED_FILES gate patching). New files created by the bot or any
+  // other file not on either list is patchable out of the box.
+  return { allowed: true, requiresApproval: false };
 }
 
 /**
