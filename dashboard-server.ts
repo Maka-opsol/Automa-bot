@@ -3026,6 +3026,117 @@ function escapeHtml(s) {
   }[c]));
 }
 
+// ── Display-only word filter (presentation layer, does NOT modify source) ──
+// Replaces Assignment/Assessment terminology with "Task" and removes
+// "educational" + similar words from the rendered display ONLY.
+// String literals are preserved verbatim (so state names like
+// 'assignments_page', URL fragments like 'assignment', DOM selectors like
+// '.assignment-card', and real MathU URLs still display correctly).
+//
+// IMPORTANT: This function returns the FILTERED text for DISPLAY ONLY.
+// The underlying _viewerCurrentContent / _historyCurrentContent / patch
+// textarea value are NEVER modified — Load into Patch, Copy, Download, and
+// submission all use the ORIGINAL source code.
+function _applyDisplayFilter(text) {
+  if (!text || typeof text !== 'string') return text;
+
+  // Find all string-literal spans (single/double/backtick quoted) using a
+  // character-by-character scanner. This avoids regex-with-backtick issues
+  // that break the template literal in getDashboardHTML().
+  // Returns array of [start, end] char offsets for each string literal found.
+  function findStringSpans(s) {
+    const spans = [];
+    let i = 0;
+    const len = s.length;
+    while (i < len) {
+      const ch = s.charCodeAt(i);
+      // 34 = double quote, 39 = single quote, 96 = backtick
+      if (ch === 34 || ch === 39 || ch === 96) {
+        const quoteChar = ch;
+        const start = i;
+        i++; // move past opening quote
+        while (i < len) {
+          if (s.charCodeAt(i) === 92) {
+            // backslash escape — skip next char
+            i += 2;
+          } else if (s.charCodeAt(i) === quoteChar) {
+            i++; // move past closing quote
+            spans.push([start, i]);
+            break;
+          } else {
+            i++;
+          }
+        }
+        // If we ran to end without finding a closing quote, the string is
+        // unterminated — don't add a span (treat rest as code)
+      } else {
+        i++;
+      }
+    }
+    return spans;
+  }
+
+  const stringSpans = findStringSpans(text);
+
+  // Process the text in chunks: alternate between in-string (preserved) and
+  // out-of-string (transformed) regions.
+  let result = '';
+  let lastEnd = 0;
+  for (let si = 0; si < stringSpans.length; si++) {
+    const start = stringSpans[si][0];
+    const end = stringSpans[si][1];
+    // Transform the chunk before this string literal
+    if (start > lastEnd) {
+      result += _transformCodeAndComments(text.slice(lastEnd, start));
+    }
+    // Preserve the string literal verbatim
+    result += text.slice(start, end);
+    lastEnd = end;
+  }
+  // Transform any trailing chunk after the last string literal
+  if (lastEnd < text.length) {
+    result += _transformCodeAndComments(text.slice(lastEnd));
+  }
+  return result;
+}
+
+// Transform a chunk of code/comments: replace Assignment/Assessment → Task,
+// remove educational-family words. Called ONLY on non-string-literal regions.
+function _transformCodeAndComments(text) {
+  if (!text) return text;
+  let out = text;
+
+  // ── Assignment / Assessment → Task / Tasks (case + plural preserving) ──
+  // Map: ASSIGNMENT(S) → TASK(S), Assignment(s) → Task(s), assignment(s) → task(s)
+  // Word-boundary safe; doesn't touch inside identifiers (assignmentId → taskId),
+  // which is the same intent as the earlier rewrite script.
+  out = out.replace(/\b(ASSIGNMENTS|ASSIGNMENT|Assignments|Assignment|assignments|assignment|ASSESSMENTS|ASSESSMENT|Assessments|Assessment|assessments|assessment)\b/g, (match) => {
+    const isUpper = match === match.toUpperCase();
+    const isTitle = match[0] === match[0].toUpperCase() && !isUpper;
+    const isPlural = match.endsWith('s') || match.endsWith('S');
+    let stem = 'task';
+    if (isUpper) stem = 'TASK';
+    else if (isTitle) stem = 'Task';
+    return stem + (isPlural ? (isUpper ? 'S' : 's') : '');
+  });
+
+  // ── Remove "educational" + similar words (delete the word, collapse spaces) ──
+  // Targets: educational, education, educator, educate, educating, educated,
+  //          academic, pedagogical, pedagogy, learning, learned, learner
+  // Strategy: match the word + any trailing whitespace, replace with a single
+  // space (or empty if at end of line). This avoids double-space artifacts.
+  const removeWordsRe = /\s*\b(educational|education|educator|educate|educating|educated|academic|pedagogical|pedagogy|learning|learned|learner)\b\s*/gi;
+  out = out.replace(removeWordsRe, ' ');
+
+  // Cleanup: collapse multiple consecutive spaces that may have resulted from
+  // word removal (e.g. "the educational system" → "the  system" → "the system")
+  // but only in pure-comment / non-quoted text (we're already in non-string
+  // regions here, so this is safe).
+  out = out.replace(/  +/g, ' ');
+
+  return out;
+}
+
 async function viewCurrentFile() {
   const file = _getSelectedFilePath();
   if (!file) { toast('Please select or type a file name first', 'error'); return; }
@@ -3082,17 +3193,21 @@ function _renderViewerPage() {
     const lineNum = i + 1;
     const lineText = _viewerAllLines[i];
     const isMatch = _viewerSearchMatches.includes(i);
-    let displayLine = escapeHtml(lineText);
+    // Apply display-only word filter (Assignment → Task, remove "educational" etc.)
+    // BEFORE escapeHtml so the displayed text uses Task terminology while the
+    // underlying _viewerAllLines (used by Load into Patch, Copy, Download) is unchanged.
+    const filteredText = _applyDisplayFilter(lineText);
+    let displayLine = escapeHtml(filteredText);
     // Highlight search query in the line.
     // Note: we build the escape regex from a string source (not a regex literal)
     // because regex literals containing the dollar-curly sequence get misparsed
     // by esbuild TS parser as a template-literal placeholder.
-    if (searchQuery && lineText.toLowerCase().includes(searchQuery)) {
+    if (searchQuery && filteredText.toLowerCase().includes(searchQuery)) {
       const SPECIAL_CHARS = '.*+?^$' + String.fromCharCode(123) + String.fromCharCode(125) + '()|[]\\\\';
       const escapeRegex = new RegExp('[' + SPECIAL_CHARS + ']', 'g');
       const escapedQuery = searchQuery.replace(escapeRegex, '\\$&');
       const re = new RegExp('(' + escapedQuery + ')', 'gi');
-      displayLine = escapeHtml(lineText).replace(re, '<mark style="background:#ffeb3b; color:#000;">$1</mark>');
+      displayLine = escapeHtml(filteredText).replace(re, '<mark style="background:#ffeb3b; color:#000;">$1</mark>');
     }
     const matchBg = isMatch ? 'background:#fff59d;' : '';
     html += '<tr><td onclick="viewerJumpToLine(' + i + ')" style="padding:0 8px; text-align:right; color:#666; user-select:none; cursor:pointer; border-right:1px solid #2a2a3e; min-width:40px; ' + matchBg + '">' + lineNum + '</td><td style="padding:0 8px; white-space:pre-wrap; word-break:break-word; ' + matchBg + '">' + (displayLine || '&nbsp;') + '</td></tr>';
@@ -3142,8 +3257,13 @@ function _performViewerSearch() {
   _viewerSearchMatches = [];
   _viewerSearchCursor = -1;
   if (query) {
+    // Search the FILTERED text (not the original) so that searching for
+    // "task" matches lines that originally said "assignment", and searching
+    // for "assignment" no longer matches (since the displayed text has
+    // been filtered). This keeps search consistent with what's rendered.
     for (let i = 0; i < _viewerAllLines.length; i++) {
-      if (_viewerAllLines[i].toLowerCase().includes(query)) {
+      const filtered = _applyDisplayFilter(_viewerAllLines[i]).toLowerCase();
+      if (filtered.includes(query)) {
         _viewerSearchMatches.push(i);
       }
     }
@@ -3332,7 +3452,7 @@ async function previewPatchDiff() {
     const color = d.type === 'added' ? '#4caf50' : (d.type === 'removed' ? '#f44336' : '#888');
     const oldNum = d.oldLine || '';
     const newNum = d.newLine || '';
-    html += '<tr style="' + bg + '"><td style="padding:0 6px; text-align:right; color:#666; user-select:none; min-width:40px;">' + oldNum + '</td><td style="padding:0 6px; text-align:right; color:#666; user-select:none; min-width:40px;">' + newNum + '</td><td style="padding:0 8px; color:' + color + '; font-weight:bold;">' + prefix + '</td><td style="padding:0 8px; white-space:pre-wrap; word-break:break-word;">' + escapeHtml(d.text || ' ') + '</td></tr>';
+    html += '<tr style="' + bg + '"><td style="padding:0 6px; text-align:right; color:#666; user-select:none; min-width:40px;">' + oldNum + '</td><td style="padding:0 6px; text-align:right; color:#666; user-select:none; min-width:40px;">' + newNum + '</td><td style="padding:0 8px; color:' + color + '; font-weight:bold;">' + prefix + '</td><td style="padding:0 8px; white-space:pre-wrap; word-break:break-word;">' + escapeHtml(_applyDisplayFilter(d.text || ' ')) + '</td></tr>';
   });
   html += '</table>';
   const contentEl = document.getElementById('diffPreviewContent');
