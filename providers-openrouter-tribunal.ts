@@ -167,6 +167,14 @@ function OpenRouterTribunalProvider() {
         throw phase1Err;
       }
 
+      // The daily free-model quota is exhausted. The base layer has already
+      // recorded the reset; do not spend more requests on named fallbacks or
+      // the final auto-router attempt in this same invocation.
+      if (p1Msg.includes('free-models-per-day') || p1Msg.includes('OPENROUTER_DAILY_LIMIT')) {
+        log('OpenRouter: daily quota exhausted during primary attempt — skipping fallbacks', 'WARN', 'openrouter');
+        throw phase1Err;
+      }
+
       log('OpenRouter: openrouter/free failed (' + p1Msg.slice(0, 80) + '), trying specific fallbacks', 'WARN', 'openrouter');
 
       // ══════════════════════════════════════════════════════════════════════
