@@ -3676,6 +3676,32 @@ function _detectPlayButton(
   // Only return a play button if the contrast score is high enough
   // (a real play button has high contrast against the video background)
   if (bestCluster.score >= 15) {
+    // A centered MathU splash mark (a high-contrast plus inside a diamond)
+    // can satisfy the generic contrast score above, but it is not a play icon.
+    // Reject a candidate only when it has a clear cross-shaped dark/light glyph:
+    // both horizontal and vertical arms must contrast against a light/dark field.
+    const luminanceAt = (x: number, y: number): number => {
+      const sx = Math.max(0, Math.min(width - 1, x));
+      const sy = Math.max(0, Math.min(height - 1, y));
+      const idx = (sy * width + sx) * 4;
+      return 0.299 * rgba[idx] + 0.587 * rgba[idx + 1] + 0.114 * rgba[idx + 2];
+    };
+    const cx = bestCluster.x, cy = bestCluster.y;
+    const centerLum = luminanceAt(cx, cy);
+    const backgroundLum = (luminanceAt(cx - 20, cy - 20) + luminanceAt(cx + 20, cy - 20) +
+      luminanceAt(cx - 20, cy + 20) + luminanceAt(cx + 20, cy + 20)) / 4;
+    const darkGlyph = centerLum < backgroundLum;
+    const arms = [-12, -6, 6, 12];
+    const alongContrast = (x: number, y: number): boolean => {
+      const lum = luminanceAt(x, y);
+      return darkGlyph ? lum < backgroundLum - 35 : lum > backgroundLum + 35;
+    };
+    const horizontalArm = arms.filter(dx => alongContrast(cx + dx, cy)).length;
+    const verticalArm = arms.filter(dy => alongContrast(cx, cy + dy)).length;
+    if (horizontalArm >= 3 && verticalArm >= 3 && Math.abs(centerLum - backgroundLum) > 45) {
+      log('Pixel fallback: rejecting cross-shaped center mark as a false play-button match', 'DEBUG', 'pixel-fallback');
+      return null;
+    }
     return { x: bestCluster.x, y: bestCluster.y };
   }
   return null;
