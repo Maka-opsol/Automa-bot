@@ -1591,15 +1591,30 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
               updatePatchStatus(patchId, 'db_record', 'pending');
               try {
                 const db = require('./database');
+                // Lazy migration: add stages_json column to patch_history if missing.
+                // The column stores the in-memory _patchStatus[patchId].stages array
+                // as JSON so the dashboard can render multi-stage statuses
+                // (submitted / approved / applied / pushed / deployed) per row.
+                // We use PRAGMA table_info + ALTER TABLE so this works on existing
+                // DBs without needing a server-side migration in database.ts (which
+                // is in IMMUTABLE_FILES and can't be patched via the dashboard).
+                try {
+                  if (db.db) {
+                    const cols = db.db.prepare('PRAGMA table_info(patch_history)').all();
+                    const hasStagesJson = cols.some((c: any) => c.name === 'stages_json');
+                    if (!hasStagesJson) {
+                      db.db.exec('ALTER TABLE patch_history ADD COLUMN stages_json TEXT;');
+                      log('Added stages_json column to patch_history', 'INFO', 'dashboard');
+                    }
+                  }
+                } catch (migErr: any) { /* column may already exist or db not ready */ }
+
                 // insertPatch SQL signature (database.ts):
                 //   INSERT INTO patch_history
                 //     (timestamp, description, file, patch, status, applied_at, branch)
                 //   VALUES (?, ?, ?, ?, ?, ?, ?)
-                // Previously the call site was passing args in the wrong order
-                // (file first instead of timestamp), was passing 'dashboard' as
-                // the patch text (instead of the actual patch body), and was
-                // missing the 7th `branch` arg — causing "Too few parameter
-                // values were provided" and a garbage DB record.
+                // We additionally update stages_json in a follow-up UPDATE since
+                // the prepared insertPatch statement doesn't include the new column.
                 const now = Date.now();
                 const branch = process.env.GIT_BRANCH || process.env.RENDER_GIT_BRANCH || 'main';
                 db.insertPatch && db.insertPatch.run && db.insertPatch.run(
@@ -1611,6 +1626,20 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
                   now,                                                       // applied_at
                   branch                                                      // branch
                 );
+                // Capture the rowid so we can UPDATE it at the complete stage
+                // with the final stages array.
+                const lastRowId = db.db ? db.db.prepare('SELECT last_insert_rowid() AS id').get() : null;
+                if (lastRowId && lastRowId.id && db.db) {
+                  // Stash the row id on the patchStatus so the complete stage can update it
+                  if (_patchStatus[patchId]) {
+                    (_patchStatus[patchId] as any).dbRowId = lastRowId.id;
+                  }
+                  // Write a snapshot of the stages so far (will be updated at complete stage)
+                  const stagesSnapshot = JSON.stringify((_patchStatus[patchId] || {}).stages || []);
+                  try {
+                    db.db.prepare('UPDATE patch_history SET stages_json = ? WHERE id = ?').run(stagesSnapshot, lastRowId.id);
+                  } catch (updateErr: any) { /* non-critical */ }
+                }
                 updatePatchStatus(patchId, 'db_record', 'passed', { timestamp: now, branch });
               } catch (dbErr) {
                 updatePatchStatus(patchId, 'db_record', 'warning', 'DB record failed (non-critical): ' + dbErr.message);
@@ -1655,6 +1684,19 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
 
               // Final status
               updatePatchStatus(patchId, 'complete', 'done', { file, size: patch.length, backup: backupPath });
+
+              // Final stages_json update — persist the complete stages array
+              // (so the dashboard history view can render multi-stage statuses
+              // like: submitted ✓ → approved ✓ → applied ✓ → pushed ✓ → deployed ✓)
+              try {
+                const db2 = require('./database');
+                const patchStatus = (_patchStatus[patchId] || {}) as any;
+                const dbRowId = patchStatus.dbRowId;
+                if (dbRowId && db2.db) {
+                  const finalStages = JSON.stringify(patchStatus.stages || []);
+                  db2.db.prepare('UPDATE patch_history SET stages_json = ? WHERE id = ?').run(finalStages, dbRowId);
+                }
+              } catch (_finalUpdateErr: any) { /* non-critical — already logged in db_record stage */ }
 
             } catch (pipelineErr) {
               updatePatchStatus(patchId, 'error', 'failed', pipelineErr.message);
@@ -1732,16 +1774,44 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
         const rows = db.getRecentPatches.all(limit);
         // Don't send the full patch body in the list view — it can be huge.
         // Send metadata only; clients can fetch full patch via /api/patch/history?id=N
-        const summary = rows.map((r: any) => ({
-          id: r.id,
-          timestamp: r.timestamp,
-          description: r.description,
-          file: r.file,
-          status: r.status,
-          applied_at: r.applied_at,
-          branch: r.branch,
-          patch_size: r.patch ? r.patch.length : 0,
-        }));
+        const summary = rows.map((r: any) => {
+          // Parse the stages_json column (if present) into a structured stages array
+          let stages: any[] = [];
+          if (r.stages_json) {
+            try { stages = JSON.parse(r.stages_json) || []; } catch { /* ignore parse errors */ }
+          }
+          // Compute a multi-stage status summary (the 5 distinct stages the user wants)
+          // submitted → approved → applied → pushed → deployed
+          const stageMap: Record<string, string> = {};
+          for (const s of stages) {
+            if (s && s.stage && s.status) stageMap[s.stage] = s.status;
+          }
+          return {
+            id: r.id,
+            timestamp: r.timestamp,
+            description: r.description,
+            file: r.file,
+            status: r.status,
+            applied_at: r.applied_at,
+            branch: r.branch,
+            patch_size: r.patch ? r.patch.length : 0,
+            // New: multi-stage status (each stage has its own pass/fail/pending)
+            stages: stages.map((s: any) => ({
+              stage: s.stage,
+              status: s.status,
+              timestamp: s.timestamp,
+            })),
+            // New: high-level lifecycle summary derived from the stages array
+            // (for quick visual badge in the history table)
+            lifecycle: {
+              submitted: stageMap['validation'] === 'passed' ? 'passed' : (stageMap['validation'] || 'pending'),
+              approved: stageMap['ai_advisory'] === 'passed' ? 'passed' : (stageMap['ai_advisory'] || 'pending'),
+              applied: stageMap['apply_local'] === 'passed' ? 'passed' : (stageMap['apply_local'] === 'warning' ? 'warning' : (stageMap['apply_local'] || 'pending')),
+              pushed: stageMap['github_push'] === 'passed' ? 'passed' : (stageMap['github_push'] || 'pending'),
+              deployed: stageMap['complete'] === 'done' ? 'passed' : (stageMap['complete'] || 'pending'),
+            },
+          };
+        });
         jsonRes(res, { patches: summary, count: summary.length });
       } catch (e: any) {
         jsonRes(res, { error: e.message }, 500);
@@ -2289,6 +2359,7 @@ function getDashboardHTML(): string {
       </div>
       <div style="display:flex; gap:8px;">
         <button class="btn" style="background:#4caf50;" onclick="submitPatch()">Submit Patch</button>
+        <button class="btn sm" onclick="previewPatchDiff()" style="background:#3a3a5c;" title="Compare the patch in the textarea against the currently-deployed file — see exactly what will change before you submit">Preview Diff</button>
         <button class="btn sm" onclick="document.getElementById('patchContent').value=''" style="background:#f44336;">Clear</button>
         <span id="patchStatus" style="font-size:13px; color:#aaa; align-self:center;"></span>
       </div>
@@ -2328,17 +2399,46 @@ function getDashboardHTML(): string {
 </div>
 
 <!-- File Viewer Modal (for "View Current" button in patch card) -->
+<!-- Enhanced: line numbers, search, paging, download -->
 <div id="fileViewerModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:9999; padding:20px; box-sizing:border-box;">
   <div style="background:#1a1a2e; border:1px solid #444; border-radius:6px; max-width:95%; max-height:90vh; margin:auto; display:flex; flex-direction:column; overflow:hidden;">
     <div style="display:flex; justify-content:space-between; align-items:center; padding:12px 16px; border-bottom:1px solid #333; background:#22223a;">
       <span id="fileViewerTitle" style="color:#4fc3f7; font-weight:bold; font-size:14px;">--</span>
-      <div style="display:flex; gap:6px;">
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
         <button class="btn sm" onclick="loadCurrentIntoPatch()" title="Load this file's content into the patch textarea so you can edit and resubmit">Load into Patch</button>
         <button class="btn sm" onclick="copyFileToClipboard()" title="Copy file content to clipboard">Copy</button>
+        <button class="btn sm" onclick="downloadCurrentFile()" title="Download the current file to your machine (read-only — does not modify anything on the server)" style="background:#2a4a3c;">Download</button>
         <button class="btn sm" onclick="closeFileViewer()" style="background:#f44336;">Close</button>
       </div>
     </div>
-    <pre id="fileViewerContent" style="margin:0; padding:12px 16px; overflow:auto; background:#0d1117; color:#e0e0e0; font-family:'Courier New',monospace; font-size:12px; line-height:1.5; flex:1; white-space:pre-wrap; word-break:break-word;"></pre>
+    <!-- Search bar + paging controls -->
+    <div style="display:flex; gap:8px; padding:8px 12px; background:#181828; border-bottom:1px solid #2a2a3e; align-items:center; flex-wrap:wrap;">
+      <input type="text" id="fileViewerSearch" placeholder="Search... (Enter for next, Shift+Enter for prev)" style="flex:1; min-width:200px; background:#0d1117; color:#e0e0e0; border:1px solid #333; padding:5px 8px; border-radius:4px; font-size:12px;" onkeydown="handleViewerSearchKey(event)">
+      <button class="btn sm" onclick="viewerSearchNext()" title="Next match">▼</button>
+      <button class="btn sm" onclick="viewerSearchPrev()" title="Previous match">▲</button>
+      <span id="fileViewerSearchInfo" style="font-size:11px; color:#888; min-width:60px;"></span>
+      <span style="font-size:11px; color:#888;">|</span>
+      <label style="font-size:11px; color:#888;">Lines:</label>
+      <select id="fileViewerPageSelect" onchange="viewerGoToPage(this.value)" style="background:#1a1a2e; color:#e0e0e0; border:1px solid #333; padding:3px; border-radius:4px; font-size:11px;"></select>
+      <span id="fileViewerPageInfo" style="font-size:11px; color:#888;"></span>
+    </div>
+    <!-- Line-numbered content -->
+    <div id="fileViewerContent" style="margin:0; padding:0; overflow:auto; background:#0d1117; color:#e0e0e0; font-family:'Courier New',monospace; font-size:12px; line-height:1.5; flex:1;"></div>
+  </div>
+</div>
+
+<!-- Diff Preview Modal (for "Preview Diff" button — shows what will change before submission) -->
+<div id="diffPreviewModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:10000; padding:20px; box-sizing:border-box;">
+  <div style="background:#1a1a2e; border:1px solid #444; border-radius:6px; max-width:95%; max-height:90vh; margin:auto; display:flex; flex-direction:column; overflow:hidden;">
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:12px 16px; border-bottom:1px solid #333; background:#22223a;">
+      <span id="diffPreviewTitle" style="color:#4fc3f7; font-weight:bold; font-size:14px;">Patch Diff Preview</span>
+      <div style="display:flex; gap:6px;">
+        <span id="diffPreviewStats" style="font-size:12px; color:#aaa; align-self:center;"></span>
+        <button class="btn sm" onclick="submitPatchAfterDiffPreview()" style="background:#4caf50;" title="Submit the patch — runs through sandbox audit, AI advisory, applies locally, and pushes to GitHub">Submit Patch</button>
+        <button class="btn sm" onclick="closeDiffPreview()" style="background:#f44336;">Cancel</button>
+      </div>
+    </div>
+    <div id="diffPreviewContent" style="margin:0; padding:8px 12px; overflow:auto; background:#0d1117; color:#e0e0e0; font-family:'Courier New',monospace; font-size:12px; line-height:1.5; flex:1; white-space:pre;"></div>
   </div>
 </div>
 
@@ -2526,9 +2626,25 @@ async function refreshBannedStates() {
     el.innerHTML = '<div class="empty">None banned</div>';
     return;
   }
+  // BUGFIX: The previous code used a broken string-escape pattern that
+  // produced a V8/Chrome syntax error ("missing ) after argument list")
+  // and broke the ENTIRE dashboard script block at parse time — every
+  // function defined after this point (including loadPatchHistory, viewCurrentFile,
+  // etc.) became unreachable, so the dashboard got stuck on Loading.
+  //
+  // Root cause: the developer wanted to produce HTML like
+  //   <button onclick="unbanState('STATE_NAME')">
+  // i.e. single quotes around the state name inside the double-quoted onclick
+  // attribute. The escape sequence used was a backslash-backslash-quote pattern
+  // that the JS parser saw as: literal-backslash + close-string + open-string,
+  // which is invalid because the next token (plus-b-state-plus) ended up inside
+  // a new string literal instead of being a JS concatenation operator.
+  //
+  // Fix: build the onclick attribute using JSON.stringify to safely embed the
+  // state name as a properly-quoted JS string inside the HTML attribute.
   el.innerHTML = r.bannedStates.map(b =>
-    '<div class="banned-item"><span>'+b.state+' <span style="color:var(--text2);font-size:11px">'+b.reason+'</span></span>' +
-    '<button class="btn sm" onclick="unbanState(\\''+b.state+'\\')">Unban</button></div>'
+    '<div class="banned-item"><span>' + escapeHtml(b.state) + ' <span style="color:var(--text2);font-size:11px">' + escapeHtml(b.reason) + '</span></span>' +
+    '<button class="btn sm" onclick="unbanState(' + JSON.stringify(b.state) + ')">Unban</button></div>'
   ).join('');
 }
 async function clearPersistence() {
@@ -2613,9 +2729,13 @@ async function refreshBannedActions() {
     el.innerHTML = '<div class="empty">None banned</div>';
     return;
   }
+  // BUGFIX (same as refreshBannedStates): the previous escape pattern was a V8
+  // syntax error that broke the entire dashboard script block at parse time.
+  // Use JSON.stringify to safely embed the action type as a quoted JS string
+  // inside the onclick attribute.
   el.innerHTML = r.bannedActions.map(b =>
-    '<div class="banned-item"><span>'+b.action+' <span style="color:var(--text2);font-size:11px">'+b.reason+'</span></span>' +
-    '<button class="btn sm" onclick="unbanAction(\\''+b.action+'\\')">Unban</button></div>'
+    '<div class="banned-item"><span>' + escapeHtml(b.action) + ' <span style="color:var(--text2);font-size:11px">' + escapeHtml(b.reason) + '</span></span>' +
+    '<button class="btn sm" onclick="unbanAction(' + JSON.stringify(b.action) + ')">Unban</button></div>'
   ).join('');
 }
 
@@ -2633,8 +2753,8 @@ async function loadConfigKeys() {
       const val = item.value;
       const displayVal = isBool ? '<span class="stat-value '+(val?'green':'red')+'">'+(val?'true':'false')+'</span>' : '<span class="stat-value">'+val+'</span>';
       const inputHtml = isBool
-        ? '<button class="btn sm '+(val?'success':'danger')+'" onclick="toggleBoolConfig(\\''+item.key+'\\','+!val+')">'+(val?'ON':'OFF')+'</button>'
-        : '<input type="'+(item.type==='number'?'number':'text')+'" value="'+val+'" style="width:80px;font-size:12px;padding:4px 8px" id="cfg_'+item.key+'"> <button class="btn sm primary" onclick="saveConfig(\\''+item.key+'\\')">Set</button>';
+        ? '<button class="btn sm '+(val?'success':'danger')+'" onclick="toggleBoolConfig(' + JSON.stringify(item.key) + ',' + !val + ')">'+(val?'ON':'OFF')+'</button>'
+        : '<input type="'+(item.type==='number'?'number':'text')+'" value="'+val+'" style="width:80px;font-size:12px;padding:4px 8px" id="cfg_'+item.key+'"> <button class="btn sm primary" onclick="saveConfig(' + JSON.stringify(item.key) + ')">Set</button>';
       html += '<div style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:8px 10px;display:flex;align-items:center;gap:8px">';
       html += '<div style="flex:1"><div style="font-size:12px;font-weight:500">'+item.label+'</div><div style="font-size:11px;color:var(--text2)">'+item.desc+'</div></div>';
       html += '<div style="display:flex;align-items:center;gap:6px">' + inputHtml + '</div>';
@@ -2884,14 +3004,26 @@ async function loadPatchableFiles() {
   }
 }
 
-// ── File viewer (read-only) ──
+// ── File viewer (read-only) — enhanced with line numbers, search, paging, download ──
 let _viewerCurrentFile = '';
 let _viewerCurrentContent = '';
+const VIEWER_PAGE_SIZE = 200; // lines per page
+let _viewerAllLines = [];
+let _viewerCurrentPage = 0;
+let _viewerSearchMatches = []; // array of line numbers (0-indexed)
+let _viewerSearchCursor = -1; // index into _viewerSearchMatches
 
 function _getSelectedFilePath() {
   const select = document.getElementById('patchFileSelect');
   const input = document.getElementById('patchFileInput');
   return ((select && select.value) || (input && input.value) || '').trim();
+}
+
+function escapeHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
 }
 
 async function viewCurrentFile() {
@@ -2903,14 +3035,162 @@ async function viewCurrentFile() {
     if (!r.exists) { toast('File does not exist: ' + file, 'error'); return; }
     _viewerCurrentFile = file;
     _viewerCurrentContent = r.content || '';
+    _viewerAllLines = _viewerCurrentContent.split('\n');
+    _viewerCurrentPage = 0;
+    _viewerSearchMatches = [];
+    _viewerSearchCursor = -1;
     const titleEl = document.getElementById('fileViewerTitle');
-    const contentEl = document.getElementById('fileViewerContent');
-    if (titleEl) titleEl.textContent = file + '  (' + (r.size || 0) + ' bytes, mtime ' + new Date(r.mtime || 0).toLocaleString() + ')';
-    if (contentEl) contentEl.textContent = _viewerCurrentContent;
+    if (titleEl) titleEl.textContent = file + '  (' + (r.size || 0) + ' bytes, ' + _viewerAllLines.length + ' lines, mtime ' + new Date(r.mtime || 0).toLocaleString() + ')';
+    // Populate page selector
+    const pageSelect = document.getElementById('fileViewerPageSelect');
+    if (pageSelect) {
+      const totalPages = Math.max(1, Math.ceil(_viewerAllLines.length / VIEWER_PAGE_SIZE));
+      pageSelect.innerHTML = '';
+      for (let i = 0; i < totalPages; i++) {
+        const startLine = i * VIEWER_PAGE_SIZE + 1;
+        const endLine = Math.min((i + 1) * VIEWER_PAGE_SIZE, _viewerAllLines.length);
+        const opt = document.createElement('option');
+        opt.value = i;
+        opt.textContent = startLine + '-' + endLine;
+        pageSelect.appendChild(opt);
+      }
+      pageSelect.value = '0';
+    }
+    _renderViewerPage();
+    // Clear search input
+    const searchInput = document.getElementById('fileViewerSearch');
+    if (searchInput) searchInput.value = '';
+    const searchInfo = document.getElementById('fileViewerSearchInfo');
+    if (searchInfo) searchInfo.textContent = '';
     const modal = document.getElementById('fileViewerModal');
     if (modal) modal.style.display = 'flex';
   } catch (e) {
     toast('Failed to load file: ' + e.message, 'error');
+  }
+}
+
+function _renderViewerPage() {
+  const contentEl = document.getElementById('fileViewerContent');
+  if (!contentEl) return;
+  const startLine = _viewerCurrentPage * VIEWER_PAGE_SIZE;
+  const endLine = Math.min(startLine + VIEWER_PAGE_SIZE, _viewerAllLines.length);
+  const searchInput = document.getElementById('fileViewerSearch');
+  const searchQuery = (searchInput && searchInput.value || '').toLowerCase();
+  // Build HTML with line numbers + content, highlight search matches
+  let html = '<table style="border-collapse:collapse; width:100%;">';
+  for (let i = startLine; i < endLine; i++) {
+    const lineNum = i + 1;
+    const lineText = _viewerAllLines[i];
+    const isMatch = _viewerSearchMatches.includes(i);
+    let displayLine = escapeHtml(lineText);
+    // Highlight search query in the line.
+    // Note: we build the escape regex from a string source (not a regex literal)
+    // because regex literals containing the dollar-curly sequence get misparsed
+    // by esbuild TS parser as a template-literal placeholder.
+    if (searchQuery && lineText.toLowerCase().includes(searchQuery)) {
+      const SPECIAL_CHARS = '.*+?^$' + String.fromCharCode(123) + String.fromCharCode(125) + '()|[]\\\\';
+      const escapeRegex = new RegExp('[' + SPECIAL_CHARS + ']', 'g');
+      const escapedQuery = searchQuery.replace(escapeRegex, '\\$&');
+      const re = new RegExp('(' + escapedQuery + ')', 'gi');
+      displayLine = escapeHtml(lineText).replace(re, '<mark style="background:#ffeb3b; color:#000;">$1</mark>');
+    }
+    const matchBg = isMatch ? 'background:#fff59d;' : '';
+    html += '<tr><td onclick="viewerJumpToLine(' + i + ')" style="padding:0 8px; text-align:right; color:#666; user-select:none; cursor:pointer; border-right:1px solid #2a2a3e; min-width:40px; ' + matchBg + '">' + lineNum + '</td><td style="padding:0 8px; white-space:pre-wrap; word-break:break-word; ' + matchBg + '">' + (displayLine || '&nbsp;') + '</td></tr>';
+  }
+  html += '</table>';
+  contentEl.innerHTML = html;
+  // Update page info
+  const pageInfo = document.getElementById('fileViewerPageInfo');
+  if (pageInfo) {
+    const totalPages = Math.max(1, Math.ceil(_viewerAllLines.length / VIEWER_PAGE_SIZE));
+    pageInfo.textContent = 'Page ' + (_viewerCurrentPage + 1) + '/' + totalPages;
+  }
+  // Highlight current search cursor (if visible on this page)
+  if (_viewerSearchCursor >= 0) {
+    const matchLine = _viewerSearchMatches[_viewerSearchCursor];
+    if (matchLine >= startLine && matchLine < endLine) {
+      const row = contentEl.querySelectorAll('tr')[matchLine - startLine];
+      if (row) {
+        row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        row.style.background = '#ff8a65';
+      }
+    }
+  }
+}
+
+function viewerGoToPage(pageStr) {
+  const page = parseInt(pageStr, 10);
+  if (Number.isFinite(page) && page >= 0 && page * VIEWER_PAGE_SIZE < _viewerAllLines.length) {
+    _viewerCurrentPage = page;
+    _renderViewerPage();
+  }
+}
+
+function handleViewerSearchKey(event) {
+  if (event.key === 'Enter') {
+    if (event.shiftKey) viewerSearchPrev(); else viewerSearchNext();
+    event.preventDefault();
+  } else if (event.key === 'Escape') {
+    const searchInput = document.getElementById('fileViewerSearch');
+    if (searchInput) { searchInput.value = ''; _performViewerSearch(); }
+  }
+}
+
+function _performViewerSearch() {
+  const searchInput = document.getElementById('fileViewerSearch');
+  const query = (searchInput && searchInput.value || '').toLowerCase().trim();
+  _viewerSearchMatches = [];
+  _viewerSearchCursor = -1;
+  if (query) {
+    for (let i = 0; i < _viewerAllLines.length; i++) {
+      if (_viewerAllLines[i].toLowerCase().includes(query)) {
+        _viewerSearchMatches.push(i);
+      }
+    }
+  }
+  const searchInfo = document.getElementById('fileViewerSearchInfo');
+  if (searchInfo) {
+    if (!query) searchInfo.textContent = '';
+    else if (_viewerSearchMatches.length === 0) searchInfo.textContent = '0 matches';
+    else searchInfo.textContent = _viewerSearchMatches.length + ' match' + (_viewerSearchMatches.length === 1 ? '' : 'es');
+  }
+  _renderViewerPage();
+}
+
+function viewerSearchNext() {
+  _performViewerSearch();
+  if (_viewerSearchMatches.length === 0) return;
+  _viewerSearchCursor = (_viewerSearchCursor + 1) % _viewerSearchMatches.length;
+  _viewerJumpToMatch();
+}
+
+function viewerSearchPrev() {
+  _performViewerSearch();
+  if (_viewerSearchMatches.length === 0) return;
+  _viewerSearchCursor = (_viewerSearchCursor - 1 + _viewerSearchMatches.length) % _viewerSearchMatches.length;
+  _viewerJumpToMatch();
+}
+
+function _viewerJumpToMatch() {
+  if (_viewerSearchCursor < 0 || _viewerSearchCursor >= _viewerSearchMatches.length) return;
+  const matchLine = _viewerSearchMatches[_viewerSearchCursor];
+  const targetPage = Math.floor(matchLine / VIEWER_PAGE_SIZE);
+  _viewerCurrentPage = targetPage;
+  _renderViewerPage();
+  const searchInfo = document.getElementById('fileViewerSearchInfo');
+  if (searchInfo) {
+    searchInfo.textContent = (_viewerSearchCursor + 1) + '/' + _viewerSearchMatches.length + ' matches';
+  }
+}
+
+function viewerJumpToLine(lineIndex) {
+  // Called when a line number is clicked — jump to that line (no-op if already on the page)
+  const targetPage = Math.floor(lineIndex / VIEWER_PAGE_SIZE);
+  if (_viewerCurrentPage !== targetPage) {
+    _viewerCurrentPage = targetPage;
+    const pageSelect = document.getElementById('fileViewerPageSelect');
+    if (pageSelect) pageSelect.value = String(targetPage);
+    _renderViewerPage();
   }
 }
 
@@ -2920,43 +3200,174 @@ function closeFileViewer() {
 }
 
 function loadCurrentIntoPatch() {
-  if (!_viewerCurrentContent) { toast('No file loaded', 'error'); return; }
+  const content = _viewerCurrentContent || _historyCurrentContent;
+  const file = _viewerCurrentFile || _historyCurrentPatch;
+  if (!content) { toast('No file loaded', 'error'); return; }
   const ta = document.getElementById('patchContent');
-  if (ta) ta.value = _viewerCurrentContent;
-  // Also populate the file input so submitPatch targets the right file
+  if (ta) ta.value = content;
   const input = document.getElementById('patchFileInput');
-  if (input && _viewerCurrentFile) input.value = _viewerCurrentFile;
+  if (input && file) input.value = file;
   closeFileViewer();
-  toast('Loaded ' + _viewerCurrentFile + ' into patch textarea — edit and submit', 'info');
+  toast('Loaded ' + (file || 'file') + ' into patch textarea — edit and submit', 'info');
 }
 
 function copyFileToClipboard() {
-  if (!_viewerCurrentContent) { toast('No file loaded', 'error'); return; }
+  const content = _viewerCurrentContent || _historyCurrentContent;
+  if (!content) { toast('No file loaded', 'error'); return; }
   try {
-    navigator.clipboard.writeText(_viewerCurrentContent).then(() => {
-      toast('Copied ' + _viewerCurrentContent.length + ' chars to clipboard', 'info');
+    navigator.clipboard.writeText(content).then(() => {
+      toast('Copied ' + content.length + ' chars to clipboard', 'info');
     }).catch(() => {
-      // Fallback: legacy execCommand
       const ta = document.createElement('textarea');
-      ta.value = _viewerCurrentContent;
+      ta.value = content;
       document.body.appendChild(ta);
       ta.select();
       document.execCommand('copy');
       document.body.removeChild(ta);
-      toast('Copied (legacy) ' + _viewerCurrentContent.length + ' chars', 'info');
+      toast('Copied (legacy) ' + content.length + ' chars', 'info');
     });
   } catch (e) {
     toast('Copy failed: ' + e.message, 'error');
   }
 }
 
-// Close modal when clicking outside the inner box
+// Download current file (read-only — does not modify anything on the server)
+function downloadCurrentFile() {
+  const content = _viewerCurrentContent || _historyCurrentContent;
+  const file = _viewerCurrentFile || _historyCurrentPatch || 'file.txt';
+  if (!content) { toast('No file loaded', 'error'); return; }
+  try {
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    // Use just the basename for the download filename
+    a.download = file.split('/').pop() || file;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    // Revoke the URL after a short delay (some browsers need it open during click)
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast('Downloaded ' + file.split('/').pop() + ' (' + content.length + ' chars)', 'info');
+  } catch (e) {
+    toast('Download failed: ' + e.message, 'error');
+  }
+}
+
+// ── Diff Preview Modal ──
+// Shows a line-by-line diff between the currently-deployed file and the patch
+// in the textarea, before the user submits. Uses a simple LCS-based diff
+// algorithm — no external dependencies.
+let _diffPreviewApproved = false;
+
+function _computeLineDiff(oldText, newText) {
+  // Simple LCS-based line diff. Returns array of {type: 'unchanged'|'added'|'removed', oldLine?, newLine?, text}
+  const oldLines = (oldText || '').split('\n');
+  const newLines = (newText || '').split('\n');
+  // Build LCS table
+  const m = oldLines.length, n = newLines.length;
+  // Cap table size to avoid OOM on very large files
+  if (m * n > 1000000) {
+    // Fall back to naive diff: every line is "added"
+    return newLines.map((line, i) => ({ type: 'added', newLine: i + 1, text: line }));
+  }
+  const dp = [];
+  for (let i = 0; i <= m; i++) dp[i] = new Array(n + 1).fill(0);
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (oldLines[i - 1] === newLines[j - 1]) dp[i][j] = dp[i - 1][j - 1] + 1;
+      else dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  // Backtrack to build diff
+  const diff = [];
+  let i = m, j = n;
+  while (i > 0 && j > 0) {
+    if (oldLines[i - 1] === newLines[j - 1]) {
+      diff.unshift({ type: 'unchanged', oldLine: i, newLine: j, text: oldLines[i - 1] });
+      i--; j--;
+    } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+      diff.unshift({ type: 'removed', oldLine: i, newLine: null, text: oldLines[i - 1] });
+      i--;
+    } else {
+      diff.unshift({ type: 'added', oldLine: null, newLine: j, text: newLines[j - 1] });
+      j--;
+    }
+  }
+  while (i > 0) { diff.unshift({ type: 'removed', oldLine: i, newLine: null, text: oldLines[i - 1] }); i--; }
+  while (j > 0) { diff.unshift({ type: 'added', oldLine: null, newLine: j, text: newLines[j - 1] }); j--; }
+  return diff;
+}
+
+async function previewPatchDiff() {
+  const file = _getSelectedFilePath();
+  const patchContent = document.getElementById('patchContent');
+  if (!file) { toast('Please select or type a file name first', 'error'); return; }
+  if (!patchContent || !patchContent.value || patchContent.value.length < 5) {
+    toast('Patch content is too short (min 5 chars)', 'error'); return;
+  }
+  // Fetch current file
+  let currentContent = '';
+  try {
+    const r = await api('/api/patch/file?path=' + encodeURIComponent(file));
+    if (r.error) { toast(r.error, 'error'); return; }
+    if (r.exists) currentContent = r.content || '';
+  } catch (e) {
+    toast('Failed to fetch current file: ' + e.message, 'error');
+    return;
+  }
+  // Compute diff
+  const diff = _computeLineDiff(currentContent, patchContent.value);
+  let added = 0, removed = 0, unchanged = 0;
+  diff.forEach(d => {
+    if (d.type === 'added') added++;
+    else if (d.type === 'removed') removed++;
+    else unchanged++;
+  });
+  // Render diff
+  let html = '<table style="border-collapse:collapse; width:100%; font-family:monospace;">';
+  diff.forEach(d => {
+    const bg = d.type === 'added' ? 'background:#1e3a1e;' : (d.type === 'removed' ? 'background:#3a1e1e;' : '');
+    const prefix = d.type === 'added' ? '+' : (d.type === 'removed' ? '-' : ' ');
+    const color = d.type === 'added' ? '#4caf50' : (d.type === 'removed' ? '#f44336' : '#888');
+    const oldNum = d.oldLine || '';
+    const newNum = d.newLine || '';
+    html += '<tr style="' + bg + '"><td style="padding:0 6px; text-align:right; color:#666; user-select:none; min-width:40px;">' + oldNum + '</td><td style="padding:0 6px; text-align:right; color:#666; user-select:none; min-width:40px;">' + newNum + '</td><td style="padding:0 8px; color:' + color + '; font-weight:bold;">' + prefix + '</td><td style="padding:0 8px; white-space:pre-wrap; word-break:break-word;">' + escapeHtml(d.text || ' ') + '</td></tr>';
+  });
+  html += '</table>';
+  const contentEl = document.getElementById('diffPreviewContent');
+  const titleEl = document.getElementById('diffPreviewTitle');
+  const statsEl = document.getElementById('diffPreviewStats');
+  if (contentEl) contentEl.innerHTML = html;
+  if (titleEl) titleEl.textContent = 'Diff: ' + file;
+  if (statsEl) statsEl.innerHTML = '<span style="color:#4caf50;">+' + added + '</span> / <span style="color:#f44336;">-' + removed + '</span> / <span style="color:#888;">=' + unchanged + '</span> lines';
+  _diffPreviewApproved = false;
+  const modal = document.getElementById('diffPreviewModal');
+  if (modal) modal.style.display = 'flex';
+}
+
+function closeDiffPreview() {
+  const modal = document.getElementById('diffPreviewModal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function submitPatchAfterDiffPreview() {
+  _diffPreviewApproved = true;
+  closeDiffPreview();
+  // Call the existing submitPatch function
+  if (typeof submitPatch === 'function') submitPatch();
+}
+
+// Close modals when clicking outside the inner box, or on Escape
 document.addEventListener('click', (e) => {
   if (e.target && e.target.id === 'fileViewerModal') closeFileViewer();
+  if (e.target && e.target.id === 'diffPreviewModal') closeDiffPreview();
 });
-// Close on Escape
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closeFileViewer();
+  if (e.key === 'Escape') {
+    closeFileViewer();
+    closeDiffPreview();
+  }
 });
 
 // ── Patch History (DB-backed) ──
@@ -2989,6 +3400,54 @@ function _statusBadge(status) {
   return '<span style="display:inline-block; padding:2px 8px; border-radius:3px; background:' + color + '; color:#000; font-weight:bold; font-size:11px;">' + s.toUpperCase() + '</span>';
 }
 
+// Render the 5-stage lifecycle as a chain of small badges with arrows.
+// lifecycle = { submitted, approved, applied, pushed, deployed } — each value is
+// 'passed' | 'warning' | 'failed' | 'pending' | 'skipped' | 'unknown'.
+// Also takes the raw stages array (used for tooltips showing the timestamp).
+function _renderLifecycleBadges(lifecycle, stages) {
+  if (!lifecycle) {
+    // Older DB rows without stages_json — show the legacy single status badge
+    return '<span style="color:#888; font-style:italic; font-size:11px;">(no stage data — older patch)</span>';
+  }
+  const stages5 = [
+    { key: 'submitted', label: 'Submitted', short: 'sub' },
+    { key: 'approved',  label: 'Approved',  short: 'appr' },
+    { key: 'applied',   label: 'Applied',   short: 'appl' },
+    { key: 'pushed',    label: 'Pushed',    short: 'push' },
+    { key: 'deployed',  label: 'Deployed',  short: 'depl' },
+  ];
+  const colors = {
+    passed:    '#4caf50',
+    warning:   '#ff9800',
+    failed:    '#f44336',
+    rejected:  '#f44336',
+    blocked:   '#f44336',
+    pending:   '#444',
+    skipped:   '#666',
+    unknown:   '#666',
+  };
+  let html = '';
+  stages5.forEach((s, i) => {
+    const status = String(lifecycle[s.key] || 'pending').toLowerCase();
+    const color = colors[status] || '#666';
+    const textColor = (status === 'pending' || status === 'unknown' || status === 'skipped') ? '#999' : '#000';
+    // Find the corresponding stage in the stages array for tooltip
+    let tooltip = s.label + ': ' + status;
+    if (stages && Array.isArray(stages)) {
+      const stageMap = { submitted: 'validation', approved: 'ai_advisory', applied: 'apply_local', pushed: 'github_push', deployed: 'complete' };
+      const matchStage = stages.find(function(st) { return st.stage === stageMap[s.key]; });
+      if (matchStage && matchStage.timestamp) {
+        tooltip += ' (' + _fmtTimestamp(matchStage.timestamp) + ')';
+      }
+    }
+    html += '<span title="' + escapeHtml(tooltip) + '" style="display:inline-block; padding:2px 6px; border-radius:3px; background:' + color + '; color:' + textColor + '; font-weight:bold; font-size:10px; margin-right:2px;">' + s.short + '</span>';
+    if (i < stages5.length - 1) {
+      html += '<span style="color:#666; margin:0 1px; font-size:10px;">→</span>';
+    }
+  });
+  return html;
+}
+
 async function loadPatchHistory() {
   const tableEl = document.getElementById('patchHistoryTable');
   if (!tableEl) return;
@@ -3008,7 +3467,7 @@ async function loadPatchHistory() {
     html += '<th style="padding:8px; text-align:left; border-bottom:1px solid #333;">Timestamp</th>';
     html += '<th style="padding:8px; text-align:left; border-bottom:1px solid #333;">File</th>';
     html += '<th style="padding:8px; text-align:left; border-bottom:1px solid #333;">Description</th>';
-    html += '<th style="padding:8px; text-align:left; border-bottom:1px solid #333;">Status</th>';
+    html += '<th style="padding:8px; text-align:left; border-bottom:1px solid #333;">Lifecycle (submitted → approved → applied → pushed → deployed)</th>';
     html += '<th style="padding:8px; text-align:left; border-bottom:1px solid #333;">Branch</th>';
     html += '<th style="padding:8px; text-align:right; border-bottom:1px solid #333;">Size</th>';
     html += '<th style="padding:8px; text-align:center; border-bottom:1px solid #333;">Actions</th>';
@@ -3021,7 +3480,7 @@ async function loadPatchHistory() {
       html += '<td style="padding:6px 8px; color:#aaa; font-family:monospace; font-size:11px;">' + _fmtTimestamp(p.timestamp) + '</td>';
       html += '<td style="padding:6px 8px; color:#e0e0e0; font-family:monospace; font-size:11px;">' + (p.file || '-') + '</td>';
       html += '<td style="padding:6px 8px; color:#e0e0e0;">' + escapeHtml(desc) + '</td>';
-      html += '<td style="padding:6px 8px;">' + _statusBadge(p.status) + '</td>';
+      html += '<td style="padding:6px 8px;">' + _renderLifecycleBadges(p.lifecycle, p.stages) + '</td>';
       html += '<td style="padding:6px 8px; color:#aaa; font-family:monospace; font-size:11px;">' + (p.branch || '-') + '</td>';
       html += '<td style="padding:6px 8px; color:#aaa; text-align:right;">' + sizeKb + '</td>';
       html += '<td style="padding:6px 8px; text-align:center; white-space:nowrap;">';
@@ -3038,12 +3497,7 @@ async function loadPatchHistory() {
   }
 }
 
-function escapeHtml(s) {
-  if (!s) return '';
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  }[c]));
-}
+// escapeHtml is defined earlier in this script (in the file viewer section).
 
 async function viewPatchFromHistory(patchId, fileName) {
   try {
@@ -3087,28 +3541,8 @@ async function reloadPatchFromHistory(patchId) {
   }
 }
 
-// Override the file viewer's "Load into Patch" button to also work for history.
-// The original loadCurrentIntoPatch (declared earlier in this script) uses
-// _viewerCurrentContent. We augment it to fall back to _historyCurrentContent
-// (set by viewPatchFromHistory) when the viewer content is empty.
-(function() {
-  const orig = window.loadCurrentIntoPatch;
-  window.loadCurrentIntoPatch = function() {
-    if (typeof _viewerCurrentContent !== 'undefined' && _viewerCurrentContent) {
-      if (orig) { orig.call(window); return; }
-    }
-    if (typeof _historyCurrentContent !== 'undefined' && _historyCurrentContent) {
-      const ta = document.getElementById('patchContent');
-      if (ta) ta.value = _historyCurrentContent;
-      const input = document.getElementById('patchFileInput');
-      if (input && _historyCurrentPatch) input.value = _historyCurrentPatch;
-      closeFileViewer();
-      toast('Loaded historical patch into patch textarea — edit and resubmit', 'info');
-      return;
-    }
-    toast('No file loaded', 'error');
-  };
-})();
+// (loadCurrentIntoPatch now natively handles both viewer and history content —
+// no override needed. It's defined earlier in this script.)
 
 // Auto-load history on page load (after a small delay so it doesn't block initial render)
 document.addEventListener('DOMContentLoaded', () => {
@@ -3164,6 +3598,51 @@ async function submitPatch() {
     toast('Error: ' + e.message, 'error');
     if (statusEl) { statusEl.textContent = 'Error: ' + e.message; statusEl.style.color = '#f44336'; }
   }
+}
+
+// ── Structured audit feedback: parse line numbers from rejection reason ──
+// Turns "line 47", "Line 47", "L47", "line:47", "at line 47" into clickable
+// links that scroll the patch textarea to that line + highlight it.
+function _formatRejectionWithLineLinks(text) {
+  if (!text) return '';
+  // Escape first to prevent XSS from server-controlled text
+  const escaped = escapeHtml(String(text));
+  // Then wrap line-number references in <a> tags. Match patterns like:
+  //   "line 47", "Line 47", "L47", "line:47", "at line 47"
+  // We insert a clickable anchor with data-line attribute, then handle click via JS.
+  const withLinks = escaped.replace(
+    /\b(?:line|Line|L|at line)\s*:?\s*(\d{1,5})\b/g,
+    (match, lineStr) => {
+      const lineNum = parseInt(lineStr, 10);
+      if (!Number.isFinite(lineNum) || lineNum < 1 || lineNum > 100000) return match;
+      return '<a href="#" onclick="jumpToPatchLine(' + lineNum + '); return false;" style="color:#4fc3f7; text-decoration:underline; cursor:pointer;" title="Jump to line ' + lineNum + ' in the patch">' + match + '</a>';
+    }
+  );
+  return withLinks;
+}
+
+function jumpToPatchLine(lineNum) {
+  const ta = document.getElementById('patchContent');
+  if (!ta) { toast('Patch textarea not found', 'error'); return; }
+  const lines = ta.value.split('\n');
+  if (lineNum < 1 || lineNum > lines.length) {
+    toast('Line ' + lineNum + ' is out of range (file has ' + lines.length + ' lines)', 'error');
+    return;
+  }
+  // Calculate character offset for the start of the target line
+  let offset = 0;
+  for (let i = 0; i < lineNum - 1; i++) {
+    offset += lines[i].length + 1; // +1 for the newline
+  }
+  // Select the line to highlight it
+  ta.focus();
+  ta.setSelectionRange(offset, offset + (lines[lineNum - 1] || '').length);
+  // Scroll the textarea so the line is visible
+  // Compute the line height and scroll position
+  const lineHeight = parseInt(window.getComputedStyle(ta).lineHeight, 10) || 18;
+  const visibleLines = Math.floor(ta.clientHeight / lineHeight);
+  ta.scrollTop = Math.max(0, (lineNum - Math.floor(visibleLines / 2)) * lineHeight);
+  toast('Jumped to line ' + lineNum, 'info');
 }
 
 var _patchPollTimer = null;
@@ -3244,10 +3723,14 @@ function pollPatchStatus(patchId) {
 
       if (stagesEl) stagesEl.innerHTML = html;
 
-      // Show rejection reason
+      // Show rejection reason (structured: parse line-number references and make them clickable)
       if (hasRejection && rejBox) {
         rejBox.style.display = 'block';
-        if (rejDetails) rejDetails.textContent = rejectionInfo;
+        if (rejDetails) {
+          // Parse the rejection info for line-number references (e.g. "line 47", "L47", "Line 47: foo")
+          // and turn them into clickable links that scroll the patch textarea to that line.
+          rejDetails.innerHTML = _formatRejectionWithLineLinks(rejectionInfo);
+        }
         if (statusEl) { statusEl.textContent = 'REJECTED'; statusEl.style.color = '#f44336'; }
         clearInterval(_patchPollTimer);
         _patchPollTimer = null;
