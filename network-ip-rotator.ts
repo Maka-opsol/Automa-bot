@@ -563,9 +563,18 @@ function _declareIpBlocked(): void {
   if (_proxyUrls.length > 0) {
     const nextProxy = _rotateProxy();
     if (nextProxy) {
-      log(`[IP] Rotating to proxy: ${nextProxy}`, 'INFO');
-      process.env.HTTP_PROXY = nextProxy;
-      process.env.HTTPS_PROXY = nextProxy;
+      // BUGFIX: Respect the bypass flag — if bypassProxy() was called (e.g.
+      // on Render where proxies deliver blank pages), do NOT re-activate the
+      // proxy here. Re-activating would set process.env.HTTP_PROXY again,
+      // and the browser (already launched) would inherit those env vars
+      // and route all navigations through the broken proxy → ERR_EMPTY_RESPONSE.
+      if ((globalThis as any).__proxyDisabled === true) {
+        log(`[IP] Would rotate to ${nextProxy} but __proxyDisabled is true — bypassing proxy rotation`, 'WARN');
+      } else {
+        log(`[IP] Rotating to proxy: ${nextProxy}`, 'INFO');
+        process.env.HTTP_PROXY = nextProxy;
+        process.env.HTTPS_PROXY = nextProxy;
+      }
       return;
     }
   }
@@ -647,9 +656,24 @@ async function start(): Promise<void> {
   // Load proxies FIRST (before checking IP)
   await _loadProxyUrls();
 
-  // If we have proxies, activate the first one immediately (before IP check)
-  // so the IP check goes through the proxy
-  if (_proxyUrls.length > 0) {
+  // BUGFIX: If bypassProxy() was called BEFORE start() finishes (which is
+  // exactly what happens on Render — render-free-plan calls bypassProxy()
+  // at startup, then network-ip-rotator.start() runs later and re-enables
+  // the proxy by setting process.env.HTTP_PROXY below), we MUST NOT
+  // re-enable the proxy here. The bypass flag is the single source of truth.
+  //
+  // Symptom before this fix: bypassProxy() clears env vars at 16:50:27,
+  // then start() re-sets them at 16:50:28 ("Activated proxy before IP
+  // check"), the browser launches with those env vars still set, and all
+  // navigations go through the broken proxy → ERR_EMPTY_RESPONSE → blank
+  // screenshots. The "Proxy DISABLED (mode=direct)" log later is the
+  // browser's own internal flag, NOT the env vars.
+  const isBypassed = (globalThis as any).__proxyDisabled === true;
+  if (isBypassed) {
+    log('[IP] start() called but __proxyDisabled is true — skipping proxy activation (bypass was requested before start completed)', 'WARN');
+  } else if (_proxyUrls.length > 0) {
+    // If we have proxies, activate the first one immediately (before IP check)
+    // so the IP check goes through the proxy
     _currentProxyIndex = 0;
     const firstProxy = _proxyUrls[0];
     process.env.HTTP_PROXY = firstProxy;
@@ -662,7 +686,28 @@ async function start(): Promise<void> {
   log('[IP] IP rotator started', 'INFO');
 
   // Check IP (will go through the proxy if one is active)
+  // If bypassed, this will use the direct connection.
   await checkIp();
+
+  // BUGFIX: After the IP check completes, if a proxy was activated just for
+  // the check, clear the env vars again so the browser (launched later)
+  // doesn't inherit them. The proxy should only be active during explicit
+  // IP checks, not during normal browser navigation — UNLESS the bypass
+  // flag is unset AND the bot is configured to use the proxy for browsing.
+  // On Render, bypass is always set, so we always clear here.
+  if (isBypassed) {
+    // Already cleared by bypassProxy() — but re-clear defensively in case
+    // any code path re-set them during the IP check.
+    if (process.env.HTTP_PROXY) {
+      delete process.env.HTTP_PROXY;
+      log('[IP] Re-cleared process.env.HTTP_PROXY after IP check (bypass active)', 'DEBUG');
+    }
+    if (process.env.HTTPS_PROXY) {
+      delete process.env.HTTPS_PROXY;
+      log('[IP] Re-cleared process.env.HTTPS_PROXY after IP check (bypass active)', 'DEBUG');
+    }
+    _currentProxyIndex = -1;
+  }
 
   // Set up periodic proxy list refresh (every 10 min)
   _proxyRefreshTimer = setInterval(async () => {
