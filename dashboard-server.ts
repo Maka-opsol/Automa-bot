@@ -1485,7 +1485,12 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
                 const sandbox = (() => { try { return require('./sandbox-executor'); } catch { return null; } })();
               if (sandbox && sandbox.executePatchInSandbox) {
                 try {
-                  const sandboxResult = await sandbox.executePatchInSandbox(file, patch);
+                  // BUGFIX (dashboard patch end-to-end test): arguments were swapped.
+                  // executePatchInSandbox(patchText, filePath) — but we were calling it
+                  // as (file, patch), which fed the filename as patchText and the entire
+                  // patch body as filePath, causing isPatchableFile() to reject with
+                  // "File 'use strict'; ... is not in any allowed patching scope".
+                  const sandboxResult = await sandbox.executePatchInSandbox(patch, file);
                   if (!sandboxResult.safe) {
                     updatePatchStatus(patchId, 'sandbox_audit', 'rejected', {
                       reason: sandboxResult.reason || sandboxResult.error || 'Unknown rejection',
