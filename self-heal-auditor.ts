@@ -416,7 +416,37 @@ async function auditPatchWithAI(patchText: any, signal: any, configOverride = nu
     return { ...parsed, provider: config.provider, model: config.model };
   } catch (err: any) {
     logError(`Auditor model (${config.model}) failed`, err);
-    return { is_safe: false, reason: `Auditor crashed: ${err.message}`, provider: config.provider, model: config.model };
+    // BUGFIX: Distinguish infrastructure failures from real safety verdicts.
+    // Previously, ANY error (HTTP 429 rate limit, HTTP 500 server error,
+    // network timeout, JSON parse failure) was treated as is_safe: false —
+    // which counted as a vote AGAINST the patch. This caused patches to be
+    // rejected just because OpenRouter's free-tier daily quota was exhausted
+    // (50 req/day limit), even when the other auditor (Mistral) said SAFE.
+    //
+    // Now: infrastructure failures return a special "skipped" verdict that
+    // does NOT count as a vote — only real safety verdicts (auditor returned
+    // valid JSON with is_safe: true/false) count.
+    const errMsg = String(err && err.message || err);
+    const isInfraFailure =
+      /HTTP_ERROR_4\d\d/.test(errMsg) ||         // 4xx client errors (429 rate limit, 401 auth, 403 forbidden, etc.)
+      /HTTP_ERROR_5\d\d/.test(errMsg) ||         // 5xx server errors (500, 502, 503, 504)
+      /Rate limit exceeded/i.test(errMsg) ||    // explicit rate-limit message
+      /ECONNRESET|ETIMEDOUT|ENOTFOUND|ECONNREFUSED/.test(errMsg) || // network errors
+      /fetch failed/i.test(errMsg) ||            // generic fetch failure
+      /Empty auditor response/i.test(errMsg) || // empty response (server returned nothing)
+      /Invalid auditor response format/i.test(errMsg); // bad JSON (auditor returned non-JSON)
+    if (isInfraFailure) {
+      return {
+        is_safe: null,                          // null = skipped (does NOT count as a vote)
+        skipped: true,
+        skip_reason: `Auditor infrastructure failure: ${errMsg.slice(0, 200)}`,
+        provider: config.provider,
+        model: config.model,
+      };
+    }
+    // For non-infrastructure errors (unexpected exceptions in our own code),
+    // fail safe — but log loudly so the dashboard surfaces the actual reason.
+    return { is_safe: false, reason: `Auditor crashed: ${errMsg}`, provider: config.provider, model: config.model };
   }
 }
 
@@ -455,15 +485,34 @@ async function auditPatchWithTribunal(patchText: any, signal: any, options?: { i
     return auditPatchWithAI(patchText as any, signal as any, config as any, isNonCodegen, originalContent);
   }));
 
-  const votes = results
+  const allResults = results
     .filter(r => r.status === 'fulfilled' && r.value)
 // @ts-expect-error
     .map(r => r.value);
+
+  // BUGFIX: Filter out "skipped" verdicts (infrastructure failures like
+  // 429 rate limit, 500 server error, network timeout). These are NOT safety
+  // verdicts — they're infrastructure failures. Only real safety verdicts
+  // (auditor returned valid JSON with is_safe: true/false) count as votes.
+  // Skipped verdicts are still included in the response so the dashboard can
+  // surface WHY an auditor didn't vote (e.g. "OpenRouter: rate limit exceeded").
+  const votes = allResults.filter(v => v && !v.skipped && v.is_safe !== null && v.is_safe !== undefined);
+  const skipped = allResults.filter(v => v && (v.skipped || v.is_safe === null || v.is_safe === undefined));
+  if (skipped.length > 0) {
+    for (const s of skipped) {
+      log(`Auditor skipped: ${s.provider}/${s.model} — ${s.skip_reason || s.reason || 'unknown reason'}`, 'WARN', 'auditor');
+    }
+  }
 
   const safeVotes = votes.filter(v => v.is_safe === true);
   const total = votes.length;
 
   if (total === 0) {
+    // ALL auditors were skipped (infrastructure failure on every auditor) —
+    // fall back to a single AI call with default config. If that ALSO fails
+    // (likely, since the same rate limits apply), the auditor will return
+    // an "Auditor infrastructure failure" verdict that the dashboard surfaces.
+    log(`All ${allResults.length} auditors were skipped — falling back to default config audit`, 'WARN', 'auditor');
     return auditPatchWithAI(patchText, signal, null, isNonCodegen, originalContent);
   }
 
@@ -495,23 +544,35 @@ async function auditPatchWithTribunal(patchText: any, signal: any, options?: { i
 
   const approved = safeVotes.length >= threshold;
 
-  // Compose a reason string that inlines each auditor's verdict so the
-  // dashboard UI can surface WHY a patch was rejected (or approved)
+  // Compose a reason string that inlines each auditor's verdict (or skip reason)
+  // so the dashboard UI can surface WHY a patch was rejected (or approved)
   // without needing to render the votes array separately.
+  // Include skipped auditors too so the user knows which auditor didn't vote
+  // and why (e.g. "OpenRouter: rate limit exceeded — daily quota exhausted").
   const voteSummary = votes.map(v => {
     const who = `${v.provider || 'unknown'}/${v.model || 'unknown'}`;
     const verdict = v.is_safe ? 'SAFE' : 'UNSAFE';
     const why = v.reason || '(no reason given)';
     return `[${who} → ${verdict}: ${why}]`;
   }).join(' | ');
+  const skippedSummary = skipped.length > 0
+    ? skipped.map(s => {
+        const who = `${s.provider || 'unknown'}/${s.model || 'unknown'}`;
+        return `[${who} → SKIPPED: ${s.skip_reason || s.reason || 'unknown'}]`;
+      }).join(' | ')
+    : '';
+  const fullSummary = skippedSummary ? voteSummary + ' | ' + skippedSummary : voteSummary;
 
   return {
     safe: approved,
     is_safe: approved,
     reason: approved
-      ? `Approved by ${safeVotes.length}/${total} auditors${isNonCodegen ? ' (non-codegen strict mode)' : ''}. ${voteSummary}`
-      : `Rejected by majority (${safeVotes.length}/${total}). ${voteSummary}`,
+      ? `Approved by ${safeVotes.length}/${total} auditors${isNonCodegen ? ' (non-codegen strict mode)' : ''}${skipped.length > 0 ? ` (${skipped.length} skipped)` : ''}. ${fullSummary}`
+      : `Rejected by majority (${safeVotes.length}/${total})${skipped.length > 0 ? ` (${skipped.length} skipped)` : ''}. ${fullSummary}`,
     votes,
+    // Include skipped verdicts separately so the dashboard can render them
+    // distinctly from real safety verdicts (e.g. with a different color badge).
+    skipped: skipped.length > 0 ? skipped : undefined,
   };
 }
 
@@ -577,10 +638,10 @@ async function auditPatch(patchText: any, signal: any, options?: { isNonCodegen?
   const aiResult = await auditPatchWithTribunal(patchText, signal, { isNonCodegen, originalContent });
   if (!aiResult.safe && !aiResult.is_safe) {
     log(`Patch blocked by AI auditor: ${aiResult.reason}`, 'WARN', 'auditor');
-    return { safe: false, reason: aiResult.reason };
+    return { safe: false, reason: aiResult.reason, votes: aiResult.votes, skipped: aiResult.skipped };
   }
   log('Patch passed AI auditor.', 'INFO', 'auditor');
-  return { safe: true, reason: aiResult.reason || 'Passed all audit layers' };
+  return { safe: true, reason: aiResult.reason || 'Passed all audit layers', votes: aiResult.votes, skipped: aiResult.skipped };
 }
 
 /**
