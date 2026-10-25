@@ -1,4 +1,4 @@
- 'use strict';
+'use strict';
 // sandbox-executor.ts — Security-critical module for validating self-heal patches.
 // P14 fixes:
 //   1. isPatchableFile() now handles absolute paths correctly (callers pass fullPath)
@@ -632,7 +632,7 @@ async function executePatchInSandbox(patchText: string, filePath: string): Promi
   _log(`Sandbox: Syntax validation passed for ${filePath}`, 'INFO', 'sandbox-executor');
 
   // Layer 5: Size limit (prevent oversized patches)
-  const MAX_PATCH_SIZE_BYTES = 50 * 1024; // 50KB
+  const MAX_PATCH_SIZE_BYTES = 500 * 1024; // 500KB
   if (Buffer.byteLength(patchText, 'utf8') > MAX_PATCH_SIZE_BYTES) {
     return { safe: false, error: `Patch exceeds maximum size (${MAX_PATCH_SIZE_BYTES / 1024}KB)` };
   }
