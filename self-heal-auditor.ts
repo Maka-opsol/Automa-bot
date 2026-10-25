@@ -410,12 +410,22 @@ async function auditPatchWithTribunal(patchText: any, signal: any, options?: { i
 
   const approved = safeVotes.length >= threshold;
 
+  // Compose a reason string that inlines each auditor's verdict so the
+  // dashboard UI can surface WHY a patch was rejected (or approved)
+  // without needing to render the votes array separately.
+  const voteSummary = votes.map(v => {
+    const who = `${v.provider || 'unknown'}/${v.model || 'unknown'}`;
+    const verdict = v.is_safe ? 'SAFE' : 'UNSAFE';
+    const why = v.reason || '(no reason given)';
+    return `[${who} → ${verdict}: ${why}]`;
+  }).join(' | ');
+
   return {
     safe: approved,
     is_safe: approved,
     reason: approved
-      ? `Approved by ${safeVotes.length}/${total} auditors${isNonCodegen ? ' (non-codegen strict mode)' : ''}`
-      : `Rejected by majority (${safeVotes.length}/${total})`,
+      ? `Approved by ${safeVotes.length}/${total} auditors${isNonCodegen ? ' (non-codegen strict mode)' : ''}. ${voteSummary}`
+      : `Rejected by majority (${safeVotes.length}/${total}). ${voteSummary}`,
     votes,
   };
 }
