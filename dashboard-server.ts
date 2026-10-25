@@ -1544,6 +1544,10 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
               }
 
               // Stage 4: Apply locally
+              // Handles read-only /app deployments (e.g. containerized runtime
+              // with a read-only rootfs): if the target dir is not writable,
+              // we treat apply_local as a non-fatal warning and rely on the
+              // overlay + git deploy stages to land the patch on next redeploy.
               updatePatchStatus(patchId, 'apply_local', 'pending');
               try {
                 const tmpPath = resolvedFile + '.tmp-' + Date.now();
@@ -1554,9 +1558,18 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
                 // Evict from require.cache
                 try { delete require.cache[require.resolve(resolvedFile)]; } catch {}
               } catch (applyErr) {
-                updatePatchStatus(patchId, 'apply_local', 'failed', applyErr.message);
-                try { fs.copyFileSync(backupPath, resolvedFile); } catch {}
-                return; // STOP
+                const code = applyErr && (applyErr.code || applyErr.errno);
+                const isReadOnly = code === 'EACCES' || code === 'EROFS' || code === 'EPERM';
+                if (isReadOnly) {
+                  // Read-only deployment — patch is still captured in /tmp/self-heal-overlay
+                  // and will land via the GitHub push stage on next redeploy.
+                  updatePatchStatus(patchId, 'apply_local', 'warning',
+                    'Target directory not writable (' + code + ') — patch will land via overlay+git deploy stage. Original error: ' + applyErr.message);
+                } else {
+                  updatePatchStatus(patchId, 'apply_local', 'failed', applyErr.message);
+                  try { fs.copyFileSync(backupPath, resolvedFile); } catch {}
+                  return; // STOP
+                }
               }
 
               // Stage 5: Record to DB
