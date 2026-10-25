@@ -544,6 +544,10 @@ const _patchQueue: Array<() => Promise<void>> = [];
 // File-level mutex: tracks which files are currently being patched.
 const _filesInFlight: Set<string> = new Set();
 
+// Multi-agent improvement proposals log (in-memory, capped at 500).
+// Stores issues, proposals, summaries, and drift_alerts submitted by AI agents.
+const _improvementProposals: any[] = [];
+
 // Patch dedup cache: maps `file:hash` → timestamp of last submission.
 // TTL: 60 minutes (matching the dedup window).
 const _patchDedupCache: Map<string, number> = new Map();
@@ -2089,6 +2093,117 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
+  // ── Multi-Agent Improvement Framework ──
+  // GET /api/improvement/framework
+  // Returns the full framework (roles, checklists, templates) as structured JSON
+  // so AI agents can fetch it programmatically and follow the rules.
+  if (pathname === '/api/improvement/framework' && req.method === 'GET') {
+    authWrap(() => {
+      try {
+        const fs = require('fs');
+        const path = require('path');
+        // Read the framework + core identity markdown files
+        const frameworkPath = path.join(path.resolve('.'), 'MULTI_AGENT_FRAMEWORK.md');
+        const identityPath = path.join(path.resolve('.'), 'CORE_IDENTITY.md');
+        let frameworkMd = '';
+        let identityMd = '';
+        try { frameworkMd = fs.readFileSync(frameworkPath, 'utf8'); } catch {}
+        try { identityMd = fs.readFileSync(identityPath, 'utf8'); } catch {}
+        // Also check /home/z/my-project/download/ as fallback (dev environment)
+        if (!frameworkMd) { try { frameworkMd = fs.readFileSync('/home/z/my-project/download/MULTI_AGENT_FRAMEWORK.md', 'utf8'); } catch {} }
+        if (!identityMd) { try { identityMd = fs.readFileSync('/home/z/my-project/download/CORE_IDENTITY.md', 'utf8'); } catch {} }
+
+        jsonRes(res, {
+          framework: frameworkMd,
+          core_identity: identityMd,
+          // Structured summary for agents that don't want to parse markdown
+          summary: {
+            roles: ['toqi', 'zapia'],
+            api_endpoints: [
+              'GET /api/improvement/framework',
+              'GET /api/improvement/proposals',
+              'POST /api/improvement/proposals',
+              'POST /api/patch/submit',
+              'GET /api/patch/status/:id',
+              'GET /api/patch/history',
+              'GET /api/patch/file?path=...',
+              'GET /api/patch/budget',
+              'GET /api/logs?limit=N',
+              'GET /api/status',
+              'GET /api/health',
+            ],
+            immutable_behaviors: [
+              'Bot mission: autonomously complete MathU tasks',
+              'Auth: Microsoft v2 login flow',
+              'State machine state names (string literals)',
+              'URL detection patterns (url.includes assignments)',
+              'DOM selectors (.assignment-card etc — preserve the selector string)',
+              'Database schema (additive changes only)',
+              'Patching pipeline safeguards (sandbox + auditor + budget)',
+            ],
+            priority_levels: {
+              P0: 'critical — bot is down, blank screenshots, stuck in loop',
+              P1: 'high — core feature broken (login, navigation, task completion)',
+              P2: 'moderate — non-core feature broken (logging, dashboard, monitoring)',
+              P3: 'low — code quality, docs, minor optimizations',
+            },
+            change_log_format: '[AGENT] Fix: <summary> | Issue: <id> | Root cause: <sentence> | Change: <sentence> | Risk: <low/medium/high> — <sentence>',
+          },
+        });
+      } catch (e: any) {
+        jsonRes(res, { error: e.message }, 500);
+      }
+    });
+    return true;
+  }
+
+  // ── Improvement proposals + summaries log ──
+  // GET /api/improvement/proposals?type=issue&limit=20
+  // POST /api/improvement/proposals  (body: { type, agent_role, ... })
+  // In-memory store (not persisted to DB — proposals are ephemeral coordination artifacts;
+  // the actual patch history IS persisted via patch_history + Turso sync).
+  if (pathname === '/api/improvement/proposals' && (req.method === 'GET' || req.method === 'POST')) {
+    authWrap(() => {
+      if (req.method === 'GET') {
+        try {
+          const typeFilter = url.searchParams.get('type'); // issue | proposal | summary | drift_alert
+          const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 1), 500);
+          let results = _improvementProposals.slice();
+          if (typeFilter) results = results.filter(p => p.type === typeFilter);
+          results = results.slice(-limit).reverse();
+          jsonRes(res, { proposals: results, count: results.length });
+        } catch (e: any) {
+          jsonRes(res, { error: e.message }, 500);
+        }
+      } else {
+        // POST — read body
+        readBody(req, res, (body) => {
+          try {
+            const data = JSON.parse(body);
+            const proposal = {
+              id: 'proposal-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8),
+              timestamp: Date.now(),
+              type: data.type || 'proposal', // issue | proposal | summary | drift_alert
+              agent_role: data.agent_role || 'unknown',
+              file: data.file || null,
+              title: data.title || data.issue_description || '(untitled)',
+              severity: data.severity || 'unknown',
+              ...data,
+            };
+            _improvementProposals.push(proposal);
+            // Keep memory bounded
+            if (_improvementProposals.length > 500) _improvementProposals.shift();
+            log('Improvement proposal logged: ' + proposal.id + ' (' + proposal.type + ')', 'INFO', 'dashboard');
+            jsonRes(res, { ok: true, proposal });
+          } catch (e: any) {
+            jsonRes(res, { error: e.message }, 400);
+          }
+        });
+      }
+    });
+    return true;
+  }
+
   // ── TASK 143: List patchable files ──
   if (pathname === '/api/patch/files' && req.method === 'GET') {
     authWrap(() => {
@@ -2663,6 +2778,34 @@ function getDashboardHTML(): string {
       <div id="patchHistoryTable" style="font-size:12px; max-height:500px; overflow:auto;">
         <div style="padding:20px; text-align:center; color:#888;">Click "Refresh" to load patch history from the database.</div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Multi-Agent Improvement Framework -->
+<div class="card full-width">
+  <div class="card-header">
+    <span>Multi-Agent Improvement Framework</span>
+    <div style="display:flex; gap:6px;">
+      <button class="btn sm" onclick="loadImprovementFramework()">Load Framework</button>
+      <button class="btn sm" onclick="loadImprovementProposals()">Recent Proposals</button>
+      <button class="btn sm" onclick="loadDeployBudget()">Budget Status</button>
+    </div>
+  </div>
+  <div class="card-body" style="padding:12px;">
+    <div style="margin-bottom:12px; padding:10px; background:rgba(99,102,241,0.1); border:1px solid #6366f1; border-radius:6px; font-size:12px; color:#a5b4fc;">
+      <strong>For AI Agents:</strong> Fetch <code style="color:#4fc3f7;">GET /api/improvement/framework</code> to get the full framework as JSON.
+      Read <code style="color:#4fc3f7;">CORE_IDENTITY.md</code> before submitting any patch.
+      Submit proposals via <code style="color:#4fc3f7;">POST /api/improvement/proposals</code>.
+    </div>
+    <div id="improvementFrameworkContent" style="font-size:12px; max-height:600px; overflow:auto; display:none;">
+      <div style="padding:20px; text-align:center; color:#888;">Click "Load Framework" to fetch the full multi-agent improvement framework.</div>
+    </div>
+    <div id="improvementProposalsContent" style="font-size:12px; max-height:600px; overflow:auto; display:none;">
+      <div style="padding:20px; text-align:center; color:#888;">Click "Recent Proposals" to see the latest issues, proposals, and summaries from AI agents.</div>
+    </div>
+    <div id="deployBudgetContent" style="font-size:12px; max-height:600px; overflow:auto; display:none;">
+      <div style="padding:20px; text-align:center; color:#888;">Click "Budget Status" to check the deploy budget and pipeline queue.</div>
     </div>
   </div>
 </div>
@@ -3968,6 +4111,115 @@ async function reloadPatchFromHistory(patchId) {
 document.addEventListener('DOMContentLoaded', () => {
   setTimeout(loadPatchHistory, 500);
 });
+
+// ── Multi-Agent Improvement Framework UI ──
+async function loadImprovementFramework() {
+  const contentEl = document.getElementById('improvementFrameworkContent');
+  if (!contentEl) return;
+  // Hide other panels
+  const p = document.getElementById('improvementProposalsContent'); if (p) p.style.display = 'none';
+  const b = document.getElementById('deployBudgetContent'); if (b) b.style.display = 'none';
+  contentEl.style.display = 'block';
+  contentEl.innerHTML = '<div style="padding:20px; text-align:center; color:#aaa;">Loading framework...</div>';
+  try {
+    const r = await api('/api/improvement/framework');
+    if (r.error) { contentEl.innerHTML = '<div style="padding:20px; color:#f44336;">Error: ' + r.error + '</div>'; return; }
+    // Render the framework markdown as preformatted text (no markdown parser — just show raw)
+    const framework = r.framework || '(framework not found)';
+    const identity = r.core_identity || '(core identity not found)';
+    let html = '<div style="margin-bottom:12px; padding:8px; background:#1a1a2e; border-radius:4px;">';
+    html += '<strong style="color:#4fc3f7;">API Endpoints for Agents:</strong><br>';
+    html += '<code style="font-size:11px; color:#81c784;">' + (r.summary.api_endpoints || []).join('<br>') + '</code>';
+    html += '</div>';
+    html += '<div style="margin-bottom:12px;"><strong style="color:#4fc3f7;">MULTI_AGENT_FRAMEWORK.md</strong></div>';
+    html += '<pre style="white-space:pre-wrap; word-break:break-word; color:#e0e0e0; font-size:11px; line-height:1.5;">' + escapeHtml(framework) + '</pre>';
+    html += '<div style="margin:16px 0 12px; border-top:1px solid #333;"></div>';
+    html += '<div style="margin-bottom:12px;"><strong style="color:#f44336;">CORE_IDENTITY.md (IMMUTABLE — read before patching)</strong></div>';
+    html += '<pre style="white-space:pre-wrap; word-break:break-word; color:#e0e0e0; font-size:11px; line-height:1.5;">' + escapeHtml(identity) + '</pre>';
+    contentEl.innerHTML = html;
+    toast('Framework loaded', 'info');
+  } catch (e) {
+    contentEl.innerHTML = '<div style="padding:20px; color:#f44336;">Failed: ' + e.message + '</div>';
+  }
+}
+
+async function loadImprovementProposals() {
+  const contentEl = document.getElementById('improvementProposalsContent');
+  if (!contentEl) return;
+  const f = document.getElementById('improvementFrameworkContent'); if (f) f.style.display = 'none';
+  const b = document.getElementById('deployBudgetContent'); if (b) b.style.display = 'none';
+  contentEl.style.display = 'block';
+  contentEl.innerHTML = '<div style="padding:20px; text-align:center; color:#aaa;">Loading proposals...</div>';
+  try {
+    const r = await api('/api/improvement/proposals?limit=50');
+    if (r.error) { contentEl.innerHTML = '<div style="padding:20px; color:#f44336;">Error: ' + r.error + '</div>'; return; }
+    if (!r.proposals || r.proposals.length === 0) {
+      contentEl.innerHTML = '<div style="padding:20px; text-align:center; color:#888;">No proposals submitted yet. AI agents can submit via POST /api/improvement/proposals.</div>';
+      return;
+    }
+    let html = '<table style="width:100%; border-collapse:collapse; font-size:11px;">';
+    html += '<thead><tr style="background:#22223a; color:#4fc3f7; position:sticky; top:0;">';
+    html += '<th style="padding:6px; text-align:left;">Time</th>';
+    html += '<th style="padding:6px; text-align:left;">Type</th>';
+    html += '<th style="padding:6px; text-align:left;">Role</th>';
+    html += '<th style="padding:6px; text-align:left;">File</th>';
+    html += '<th style="padding:6px; text-align:left;">Title / Description</th>';
+    html += '<th style="padding:6px; text-align:left;">Severity</th>';
+    html += '</tr></thead><tbody>';
+    r.proposals.forEach(p => {
+      const ts = _fmtTimestamp(p.timestamp);
+      const sevColor = p.severity === 'critical' ? '#f44336' : (p.severity === 'high' ? '#ff9800' : (p.severity === 'moderate' ? '#ffeb3b' : '#888'));
+      html += '<tr style="border-bottom:1px solid #2a2a3e;">';
+      html += '<td style="padding:4px 6px; color:#aaa; font-family:monospace;">' + ts + '</td>';
+      html += '<td style="padding:4px 6px;"><span style="background:#3a3a5c; padding:2px 6px; border-radius:3px; font-size:10px;">' + (p.type || '?') + '</span></td>';
+      html += '<td style="padding:4px 6px; color:#81c784;">' + (p.agent_role || '?') + '</td>';
+      html += '<td style="padding:4px 6px; color:#aaa; font-family:monospace; font-size:10px;">' + (p.file || '-') + '</td>';
+      html += '<td style="padding:4px 6px; color:#e0e0e0;">' + escapeHtml((p.title || '').slice(0, 100)) + '</td>';
+      html += '<td style="padding:4px 6px; color:' + sevColor + ';">' + (p.severity || '?') + '</td>';
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    contentEl.innerHTML = html;
+    toast('Loaded ' + r.count + ' proposals', 'info');
+  } catch (e) {
+    contentEl.innerHTML = '<div style="padding:20px; color:#f44336;">Failed: ' + e.message + '</div>';
+  }
+}
+
+async function loadDeployBudget() {
+  const contentEl = document.getElementById('deployBudgetContent');
+  if (!contentEl) return;
+  const f = document.getElementById('improvementFrameworkContent'); if (f) f.style.display = 'none';
+  const p = document.getElementById('improvementProposalsContent'); if (p) p.style.display = 'none';
+  contentEl.style.display = 'block';
+  contentEl.innerHTML = '<div style="padding:20px; text-align:center; color:#aaa;">Loading budget...</div>';
+  try {
+    const r = await api('/api/patch/budget');
+    if (r.error) { contentEl.innerHTML = '<div style="padding:20px; color:#f44336;">Error: ' + r.error + '</div>'; return; }
+    const pct = r.maxDeploys > 0 ? Math.round((r.deploys / r.maxDeploys) * 100) : 0;
+    const barColor = r.paused ? '#f44336' : (r.warn ? '#ff9800' : '#4caf50');
+    let html = '<div style="padding:12px;">';
+    html += '<div style="font-size:14px; font-weight:bold; margin-bottom:8px;">Deploy Budget (rolling 30-day window)</div>';
+    html += '<div style="margin-bottom:4px; font-size:12px; color:#aaa;">' + r.deploys + ' / ' + r.maxDeploys + ' deploys used (' + pct + '%)</div>';
+    html += '<div style="background:#1a1a2e; border-radius:4px; height:20px; overflow:hidden; margin-bottom:8px;">';
+    html += '<div style="background:' + barColor + '; height:100%; width:' + pct + '%; transition:width 0.3s;"></div></div>';
+    if (r.paused) {
+      html += '<div style="padding:8px; background:rgba(244,67,54,0.1); border:1px solid #f44336; border-radius:4px; color:#f44336; font-size:12px; margin-bottom:8px;"><strong>PAUSED:</strong> Deploy budget at ' + pct + '% (≥' + r.pauseThreshold + ' threshold). Patches are saved but not deployed until budget recovers.</div>';
+    } else if (r.warn) {
+      html += '<div style="padding:8px; background:rgba(255,152,0,0.1); border:1px solid #ff9800; border-radius:4px; color:#ff9800; font-size:12px; margin-bottom:8px;"><strong>WARNING:</strong> Deploy budget at ' + pct + '% (≥' + r.warnThreshold + ' threshold). Approaching pause limit.</div>';
+    }
+    html += '<div style="font-size:12px; color:#aaa; margin-top:12px;">Build minutes: ' + (r.deploys * r.buildMinutesPerDeploy) + ' / ' + r.buildMinutesPerMonth + ' min/month (' + r.buildMinutesPerDeploy + ' min/deploy)</div>';
+    html += '<div style="font-size:12px; color:#aaa; margin-top:8px;">Pipeline: ' + (r.pipelineBusy ? '<span style="color:#ff9800;">BUSY</span>' : '<span style="color:#4caf50;">IDLE</span>') + ' | Queue depth: ' + r.queueDepth + '</div>';
+    if (r.filesInFlight && r.filesInFlight.length > 0) {
+      html += '<div style="font-size:12px; color:#aaa; margin-top:4px;">Files in flight: ' + r.filesInFlight.join(', ') + '</div>';
+    }
+    html += '</div>';
+    contentEl.innerHTML = html;
+    toast('Budget: ' + r.deploys + '/' + r.maxDeploys + ' deploys (' + pct + '%)', r.paused ? 'error' : (r.warn ? 'warning' : 'info'));
+  } catch (e) {
+    contentEl.innerHTML = '<div style="padding:20px; color:#f44336;">Failed: ' + e.message + '</div>';
+  }
+}
 
 async function submitPatch() {
   var select = document.getElementById('patchFileSelect');
