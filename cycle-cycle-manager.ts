@@ -1431,12 +1431,16 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
               }
             } catch { /* ip-rotator not loaded */ }
 
-            // Relaunch browser with fresh context (picks up the new proxy mode)
-            _networkSetup = false;
-            const bm = _browserDep?.getBrowserManager?.();
-            if (bm) bm._intentionalClose = true;
-            await closeBrowser?.();
-            await new Promise(r => setTimeout(r, 2000));
+            // TASK 146: Skip browser close/relaunch if proxy is already disabled.
+            // The proxy is disabled on startup (Task 135), so this retry logic
+            // should never execute. If it does (stale code), don't close the browser.
+            if (!_proxyAlreadyDisabled) {
+              _networkSetup = false;
+              const bm = _browserDep?.getBrowserManager?.();
+              if (bm) bm._intentionalClose = true;
+              await closeBrowser?.();
+              await new Promise(r => setTimeout(r, 2000));
+            }
             page = await safeBrowserRetry(async (p: any) => {
               if (authenticate) await authenticate(p);
               return p;
@@ -1954,17 +1958,25 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           _trackBrowserRestart();
         }
       }
-      if (typeof getBrowserDisconnected === 'function' && getBrowserDisconnected()) throw new Error('Browser disconnected');
-      if ((typeof getBrowserLaunchCount === 'function' && getBrowserLaunchCount() > 10) || (Date.now() - browserLastRestart) > browserRestartInterval) {
-        log('Restarting browser for stability', 'INFO', 'cycle');
-        if (typeof closeBrowser === 'function') await closeBrowser();
-        _networkSetup = false;
-        page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
-        browserLastRestart = Date.now();
-        _trackBrowserRestart();
-        if (typeof resetBrowserLaunchCount === 'function') resetBrowserLaunchCount();
-        else log('resetBrowserLaunchCount not available from browser module', 'WARN', 'cycle');
+      if (typeof getBrowserDisconnected === 'function' && getBrowserDisconnected()) {
+        // TASK 146: Don't throw — just relaunch. Throwing causes "Browser disconnected"
+        // error which triggers cascade-breaker + alert + 25min sleep.
+        // Instead, quietly relaunch the browser and continue.
+        log('Browser disconnected — relaunching (NOT throwing)...', 'WARN', 'cycle');
+        try {
+          _networkSetup = false;
+          page = await safeBrowserRetry(async (p: any) => { if (authenticate) await authenticate(p); return p; });
+          browserLastRestart = Date.now();
+          _trackBrowserRestart();
+        } catch (relaunchErr: any) {
+          log('Browser relaunch failed: ' + relaunchErr.message, 'ERROR', 'cycle');
+          throw new Error('Browser disconnected and relaunch failed');
+        }
       }
+      // TASK 146: Don't restart browser for "stability" — Task 87 says protect
+      // browser at all costs. Only restart if the browser is actually dead,
+      // not just because launchCount > 10 or time interval passed.
+      // (The browser reuse check in browser.ts launch() already handles this.)
       if (Date.now() - cycleStart > CONFIG.MAX_RUNTIME_PER_CYCLE_MS) {
         log('Cycle timeout', 'INFO', 'cycle');
         break;
