@@ -152,10 +152,12 @@ async function _getFallbackActionInner(page: any, log: any, currentState?: strin
   // this systematically probes the viewport grid and learns from outcomes.
   try {
     const pixelExplorer = require('./pixel-explorer');
-    const explorerAction = await pixelExplorer.explore(page);
-    if (explorerAction) {
-      log(`Pixel explorer provided action: ${explorerAction.actionType} at (${explorerAction.targetX}, ${explorerAction.targetY})`, 'INFO', 'fallback');
-      return explorerAction;
+    if (typeof pixelExplorer.explore === 'function') {
+      const explorerAction = await pixelExplorer.explore(page);
+      if (explorerAction) {
+        log(`Pixel explorer provided action: ${explorerAction.actionType} at (${explorerAction.targetX}, ${explorerAction.targetY})`, 'INFO', 'fallback');
+        return explorerAction;
+      }
     }
   } catch (e: any) {
     log(`Pixel explorer failed: ${e.message || e}`, 'DEBUG', 'fallback');
