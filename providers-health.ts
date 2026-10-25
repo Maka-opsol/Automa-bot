@@ -101,23 +101,32 @@ function classifyError(err: unknown): ClassifiedError {
 }
 
 function extractStatus(err: unknown): number {
-  if (!err || typeof err !== 'object') return 0;
-  const e = err as any;
-  // Check for status property directly
-  if (typeof e.status === 'number') return e.status;
-  // Check for statusCode property
-  if (typeof e.statusCode === 'number') return e.statusCode;
-  // Extract from message like "HTTP_ERROR_404: ..."
-  const msg = e.message || '';
-  const match = msg.match(/HTTP_ERROR_(\d{3})/);
+  const message = (err && typeof err === 'object' && (err as any).message)
+    || (typeof err === 'string' ? err : '');
+  if (err && typeof err === 'object') {
+    const e = err as any;
+    if (typeof e.status === 'number') return e.status;
+    if (typeof e.statusCode === 'number') return e.statusCode;
+  }
+  const match = String(message).match(/(?:HTTP_ERROR_|HTTPs+|^)([45]d{2})/i);
   if (match) return parseInt(match[1], 10);
   return 0;
 }
 
 function extractRetryAfter(err: unknown): number {
-  if (!err || typeof err !== 'object') return 0;
-  const e = err as any;
-  if (typeof e.retryAfterMs === 'number' && e.retryAfterMs > 0) return e.retryAfterMs;
+  const message = (err && typeof err === 'object' && (err as any).message)
+    || (typeof err === 'string' ? err : '');
+  if (err && typeof err === 'object') {
+    const retryAfterMs = (err as any).retryAfterMs;
+    if (typeof retryAfterMs === 'number' && retryAfterMs > 0) return retryAfterMs;
+  }
+  const delay = String(message).match(/try again ins+(?:(d+)m)?([d.]+)s/i);
+  if (delay) {
+    const minutes = parseInt(delay[1] || '0', 10);
+    const seconds = parseFloat(delay[2]);
+    const retryAfterMs = Math.round((minutes * 60 + seconds) * 1000);
+    if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) return retryAfterMs;
+  }
   return 0;
 }
 
@@ -742,7 +751,10 @@ export function pruneHealthData(): void {
 }
 
 // Periodic prune every 10 minutes
-setInterval(pruneHealthData, 10 * 60 * 1000).unref();
+const _pruneHealthInterval = setInterval(pruneHealthData, 10 * 60 * 1000);
+if (typeof (_pruneHealthInterval as any).unref === 'function') {
+  _pruneHealthInterval.unref();
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // STRUCTURED LOGGING HELPERS (P20)
