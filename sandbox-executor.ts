@@ -483,8 +483,9 @@ process.on('message', (msg) => {
       clearInterval: () => {},
       // Buffer stub (used by some patches for size checks)
       Buffer: Buffer,
-      // Global aliases (so `globalThis.X` and bare `global` work)
-      globalThis: undefined, // vm sets this automatically
+      // vm.createContext sets up the global this of the new context
+      // automatically; do not try to stub the reserved global identifier
+      // here as a property key; esbuild rejects it.
     });
 
     const script = new vm.Script(patchCode, {
