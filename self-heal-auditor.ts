@@ -226,15 +226,28 @@ function _hasBalancedBraces(str: string): boolean {
 
 const AUDITOR_PROMPT = `
 You are a strict cybersecurity auditor for an autonomous bot.
-Another AI has generated a JavaScript code patch to fix a broken web scraper.
+Another AI has generated a JavaScript/TypeScript code patch as a FULL FILE REPLACEMENT
+(i.e., the patch IS the new version of the file — not a diff).
+
 YOUR ONLY JOB is to determine if this code is MALICIOUS or DANGEROUS.
-You must REJECT the patch if it contains ANY of the following:
-1. Network requests to domains OTHER THAN the target website (mathu.co.za, microsoftonline.com) or known API providers.
-2. Attempts to read, write, or delete files outside of the bot's own directory.
-3. Usage of 'child_process', 'exec', 'spawn', or 'eval()'.
-4. Attempts to steal environment variables and send them externally.
-5. Infinite loops or intentional memory bombs.
-6. Obfuscated code (base64 decoding, weird hex sequences).
+
+CRITICAL — CONTEXT-AWARE EVALUATION:
+If the "CURRENTLY APPROVED VERSION" section is provided below, you MUST compare the
+patch against it. Patterns that ALREADY EXIST in the approved version are pre-approved
+and MUST NOT be flagged. Only flag NEW dangerous patterns that the patch INTRODUCES.
+For example, if the approved version already fetches from api.proxyscrape.com and the
+patch keeps that same fetch, that is NOT a violation — the integration was already
+approved. Only flag a NEW fetch to a domain that wasn't already in the approved version.
+
+You must REJECT the patch if it INTRODUCES any of the following:
+1. NEW network requests to domains OTHER THAN the target website (mathu.co.za,
+   microsoftonline.com) or already-approved integrations present in the current version.
+2. NEW attempts to read, write, or delete files outside of the bot's own directory.
+3. NEW usage of 'child_process', 'exec', 'spawn', or 'eval()'.
+4. NEW attempts to steal environment variables and send them externally.
+5. NEW infinite loops or intentional memory bombs.
+6. NEW obfuscated code (base64 decoding, weird hex sequences).
+
 Respond ONLY in this exact JSON format:
 { "is_safe": true/false, "reason": "One sentence explaining why." }
 `;
@@ -242,23 +255,30 @@ Respond ONLY in this exact JSON format:
 /**
  * v2: Stricter auditor prompt for non-codegen patches.
  * Adds more specific checks for common non-codegen failure modes.
+ * Also context-aware: skips patterns already present in the approved version.
  */
 const NON_CODEGEN_AUDITOR_PROMPT = `
 You are an EXTREMELY strict cybersecurity auditor for an autonomous bot.
 A NON-CODE-GENERATION AI model (like Gemini, Groq, or Cloudflare) has generated
-a JavaScript code patch. These models are NOT designed for code generation and
-frequently produce dangerous, malformed, or subtly broken code.
+a JavaScript/TypeScript code patch as a FULL FILE REPLACEMENT. These models are
+NOT designed for code generation and frequently produce dangerous, malformed, or
+subtly broken code.
 
-You must REJECT the patch if it contains ANY of the following:
-1. Network requests to ANY domain (the bot should never make outbound HTTP requests from patched code).
-2. ANY file system operations (fs.read, fs.write, etc.).
-3. ANY usage of 'child_process', 'exec', 'spawn', 'eval()', 'Function('.
-4. ANY access to environment variables.
-5. Infinite loops, unbounded recursion, or memory bombs.
-6. Obfuscated code (base64, hex sequences, encoded strings).
-7. Code that modifies process-level state (process.env, process.exit, etc.).
+CRITICAL — CONTEXT-AWARE EVALUATION:
+If the "CURRENTLY APPROVED VERSION" section is provided below, you MUST compare the
+patch against it. Patterns that ALREADY EXIST in the approved version are pre-approved
+and MUST NOT be flagged. Only flag NEW dangerous patterns the patch INTRODUCES.
+
+You must REJECT the patch if it INTRODUCES any of the following:
+1. NEW network requests to ANY domain not already present in the approved version.
+2. NEW file system operations (fs.read, fs.write, etc.) not already in the approved version.
+3. NEW usage of 'child_process', 'exec', 'spawn', 'eval()', 'Function('.
+4. NEW access to environment variables not already in the approved version.
+5. NEW infinite loops, unbounded recursion, or memory bombs.
+6. NEW obfuscated code (base64, hex sequences, encoded strings).
+7. NEW code that modifies process-level state (process.env.X = ..., process.exit()).
 8. Code that seems like placeholder/dummy content (e.g., just 'use strict' with nothing else, or a file that just exports an empty object).
-9. Code that imports or requires modules not related to the fix.
+9. NEW imports or requires of modules not already used in the approved version.
 10. The patch looks like a DESCRIPTION of a fix rather than actual code.
 11. The patch contains markdown, HTML, or non-JavaScript content.
 12. The patch is a unified diff (lines starting with + or -) rather than a complete file.
@@ -343,7 +363,7 @@ function getNonCodegenAuditorConfigs(): Array<{ provider: string; model: string;
 
 // ─── Single AI Auditor Call ───
 
-async function auditPatchWithAI(patchText: any, signal: any, configOverride = null, isNonCodegen = false) {
+async function auditPatchWithAI(patchText: any, signal: any, configOverride = null, isNonCodegen = false, originalContent?: string) {
   let config = configOverride || getAuditorConfig();
   if (!config.apiKey) {
     log('Auditor API key missing. Blocking patch by default.', 'WARN', 'auditor');
@@ -358,6 +378,22 @@ async function auditPatchWithAI(patchText: any, signal: any, configOverride = nu
     : undefined;
   try {
     const prompt = isNonCodegen ? NON_CODEGEN_AUDITOR_PROMPT : AUDITOR_PROMPT;
+    // Build the user message: include the currently-approved version (if
+    // available) so the LLM can compare the patch against it. Without this
+    // context, the LLM sees the patch in isolation and flags pre-existing
+    // patterns (e.g. ProxyScrape fetch, process.env access) as violations,
+    // even though those patterns were already approved in the original file.
+    let userMessage = '';
+    if (originalContent && typeof originalContent === 'string' && originalContent.trim().length > 0) {
+      // Cap the original content at 16KB to avoid blowing past the model's
+      // context window. If the original is larger, send the first 16KB which
+      // is enough to see the imports, top-level constants, and main exports.
+      const truncated = originalContent.length > 16384
+        ? originalContent.slice(0, 16384) + '\n\n// ... [TRUNCATED for context length] ...\n'
+        : originalContent;
+      userMessage += 'CURRENTLY APPROVED VERSION (evaluate the patch AGAINST this — patterns already present here are pre-approved and MUST NOT be flagged):\n```\n' + truncated + '\n```\n\n';
+    }
+    userMessage += 'PATCH TO AUDIT:\n```\n' + patchText + '\n```';
     // callChatCompletionWithRollback returns the assistant's message content
     // as a STRING (not the raw OpenAI-style response object). Previous code
     // was treating the return value as the full response and reading
@@ -365,7 +401,7 @@ async function auditPatchWithAI(patchText: any, signal: any, configOverride = nu
     // string — causing every audit to crash with "Empty auditor response".
     const content = await getCallChatCompletion()(
       config.endpoint, config.apiKey, config.model, null,
-      prompt + '\n\nPATCH TO AUDIT:\n' + patchText,
+      prompt + '\n\n' + userMessage,
       config.provider || 'auditor',
       { responseFormat: { type: 'json_object' }, signal: safeSignal }
     );
@@ -386,8 +422,9 @@ async function auditPatchWithAI(patchText: any, signal: any, configOverride = nu
 
 // ─── Tribunal Audit (multiple independent models) ───
 
-async function auditPatchWithTribunal(patchText: any, signal: any, options?: { isNonCodegen?: boolean }) {
+async function auditPatchWithTribunal(patchText: any, signal: any, options?: { isNonCodegen?: boolean; originalContent?: string }) {
   const isNonCodegen = options?.isNonCodegen || false;
+  const originalContent = options?.originalContent;
 
   // v2: Use more auditors and stricter thresholds for non-codegen patches
   let auditorConfigs: Array<{ provider: string; model: string }>;
@@ -415,7 +452,7 @@ async function auditPatchWithTribunal(patchText: any, signal: any, options?: { i
       config = { provider, model, endpoint: 'https://api.groq.com/openai/v1/chat/completions', apiKey: getCONFIG().GROQ_API_KEY };
     }
     if (!config) return null;
-    return auditPatchWithAI(patchText as any, signal as any, config as any, isNonCodegen);
+    return auditPatchWithAI(patchText as any, signal as any, config as any, isNonCodegen, originalContent);
   }));
 
   const votes = results
@@ -427,7 +464,7 @@ async function auditPatchWithTribunal(patchText: any, signal: any, options?: { i
   const total = votes.length;
 
   if (total === 0) {
-    return auditPatchWithAI(patchText, signal, null, isNonCodegen);
+    return auditPatchWithAI(patchText, signal, null, isNonCodegen, originalContent);
   }
 
   // v2: Stricter threshold for non-codegen patches
@@ -535,8 +572,9 @@ async function auditPatch(patchText: any, signal: any, options?: { isNonCodegen?
     return { safe: false, reason: `Sandbox content audit: ${sandboxAudit.violations.join('; ')}` };
   }
 
-  // AI tribunal
-  const aiResult = await auditPatchWithTribunal(patchText, signal, { isNonCodegen });
+  // AI tribunal (pass originalContent so context-aware evaluation works —
+  // LLM can compare patch against approved version and skip pre-existing patterns)
+  const aiResult = await auditPatchWithTribunal(patchText, signal, { isNonCodegen, originalContent });
   if (!aiResult.safe && !aiResult.is_safe) {
     log(`Patch blocked by AI auditor: ${aiResult.reason}`, 'WARN', 'auditor');
     return { safe: false, reason: aiResult.reason };
@@ -606,8 +644,8 @@ async function auditPatchWithVotes(patchText: any, signal: any, options?: { isNo
     };
   }
 
-  // AI tribunal with vote collection
-  const result = await auditPatchWithTribunal(patchText, signal, { isNonCodegen });
+  // AI tribunal with vote collection (context-aware: passes originalContent)
+  const result = await auditPatchWithTribunal(patchText, signal, { isNonCodegen, originalContent });
   return {
     safe: result.safe,
     is_safe: result.is_safe,
