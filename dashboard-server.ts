@@ -1699,6 +1699,63 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
+  // ── View current source of a file (read-only, sandboxed) ──
+  // GET /api/patch/file?path=adaptive-performance-engine.ts
+  // Returns: { path, content, size, mtime, exists }
+  // Safety:
+  //   1. Path is resolved against process.cwd() and must stay inside it.
+  //   2. Must have a code-file extension (.ts/.tsx/.js/.jsx/.json/.md).
+  //   3. Hard size cap (200KB) — files larger than this return an error
+  //      instead of attempting to load them into the browser.
+  //   4. Read-only — no write/execute side effects.
+  if (pathname === '/api/patch/file' && req.method === 'GET') {
+    authWrap(() => {
+      try {
+        const fs = require('fs');
+        const path = require('path');
+        const requestedFile = (url.searchParams.get('path') || '').trim();
+        if (!requestedFile) {
+          jsonRes(res, { error: 'Missing "path" query parameter' }, 400);
+          return;
+        }
+        // Resolve and confine to process.cwd()
+        const root = path.resolve('.');
+        const resolved = path.resolve(root, requestedFile);
+        const normalizedRoot = path.normalize(root) + path.sep;
+        if (!resolved.startsWith(normalizedRoot) && resolved !== path.normalize(root)) {
+          jsonRes(res, { error: 'File must be within the project directory' }, 400);
+          return;
+        }
+        // Extension allowlist
+        const allowedExts = new Set(['.ts', '.tsx', '.js', '.jsx', '.json', '.md']);
+        if (!allowedExts.has(path.extname(resolved).toLowerCase())) {
+          jsonRes(res, { error: 'File type not allowed (must be .ts/.tsx/.js/.jsx/.json/.md)' }, 400);
+          return;
+        }
+        if (!fs.existsSync(resolved)) {
+          jsonRes(res, { exists: false, path: requestedFile, content: '', size: 0 }, 404);
+          return;
+        }
+        const stat = fs.statSync(resolved);
+        if (stat.size > 200 * 1024) {
+          jsonRes(res, { error: `File too large to display (${Math.round(stat.size / 1024)}KB > 200KB limit)` }, 413);
+          return;
+        }
+        const content = fs.readFileSync(resolved, 'utf8');
+        jsonRes(res, {
+          exists: true,
+          path: requestedFile,
+          content,
+          size: stat.size,
+          mtime: stat.mtimeMs,
+        });
+      } catch (e: any) {
+        jsonRes(res, { error: e.message }, 500);
+      }
+    });
+    return true;
+  }
+
   // ── Generic command endpoint (legacy compat) ──
   if (pathname === '/api/command' && req.method === 'POST') {
     authWrap(() => {
@@ -2147,6 +2204,7 @@ function getDashboardHTML(): string {
         <select id="patchFileSelect" style="flex:1; background:#1a1a2e; color:#e0e0e0; border:1px solid #333; padding:6px; border-radius:4px;">
           <option value="">-- Select a file (or type manually below) --</option>
         </select>
+        <button class="btn sm" onclick="viewCurrentFile()" title="View the current source of the selected file" style="background:#3a3a5c;">View Current</button>
       </div>
       <div style="display:flex; gap:8px; margin-bottom:8px; align-items:center;">
         <label style="min-width:80px; font-size:13px;">Or type:</label>
@@ -2175,6 +2233,21 @@ function getDashboardHTML(): string {
         </div>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- File Viewer Modal (for "View Current" button in patch card) -->
+<div id="fileViewerModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:9999; padding:20px; box-sizing:border-box;">
+  <div style="background:#1a1a2e; border:1px solid #444; border-radius:6px; max-width:95%; max-height:90vh; margin:auto; display:flex; flex-direction:column; overflow:hidden;">
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:12px 16px; border-bottom:1px solid #333; background:#22223a;">
+      <span id="fileViewerTitle" style="color:#4fc3f7; font-weight:bold; font-size:14px;">--</span>
+      <div style="display:flex; gap:6px;">
+        <button class="btn sm" onclick="loadCurrentIntoPatch()" title="Load this file's content into the patch textarea so you can edit and resubmit">Load into Patch</button>
+        <button class="btn sm" onclick="copyFileToClipboard()" title="Copy file content to clipboard">Copy</button>
+        <button class="btn sm" onclick="closeFileViewer()" style="background:#f44336;">Close</button>
+      </div>
+    </div>
+    <pre id="fileViewerContent" style="margin:0; padding:12px 16px; overflow:auto; background:#0d1117; color:#e0e0e0; font-family:'Courier New',monospace; font-size:12px; line-height:1.5; flex:1; white-space:pre-wrap; word-break:break-word;"></pre>
   </div>
 </div>
 
@@ -2719,6 +2792,81 @@ async function loadPatchableFiles() {
     toast('Failed to load files: ' + e.message, 'error');
   }
 }
+
+// ── File viewer (read-only) ──
+let _viewerCurrentFile = '';
+let _viewerCurrentContent = '';
+
+function _getSelectedFilePath() {
+  const select = document.getElementById('patchFileSelect');
+  const input = document.getElementById('patchFileInput');
+  return ((select && select.value) || (input && input.value) || '').trim();
+}
+
+async function viewCurrentFile() {
+  const file = _getSelectedFilePath();
+  if (!file) { toast('Please select or type a file name first', 'error'); return; }
+  try {
+    const r = await api('/api/patch/file?path=' + encodeURIComponent(file));
+    if (r.error) { toast(r.error, 'error'); return; }
+    if (!r.exists) { toast('File does not exist: ' + file, 'error'); return; }
+    _viewerCurrentFile = file;
+    _viewerCurrentContent = r.content || '';
+    const titleEl = document.getElementById('fileViewerTitle');
+    const contentEl = document.getElementById('fileViewerContent');
+    if (titleEl) titleEl.textContent = file + '  (' + (r.size || 0) + ' bytes, mtime ' + new Date(r.mtime || 0).toLocaleString() + ')';
+    if (contentEl) contentEl.textContent = _viewerCurrentContent;
+    const modal = document.getElementById('fileViewerModal');
+    if (modal) modal.style.display = 'flex';
+  } catch (e) {
+    toast('Failed to load file: ' + e.message, 'error');
+  }
+}
+
+function closeFileViewer() {
+  const modal = document.getElementById('fileViewerModal');
+  if (modal) modal.style.display = 'none';
+}
+
+function loadCurrentIntoPatch() {
+  if (!_viewerCurrentContent) { toast('No file loaded', 'error'); return; }
+  const ta = document.getElementById('patchContent');
+  if (ta) ta.value = _viewerCurrentContent;
+  // Also populate the file input so submitPatch targets the right file
+  const input = document.getElementById('patchFileInput');
+  if (input && _viewerCurrentFile) input.value = _viewerCurrentFile;
+  closeFileViewer();
+  toast('Loaded ' + _viewerCurrentFile + ' into patch textarea — edit and submit', 'info');
+}
+
+function copyFileToClipboard() {
+  if (!_viewerCurrentContent) { toast('No file loaded', 'error'); return; }
+  try {
+    navigator.clipboard.writeText(_viewerCurrentContent).then(() => {
+      toast('Copied ' + _viewerCurrentContent.length + ' chars to clipboard', 'info');
+    }).catch(() => {
+      // Fallback: legacy execCommand
+      const ta = document.createElement('textarea');
+      ta.value = _viewerCurrentContent;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      toast('Copied (legacy) ' + _viewerCurrentContent.length + ' chars', 'info');
+    });
+  } catch (e) {
+    toast('Copy failed: ' + e.message, 'error');
+  }
+}
+
+// Close modal when clicking outside the inner box
+document.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'fileViewerModal') closeFileViewer();
+});
+// Close on Escape
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeFileViewer();
+});
 
 async function submitPatch() {
   var select = document.getElementById('patchFileSelect');
