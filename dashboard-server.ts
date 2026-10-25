@@ -1518,9 +1518,14 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
                   // as `options.signal` and crashed with
                   // "options.signal.addEventListener is not a function".
                   // Pass null for signal (no abort) and route description
-                  // through options instead.
+                  // through options. Also pass filePath so the keyword scanner
+                  // can read the original file and skip patterns that already
+                  // exist there (e.g. process.env.NODE_ENV) — without this,
+                  // every patch to a file that already uses process.env gets
+                  // falsely rejected by the keyword scanner.
                   const auditResult = await auditor.auditPatch(patch, null, {
                     isNonCodegen: false,
+                    filePath: resolvedFile,
                     description: description || 'Dashboard patch',
                   });
                   if (auditResult && !auditResult.safe) {
