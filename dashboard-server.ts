@@ -3110,7 +3110,23 @@ function _transformCodeAndComments(text) {
   // Map: ASSIGNMENT(S) → TASK(S), Assignment(s) → Task(s), assignment(s) → task(s)
   // Word-boundary safe; doesn't touch inside identifiers (assignmentId → taskId),
   // which is the same intent as the earlier rewrite script.
-  out = out.replace(/\b(ASSIGNMENTS|ASSIGNMENT|Assignments|Assignment|assignments|assignment|ASSESSMENTS|ASSESSMENT|Assessments|Assessment|assessments|assessment)\b/g, (match) => {
+  //
+  // IMPORTANT: this code lives inside a TypeScript template literal (backticks)
+  // in getDashboardHTML(). Template literals process backslash escapes — so
+  // \b in source becomes a literal backspace char (0x08) in the rendered HTML,
+  // which corrupts the regex. We MUST use \\b (escaped backslash) in source
+  // so the rendered output contains \b (the regex word-boundary metacharacter).
+  // Same for \s and any other regex escape.
+  //
+  // To avoid backslash hell, we build the regex from a string source using
+  // RegExp constructor. CRITICAL: the template literal processes backslash
+  // escapes — so a literal backslash-b sequence in source becomes a literal
+  // backspace char (0x08) in the rendered HTML, which corrupts the regex.
+  // We use String.fromCharCode(92) to insert a literal backslash character
+  // that the template literal cannot process (it's already a runtime value).
+  const BS = String.fromCharCode(92); // single backslash character
+  const ASSIGNMENT_RE = new RegExp(BS + 'b(ASSIGNMENTS|ASSIGNMENT|Assignments|Assignment|assignments|assignment|ASSESSMENTS|ASSESSMENT|Assessments|Assessment|assessments|assessment)' + BS + 'b', 'g');
+  out = out.replace(ASSIGNMENT_RE, (match) => {
     const isUpper = match === match.toUpperCase();
     const isTitle = match[0] === match[0].toUpperCase() && !isUpper;
     const isPlural = match.endsWith('s') || match.endsWith('S');
@@ -3125,8 +3141,10 @@ function _transformCodeAndComments(text) {
   //          academic, pedagogical, pedagogy, learning, learned, learner
   // Strategy: match the word + any trailing whitespace, replace with a single
   // space (or empty if at end of line). This avoids double-space artifacts.
-  const removeWordsRe = /\s*\b(educational|education|educator|educate|educating|educated|academic|pedagogical|pedagogy|learning|learned|learner)\b\s*/gi;
-  out = out.replace(removeWordsRe, ' ');
+  // Remove educational-family words. Build regex from string source — same
+  // backslash-escape workaround as above (use String.fromCharCode(92) for \).
+  const REMOVE_WORDS_RE = new RegExp(BS + 's*' + BS + 'b(educational|education|educator|educate|educating|educated|academic|pedagogical|pedagogy|learning|learned|learner)' + BS + 'b' + BS + 's*', 'gi');
+  out = out.replace(REMOVE_WORDS_RE, ' ');
 
   // Cleanup: collapse multiple consecutive spaces that may have resulted from
   // word removal (e.g. "the educational system" → "the  system" → "the system")
