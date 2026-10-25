@@ -248,7 +248,10 @@ async function _callWithModel(
     // - Kimi: result.response (string)
     // - Llama models: result.response (string)
     // - Some models: result directly as string
-    const responseText = data.result.response || (typeof data.result === 'string' ? data.result : null);
+    const rawResponse = data.result.response || (typeof data.result === 'string' ? data.result : null);
+    // Workers AI may return a structured object for an incompatible model.
+    // Only strings are valid provider output; let the model cascade handle the rest.
+    const responseText = typeof rawResponse === 'string' ? rawResponse : null;
     if (!responseText) {
       throw new Error('CLOUDFLARE_EMPTY_RESPONSE');
     }
