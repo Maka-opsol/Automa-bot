@@ -15,11 +15,11 @@
 //
 // Tables managed in Turso (critical/persistent data):
 //   calibration, completed_modules, last_state, banned_actions,
-//   provider_registry, model_registry, action_cache
+//   provider_registry, model_registry, action_cache, patch_history
 //
 // Tables NOT synced (ephemeral/high-churn — local only):
 //   blackbox, progress_log, semantics_snapshots, template_cache,
-//   network_intercept_log, performance_profile, patch_history,
+//   network_intercept_log, performance_profile,
 //   gitops_rollback_chain, etc.
 //
 // Environment variables:
@@ -214,6 +214,10 @@ async function initTursoSchema(): Promise<void> {
     `CREATE TABLE IF NOT EXISTS model_registry (provider TEXT, model_id TEXT PRIMARY KEY, is_free INTEGER DEFAULT 0, is_working INTEGER DEFAULT 0, role TEXT DEFAULT 'candidate', last_tested_at INTEGER, last_success_at INTEGER, failure_count INTEGER DEFAULT 0)`,
     // R6: action_cache — critical for AI call avoidance, must survive restarts
     `CREATE TABLE IF NOT EXISTS action_cache (context_sig TEXT PRIMARY KEY, action_type TEXT NOT NULL, target_x REAL NOT NULL, target_y REAL NOT NULL, value TEXT DEFAULT '', keypad_sequence TEXT, current_state TEXT NOT NULL, reasoning TEXT DEFAULT '', success_count INTEGER DEFAULT 0, failure_count INTEGER DEFAULT 0, hit_count INTEGER DEFAULT 0, created_at INTEGER NOT NULL, last_used INTEGER NOT NULL, evicted INTEGER DEFAULT 0)`,
+    // NEW: patch_history — must persist across deploys so the dashboard can
+    // show past patches (submitted, approved, applied, pushed, deployed) even
+    // after the ephemeral Render disk is wiped on restart.
+    `CREATE TABLE IF NOT EXISTS patch_history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, description TEXT, file TEXT, patch TEXT, status TEXT, applied_at INTEGER, branch TEXT, stages_json TEXT)`,
   ];
 
   // Create indexes for common query patterns
@@ -222,6 +226,8 @@ async function initTursoSchema(): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_action_cache_last_used ON action_cache(last_used)`,
     `CREATE INDEX IF NOT EXISTS idx_calibration_updated ON calibration(updated_at)`,
     `CREATE INDEX IF NOT EXISTS idx_model_role ON model_registry(role)`,
+    // NEW: index for patch_history queries (history list orders by timestamp DESC)
+    `CREATE INDEX IF NOT EXISTS idx_patch_timestamp ON patch_history(timestamp)`,
   ];
 
   for (const sql of tables) {
@@ -615,6 +621,40 @@ async function pullFromTurso(): Promise<{ pulled: number; tables: Record<string,
       tables.provider_registry = result.rows.length;
     } catch {}
 
+    // NEW: Pull patch_history — restore past patches so the dashboard can show
+    // history across deploys. Uses INSERT OR IGNORE (not REPLACE) so local rows
+    // with the same id are preserved (in case the local DB has unsynced new rows).
+    // Cap at 500 most recent rows to avoid pulling megabytes of patch source.
+    try {
+      const result = await client.execute('SELECT * FROM patch_history ORDER BY timestamp DESC LIMIT 500');
+      const localDb = db.db;
+      if (localDb) {
+        // Make sure the local table exists (it should, but defensive)
+        try {
+          localDb.exec(`CREATE TABLE IF NOT EXISTS patch_history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, description TEXT, file TEXT, patch TEXT, status TEXT, applied_at INTEGER, branch TEXT, stages_json TEXT)`);
+          // Make sure stages_json column exists (added by dashboard-server migration)
+          const cols = localDb.prepare('PRAGMA table_info(patch_history)').all();
+          const hasStagesJson = cols.some((c: any) => c.name === 'stages_json');
+          if (!hasStagesJson) {
+            localDb.exec('ALTER TABLE patch_history ADD COLUMN stages_json TEXT');
+          }
+        } catch {}
+        for (const row of result.rows) {
+          try {
+            localDb.prepare(
+              `INSERT OR IGNORE INTO patch_history (id, timestamp, description, file, patch, status, applied_at, branch, stages_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            ).run(
+              row.id, row.timestamp, row.description, row.file, row.patch,
+              row.status, row.applied_at, row.branch, row.stages_json
+            );
+            pulled++;
+          } catch {}
+        }
+      }
+      tables.patch_history = result.rows.length;
+    } catch {}
+
     _lastPullTime = Date.now();
     _getLog()(`Pulled ${pulled} rows from Turso (AUTHORITATIVE). Tables: ${JSON.stringify(tables)}`);
   } catch (err: any) {
@@ -833,6 +873,32 @@ async function syncToTurso(): Promise<{ synced: number; errors: number }> {
               [row.context_sig, row.action_type, row.target_x, row.target_y, row.value,
                row.keypad_sequence, row.current_state, row.reasoning, row.success_count,
                row.failure_count, row.hit_count, row.created_at, row.last_used, row.evicted]
+            );
+            if (ok) synced++; else errors++;
+          }
+        }
+      }
+    } catch (e: any) { errors++; }
+
+    // NEW: Sync patch_history — push local rows to Turso so they survive
+    // Render's ephemeral disk wipe on next deploy/restart. Uses INSERT OR REPLACE
+    // keyed by id so rows are updated (not duplicated) on each sync.
+    // Cap at 500 most recent rows to avoid pushing megabytes of patch source
+    // every 120s — only the latest patches are relevant for cross-deploy history.
+    try {
+      const patches = db.db?.prepare('SELECT * FROM patch_history ORDER BY timestamp DESC LIMIT 500')?.all() || [];
+      if (patches.length > 0) {
+        if (useBatch) {
+          const stmts = patches.map((r: any) =>
+            `INSERT OR REPLACE INTO patch_history (id, timestamp, description, file, patch, status, applied_at, branch, stages_json) VALUES (${_esc(r.id)}, ${_esc(r.timestamp)}, ${_esc(r.description)}, ${_esc(r.file)}, ${_esc(r.patch)}, ${_esc(r.status)}, ${_esc(r.applied_at)}, ${_esc(r.branch)}, ${_esc(r.stages_json)})`
+          );
+          await client.executeMultiple(stmts.join('; '));
+          synced += patches.length;
+        } else {
+          for (const row of patches) {
+            const ok = await _exec(
+              'INSERT OR REPLACE INTO patch_history (id, timestamp, description, file, patch, status, applied_at, branch, stages_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+              [row.id, row.timestamp, row.description, row.file, row.patch, row.status, row.applied_at, row.branch, row.stages_json]
             );
             if (ok) synced++; else errors++;
           }
