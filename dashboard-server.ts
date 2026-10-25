@@ -1512,7 +1512,17 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
               try {
                 const auditor = (() => { try { return require('./self-heal-auditor'); } catch { return null; } })();
                 if (auditor && auditor.auditPatch) {
-                  const auditResult = await auditor.auditPatch(file, patch, description || 'Dashboard patch');
+                  // BUGFIX: auditPatch signature is (patchText, signal, options) —
+                  // previously we were passing `description` (a string) as the
+                  // `signal` arg, which then propagated into fetchWithTimeout
+                  // as `options.signal` and crashed with
+                  // "options.signal.addEventListener is not a function".
+                  // Pass null for signal (no abort) and route description
+                  // through options instead.
+                  const auditResult = await auditor.auditPatch(patch, null, {
+                    isNonCodegen: false,
+                    description: description || 'Dashboard patch',
+                  });
                   if (auditResult && !auditResult.safe) {
                     updatePatchStatus(patchId, 'ai_advisory', 'rejected', {
                       reason: auditResult.reason || 'AI advisor rejected the patch',
