@@ -423,7 +423,24 @@ process.on('message', (msg) => {
     }
 
     // Step 3: Runtime behavior check — execute in a strict vm context
-    // with NO access to require, process, fs, etc.
+    // with stub CJS globals so module-level code (require, module.exports,
+    // process.env, setTimeout) can evaluate without crashing. The stubs
+    // are inert: require() returns {} (no real module loading), module is
+    // a fresh {exports:{}} object, process is a minimal stub. This lets us
+    // catch top-level runtime errors (undefined variables, bad refs, etc.)
+    // without falsely rejecting every CommonJS module.
+    //
+    // Security: we still don't expose fs, child_process, network, or any
+    // real host module. require() returns a frozen empty object — patches
+    // cannot reach the host's actual require cache.
+    const _moduleStub = { exports: {} };
+    const _requireStub = (name) => {
+      // Return an empty object for any module name — destructuring on
+      // the result yields undefined values, which is fine for top-level
+      // const { x } = require('y') patterns as long as x isn't called
+      // at module load time.
+      return {};
+    };
     const isolatedContext = vm.createContext({
       console: { log: () => {}, warn: () => {}, error: () => {}, info: () => {}, debug: () => {} },
       Math: Math,
@@ -441,6 +458,33 @@ process.on('message', (msg) => {
       TypeError: TypeError,
       RangeError: RangeError,
       SyntaxError: SyntaxError,
+      // CJS stubs
+      require: _requireStub,
+      module: _moduleStub,
+      exports: _moduleStub.exports,
+      // Minimal process stub — many patches reference process.env at top level
+      process: {
+        env: {},
+        pid: 0,
+        platform: 'linux',
+        arch: 'x64',
+        hrtime: () => [0, 0],
+        uptime: () => 0,
+        send: () => {},
+        on: () => {},
+        exit: () => {},
+        argv: [],
+        cwd: () => '/',
+      },
+      // Timer stubs — some patches reference these at module scope
+      setTimeout: () => 0,
+      clearTimeout: () => {},
+      setInterval: () => 0,
+      clearInterval: () => {},
+      // Buffer stub (used by some patches for size checks)
+      Buffer: Buffer,
+      // Global aliases (so `globalThis.X` and bare `global` work)
+      globalThis: undefined, // vm sets this automatically
     });
 
     const script = new vm.Script(patchCode, {
