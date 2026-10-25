@@ -19,6 +19,8 @@
 // All backends include a realistic User-Agent header to avoid being blocked.
 // ═══════════════════════════════════════════════════════════════════════════
 
+let _externalSearchCooldownUntil = 0;
+
 let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function getCONFIG(): Record<string, any> { return _deps.config || require('./get-config'); }
@@ -328,6 +330,12 @@ async function searchWeb(query: any, _maxResults = 1): Promise<string | null> {
     return providerResult;
   }
 
+  // Avoid repeating known-unreachable public-search calls during an outage.
+  if (Date.now() < _externalSearchCooldownUntil) {
+    log('External web search is cooling down after recent network failures.', 'DEBUG', 'web-search');
+    return null;
+  }
+
   // ── Backend 1: DuckDuckGo HTML search ──
   let result = await searchDuckDuckGoHTML(queryStr);
   if (result && result.length > 20) return result;
@@ -346,6 +354,8 @@ async function searchWeb(query: any, _maxResults = 1): Promise<string | null> {
     if (or) return or;
   }
 
+  _externalSearchCooldownUntil = Date.now() + 5 * 60 * 1000;
+  log('All external web-search backends failed; pausing retries for 5 minutes.', 'DEBUG', 'web-search');
   return null;
 }
 
