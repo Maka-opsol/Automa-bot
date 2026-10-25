@@ -1591,11 +1591,27 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
               updatePatchStatus(patchId, 'db_record', 'pending');
               try {
                 const db = require('./database');
+                // insertPatch SQL signature (database.ts):
+                //   INSERT INTO patch_history
+                //     (timestamp, description, file, patch, status, applied_at, branch)
+                //   VALUES (?, ?, ?, ?, ?, ?, ?)
+                // Previously the call site was passing args in the wrong order
+                // (file first instead of timestamp), was passing 'dashboard' as
+                // the patch text (instead of the actual patch body), and was
+                // missing the 7th `branch` arg — causing "Too few parameter
+                // values were provided" and a garbage DB record.
+                const now = Date.now();
+                const branch = process.env.GIT_BRANCH || process.env.RENDER_GIT_BRANCH || 'main';
                 db.insertPatch && db.insertPatch.run && db.insertPatch.run(
-                  file, description || 'Dashboard patch submission', 'applied', 'dashboard',
-                  Date.now(), JSON.stringify({ size: patch.length, backup: backupPath, patchId })
+                  now,                                                       // timestamp
+                  description || 'Dashboard patch submission',                // description
+                  file,                                                       // file
+                  patch,                                                      // patch (actual patch body)
+                  'applied',                                                  // status
+                  now,                                                       // applied_at
+                  branch                                                      // branch
                 );
-                updatePatchStatus(patchId, 'db_record', 'passed');
+                updatePatchStatus(patchId, 'db_record', 'passed', { timestamp: now, branch });
               } catch (dbErr) {
                 updatePatchStatus(patchId, 'db_record', 'warning', 'DB record failed (non-critical): ' + dbErr.message);
               }
@@ -1672,11 +1688,64 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
     return true;
   }
 
-  // ── TASK 144: List recent patches ──
+  // ── TASK 144: List recent patches (in-memory, current process only) ──
   if (pathname === '/api/patch/list' && req.method === 'GET') {
     authWrap(() => {
       const patches = Object.values(_patchStatus).slice(-20).reverse();
       jsonRes(res, { patches, count: patches.length });
+    });
+    return true;
+  }
+
+  // ── Patch history from DB (persists across deployments) ──
+  // GET /api/patch/history?limit=50
+  // Returns rows from patch_history table, most recent first.
+  // Optional ?id=N returns a single patch by id (full row, including patch body).
+  if (pathname === '/api/patch/history' && req.method === 'GET') {
+    authWrap(() => {
+      try {
+        const db = (() => { try { return require('./database'); } catch { return null; } })();
+        if (!db || !db.getRecentPatches) {
+          jsonRes(res, { error: 'Database module or getRecentPatches not available' }, 500);
+          return;
+        }
+        // Single-patch lookup by id
+        const idParam = url.searchParams.get('id');
+        if (idParam) {
+          const id = parseInt(idParam, 10);
+          if (!Number.isFinite(id) || id <= 0) {
+            jsonRes(res, { error: 'Invalid id parameter' }, 400);
+            return;
+          }
+          // Use a one-off prepared statement (cache on the db module if needed)
+          const row = db.db ? db.db.prepare('SELECT * FROM patch_history WHERE id = ?').get(id) : null;
+          if (!row) {
+            jsonRes(res, { exists: false, id }, 404);
+            return;
+          }
+          jsonRes(res, { exists: true, patch: row });
+          return;
+        }
+        // List recent patches
+        const limitParam = url.searchParams.get('limit') || '50';
+        const limit = Math.min(Math.max(parseInt(limitParam, 10) || 50, 1), 500);
+        const rows = db.getRecentPatches.all(limit);
+        // Don't send the full patch body in the list view — it can be huge.
+        // Send metadata only; clients can fetch full patch via /api/patch/history?id=N
+        const summary = rows.map((r: any) => ({
+          id: r.id,
+          timestamp: r.timestamp,
+          description: r.description,
+          file: r.file,
+          status: r.status,
+          applied_at: r.applied_at,
+          branch: r.branch,
+          patch_size: r.patch ? r.patch.length : 0,
+        }));
+        jsonRes(res, { patches: summary, count: summary.length });
+      } catch (e: any) {
+        jsonRes(res, { error: e.message }, 500);
+      }
     });
     return true;
   }
@@ -1705,7 +1774,7 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
   // Safety:
   //   1. Path is resolved against process.cwd() and must stay inside it.
   //   2. Must have a code-file extension (.ts/.tsx/.js/.jsx/.json/.md).
-  //   3. Hard size cap (200KB) — files larger than this return an error
+  //   3. Hard size cap (250KB) — files larger than this return an error
   //      instead of attempting to load them into the browser.
   //   4. Read-only — no write/execute side effects.
   if (pathname === '/api/patch/file' && req.method === 'GET') {
@@ -1737,8 +1806,8 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           return;
         }
         const stat = fs.statSync(resolved);
-        if (stat.size > 200 * 1024) {
-          jsonRes(res, { error: `File too large to display (${Math.round(stat.size / 1024)}KB > 200KB limit)` }, 413);
+        if (stat.size > 250 * 1024) {
+          jsonRes(res, { error: `File too large to display (${Math.round(stat.size / 1024)}KB > 250KB limit)` }, 413);
           return;
         }
         const content = fs.readFileSync(resolved, 'utf8');
@@ -2231,6 +2300,28 @@ function getDashboardHTML(): string {
           <strong style="color:#f44336;">Rejection Reason:</strong>
           <div id="rejectionDetails" style="margin-top:4px; color:#e57373;"></div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Patch History (from DB, persists across deployments) -->
+  <div class="card full-width">
+    <div class="card-header">
+      <span>Patch History</span>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <label style="font-size:12px; color:#aaa;">Limit:</label>
+        <select id="patchHistoryLimit" style="background:#1a1a2e; color:#e0e0e0; border:1px solid #333; padding:4px; border-radius:4px; font-size:12px;">
+          <option value="20">20</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+          <option value="200">200</option>
+        </select>
+        <button class="btn sm" onclick="loadPatchHistory()">Refresh</button>
+      </div>
+    </div>
+    <div class="card-body" style="padding:0;">
+      <div id="patchHistoryTable" style="font-size:12px; max-height:500px; overflow:auto;">
+        <div style="padding:20px; text-align:center; color:#888;">Click "Refresh" to load patch history from the database.</div>
       </div>
     </div>
   </div>
@@ -2866,6 +2957,162 @@ document.addEventListener('click', (e) => {
 // Close on Escape
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeFileViewer();
+});
+
+// ── Patch History (DB-backed) ──
+let _historyCurrentPatch = '';
+let _historyCurrentContent = '';
+
+function _fmtTimestamp(ts) {
+  if (!ts) return '-';
+  const d = new Date(typeof ts === 'number' ? ts : parseInt(ts, 10));
+  if (isNaN(d.getTime())) return String(ts);
+  return d.toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+}
+
+function _statusBadge(status) {
+  const s = String(status || 'unknown').toLowerCase();
+  const colors = {
+    applied:  '#4caf50',
+    approved:  '#4caf50',
+    safe:      '#4caf50',
+    passed:    '#4caf50',
+    rejected:  '#f44336',
+    failed:    '#f44336',
+    blocked:   '#f44336',
+    warning:   '#ff9800',
+    pending:   '#ff9800',
+    skipped:   '#9e9e9e',
+    unknown:   '#9e9e9e',
+  };
+  const color = colors[s] || '#9e9e9e';
+  return '<span style="display:inline-block; padding:2px 8px; border-radius:3px; background:' + color + '; color:#000; font-weight:bold; font-size:11px;">' + s.toUpperCase() + '</span>';
+}
+
+async function loadPatchHistory() {
+  const tableEl = document.getElementById('patchHistoryTable');
+  if (!tableEl) return;
+  const limitEl = document.getElementById('patchHistoryLimit');
+  const limit = (limitEl && limitEl.value) || '50';
+  tableEl.innerHTML = '<div style="padding:20px; text-align:center; color:#aaa;">Loading...</div>';
+  try {
+    const r = await api('/api/patch/history?limit=' + encodeURIComponent(limit));
+    if (r.error) { tableEl.innerHTML = '<div style="padding:20px; color:#f44336;">Error: ' + r.error + '</div>'; return; }
+    if (!r.patches || r.patches.length === 0) {
+      tableEl.innerHTML = '<div style="padding:20px; text-align:center; color:#888;">No patches recorded yet. Submit a patch above and it will appear here.</div>';
+      return;
+    }
+    let html = '<table style="width:100%; border-collapse:collapse;">';
+    html += '<thead><tr style="background:#22223a; color:#4fc3f7; position:sticky; top:0;">';
+    html += '<th style="padding:8px; text-align:left; border-bottom:1px solid #333;">ID</th>';
+    html += '<th style="padding:8px; text-align:left; border-bottom:1px solid #333;">Timestamp</th>';
+    html += '<th style="padding:8px; text-align:left; border-bottom:1px solid #333;">File</th>';
+    html += '<th style="padding:8px; text-align:left; border-bottom:1px solid #333;">Description</th>';
+    html += '<th style="padding:8px; text-align:left; border-bottom:1px solid #333;">Status</th>';
+    html += '<th style="padding:8px; text-align:left; border-bottom:1px solid #333;">Branch</th>';
+    html += '<th style="padding:8px; text-align:right; border-bottom:1px solid #333;">Size</th>';
+    html += '<th style="padding:8px; text-align:center; border-bottom:1px solid #333;">Actions</th>';
+    html += '</tr></thead><tbody>';
+    r.patches.forEach((p) => {
+      const desc = (p.description || '').slice(0, 80) + ((p.description || '').length > 80 ? '…' : '');
+      const sizeKb = p.patch_size ? (p.patch_size / 1024).toFixed(1) + ' KB' : '-';
+      html += '<tr style="border-bottom:1px solid #2a2a3e; cursor:pointer;" onmouseover="this.style.background=\'#1f1f30\'" onmouseout="this.style.background=\'\'">';
+      html += '<td style="padding:6px 8px; color:#aaa;">#' + p.id + '</td>';
+      html += '<td style="padding:6px 8px; color:#aaa; font-family:monospace; font-size:11px;">' + _fmtTimestamp(p.timestamp) + '</td>';
+      html += '<td style="padding:6px 8px; color:#e0e0e0; font-family:monospace; font-size:11px;">' + (p.file || '-') + '</td>';
+      html += '<td style="padding:6px 8px; color:#e0e0e0;">' + escapeHtml(desc) + '</td>';
+      html += '<td style="padding:6px 8px;">' + _statusBadge(p.status) + '</td>';
+      html += '<td style="padding:6px 8px; color:#aaa; font-family:monospace; font-size:11px;">' + (p.branch || '-') + '</td>';
+      html += '<td style="padding:6px 8px; color:#aaa; text-align:right;">' + sizeKb + '</td>';
+      html += '<td style="padding:6px 8px; text-align:center; white-space:nowrap;">';
+      html += '<button class="btn sm" style="background:#3a3a5c; padding:3px 8px; font-size:11px;" onclick="event.stopPropagation(); viewPatchFromHistory(' + p.id + ', \'' + escapeHtml(p.file || '').replace(/'/g, "\\'") + '\')">View Patch</button>';
+      html += ' <button class="btn sm" style="background:#2a4a3c; padding:3px 8px; font-size:11px;" onclick="event.stopPropagation(); reloadPatchFromHistory(' + p.id + ')" title="Load this patch into the Submit Patch form to re-apply or modify">Re-apply</button>';
+      html += '</td>';
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    tableEl.innerHTML = html;
+    toast('Loaded ' + r.count + ' patches from history', 'info');
+  } catch (e) {
+    tableEl.innerHTML = '<div style="padding:20px; color:#f44336;">Failed to load history: ' + (e.message || String(e)) + '</div>';
+  }
+}
+
+function escapeHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+async function viewPatchFromHistory(patchId, fileName) {
+  try {
+    const r = await api('/api/patch/history?id=' + encodeURIComponent(patchId));
+    if (r.error) { toast(r.error, 'error'); return; }
+    if (!r.exists || !r.patch) { toast('Patch #' + patchId + ' not found', 'error'); return; }
+    _historyCurrentPatch = fileName || r.patch.file || ('patch-' + patchId);
+    _historyCurrentContent = r.patch.patch || '';
+    const titleEl = document.getElementById('fileViewerTitle');
+    const contentEl = document.getElementById('fileViewerContent');
+    const ts = _fmtTimestamp(r.patch.timestamp);
+    const sizeKb = _historyCurrentContent ? (_historyCurrentContent.length / 1024).toFixed(1) + ' KB' : '0 KB';
+    if (titleEl) titleEl.textContent = 'Patch #' + patchId + ' — ' + _historyCurrentPatch + '  (' + sizeKb + ', ' + ts + ', branch: ' + (r.patch.branch || '?') + ')';
+    if (contentEl) contentEl.textContent = _historyCurrentContent;
+    // Switch the "Load into Patch" button to use the history content
+    const modal = document.getElementById('fileViewerModal');
+    if (modal) modal.style.display = 'flex';
+  } catch (e) {
+    toast('Failed to load patch: ' + e.message, 'error');
+  }
+}
+
+async function reloadPatchFromHistory(patchId) {
+  try {
+    const r = await api('/api/patch/history?id=' + encodeURIComponent(patchId));
+    if (r.error || !r.exists || !r.patch) {
+      toast('Patch #' + patchId + ' not found', 'error');
+      return;
+    }
+    const ta = document.getElementById('patchContent');
+    if (ta) ta.value = r.patch.patch || '';
+    const input = document.getElementById('patchFileInput');
+    if (input && r.patch.file) input.value = r.patch.file;
+    const desc = document.getElementById('patchDescription');
+    if (desc && r.patch.description) desc.value = r.patch.description;
+    toast('Loaded patch #' + patchId + ' — edit and resubmit', 'info');
+    // Scroll up to the Submit Patch card so the user can review
+    document.getElementById('patchContent') && document.getElementById('patchContent').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) {
+    toast('Failed to reload patch: ' + e.message, 'error');
+  }
+}
+
+// Override the file viewer's "Load into Patch" button to also work for history.
+// The original loadCurrentIntoPatch (declared earlier in this script) uses
+// _viewerCurrentContent. We augment it to fall back to _historyCurrentContent
+// (set by viewPatchFromHistory) when the viewer content is empty.
+(function() {
+  const orig = window.loadCurrentIntoPatch;
+  window.loadCurrentIntoPatch = function() {
+    if (typeof _viewerCurrentContent !== 'undefined' && _viewerCurrentContent) {
+      if (orig) { orig.call(window); return; }
+    }
+    if (typeof _historyCurrentContent !== 'undefined' && _historyCurrentContent) {
+      const ta = document.getElementById('patchContent');
+      if (ta) ta.value = _historyCurrentContent;
+      const input = document.getElementById('patchFileInput');
+      if (input && _historyCurrentPatch) input.value = _historyCurrentPatch;
+      closeFileViewer();
+      toast('Loaded historical patch into patch textarea — edit and resubmit', 'info');
+      return;
+    }
+    toast('No file loaded', 'error');
+  };
+})();
+
+// Auto-load history on page load (after a small delay so it doesn't block initial render)
+document.addEventListener('DOMContentLoaded', () => {
+  setTimeout(loadPatchHistory, 500);
 });
 
 async function submitPatch() {
