@@ -318,6 +318,13 @@ async function auditPatchWithAI(patchText: any, signal: any, configOverride = nu
     log('Auditor API key missing. Blocking patch by default.', 'WARN', 'auditor');
     return { is_safe: false, reason: 'Auditor API key not configured', provider: config.provider, model: config.model };
   }
+  // Defensive: callers have historically passed the wrong thing as `signal`
+  // (e.g. a description string from the dashboard). Coerce anything that
+  // isn't a real AbortSignal to undefined so fetchWithTimeout doesn't crash
+  // with "options.signal.addEventListener is not a function".
+  const safeSignal = (signal && typeof signal.addEventListener === 'function' && typeof signal.aborted === 'boolean')
+    ? signal
+    : undefined;
   try {
     const prompt = isNonCodegen ? NON_CODEGEN_AUDITOR_PROMPT : AUDITOR_PROMPT;
     // callChatCompletionWithRollback signature: (endpoint, apiKey, model, base64Image, prompt, providerName, options)
@@ -328,7 +335,7 @@ async function auditPatchWithAI(patchText: any, signal: any, configOverride = nu
       config.endpoint, config.apiKey, config.model, null,
       prompt + '\n\nPATCH TO AUDIT:\n' + patchText,
       config.provider || 'auditor',
-      { responseFormat: { type: 'json_object' }, signal }
+      { responseFormat: { type: 'json_object' }, signal: safeSignal }
     );
     const content = response.choices?.[0]?.message?.content;
     if (!content) throw new Error('Empty auditor response');
