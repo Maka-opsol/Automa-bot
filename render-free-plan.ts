@@ -649,7 +649,16 @@ function _startMemoryMonitor(): void {
     // TASK 86 (2026-09-25): Reduced from 470MB to 460MB for new 384MB V8 limit.
     // Old: 470MB RSS / 512MB container = 42MB headroom (too tight with 448MB V8)
     // New: 460MB RSS / 512MB container = 52MB headroom (safer with 384MB V8)
-    const HARD_RSS_LIMIT_MB = 460;   // only fire if RSS > 460MB (out of 512MB container)
+    //
+    // BUGFIX (2026-10-26): Reduced from 460MB to 410MB.
+    // The 460MB threshold was too high — the browser startup alone pushes RSS
+    // to 430MB, and by the time the monitor fires (20s interval), the process
+    // has already been OOM-killed or Render's load balancer returns 502/503.
+    // 410MB gives 102MB of headroom in the 512MB container — enough for the
+    // memory shed (L2: page reload + cache clear) to complete before OOM.
+    // Also: when this fires, immediately do a global.gc() + close non-essential
+    // page tabs (keep only the main page) to free memory faster.
+    const HARD_RSS_LIMIT_MB = 410;   // only fire if RSS > 410MB (out of 512MB container)
     if (used > HARD_RESTART_HEAP_MB || rss > HARD_RSS_LIMIT_MB) {
       log(`Memory CRITICAL (hard threshold): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'ERROR', 'render-free-plan');
       // BUG FIX (2026-09-06): Cap maxLevel at L2 to prevent closing the browser.
