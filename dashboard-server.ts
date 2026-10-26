@@ -1795,6 +1795,109 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
                 updatePatchStatus(patchId, 'ai_advisory', 'skipped', 'AI auditor error: ' + auditErr.message);
               }
 
+              // ── CRITICAL FILE TESTS ──────────────────────────────────────────
+              // For critical files (previously IMMUTABLE/RESTRICTED), run extra
+              // validation tests that don't apply to normal files. These tests
+              // are STRICTER than the sandbox audit and catch issues that the
+              // sandbox doesn't (e.g. removed exports, broken import graph,
+              // dangerous new require() calls).
+              if (isCriticalFile) {
+                updatePatchStatus(patchId, 'critical_tests', 'pending');
+
+                // Load the original file content for comparison tests
+                let originalContent: string | undefined;
+                try {
+                  originalContent = fs.readFileSync(resolvedFile, 'utf8');
+                } catch { /* original not available — tests will skip comparison */ }
+
+                // Test 1: Patched file transpiles independently via esbuild
+                try {
+                  const esbuild = require('esbuild');
+                  esbuild.transformSync(patch, {
+                    loader: file.endsWith('.tsx') ? 'tsx' : 'ts',
+                    target: 'es2020',
+                    format: 'cjs',
+                  });
+                  updatePatchStatus(patchId, 'critical_tests', 'passed', { test: 'transpile', result: 'Patch transpiles cleanly via esbuild' });
+                } catch (transpileErr: any) {
+                  updatePatchStatus(patchId, 'critical_tests', 'rejected', {
+                    test: 'transpile',
+                    reason: 'Critical file patch does not transpile: ' + transpileErr.message,
+                  });
+                  log(`CRITICAL FILE REJECTED: ${file} — patch does not transpile: ${transpileErr.message}`, 'ERROR', 'dashboard');
+                  return; // STOP — critical file must transpile
+                }
+
+                // Test 2: No exports removed (compare to original)
+                try {
+                  const origExports = (originalContent || '')
+                    .split('\n')
+                    .filter(l => /^\s*(module\.exports|exports\.\w+|export\s+)/.test(l))
+                    .map(l => l.trim().split(/[=\s]/)[0] + ' ' + l.trim().match(/exports\.(\w+)|export\s+(?:const|function|class)\s+(\w+)/)?.[0] || l.trim().slice(0, 60));
+                  const newExports = patch
+                    .split('\n')
+                    .filter(l => /^\s*(module\.exports|exports\.\w+|export\s+)/.test(l))
+                    .map(l => l.trim().split(/[=\s]/)[0] + ' ' + l.trim().match(/exports\.(\w+)|export\s+(?:const|function|class)\s+(\w+)/)?.[0] || l.trim().slice(0, 60));
+                  const removed = origExports.filter((e: string) => !newExports.includes(e));
+                  if (removed.length > 0) {
+                    updatePatchStatus(patchId, 'critical_tests', 'rejected', {
+                      test: 'exports',
+                      reason: `Critical file patch removes ${removed.length} export(s): ${removed.join(', ')}. Removing exports from critical files can break the bot.`,
+                    });
+                    log(`CRITICAL FILE REJECTED: ${file} — removes ${removed.length} export(s)`, 'ERROR', 'dashboard');
+                    return; // STOP — critical file can't remove exports
+                  }
+                  updatePatchStatus(patchId, 'critical_tests', 'passed', { test: 'exports', result: `All ${origExports.length} exports preserved` });
+                } catch (exportErr: any) {
+                  // Non-fatal — export comparison is heuristic
+                  updatePatchStatus(patchId, 'critical_tests', 'warning', { test: 'exports', reason: 'Export comparison failed (non-critical): ' + exportErr.message });
+                }
+
+                // Test 3: No new require() of dangerous modules
+                try {
+                  const DANGEROUS_MODULES = ['child_process', 'worker_threads', 'cluster', 'dgram', 'net', 'dns', 'tls'];
+                  const newRequires = patch.match(/require\(['"]([^'"]+)['"]\)/g) || [];
+                  const origRequires = (originalContent || '').match(/require\(['"]([^'"]+)['"]\)/g) || [];
+                  const addedRequires = newRequires.filter(r => !origRequires.includes(r));
+                  const dangerous = addedRequires.filter(r => {
+                    const mod = r.match(/require\(['"]([^'"]+)['"]\)/)?.[1] || '';
+                    return DANGEROUS_MODULES.some(d => mod === d || mod.startsWith(d + '/'));
+                  });
+                  if (dangerous.length > 0) {
+                    updatePatchStatus(patchId, 'critical_tests', 'rejected', {
+                      test: 'imports',
+                      reason: `Critical file patch adds dangerous require(): ${dangerous.join(', ')}. These modules can spawn processes, open sockets, or access the network.`,
+                    });
+                    log(`CRITICAL FILE REJECTED: ${file} — adds dangerous require(): ${dangerous.join(', ')}`, 'ERROR', 'dashboard');
+                    return; // STOP — critical file can't add dangerous imports
+                  }
+                  updatePatchStatus(patchId, 'critical_tests', 'passed', { test: 'imports', result: `No dangerous new require() calls (${addedRequires.length} new require() added, all safe)` });
+                } catch (importErr: any) {
+                  updatePatchStatus(patchId, 'critical_tests', 'warning', { test: 'imports', reason: 'Import check failed (non-critical): ' + importErr.message });
+                }
+
+                // Test 4: Patch size delta check — if the patch is dramatically
+                // smaller than the original (e.g. accidentally truncated), reject.
+                try {
+                  if (originalContent && patch.length < originalContent.length * 0.5) {
+                    const origLines = originalContent.split('\n').length;
+                    const newLines = patch.split('\n').length;
+                    updatePatchStatus(patchId, 'critical_tests', 'rejected', {
+                      test: 'size_delta',
+                      reason: `Critical file patch is ${newLines} lines vs original ${origLines} lines (${Math.round((newLines / origLines) * 100)}% of original). Suspicious size reduction — patch may be truncated or accidentally destructive.`,
+                    });
+                    log(`CRITICAL FILE REJECTED: ${file} — suspicious size reduction (${newLines}/${origLines} lines)`, 'ERROR', 'dashboard');
+                    return; // STOP — critical file can't shrink dramatically
+                  }
+                  updatePatchStatus(patchId, 'critical_tests', 'passed', { test: 'size_delta', result: 'Patch size is reasonable' });
+                } catch (sizeErr: any) {
+                  updatePatchStatus(patchId, 'critical_tests', 'warning', { test: 'size_delta', reason: 'Size check failed (non-critical): ' + sizeErr.message });
+                }
+              } else {
+                // Non-critical file — skip critical tests
+                updatePatchStatus(patchId, 'critical_tests', 'skipped', 'Not a critical file');
+              }
+
               // Stage 3: Backup
               updatePatchStatus(patchId, 'backup', 'pending');
               const backupDir = '/tmp/patch-backups';
@@ -1951,6 +2054,76 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
 
               // Final status
               updatePatchStatus(patchId, 'complete', 'done', { file, size: patch.length, backup: backupPath });
+
+              // ── POST-DEPLOY VERIFICATION (critical files only) ─────────────
+              // For critical files, wait ~30s after deploy completes, then
+              // fetch /api/health to verify the bot is still alive. If the
+              // health check fails or times out, mark the patch as "deployed
+              // with warnings" so the dashboard surfaces it.
+              if (isCriticalFile) {
+                updatePatchStatus(patchId, 'post_deploy_check', 'pending');
+                try {
+                  // Wait 30s for the deploy to take effect
+                  await new Promise(resolve => setTimeout(resolve, 30000));
+                  // Self-check: try to require the patched module
+                  // (This won't work if the file was just deployed via GitHub
+                  // and the new code hasn't been pulled yet — but it's a start.)
+                  const selfCheckResult: { healthy: boolean; details: any } = { healthy: true, details: {} };
+                  try {
+                    // Check if the bot's HTTP server is still responding
+                    const http = require('http');
+                    const port = process.env.PORT || 10000;
+                    await new Promise<void>((resolve, reject) => {
+                      const req = http.get(`http://localhost:${port}/api/status`, (resp: any) => {
+                        let data = '';
+                        resp.on('data', (chunk: any) => data += chunk);
+                        resp.on('end', () => {
+                          if (resp.statusCode === 200) {
+                            try {
+                              const json = JSON.parse(data);
+                              selfCheckResult.details.status = 'ok';
+                              selfCheckResult.details.state = json.currentState || 'unknown';
+                            } catch { selfCheckResult.details.status = 'ok (non-JSON response)'; }
+                          } else {
+                            selfCheckResult.healthy = false;
+                            selfCheckResult.details.status = 'HTTP ' + resp.statusCode;
+                          }
+                          resolve();
+                        });
+                      });
+                      req.on('error', (err: any) => {
+                        selfCheckResult.healthy = false;
+                        selfCheckResult.details.error = err.message;
+                        resolve(); // resolve (not reject) — we want to surface the failure
+                      });
+                      req.setTimeout(5000, () => {
+                        selfCheckResult.healthy = false;
+                        selfCheckResult.details.error = 'Health check timed out (5s)';
+                        req.destroy();
+                        resolve();
+                      });
+                    });
+                  } catch (healthErr: any) {
+                    selfCheckResult.healthy = false;
+                    selfCheckResult.details.error = healthErr.message;
+                  }
+                  if (selfCheckResult.healthy) {
+                    updatePatchStatus(patchId, 'post_deploy_check', 'passed', { test: 'health', ...selfCheckResult.details });
+                    log(`CRITICAL FILE POST-DEPLOY OK: ${file} — bot is healthy`, 'INFO', 'dashboard');
+                  } else {
+                    updatePatchStatus(patchId, 'post_deploy_check', 'warning', {
+                      test: 'health',
+                      reason: 'Bot health check failed after critical file deploy — patch may have broken something. Check logs immediately.',
+                      ...selfCheckResult.details,
+                    });
+                    log(`CRITICAL FILE POST-DEPLOY WARNING: ${file} — bot health check failed: ${JSON.stringify(selfCheckResult.details)}`, 'WARN', 'dashboard');
+                  }
+                } catch (postDeployErr: any) {
+                  updatePatchStatus(patchId, 'post_deploy_check', 'warning', { test: 'health', reason: 'Post-deploy check failed (non-critical): ' + postDeployErr.message });
+                }
+              } else {
+                updatePatchStatus(patchId, 'post_deploy_check', 'skipped', 'Not a critical file');
+              }
 
               // Final stages_json update — persist the complete stages array
               // (so the dashboard history view can render multi-stage statuses
@@ -4433,14 +4606,18 @@ function pollPatchStatus(patchId) {
       var stageLabels = {
         validation: 'Input Validation',
         path_check: 'Path Traversal Check',
+        queue_wait: 'Queue Wait',
+        file_lock: 'File Lock',
         sandbox_audit: 'Sandbox Audit',
         ai_advisory: 'AI Advisory',
+        critical_tests: 'Critical File Tests',
         backup: 'File Backup',
         apply_local: 'Apply Locally',
         db_record: 'DB Recording',
         overlay_write: 'Overlay Write',
         github_push: 'GitHub Push',
         complete: 'Complete',
+        post_deploy_check: 'Post-Deploy Health Check',
         error: 'Error',
       };
 
