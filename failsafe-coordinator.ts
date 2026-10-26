@@ -3,7 +3,11 @@ let _deps: Record<string, any> = {};
 function _injectDependencies(deps: Record<string, any>) { _deps = deps; }
 function getStateDiagnostics() { return _deps.stateMachine?.getStateDiagnostics; }
 function getCacheStats() { return _deps.cache?.getCacheStats; }
-function getBrowserManager() { return _deps.browser?.getBrowserManager(); }
+function getBrowserMetrics() {
+  const browser = _deps.browser;
+  if (typeof browser?.getBrowserMetrics !== 'function') return 'unavailable';
+  try { return browser.getBrowserMetrics(); } catch { return 'unavailable'; }
+}
 
 const { log, logError } = require('./logger');
 const CONFIG = require('./get-config');
@@ -125,7 +129,7 @@ class FailsafeCoordinator {
   getFullDiagnostics() { 
     let dbStats = null;
     try { const { getDatabaseStats } = require('./database'); dbStats = getDatabaseStats(); } catch {}
-    return { timestamp: Date.now(), degradationLevel: this._degradationLevel, database: dbStats, stateMachine: getStateDiagnostics ? getStateDiagnostics()?.() : 'unavailable', cache: getCacheStats ? getCacheStats()?.() : 'unavailable', circuitBreakers: this.getCircuitBreakerStatus(), browser: getBrowserManager() ? getBrowserManager().getMetrics() : 'unavailable', memory: process.memoryUsage(), uptime: process.uptime() };
+    return { timestamp: Date.now(), degradationLevel: this._degradationLevel, database: dbStats, stateMachine: getStateDiagnostics ? getStateDiagnostics()?.() : 'unavailable', cache: getCacheStats ? getCacheStats()?.() : 'unavailable', circuitBreakers: this.getCircuitBreakerStatus(), browser: getBrowserMetrics(), memory: process.memoryUsage(), uptime: process.uptime() };
   }
 }
 
