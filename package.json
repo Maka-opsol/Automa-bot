@@ -4,9 +4,9 @@
   "description": "Autonomous bot for MathU educational platform with self-improvement, experimentation, and cross-domain capabilities",
   "main": "render-free-plan.ts",
   "scripts": {
-    "start": "node --expose-gc --max-old-space-size=256 --import tsx hf-spaces.ts",
-    "start:agent": "node --import tsx --expose-gc --max-old-space-size=256 agent.ts",
-    "start:tsx": "node --import tsx --expose-gc --max-old-space-size=256 agent.ts",
+    "start": "node --expose-gc --max-old-space-size=384 --import tsx hf-spaces.ts",
+    "start:agent": "node --import tsx --expose-gc --max-old-space-size=338 agent.ts",
+    "start:tsx": "node --import tsx --expose-gc --max-old-space-size=338 agent.ts",
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -63,4 +63,3 @@
     "sharp": "^0.33.2",
     "tesseract.js": "^4.1.1"
   }
-}
