@@ -190,6 +190,21 @@ interface SandboxResult {
   error?: string;
   violations?: string[];
   requiresApproval?: boolean;
+  criticalFile?: boolean;  // NEW: true if the file was previously IMMUTABLE or RESTRICTED
+  criticalFileReason?: string;  // NEW: why it's critical (which list it was on)
+}
+
+// NEW: Check if a file is "critical" (was previously IMMUTABLE or RESTRICTED).
+// Critical files get stricter checks when patched via the dashboard.
+function isCriticalFile(filePath: string): { critical: boolean; reason?: string } {
+  const relativeName = extractRelativeName(filePath);
+  if (IMMUTABLE_FILES.has(relativeName) || IMMUTABLE_FILES.has(path.basename(relativeName))) {
+    return { critical: true, reason: 'IMMUTABLE file (was previously never patchable)' };
+  }
+  if (RESTRICTED_FILES.has(relativeName) || RESTRICTED_FILES.has(path.basename(relativeName))) {
+    return { critical: true, reason: 'RESTRICTED file (was previously approval-only)' };
+  }
+  return { critical: false };
 }
 
 /**
@@ -631,12 +646,25 @@ function executePatchInIsolatedProcess(patchCode: string, filePath: string, time
  *  6. Runtime validation in isolated child process (true process isolation)
  *  7. No file writes — caller is responsible for writing after all checks pass
  */
-async function executePatchInSandbox(patchText: string, filePath: string): Promise<SandboxResult> {
-  // Layer 1: File-level check (P14: works with absolute paths now)
-  const fileCheck = isPatchableFile(filePath);
-  if (!fileCheck.allowed) {
-    _log(`Sandbox: File not patchable: ${filePath} — ${fileCheck.reason}`, 'ERROR', 'sandbox-executor');
-    return { safe: false, error: fileCheck.reason, requiresApproval: fileCheck.requiresApproval };
+async function executePatchInSandbox(patchText: string, filePath: string, source?: string): Promise<SandboxResult> {
+  // NEW: Dashboard patches can target ANY file (no restrictions).
+  // Self-heal patches still respect IMMUTABLE_FILES / RESTRICTED_FILES.
+  // Critical files (previously IMMUTABLE or RESTRICTED) are flagged so the
+  // dashboard pipeline can apply stricter checks (unanimous auditor approval,
+  // additional validation stages).
+  const criticalCheck = isCriticalFile(filePath);
+  const isDashboardPatch = source === 'dashboard';
+
+  if (isDashboardPatch) {
+    // Dashboard: all files allowed — skip isPatchableFile entirely
+    _log(`Sandbox: Dashboard patch to ${filePath} — bypassing file restrictions${criticalCheck.critical ? ' (CRITICAL FILE: ' + criticalCheck.reason + ')' : ''}`, 'INFO', 'sandbox-executor');
+  } else {
+    // Self-heal (or unspecified source): respect IMMUTABLE / RESTRICTED / ALLOWED_PREFIXES
+    const fileCheck = isPatchableFile(filePath);
+    if (!fileCheck.allowed) {
+      _log(`Sandbox: File not patchable (self-heal): ${filePath} — ${fileCheck.reason}`, 'ERROR', 'sandbox-executor');
+      return { safe: false, error: fileCheck.reason, requiresApproval: fileCheck.requiresApproval };
+    }
   }
 
   // Layer 2: Content-level audit (context-aware: skips patterns already in original file)
@@ -739,15 +767,20 @@ async function executePatchInSandbox(patchText: string, filePath: string): Promi
   // All checks passed — the patch is safe to apply.
   // NOTE: The caller (self-heal.js) is responsible for the actual file write.
   // This function NO LONGER writes files — separation of concerns for security.
-  _log(`Sandbox: Patch for ${filePath} passed all security checks`, 'INFO', 'sandbox-executor');
-  return { safe: true, requiresApproval: fileCheck.requiresApproval };
+  _log(`Sandbox: Patch for ${filePath} passed all security checks${criticalCheck.critical ? ' (CRITICAL FILE)' : ''}`, 'INFO', 'sandbox-executor');
+  return {
+    safe: true,
+    requiresApproval: isDashboardPatch ? false : (isPatchableFile(filePath).requiresApproval),
+    criticalFile: criticalCheck.critical,
+    criticalFileReason: criticalCheck.reason,
+  };
 }
 
 // @ts-expect-error
 module.exports = {
   vm, path, SOURCE_DIR,
   ALLOWED_MODULES, BLOCKED_PATTERNS, IMMUTABLE_FILES, RESTRICTED_FILES, ALLOWED_PREFIXES,
-  auditPatchContent, isPatchableFile, extractRelativeName,
+  auditPatchContent, isPatchableFile, extractRelativeName, isCriticalFile,
   createSandboxContext, runPatchInSandbox,
   executePatchInIsolatedProcess, executePatchInSandbox,
   _injectDependencies,
