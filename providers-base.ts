@@ -518,7 +518,12 @@ function getProviderCooldownRemainingMs(providerName: string): number {
 
 function classifyError(err: any): { category: string; retryable: boolean; retryAfterMs: number } {
   const msg = err?.message || err?.toString?.() || '';
-  const status = err?.status || err?.statusCode || 0;
+  // Providers commonly wrap HTTP responses in plain Error messages such as
+  // HTTP_ERROR_429: {...}; these errors have no status/statusCode property.
+  // Extract the wrapped status before message heuristics so bare 429s are not
+  // misclassified as unknown and retried with the generic cooldown.
+  const statusMatch = String(msg).match(/(?:HTTP_ERROR_|HTTP\s+|^)([45]\d{2})\b/i);
+  const status = err?.status || err?.statusCode || (statusMatch ? parseInt(statusMatch[1], 10) : 0);
 
   // Rate limited
   if (status === 429 || msg.includes('rate_limit') || msg.includes('rate limit') || msg.includes('rate_limited')) {
