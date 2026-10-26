@@ -34,9 +34,12 @@ There are exactly **two AI agents**: **Toqi** and **Zapia**. Both do the full im
 Every shift, the active agent (Toqi or Zapia) follows this loop:
 
 ### Step 1: Review (find issues)
-- Fetch recent logs: `GET /api/logs?limit=100`
-- Fetch recent patch history: `GET /api/patch/history?limit=20`
-- Fetch the previous shift's summary: `GET /api/improvement/proposals?type=summary&limit=2`
+- **First, check if the bot is alive**: `GET /api/ping` (ultra-lightweight — no memory pressure)
+  - If this returns 503 or times out, the bot is down. Wait 60s and retry.
+  - If `rss_mb > 380`, the bot is under memory pressure. Non-essential API requests will return 503. Only use `/api/ping` until RSS drops below 380MB.
+- Fetch recent logs: `GET /api/logs?limit=100` (skip if memory pressure)
+- Fetch recent patch history: `GET /api/patch/history?limit=20` (lightweight — OK during memory pressure)
+- Fetch the previous shift's summary: `GET /api/improvement/proposals?type=summary&limit=2` (lightweight — OK during memory pressure)
 - Look for:
   - Errors that appear 3+ times (`ERROR`, `WARN`, `crash`, `timeout`)
   - Patches that FAILED the sandbox audit or AI advisory — understand WHY
@@ -306,8 +309,9 @@ The midnight-shift agent should include these metrics in the daily meta-review.
 | `/api/patch/history` | GET | List past patches |
 | `/api/patch/file?path=...` | GET | Fetch current source of a file |
 | `/api/patch/budget` | GET | Check deploy budget + queue status |
-| `/api/logs?limit=N` | GET | Fetch recent logs |
-| `/api/status` | GET | Bot health/status |
+| `/api/ping` | GET | Ultra-lightweight health check (returns ok + RSS/heap). Use this FIRST before any other API call — it adds zero memory pressure. |
+| `/api/logs?limit=N` | GET | Fetch recent logs (skip when RSS > 380MB — will return 503) |
+| `/api/status` | GET | Bot health/status (skip when RSS > 380MB — will return 503) |
 | `/api/health` | GET | Deep health check |
 
 ---
