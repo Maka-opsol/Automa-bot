@@ -106,35 +106,36 @@ type MemoryMode = 'full_power' | 'memory_protection' | 'minimum';
 
 const MODE_THRESHOLDS = {
   full_power: {
-    // TASK 86 (2026-09-25): Reduced from 350/400/420 to 300/330/450 for new 384MB V8 limit.
-    // Old: 350/400 with 448MB V8 = 48MB headroom (but 448+150 Chromium = 598 > 512 container → OOM)
-    // New: 300/330 with 384MB V8 = 54MB headroom (and 384+128 = 512, fits container)
-    warnHeapMB: 300,
-    restartHeapMB: 330,
-    rssHardLimitMB: 450,
-    gcIntervalMs: 90 * 1000,
-    monitorIntervalMs: 20 * 1000,
+    // BUGFIX (2026-10-26): V8 max-old-space-size was 3584MB (3.5GB!) on a 512MB
+    // container — V8 never GC'd and the process OOM-killed every ~3 minutes.
+    // Fixed in package.json: --max-old-space-size=256.
+    // With 256MB V8 limit, thresholds must be well below 256MB:
+    //   - warnHeapMB = 160 (V8 starts GCing at ~200MB, warn at 160)
+    //   - restartHeapMB = 200 (clean restart before V8 OOM at 256MB)
+    //   - rssHardLimitMB = 410 (total process RSS, including Chromium ~200MB)
+    //   - gcIntervalMs = 30s (more frequent GC than old 90s)
+    warnHeapMB: 160,
+    restartHeapMB: 200,
+    rssHardLimitMB: 410,
+    gcIntervalMs: 30 * 1000,
+    monitorIntervalMs: 15 * 1000,
     warningStreak: 2,
   },
   memory_protection: {
-    // BUG FIX (2026-09-06): Set to 280/320 for 384MB V8 limit.
-    warnHeapMB: 280,
-    restartHeapMB: 320,
+    // BUGFIX (2026-10-26): Match 256MB V8 limit.
+    warnHeapMB: 140,
+    restartHeapMB: 180,
     rssHardLimitMB: 380,
-    gcIntervalMs: 15 * 1000,
+    gcIntervalMs: 10 * 1000,
     monitorIntervalMs: 8 * 1000,
     warningStreak: 1,
   },
   minimum: {
-    // BUG FIX (2026-09-06): Match memory_protection thresholds.
-    // The old minimum thresholds (150/170) were so low that the bot couldn't
-    // function — it just looped "Memory CRITICAL" and closed the browser.
-    // Minimum mode now has the same thresholds as memory_protection — it just
-    // disables more modules. The thresholds should never cause a death loop.
-    warnHeapMB: 280,
-    restartHeapMB: 320,
+    // BUGFIX (2026-10-26): Match memory_protection thresholds for 256MB V8.
+    warnHeapMB: 140,
+    restartHeapMB: 180,
     rssHardLimitMB: 380,
-    gcIntervalMs: 15 * 1000,
+    gcIntervalMs: 10 * 1000,
     monitorIntervalMs: 8 * 1000,
     warningStreak: 1,
   },
