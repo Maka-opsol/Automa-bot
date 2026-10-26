@@ -731,6 +731,51 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
   //  READ-ONLY API ENDPOINTS
   // ═══════════════════════════════════════════════════════════════
 
+  // ── Lightweight ping endpoint (no allocations, no DB, no modules) ──
+  // GET /api/ping — returns { ok: true, ts: <epoch_ms>, rss_mb: <number> }
+  // This is the cheapest possible endpoint — used by AI agents (Toqi/Zapia)
+  // to check if the bot is alive WITHOUT adding memory pressure.
+  // Regular API endpoints (full-status, logs, etc.) allocate large JSON
+  // responses that can push an already-strained process past the OOM limit.
+  if (pathname === '/api/ping') {
+    const mem = process.memoryUsage();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, ts: Date.now(), rss_mb: Math.round(mem.rss / 1024 / 1024), heap_mb: Math.round(mem.heapUsed / 1024 / 1024) }));
+    return true;
+  }
+
+  // ── Server-side memory guard ──
+  // If RSS > 380MB, reject non-essential API requests with 503 to avoid
+  // pushing the process past the OOM limit. Essential endpoints that are
+  // allowed through even under memory pressure:
+  //   /api/ping (ultra-lightweight)
+  //   /dashboard (HTML — no server-side allocation, just returns a string)
+  //   /api/patch/submit (POST — needed for patching the bot itself)
+  //   /api/patch/status/:id (lightweight — just reads in-memory object)
+  //   /api/patch/budget (lightweight — just reads in-memory counters)
+  // Everything else (full-status, logs, raw-responses, screenshot, etc.)
+  // is rejected with 503 + a clear message so the client can back off.
+  const _rssMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+  const MEMORY_GUARD_THRESHOLD_MB = 380;
+  const _isEssentialEndpoint =
+    pathname === '/api/ping' ||
+    pathname === '/dashboard' || pathname === '/dashboard/' ||
+    pathname.startsWith('/api/patch/submit') ||
+    pathname.startsWith('/api/patch/status/') ||
+    pathname.startsWith('/api/patch/budget') ||
+    pathname.startsWith('/api/improvement/');
+  if (_rssMB > MEMORY_GUARD_THRESHOLD_MB && !_isEssentialEndpoint) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'Service under memory pressure',
+      rss_mb: _rssMB,
+      threshold_mb: MEMORY_GUARD_THRESHOLD_MB,
+      hint: 'The bot process is near its memory limit. Non-essential API requests are paused to prevent OOM. Use GET /api/ping for a lightweight health check. Retry in 30-60s after memory recovery.',
+      retry_after_seconds: 30,
+    }));
+    return true;
+  }
+
   // Status
   if (pathname === '/api/status') {
     authWrap(() => {
@@ -2783,6 +2828,12 @@ function getDashboardHTML(): string {
   <span class="meta" id="metaInfo"></span>
 </div>
 
+<!-- Memory pressure banner (shown when RSS > 380MB) -->
+<div id="memoryPressureBanner" style="display:none; padding:10px 16px; background:rgba(244,67,54,0.15); border:1px solid #f44336; border-radius:6px; margin-bottom:12px; font-size:13px; color:#ef5350;">
+  <strong>⚠ Memory Pressure:</strong> <span id="memoryPressureText"></span>
+  <br><span style="font-size:11px; color:#aaa;">Non-essential API requests are paused. Use GET /api/ping for lightweight health checks. AI agents should wait 30-60s before retrying.</span>
+</div>
+
 <div class="grid" id="mainGrid">
 
   <!-- Screenshot -->
@@ -3520,6 +3571,18 @@ async function refreshAll() {
     // Meta
     document.getElementById('metaInfo').textContent = fmtUptime(full.uptime) + ' | ' + (full.memory?.rss || '-') + ' RSS';
 
+    // Memory pressure banner — show if RSS > 380MB
+    const rssStr = (full.memory?.rss || '').toString().replace(/[^\d]/g, '');
+    const rssNum = parseInt(rssStr, 10) || 0;
+    const memBanner = document.getElementById('memoryPressureBanner');
+    const memText = document.getElementById('memoryPressureText');
+    if (memBanner && rssNum > 380) {
+      memBanner.style.display = 'block';
+      if (memText) memText.textContent = 'RSS at ' + rssNum + 'MB (threshold: 380MB). The bot may become unresponsive. Non-essential API requests are being rejected with 503.';
+    } else if (memBanner) {
+      memBanner.style.display = 'none';
+    }
+
     // Daemon state
     document.getElementById('daemonState').textContent = 'Stop: ' + (ds?.stopRequested ? 'YES' : 'no') + ' | Cycles: ' + (full.cycleCount || 0) + ' | Questions: ' + (full.questionsCompleted || 0);
 
@@ -3626,6 +3689,63 @@ async function refreshAll() {
 }
 
 // ── Init ──
+// BUGFIX (2026-10-26): Slowed down auto-refresh intervals to reduce
+// memory pressure on the bot. The old intervals (5s/10s/2s) generated
+// 36 requests/min per browser tab. With 2 AI agents' dashboards open,
+// that's 72 requests/min — each request adds HTTP parsing + JSON
+// serialization overhead that pushes the already-strained process
+// closer to OOM.
+//
+// New intervals: 15s/30s/30s = ~8 requests/min per tab = 16/min for 2 tabs.
+// Also added exponential backoff: when a request fails, the next poll
+// is delayed by 2x (up to 60s max) instead of firing again immediately.
+const REFRESH_ALL_INTERVAL_MS = 15000;   // was 5000 (15s instead of 5s)
+const REFRESH_LOGS_INTERVAL_MS = 30000;   // was 10000 (30s instead of 10s)
+const REFRESH_RAW_INTERVAL_MS = 30000;    // was 2000 (30s instead of 2s)
+let _refreshAllBackoff = 1;  // multiplier: 1 = normal, 2/4/8 = backing off
+let _refreshLogsBackoff = 1;
+let _refreshRawBackoff = 1;
+const MAX_BACKOFF = 4;  // max 4x = 60s/120s/120s
+
+function _scheduleNextRefreshAll() {
+  const delay = REFRESH_ALL_INTERVAL_MS * _refreshAllBackoff;
+  setTimeout(async () => {
+    if (autoRefresh) {
+      try {
+        await refreshAll();
+        _refreshAllBackoff = 1;  // reset on success
+      } catch {
+        _refreshAllBackoff = Math.min(_refreshAllBackoff * 2, MAX_BACKOFF);
+      }
+    }
+    _scheduleNextRefreshAll();
+  }, delay);
+}
+function _scheduleNextRefreshLogs() {
+  const delay = REFRESH_LOGS_INTERVAL_MS * _refreshLogsBackoff;
+  setTimeout(async () => {
+    try {
+      await refreshLogs();
+      _refreshLogsBackoff = 1;
+    } catch {
+      _refreshLogsBackoff = Math.min(_refreshLogsBackoff * 2, MAX_BACKOFF);
+    }
+    _scheduleNextRefreshLogs();
+  }, delay);
+}
+function _scheduleNextRefreshRaw() {
+  const delay = REFRESH_RAW_INTERVAL_MS * _refreshRawBackoff;
+  setTimeout(async () => {
+    try {
+      await refreshRawResponses();
+      _refreshRawBackoff = 1;
+    } catch {
+      _refreshRawBackoff = Math.min(_refreshRawBackoff * 2, MAX_BACKOFF);
+    }
+    _scheduleNextRefreshRaw();
+  }, delay);
+}
+
 (async function init() {
   await loadStates();
   await loadActions();
@@ -3633,9 +3753,12 @@ async function refreshAll() {
   await loadConfigKeys();
   refreshLogs();
   refreshRawResponses();
-  setInterval(() => { if (autoRefresh) refreshAll(); }, 5000);
-  setInterval(refreshLogs, 10000);
-  setInterval(refreshRawResponses, 2000);
+  // Use recursive setTimeout instead of setInterval so each poll
+  // waits for the previous one to complete (or fail) before scheduling
+  // the next — prevents request pileup when the bot is slow.
+  _scheduleNextRefreshAll();
+  _scheduleNextRefreshLogs();
+  _scheduleNextRefreshRaw();
 })();
 
 // ── TASK 143: Patch Submission Functions ──
