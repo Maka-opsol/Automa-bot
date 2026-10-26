@@ -1698,6 +1698,12 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
 
                 // Stage 1: Sandbox Audit
                 updatePatchStatus(patchId, 'sandbox_audit', 'pending');
+                // Hoist isCriticalFile to the outer scope so it's accessible
+                // in the critical_tests stage (line ~1804) and post_deploy_check
+                // stage (line ~2063). Previously it was declared inside the
+                // if(sandbox) block, causing "isCriticalFile is not defined"
+                // at runtime when the critical tests ran.
+                let isCriticalFile = false;
                 const sandbox = (() => { try { return require('./sandbox-executor'); } catch { return null; } })();
               if (sandbox && sandbox.executePatchInSandbox) {
                 try {
@@ -1722,7 +1728,7 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
                   }
                   // NEW: Flag critical files (previously IMMUTABLE/RESTRICTED) so the
                   // AI advisory stage applies stricter checks (unanimous approval).
-                  const isCriticalFile = !!(sandboxResult as any).criticalFile;
+                  isCriticalFile = !!(sandboxResult as any).criticalFile;
                   if (isCriticalFile) {
                     updatePatchStatus(patchId, 'sandbox_audit', 'passed', {
                       reason: 'All checks passed (CRITICAL FILE — stricter auditor checks apply)',
