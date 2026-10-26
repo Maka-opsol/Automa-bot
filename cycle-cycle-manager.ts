@@ -1360,7 +1360,16 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // Flutter Web loads ~150MB into the shared V8 heap (Chromium --single-process).
       // 66MB baseline + 150MB Flutter = 216MB. Allow up to 300MB heap / 430MB RSS
       // before bailing — gives 84MB headroom below V8's 384MB limit.
-      if (_preNavHeapMB >= 300 || _preNavRSSMB >= 430) {
+      //
+      // BUGFIX (2026-10-26): Lowered RSS threshold from 430MB to 400MB.
+      // The 430MB threshold was too high — the browser startup pushed RSS to
+      // 433.6MB (past the threshold), but the bot continued anyway because
+      // the check only runs once before navigation. By the time the memory
+      // monitor fires (20s later), the process was already unresponsive,
+      // causing 502/503 errors on the dashboard.
+      // 400MB gives 112MB of headroom — enough for Flutter canvas render +
+      // tribunal allocations without hitting the 512MB container OOM.
+      if (_preNavHeapMB >= 280 || _preNavRSSMB >= 400) {
         log(`FATAL: Memory too high before navigation (heap=${_preNavHeapMB.toFixed(0)}MB, rss=${_preNavRSSMB.toFixed(0)}MB). Exiting for clean restart.`, 'FATAL', 'cycle');
         try { require('./survival-restart-guardian').preserveBeforeExit?.('pre_nav_oom').catch(() => {}); } catch {}
         const origExit = (process as any)._originalExit || process.exit.bind(process);
@@ -1529,7 +1538,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const _postNavHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
       const _postNavRSSMB = process.memoryUsage().rss / 1024 / 1024;
       log(`Post-navigation memory: heap=${_postNavHeapMB.toFixed(0)}MB, rss=${_postNavRSSMB.toFixed(0)}MB`, 'INFO', 'cycle');
-      if (_postNavHeapMB >= 320 || _postNavRSSMB >= 440) {
+      // BUGFIX (2026-10-26): Lowered from 320/440 to 300/410.
+      // Same reasoning as the pre-nav check — the 440MB RSS threshold was
+      // too high and caused 502/503 errors when the process became
+      // unresponsive before the next monitor check.
+      if (_postNavHeapMB >= 300 || _postNavRSSMB >= 410) {
         log(`FATAL: Memory too high after navigation (heap=${_postNavHeapMB.toFixed(0)}MB, rss=${_postNavRSSMB.toFixed(0)}MB). Exiting for clean restart.`, 'FATAL', 'cycle');
         try { require('./survival-restart-guardian').preserveBeforeExit?.('post_nav_oom').catch(() => {}); } catch {}
         const origExit = (process as any)._originalExit || process.exit.bind(process);
