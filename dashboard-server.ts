@@ -1706,7 +1706,13 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
                   // as (file, patch), which fed the filename as patchText and the entire
                   // patch body as filePath, causing isPatchableFile() to reject with
                   // "File 'use strict'; ... is not in any allowed patching scope".
-                  const sandboxResult = await sandbox.executePatchInSandbox(patch, file);
+                  //
+                  // NEW: pass source='dashboard' so the sandbox knows this is a
+                  // dashboard patch (all files allowed, no restrictions) vs. a
+                  // self-heal patch (restrictions still apply). Critical files
+                  // (previously IMMUTABLE/RESTRICTED) are flagged in the result
+                  // so we can apply stricter auditor checks below.
+                  const sandboxResult = await sandbox.executePatchInSandbox(patch, file, 'dashboard');
                   if (!sandboxResult.safe) {
                     updatePatchStatus(patchId, 'sandbox_audit', 'rejected', {
                       reason: sandboxResult.reason || sandboxResult.error || 'Unknown rejection',
@@ -1714,7 +1720,19 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
                     });
                     return; // STOP — patch rejected
                   }
-                  updatePatchStatus(patchId, 'sandbox_audit', 'passed', sandboxResult.reason || sandboxResult.error || 'All checks passed');
+                  // NEW: Flag critical files (previously IMMUTABLE/RESTRICTED) so the
+                  // AI advisory stage applies stricter checks (unanimous approval).
+                  const isCriticalFile = !!(sandboxResult as any).criticalFile;
+                  if (isCriticalFile) {
+                    updatePatchStatus(patchId, 'sandbox_audit', 'passed', {
+                      reason: 'All checks passed (CRITICAL FILE — stricter auditor checks apply)',
+                      criticalFile: true,
+                      criticalFileReason: (sandboxResult as any).criticalFileReason,
+                    });
+                    log(`CRITICAL FILE PATCH: ${file} — ${ (sandboxResult as any).criticalFileReason }. Auditor will require unanimous approval.`, 'WARN', 'dashboard');
+                  } else {
+                    updatePatchStatus(patchId, 'sandbox_audit', 'passed', sandboxResult.reason || sandboxResult.error || 'All checks passed');
+                  }
                 } catch (sandboxErr) {
                   updatePatchStatus(patchId, 'sandbox_audit', 'rejected', { reason: 'Sandbox error: ' + sandboxErr.message });
                   return;
@@ -1744,6 +1762,21 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
                     filePath: resolvedFile,
                     description: description || 'Dashboard patch',
                   });
+                  // NEW: For critical files (previously IMMUTABLE/RESTRICTED),
+                  // require UNANIMOUS auditor approval — any UNSAFE vote rejects
+                  // the patch. Non-critical files use the normal majority threshold.
+                  if (isCriticalFile && auditResult && auditResult.votes) {
+                    const unsafeVotes = auditResult.votes.filter((v: any) => v.is_safe === false);
+                    if (unsafeVotes.length > 0) {
+                      const reasons = unsafeVotes.map((v: any) => `${v.provider}/${v.model}: ${v.reason || ''}`).join('; ');
+                      updatePatchStatus(patchId, 'ai_advisory', 'rejected', {
+                        reason: `CRITICAL FILE requires unanimous approval — ${unsafeVotes.length} auditor(s) voted UNSAFE: ${reasons}`,
+                        votes: auditResult.votes || [],
+                      });
+                      log(`CRITICAL FILE REJECTED: ${file} — ${unsafeVotes.length} unsafe vote(s) out of ${auditResult.votes.length}`, 'ERROR', 'dashboard');
+                      return; // STOP — critical file needs unanimous approval
+                    }
+                  }
                   if (auditResult && !auditResult.safe) {
                     updatePatchStatus(patchId, 'ai_advisory', 'rejected', {
                       reason: auditResult.reason || 'AI advisor rejected the patch',
@@ -2031,6 +2064,42 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
           for (const s of stages) {
             if (s && s.stage && s.status) stageMap[s.stage] = s.status;
           }
+
+          // FALLBACK: If stages_json is missing (NULL — happens for patches
+          // submitted before the stages_json feature was deployed, or when the
+          // DB_RECORD stage failed to write stages_json), infer the lifecycle
+          // from the patch's `status` field. The `status` column is always
+          // populated (it's set by the insertPatch SQL). If status === 'applied',
+          // the patch went through the full pipeline successfully.
+          let lifecycle: Record<string, string>;
+          if (stages.length === 0 && r.status === 'applied') {
+            // No stage data, but the patch was marked as applied → infer all passed
+            lifecycle = {
+              submitted: 'passed',
+              approved: 'passed',
+              applied: 'warning', // apply_local likely returned EACCES (read-only /app) → warning
+              pushed: 'passed',
+              deployed: 'passed',
+            };
+          } else if (stages.length === 0 && r.status && r.status !== 'applied') {
+            // No stage data and the patch was NOT applied → infer rejection
+            lifecycle = {
+              submitted: 'passed',
+              approved: 'failed',
+              applied: 'pending',
+              pushed: 'pending',
+              deployed: 'pending',
+            };
+          } else {
+            // Normal case: stages_json is populated → derive lifecycle from stages
+            lifecycle = {
+              submitted: stageMap['validation'] === 'passed' ? 'passed' : (stageMap['validation'] || 'pending'),
+              approved: stageMap['ai_advisory'] === 'passed' ? 'passed' : (stageMap['ai_advisory'] || 'pending'),
+              applied: stageMap['apply_local'] === 'passed' ? 'passed' : (stageMap['apply_local'] === 'warning' ? 'warning' : (stageMap['apply_local'] || 'pending')),
+              pushed: stageMap['github_push'] === 'passed' ? 'passed' : (stageMap['github_push'] || 'pending'),
+              deployed: stageMap['complete'] === 'done' ? 'passed' : (stageMap['complete'] || 'pending'),
+            };
+          }
           return {
             id: r.id,
             timestamp: r.timestamp,
@@ -2046,15 +2115,9 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
               status: s.status,
               timestamp: s.timestamp,
             })),
-            // New: high-level lifecycle summary derived from the stages array
-            // (for quick visual badge in the history table)
-            lifecycle: {
-              submitted: stageMap['validation'] === 'passed' ? 'passed' : (stageMap['validation'] || 'pending'),
-              approved: stageMap['ai_advisory'] === 'passed' ? 'passed' : (stageMap['ai_advisory'] || 'pending'),
-              applied: stageMap['apply_local'] === 'passed' ? 'passed' : (stageMap['apply_local'] === 'warning' ? 'warning' : (stageMap['apply_local'] || 'pending')),
-              pushed: stageMap['github_push'] === 'passed' ? 'passed' : (stageMap['github_push'] || 'pending'),
-              deployed: stageMap['complete'] === 'done' ? 'passed' : (stageMap['complete'] || 'pending'),
-            },
+            // New: high-level lifecycle summary (derived from stages_json,
+            // or inferred from `status` field when stages_json is missing)
+            lifecycle,
           };
         });
         jsonRes(res, { patches: summary, count: summary.length });
@@ -4069,13 +4132,43 @@ async function viewPatchFromHistory(patchId, fileName) {
     if (!r.exists || !r.patch) { toast('Patch #' + patchId + ' not found', 'error'); return; }
     _historyCurrentPatch = fileName || r.patch.file || ('patch-' + patchId);
     _historyCurrentContent = r.patch.patch || '';
+    // Populate the viewer state so _renderViewerPage displays the patch source
+    // in the line-numbered table (instead of just setting textContent, which
+    // the new viewer ignores — it uses innerHTML built from _viewerAllLines).
+    _viewerCurrentFile = _historyCurrentPatch;
+    _viewerCurrentContent = _historyCurrentContent;
+    _viewerAllLines = _historyCurrentContent.split('\\n');
+    _viewerCurrentPage = 0;
+    _viewerSearchMatches = [];
+    _viewerSearchCursor = -1;
     const titleEl = document.getElementById('fileViewerTitle');
-    const contentEl = document.getElementById('fileViewerContent');
     const ts = _fmtTimestamp(r.patch.timestamp);
     const sizeKb = _historyCurrentContent ? (_historyCurrentContent.length / 1024).toFixed(1) + ' KB' : '0 KB';
-    if (titleEl) titleEl.textContent = 'Patch #' + patchId + ' — ' + _historyCurrentPatch + '  (' + sizeKb + ', ' + ts + ', branch: ' + (r.patch.branch || '?') + ')';
-    if (contentEl) contentEl.textContent = _historyCurrentContent;
-    // Switch the "Load into Patch" button to use the history content
+    if (titleEl) titleEl.textContent = 'Patch #' + patchId + ' — ' + _historyCurrentPatch + '  (' + sizeKb + ', ' + _historyCurrentContent.split('\\n').length + ' lines, ' + ts + ', branch: ' + (r.patch.branch || '?') + ')';
+    // Populate page selector for the new viewer
+    const pageSelect = document.getElementById('fileViewerPageSelect');
+    if (pageSelect) {
+      const totalPages = Math.max(1, Math.ceil(_viewerAllLines.length / VIEWER_PAGE_SIZE));
+      pageSelect.innerHTML = '';
+      for (let i = 0; i < totalPages; i++) {
+        const startLine = i * VIEWER_PAGE_SIZE + 1;
+        const endLine = Math.min((i + 1) * VIEWER_PAGE_SIZE, _viewerAllLines.length);
+        const opt = document.createElement('option');
+        opt.value = String(i);
+        opt.textContent = startLine + '-' + endLine;
+        pageSelect.appendChild(opt);
+      }
+      pageSelect.value = '0';
+    }
+    // Clear search input
+    const searchInput = document.getElementById('fileViewerSearch');
+    if (searchInput) searchInput.value = '';
+    const searchInfo = document.getElementById('fileViewerSearchInfo');
+    if (searchInfo) searchInfo.textContent = '';
+    const pageInfo = document.getElementById('fileViewerPageInfo');
+    if (pageInfo) pageInfo.textContent = 'Page 1/' + Math.max(1, Math.ceil(_viewerAllLines.length / VIEWER_PAGE_SIZE));
+    // Render the first page
+    _renderViewerPage();
     const modal = document.getElementById('fileViewerModal');
     if (modal) modal.style.display = 'flex';
   } catch (e) {
