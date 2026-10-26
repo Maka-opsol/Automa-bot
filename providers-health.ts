@@ -108,7 +108,7 @@ function extractStatus(err: unknown): number {
     if (typeof e.status === 'number') return e.status;
     if (typeof e.statusCode === 'number') return e.statusCode;
   }
-  const match = String(message).match(/(?:HTTP_ERROR_|HTTPs+|^)([45]d{2})/i);
+  const match = String(message).match(/(?:HTTP_ERROR_|HTTP\s+|^)([45]\d{2})\b/i);
   if (match) return parseInt(match[1], 10);
   return 0;
 }
@@ -120,7 +120,7 @@ function extractRetryAfter(err: unknown): number {
     const retryAfterMs = (err as any).retryAfterMs;
     if (typeof retryAfterMs === 'number' && retryAfterMs > 0) return retryAfterMs;
   }
-  const delay = String(message).match(/try again ins+(?:(d+)m)?([d.]+)s/i);
+  const delay = String(message).match(/try again in\s+(?:(\d+)m)?([\d.]+)s/i);
   if (delay) {
     const minutes = parseInt(delay[1] || '0', 10);
     const seconds = parseFloat(delay[2]);
