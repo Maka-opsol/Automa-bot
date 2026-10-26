@@ -3676,6 +3676,22 @@ function _detectPlayButton(
   // Only return a play button if the contrast score is high enough
   // (a real play button has high contrast against the video background)
   if (bestCluster.score >= 15) {
+    // The MathU startup mark is centered in a bright diamond with a short,
+    // symmetric dark horizontal dash. Generic contrast scanning can pick an
+    // offset edge of that diamond as a play-button candidate, so test the
+    // actual screen-center glyph before accepting any candidate.
+    const screenCx = Math.floor(width / 2), screenCy = Math.floor(height / 2);
+    const centerBackground = (luminanceAt(screenCx - 18, screenCy - 18) +
+      luminanceAt(screenCx + 18, screenCy - 18) + luminanceAt(screenCx - 18, screenCy + 18) +
+      luminanceAt(screenCx + 18, screenCy + 18)) / 4;
+    const dashOffsets = [-12, -8, -4, 0, 4, 8, 12];
+    const centeredDarkDash = dashOffsets.filter(dx => luminanceAt(screenCx + dx, screenCy) < 90).length >= 6;
+    const centerVerticalLight = [-12, -8, -4, 4, 8, 12].filter(dy => luminanceAt(screenCx, screenCy + dy) > 180).length >= 5;
+    if (centerBackground > 200 && centeredDarkDash && centerVerticalLight) {
+      log('Pixel fallback: rejecting centered MathU splash dash as a false play-button match', 'DEBUG', 'pixel-fallback');
+      return null;
+    }
+
     // A centered MathU splash mark (a high-contrast plus inside a diamond)
     // can satisfy the generic contrast score above, but it is not a play icon.
     // Reject a candidate only when it has a clear cross-shaped dark/light glyph:
