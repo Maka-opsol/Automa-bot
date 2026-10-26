@@ -5,8 +5,8 @@
   "main": "render-free-plan.ts",
   "scripts": {
     "start": "node --expose-gc --max-old-space-size=256 --import tsx hf-spaces.ts",
-    "start:agent": "node --import tsx --expose-gc --max-old-space-size=512 agent.ts",
-    "start:tsx": "node --import tsx --expose-gc --max-old-space-size=512 agent.ts",
+    "start:agent": "node --import tsx --expose-gc --max-old-space-size=256 agent.ts",
+    "start:tsx": "node --import tsx --expose-gc --max-old-space-size=256 agent.ts",
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
