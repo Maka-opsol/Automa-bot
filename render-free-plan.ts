@@ -26,7 +26,12 @@
 // Old: 350MB threshold / 448MB V8 = 98MB headroom — but 448MB V8 + 150MB
 // Chromium RSS = 598MB total, exceeding 512MB container → OOM kill.
 // New: 300MB threshold / 384MB V8 = 84MB headroom, and 384MB + 128MB = 512MB.
-const EARLY_OOM_THRESHOLD_MB = 300;
+// BUGFIX (2026-10-26): Raised from 300 to 350 for 384MB V8 limit.
+// The bot's heap legitimately reaches ~247MB during Flutter Web CanvasKit
+// load — that's normal, not a crisis. 300MB was too low and killed the
+// process during normal browser launch.
+// 350MB / 384MB V8 = 34MB headroom — enough for V8 to GC before hitting limit.
+const EARLY_OOM_THRESHOLD_MB = 350;
 const EARLY_OOM_CHECK_INTERVAL_MS = 2000; // every 2s — fast enough to catch boot spikes
 let _earlyOomTriggered = false;
 const _earlyOomInterval = setInterval(() => {
@@ -35,18 +40,14 @@ const _earlyOomInterval = setInterval(() => {
     const heapMB = mem.heapUsed / 1024 / 1024;
     const rssMB = mem.rss / 1024 / 1024;
     // BUG FIX (2026-09-05): Check BOTH heap AND RSS. On Render free plan (512MB),
-    // the kernel OOM killer fires on RSS, not V8 heap. Chromium single-process
-    // uses ~100-150MB RSS on top of Node's heap. If RSS > 480MB, the kernel
-    // will SIGKILL the process before our heap guardian can react.
-    // TASK 41 (2026-09-10): Raised RSS limit from 450→480MB to match new 448MB V8 limit.
-    // Old: 450MB RSS / 384MB V8 = 66MB non-V8 headroom
-    // New: 480MB RSS / 448MB V8 = 32MB non-V8 headroom (tighter, but V8 now has more room)
-    // TASK 86 (2026-09-25): Reduced from 480MB to 450MB for new 384MB V8 limit.
-    // Old: 480MB RSS / 448MB V8 = only 32MB non-V8 headroom (too tight)
-    // New: 450MB RSS / 384MB V8 = 66MB non-V8 headroom (safer)
-    if (rssMB >= 450 && !_earlyOomTriggered) {
+    // the kernel OOM killer fires on RSS, not V8 heap.
+    // BUGFIX (2026-10-26): Raised RSS threshold from 450 to 485.
+    // The old 450MB threshold fired during normal Flutter load (RSS 455MB).
+    // 485MB / 512MB container = 27MB headroom — tight but enough for the
+    // memory shed to free ~20-40MB before the kernel OOM killer fires.
+    if (rssMB >= 485 && !_earlyOomTriggered) {
       _earlyOomTriggered = true;
-      console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 480MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
+      console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 485MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
       clearInterval(_earlyOomInterval);
       process.exit(137);
     }
@@ -217,8 +218,8 @@ const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilien
   const _mem = process.memoryUsage();
   const _postContainerHeapMB = _mem.heapUsed / 1024 / 1024;
   const _postContainerRSSMB = _mem.rss / 1024 / 1024;
-  if (_postContainerRSSMB >= 480) {
-    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 480MB after container init. Kernel OOM imminent. Exiting immediately.`);
+  if (_postContainerRSSMB >= 485) {
+    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 485MB after container init. Kernel OOM imminent. Exiting immediately.`);
     clearInterval(_earlyOomInterval);
     process.exit(137);
   }
@@ -642,18 +643,15 @@ function _startMemoryMonitor(): void {
     //      memory_protection death loops when heap spiked to 320MB.
     // New: HARD_RESTART_HEAP_MB=380 (out of 448MB V8) → gives 68MB headroom.
     //      The bot typically runs at 280-350MB; 380MB only fires on real spikes.
-    // TASK 86 (2026-09-25): Reduced from 380MB to 330MB for new 384MB V8 limit.
     // BUGFIX (2026-10-26): V8 max-old-space-size was 3584MB (3.5GB!) on a 512MB
     // container — V8 never GC'd and the process OOM-killed every ~3 minutes.
-    // Fixed in package.json: --max-old-space-size=256.
-    // With 256MB V8 limit, heap thresholds must be well below 256MB:
-    //   - HARD_RESTART_HEAP_MB = 200 (gives 56MB headroom for GC)
-    //   - HARD_RSS_LIMIT_MB = 410 (total process RSS, including Chromium)
-    const HARD_RESTART_HEAP_MB = 200; // fire if heap > 200MB (out of 256MB V8 limit)
-    //
-    // BUGFIX (2026-10-26): Reduced from 460MB to 410MB.
-    // 410MB gives 102MB of headroom in the 512MB container.
-    const HARD_RSS_LIMIT_MB = 410;   // fire if RSS > 410MB (out of 512MB container)
+    // Fixed in package.json: --max-old-space-size=384.
+    // 256MB was too low — V8 OOM'd when Flutter Web loaded CanvasKit (~150MB).
+    // 384MB = enough for bot JS + Flutter + headroom, still forces GC.
+    //   - HARD_RESTART_HEAP_MB = 280 (gives 104MB headroom below 384MB V8 limit)
+    //   - HARD_RSS_LIMIT_MB = 440 (gives 72MB headroom in 512MB container)
+    const HARD_RESTART_HEAP_MB = 280; // fire if heap > 280MB (out of 384MB V8 limit)
+    const HARD_RSS_LIMIT_MB = 440;   // fire if RSS > 440MB (out of 512MB container)
     if (used > HARD_RESTART_HEAP_MB || rss > HARD_RSS_LIMIT_MB) {
       log(`Memory CRITICAL (hard threshold): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'ERROR', 'render-free-plan');
       // BUG FIX (2026-09-06): Cap maxLevel at L2 to prevent closing the browser.
