@@ -2039,7 +2039,7 @@ function _findChoiceButtons(
     .sort((a, b) => a.cx - b.cx);
 }
 
-// ─── Selected choice detection ─────────────────────────────────────────────
+// ─── Selected choice detection ─────────────────────��───────────────────────
 
 function _isSelectedChoice(
   rgba: Uint8ClampedArray, width: number, rect: DetectedRect,
@@ -3676,6 +3676,14 @@ function _detectPlayButton(
   // Only return a play button if the contrast score is high enough
   // (a real play button has high contrast against the video background)
   if (bestCluster.score >= 15) {
+    const luminanceAt = (x: number, y: number): number => {
+      const sx = Math.max(0, Math.min(width - 1, x));
+      const sy = Math.max(0, Math.min(height - 1, y));
+      const idx = (sy * width + sx) * 4;
+      return 0.299 * rgba[idx] + 0.587 * rgba[idx + 1] + 0.114 * rgba[idx + 2];
+    };
+
+
     // The MathU startup mark is centered in a bright diamond with a short,
     // symmetric dark horizontal dash. Generic contrast scanning can pick an
     // offset edge of that diamond as a play-button candidate, so test the
@@ -3696,12 +3704,6 @@ function _detectPlayButton(
     // can satisfy the generic contrast score above, but it is not a play icon.
     // Reject a candidate only when it has a clear cross-shaped dark/light glyph:
     // both horizontal and vertical arms must contrast against a light/dark field.
-    const luminanceAt = (x: number, y: number): number => {
-      const sx = Math.max(0, Math.min(width - 1, x));
-      const sy = Math.max(0, Math.min(height - 1, y));
-      const idx = (sy * width + sx) * 4;
-      return 0.299 * rgba[idx] + 0.587 * rgba[idx + 1] + 0.114 * rgba[idx + 2];
-    };
     const cx = bestCluster.x, cy = bestCluster.y;
     const centerLum = luminanceAt(cx, cy);
     const backgroundLum = (luminanceAt(cx - 20, cy - 20) + luminanceAt(cx + 20, cy - 20) +
