@@ -643,22 +643,17 @@ function _startMemoryMonitor(): void {
     // New: HARD_RESTART_HEAP_MB=380 (out of 448MB V8) → gives 68MB headroom.
     //      The bot typically runs at 280-350MB; 380MB only fires on real spikes.
     // TASK 86 (2026-09-25): Reduced from 380MB to 330MB for new 384MB V8 limit.
-    // Old: 380MB / 448MB V8 = 68MB headroom
-    // New: 330MB / 384MB V8 = 54MB headroom
-    const HARD_RESTART_HEAP_MB = 330; // only fire if heap > 330MB (out of 384MB V8 limit)
-    // TASK 86 (2026-09-25): Reduced from 470MB to 460MB for new 384MB V8 limit.
-    // Old: 470MB RSS / 512MB container = 42MB headroom (too tight with 448MB V8)
-    // New: 460MB RSS / 512MB container = 52MB headroom (safer with 384MB V8)
+    // BUGFIX (2026-10-26): V8 max-old-space-size was 3584MB (3.5GB!) on a 512MB
+    // container — V8 never GC'd and the process OOM-killed every ~3 minutes.
+    // Fixed in package.json: --max-old-space-size=256.
+    // With 256MB V8 limit, heap thresholds must be well below 256MB:
+    //   - HARD_RESTART_HEAP_MB = 200 (gives 56MB headroom for GC)
+    //   - HARD_RSS_LIMIT_MB = 410 (total process RSS, including Chromium)
+    const HARD_RESTART_HEAP_MB = 200; // fire if heap > 200MB (out of 256MB V8 limit)
     //
     // BUGFIX (2026-10-26): Reduced from 460MB to 410MB.
-    // The 460MB threshold was too high — the browser startup alone pushes RSS
-    // to 430MB, and by the time the monitor fires (20s interval), the process
-    // has already been OOM-killed or Render's load balancer returns 502/503.
-    // 410MB gives 102MB of headroom in the 512MB container — enough for the
-    // memory shed (L2: page reload + cache clear) to complete before OOM.
-    // Also: when this fires, immediately do a global.gc() + close non-essential
-    // page tabs (keep only the main page) to free memory faster.
-    const HARD_RSS_LIMIT_MB = 410;   // only fire if RSS > 410MB (out of 512MB container)
+    // 410MB gives 102MB of headroom in the 512MB container.
+    const HARD_RSS_LIMIT_MB = 410;   // fire if RSS > 410MB (out of 512MB container)
     if (used > HARD_RESTART_HEAP_MB || rss > HARD_RSS_LIMIT_MB) {
       log(`Memory CRITICAL (hard threshold): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'ERROR', 'render-free-plan');
       // BUG FIX (2026-09-06): Cap maxLevel at L2 to prevent closing the browser.
