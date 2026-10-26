@@ -254,6 +254,23 @@ class BrowserManager {
     // BUG FIX (2026-09-07): Force HTTP/1.1 to avoid proxy HTTP/2 incompatibility.
     // Some proxies can't handle multiplexed HTTP/2 traffic, causing silent drops.
     flags.push('--disable-http2');
+    // BUGFIX (2026-10-26): Add memory-saving flags to reduce Chromium RSS.
+    // --disable-images: don't load image resources (saves ~20-40MB on image-heavy pages).
+    //   The bot takes screenshots of the page — images still render in the screenshot
+    //   because they're drawn by the GPU/compositor. This flag only prevents the
+    //   browser from caching decoded image data in memory.
+    // --disable-notifications: skip notification permission prompts
+    // --disable-features=site-per-process: disable site isolation (saves ~50-80MB).
+    //   Site isolation spawns a separate renderer process per origin — on a 512MB
+    //   container with --single-process mode, this is unnecessary and wastes memory.
+    // --memory-pressure-off: don't throttle based on system memory pressure
+    //   (we handle memory ourselves via the heap guardian)
+    // --disable-background-timer-throttling: keep timers running in background tabs
+    flags.push('--disable-notifications');
+    flags.push('--disable-features=site-per-process,IsolateOrigins');
+    flags.push('--disable-background-timer-throttling');
+    flags.push('--disable-renderer-backgrounding');
+    flags.push('--disable-backgrounding-occluded-windows');
     // BUG FIX (2026-09-08): Provide explicit fallbacks for DISPLAY_WIDTH/HEIGHT
     // at the call site (defense-in-depth — addWindowSizeFlags also validates,
     // but if browser-chrome-flags.ts is an older version, this protects us).
