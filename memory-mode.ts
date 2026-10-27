@@ -108,39 +108,33 @@ const MODE_THRESHOLDS = {
   full_power: {
     // BUGFIX (2026-10-26): V8 max-old-space-size was 3584MB (3.5GB!) on a 512MB
     // container — V8 never GC'd and the process OOM-killed every ~3 minutes.
-    // Fixed in package.json: --max-old-space-size=384.
-    // 384MB V8 = enough for bot JS (~80MB) + Flutter CanvasKit (~150MB) + headroom.
-    // 256MB was too low — V8 OOM'd when Flutter loaded. 384MB forces GC while
-    // still having room for the full stack.
-    // Total RSS budget: 384MB V8 + ~100MB Chromium non-heap = ~484MB < 512MB container.
-    warnHeapMB: 200,
-    restartHeapMB: 260,
-    rssHardLimitMB: 440,
+    // Fixed in package.json: --max-old-space-size=256.
+    // With 256MB V8 limit, thresholds must be well below 256MB:
+    //   - warnHeapMB = 160 (V8 starts GCing at ~200MB, warn at 160)
+    //   - restartHeapMB = 200 (clean restart before V8 OOM at 256MB)
+    //   - rssHardLimitMB = 410 (total process RSS, including Chromium ~200MB)
+    //   - gcIntervalMs = 30s (more frequent GC than old 90s)
+    warnHeapMB: 160,
+    restartHeapMB: 200,
+    rssHardLimitMB: 410,
     gcIntervalMs: 30 * 1000,
     monitorIntervalMs: 15 * 1000,
     warningStreak: 2,
   },
   memory_protection: {
-    // BUGFIX (2026-10-26): Flutter Web CanvasKit loads ~150MB into the V8
-    // heap during page navigation. Bot code needs ~80MB. Total: ~230-250MB
-    // during browser launch. The old thresholds (140/180) killed the process
-    // at 180MB heap — BEFORE Flutter even finished loading.
-    // With 384MB V8 limit, these thresholds allow the Flutter spike:
-    //   - warn=220 (warn after Flutter loads, not during)
-    //   - restart=300 (only restart if heap stays >300MB after GC)
-    //   - rss_hard=440 (total process RSS)
-    warnHeapMB: 220,
-    restartHeapMB: 300,
-    rssHardLimitMB: 440,
+    // BUGFIX (2026-10-26): Match 256MB V8 limit.
+    warnHeapMB: 140,
+    restartHeapMB: 180,
+    rssHardLimitMB: 380,
     gcIntervalMs: 10 * 1000,
     monitorIntervalMs: 8 * 1000,
     warningStreak: 1,
   },
   minimum: {
-    // BUGFIX (2026-10-26): Match memory_protection.
-    warnHeapMB: 220,
-    restartHeapMB: 300,
-    rssHardLimitMB: 440,
+    // BUGFIX (2026-10-26): Match memory_protection thresholds for 256MB V8.
+    warnHeapMB: 140,
+    restartHeapMB: 180,
+    rssHardLimitMB: 380,
     gcIntervalMs: 10 * 1000,
     monitorIntervalMs: 8 * 1000,
     warningStreak: 1,
