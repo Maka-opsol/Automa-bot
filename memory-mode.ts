@@ -79,14 +79,17 @@ if (_isSmallInstance) {
     MODE_THRESHOLDS.full_power.rssHardLimitMB = maxSafeRSS;
     _log(`Clamped full_power RSS hard limit to ${maxSafeRSS}MB`, 'WARN');
   }
-  // Also clamp heap thresholds — on 512MB, heap should never reach 200MB
-  // because Chrome needs ~200MB RSS and Node RSS ≈ heap + 70MB overhead
-  const maxSafeHeap = _systemTotalMB - 300; // leave 300MB for Chrome + system + Node overhead
-  if (maxSafeHeap < MODE_THRESHOLDS.memory_protection.restartHeapMB) {
-    MODE_THRESHOLDS.memory_protection.restartHeapMB = maxSafeHeap;
-    MODE_THRESHOLDS.memory_protection.warnHeapMB = Math.max(maxSafeHeap - 30, 80);
-    _log(`Clamped memory_protection heap thresholds: warn=${MODE_THRESHOLDS.memory_protection.warnHeapMB}MB restart=${MODE_THRESHOLDS.memory_protection.restartHeapMB}MB`, 'INFO');
-  }
+  // BUGFIX (2026-10-26): DISABLED heap threshold clamping on small instances.
+  // The old formula (maxSafeHeap = _systemTotalMB - 300) assumed heap would
+  // stay below ~200MB on a 512MB container. But with Chromium --single-process,
+  // Flutter Web CanvasKit loads ~150MB INTO the V8 heap — total ~247MB during
+  // browser launch. The clamp was reducing restartHeapMB to 212MB, which is
+  // BELOW the normal Flutter load, causing the heap guardian to kill the
+  // process on every browser launch.
+  // The correct fix is to let the MODE_THRESHOLDS values (set above) be used
+  // as-is — they're already calibrated for the 384MB V8 limit.
+  // const maxSafeHeap = _systemTotalMB - 300;
+  // if (maxSafeHeap < MODE_THRESHOLDS.memory_protection.restartHeapMB) { ... }
 }
 
 const persistConfig = require('./persistent-config');
@@ -106,35 +109,33 @@ type MemoryMode = 'full_power' | 'memory_protection' | 'minimum';
 
 const MODE_THRESHOLDS = {
   full_power: {
-    // BUGFIX (2026-10-26): V8 max-old-space-size was 3584MB (3.5GB!) on a 512MB
-    // container — V8 never GC'd and the process OOM-killed every ~3 minutes.
-    // Fixed in package.json: --max-old-space-size=256.
-    // With 256MB V8 limit, thresholds must be well below 256MB:
-    //   - warnHeapMB = 160 (V8 starts GCing at ~200MB, warn at 160)
-    //   - restartHeapMB = 200 (clean restart before V8 OOM at 256MB)
-    //   - rssHardLimitMB = 410 (total process RSS, including Chromium ~200MB)
-    //   - gcIntervalMs = 30s (more frequent GC than old 90s)
-    warnHeapMB: 160,
-    restartHeapMB: 200,
-    rssHardLimitMB: 410,
+    // BUGFIX (2026-10-26): V8 max-old-space-size is now 384MB (was 3584MB).
+    // 384MB V8 = enough for bot JS (~80MB) + Flutter CanvasKit (~150MB) + headroom.
+    // 256MB was too low — V8 OOM'd when Flutter loaded.
+    warnHeapMB: 200,
+    restartHeapMB: 260,
+    rssHardLimitMB: 440,
     gcIntervalMs: 30 * 1000,
     monitorIntervalMs: 15 * 1000,
     warningStreak: 2,
   },
   memory_protection: {
-    // BUGFIX (2026-10-26): Match 256MB V8 limit.
-    warnHeapMB: 140,
-    restartHeapMB: 180,
-    rssHardLimitMB: 380,
+    // BUGFIX (2026-10-26): Flutter Web CanvasKit loads ~150MB into V8 heap.
+    // Bot code needs ~80MB. Total ~230-250MB during browser launch.
+    // Old thresholds (140/180) killed the process BEFORE Flutter finished loading.
+    // With 384MB V8 limit, these thresholds allow the Flutter spike:
+    warnHeapMB: 220,
+    restartHeapMB: 300,
+    rssHardLimitMB: 440,
     gcIntervalMs: 10 * 1000,
     monitorIntervalMs: 8 * 1000,
     warningStreak: 1,
   },
   minimum: {
-    // BUGFIX (2026-10-26): Match memory_protection thresholds for 256MB V8.
-    warnHeapMB: 140,
-    restartHeapMB: 180,
-    rssHardLimitMB: 380,
+    // BUGFIX (2026-10-26): Match memory_protection.
+    warnHeapMB: 220,
+    restartHeapMB: 300,
+    rssHardLimitMB: 440,
     gcIntervalMs: 10 * 1000,
     monitorIntervalMs: 8 * 1000,
     warningStreak: 1,
