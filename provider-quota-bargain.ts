@@ -60,8 +60,9 @@ class QuotaBargainManager {
     // native module into V8 heap even though ENABLE_LOCAL_VLM=false.
     // This was consuming ~100MB of heap that the bot couldn't afford on a
     // 512MB container. Now initLocalONNX is only called explicitly if
-    // CONFIG.ENABLE_LOCAL_VLM is true.
-    if (getCONFIG().ENABLE_LOCAL_VLM) {
+    // ENABLE_LOCAL_VLM is true (checked via process.env, not getCONFIG
+    // which isn't in scope in this module).
+    if (process.env.ENABLE_LOCAL_VLM === 'true') {
       this.initLocalONNX();
     }
   }
