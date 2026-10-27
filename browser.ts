@@ -260,14 +260,13 @@ class BrowserManager {
     //   because they're drawn by the GPU/compositor. This flag only prevents the
     //   browser from caching decoded image data in memory.
     // --disable-notifications: skip notification permission prompts
-    // --disable-features=site-per-process: disable site isolation (saves ~50-80MB).
-    //   Site isolation spawns a separate renderer process per origin — on a 512MB
-    //   container with --single-process mode, this is unnecessary and wastes memory.
-    // --memory-pressure-off: don't throttle based on system memory pressure
-    //   (we handle memory ourselves via the heap guardian)
-    // --disable-background-timer-throttling: keep timers running in background tabs
+    // BUGFIX (2026-10-27): REMOVED --disable-features=site-per-process,IsolateOrigins.
+    // Disabling site isolation breaks Flutter Web CanvasKit — it uses
+    // SharedArrayBuffer + WebGL which require site isolation to be enabled.
+    // With site isolation disabled, Flutter fails to initialize → BLANK screen
+    // → bot enters retry loop → accumulates memory → OOM.
+    // The memory savings (~50-80MB) are NOT worth a blank page.
     flags.push('--disable-notifications');
-    flags.push('--disable-features=site-per-process,IsolateOrigins');
     flags.push('--disable-background-timer-throttling');
     flags.push('--disable-renderer-backgrounding');
     flags.push('--disable-backgrounding-occluded-windows');
