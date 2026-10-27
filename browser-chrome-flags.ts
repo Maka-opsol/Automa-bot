@@ -138,11 +138,43 @@ function getChromeFlags(options: any = {}) {
   // On Render, CHROMIUM_FLAGS contains ~12 flags, ~8 of which overlap
   // with FLAG_GROUPS. Deduplication saves ~200 bytes of argv and reduces
   // Chromium stderr noise from duplicate-flag warnings.
+  //
+  // BUGFIX (2026-10-27): FILTER OUT --disable-gpu and --disable-software-rasterizer
+  // from the env var. The Dockerfile sets these in CHROMIUM_FLAGS, but they
+  // kill WebGL → kill Flutter Web CanvasKit → BLANK screen → retry loop → OOM.
+  // The Dockerfile can't be patched via the dashboard, so we filter them here.
+  // Also filter --js-flags=--max-old-space-size=96 (too low for Flutter) and
+  // replace with --js-flags=--max-old-space-size=128.
+  const BLOCKED_ENV_FLAGS = [
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+    '--disable-accelerated-2d-canvas',
+  ];
   const extraFlags = process.env.CHROMIUM_FLAGS;
   let envSkipped = 0;
   if (extraFlags) {
     const envFlagList = extraFlags.split(/\s+/).filter(Boolean);
     for (const flag of envFlagList) {
+      // BUGFIX: Skip flags that break Flutter Web rendering
+      if (BLOCKED_ENV_FLAGS.includes(flag)) {
+        envSkipped++;
+        if (options.verbose) {
+          _getLogger().log(`Chrome flags: FILTERED OUT harmful env flag: ${flag} (breaks Flutter Web CanvasKit)`, 'WARN', 'chrome-flags');
+        }
+        continue;
+      }
+      // BUGFIX: Replace low Chromium V8 limit (96MB) with higher one (128MB)
+      if (flag.startsWith('--js-flags=--max-old-space-size=')) {
+        const newSize = '128';
+        const replacement = `--js-flags=--max-old-space-size=${newSize}`;
+        if (flag !== replacement) {
+          flags.push(replacement);
+          if (options.verbose) {
+            _getLogger().log(`Chrome flags: REPLACED ${flag} with ${replacement} (Flutter needs more V8 heap)`, 'WARN', 'chrome-flags');
+          }
+          continue;
+        }
+      }
       if (dedupEnvFlags && _matchesCommonPrefix(flag) && addedPrefixes.has(flag)) {
         envSkipped++;
         continue;
