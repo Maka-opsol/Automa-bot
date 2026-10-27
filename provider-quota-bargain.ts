@@ -55,7 +55,15 @@ class QuotaBargainManager {
     this.budgets = new Map();
     this.localModel = null;
     this.loadQuotas();
-    this.initLocalONNX();
+    // BUGFIX (2026-10-27): Removed this.initLocalONNX() from constructor.
+    // It called require('onnxruntime-node') at startup — loading a ~100MB+
+    // native module into V8 heap even though ENABLE_LOCAL_VLM=false.
+    // This was consuming ~100MB of heap that the bot couldn't afford on a
+    // 512MB container. Now initLocalONNX is only called explicitly if
+    // CONFIG.ENABLE_LOCAL_VLM is true.
+    if (getCONFIG().ENABLE_LOCAL_VLM) {
+      this.initLocalONNX();
+    }
   }
 
   loadQuotas() {
