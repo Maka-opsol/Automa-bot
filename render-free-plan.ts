@@ -73,66 +73,134 @@ const _earlyOomIntervalHandle: any = _earlyOomInterval;
 if (_earlyOomIntervalHandle.unref) _earlyOomIntervalHandle.unref();
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// TASK 133 (2026-10-28): ULTRA-FAST MEMORY WATCHDOG (500ms interval)
+// TASK 134 (2026-10-28): CGROUP MEMORY WATCHDOG (reads TOTAL container memory)
 // ═══════════════════════════════════════════════════════════════════════════════
-// The 2s early-oom guard and 5s runtime monitor were too slow to catch
-// Chrome's CanvasKit WASM compile spike. Chrome's RSS can jump 200MB in
-// <1 second during WASM compilation, and the kernel's cgroup OOM killer
-// fires INSTANTLY when the cgroup exceeds 512MB — no chance for our
-// 2s/5s intervals to react.
+// TASK 133's watchdog was blind! It only measured Node's RSS (process.memoryUsage().rss)
+// — but Chrome is a SEPARATE process (Playwright launches it as a child process,
+// even with --single-process). Xvfb is also separate. So:
 //
-// This 500ms watchdog is the LAST line of defense. It:
-//   1. Checks RSS every 500ms
-//   2. If RSS > 320MB, attempts to close Chrome immediately (frees ~100MB)
-//   3. If RSS > 380MB, calls process.exit(137) before the kernel kills us
-//   4. Logs every 5s (10 polls) so we can see the memory trend
+//   Node RSS (what we measured):  ~280MB
+//   Chrome RSS (NOT measured):   ~200-300MB (CanvasKit WASM compile)
+//   Xvfb RSS (NOT measured):     ~20-30MB
+//   Total cgroup:                ~500-610MB → kernel OOM kill at 512MB!
 //
-// The 320MB threshold is deliberately LOW — Chrome's CanvasKit compile
-// can spike 200MB in <1s, so we need to react at 320MB to stay under 512MB.
+// The watchdog never fired because Node's RSS never crossed 320MB. But the
+// CGROUP memory crossed 512MB and the kernel SIGKILLed the process.
+//
+// FIX: Read the actual cgroup memory usage from /sys/fs/cgroup/. This includes
+// ALL processes in the container (Node + Chrome + Xvfb). When cgroup memory
+// is high, close Chrome BEFORE the kernel kills us.
+//
+// Cgroup v1 path: /sys/fs/cgroup/memory/memory.usage_in_bytes
+// Cgroup v2 path: /sys/fs/cgroup/memory.current
+// We try both, plus /proc/meminfo as a fallback.
 // ═══════════════════════════════════════════════════════════════════════════════
+const fs_watchdog = require('fs');
+function _readCgroupMemoryMB(): number {
+  // Try cgroup v2 first (modern Docker/K8s)
+  try {
+    const v2 = fs_watchdog.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim();
+    const bytes = parseInt(v2, 10);
+    if (bytes > 0) return bytes / 1024 / 1024;
+  } catch {}
+  // Try cgroup v1
+  try {
+    const v1 = fs_watchdog.readFileSync('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'utf8').trim();
+    const bytes = parseInt(v1, 10);
+    if (bytes > 0) return bytes / 1024 / 1024;
+  } catch {}
+  // Fallback: use /proc/meminfo (MemTotal - MemAvailable = used)
+  // This is less accurate but works without cgroup support
+  try {
+    const meminfo = fs_watchdog.readFileSync('/proc/meminfo', 'utf8');
+    const totalMatch = meminfo.match(/MemTotal:\s+(\d+)\s+kB/);
+    const availMatch = meminfo.match(/MemAvailable:\s+(\d+)\s+kB/);
+    if (totalMatch && availMatch) {
+      const totalKB = parseInt(totalMatch[1], 10);
+      const availKB = parseInt(availMatch[1], 10);
+      return (totalKB - availKB) / 1024;
+    }
+  } catch {}
+  // Last resort: return Node's RSS (inaccurate but better than nothing)
+  return process.memoryUsage().rss / 1024 / 1024;
+}
+
+// Log the cgroup memory limit once at startup so we know the actual container limit
+function _logCgroupLimit() {
+  try {
+    // cgroup v2
+    const v2max = fs_watchdog.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
+    if (v2max && v2max !== 'max') {
+      const maxMB = parseInt(v2max, 10) / 1024 / 1024;
+      console.error(`[WATCHDOG] Cgroup v2 memory limit: ${maxMB.toFixed(0)}MB (from /sys/fs/cgroup/memory.max)`);
+      return;
+    } else if (v2max === 'max') {
+      console.error(`[WATCHDOG] Cgroup v2 memory limit: UNLIMITED (no cgroup limit)`);
+      return;
+    }
+  } catch {}
+  try {
+    // cgroup v1
+    const v1limit = fs_watchdog.readFileSync('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8').trim();
+    const limitMB = parseInt(v1limit, 10) / 1024 / 1024;
+    if (limitMB > 0 && limitMB < 100000) { // sanity check — if > 100GB, it's not a real limit
+      console.error(`[WATCHDOG] Cgroup v1 memory limit: ${limitMB.toFixed(0)}MB (from /sys/fs/cgroup/memory/memory.limit_in_bytes)`);
+      return;
+    }
+  } catch {}
+  console.error(`[WATCHDOG] Could not read cgroup memory limit — using /proc/meminfo fallback`);
+}
+_logCgroupLimit();
+
 const _WATCHDOG_INTERVAL_MS = 500;
-const _WATCHDOG_CLOSE_CHROME_AT_RSS_MB = 320;  // close Chrome to free ~100MB
-const _WATCHDOG_EXIT_AT_RSS_MB = 380;            // exit before kernel kills us
-const _WATCHDOG_LOG_EVERY_N_POLLS = 10;          // log every 5s (10 * 500ms)
+// TASK 134: These thresholds are for CGROUP memory (Node + Chrome + Xvfb).
+// Container limit: 512MB. Kernel kills at ~510MB.
+//   CGROUP > 380MB → close Chrome (frees ~150-200MB)
+//   CGROUP > 430MB → exit immediately (kernel is about to kill us)
+const _WATCHDOG_CLOSE_CHROME_AT_CGROUP_MB = 380;
+const _WATCHDOG_EXIT_AT_CGROUP_MB = 430;
+const _WATCHDOG_LOG_EVERY_N_POLLS = 10; // log every 5s
 let _watchdogPollCount = 0;
 let _watchdogChromeClosed = false;
 const _watchdogInterval = setInterval(() => {
   try {
     const mem = process.memoryUsage();
     const heapMB = mem.heapUsed / 1024 / 1024;
-    const rssMB = mem.rss / 1024 / 1024;
+    const nodeRssMB = mem.rss / 1024 / 1024;
+    const cgroupMB = _readCgroupMemoryMB(); // ← THE KEY FIX: total container memory
     _watchdogPollCount++;
 
-    // Log every 5s (10 polls) — gives us the memory trend
+    // Log every 5s (10 polls) — shows BOTH Node RSS and cgroup memory
     if (_watchdogPollCount % _WATCHDOG_LOG_EVERY_N_POLLS === 0) {
-      console.error(`[WATCHDOG] heap=${heapMB.toFixed(0)}MB rss=${rssMB.toFixed(0)}MB (poll #${_watchdogPollCount})`);
+      console.error(`[WATCHDOG] nodeHeap=${heapMB.toFixed(0)}MB nodeRSS=${nodeRssMB.toFixed(0)}MB cgroup=${cgroupMB.toFixed(0)}MB (poll #${_watchdogPollCount})`);
     }
 
-    // TIER 1: RSS > 320MB → close Chrome to free ~100MB
-    if (rssMB > _WATCHDOG_CLOSE_CHROME_AT_RSS_MB && !_watchdogChromeClosed) {
-      _watchdogChromeClosed = true;  // only close once per spike
-      console.error(`[WATCHDOG] RSS ${rssMB.toFixed(0)}MB > ${_WATCHDOG_CLOSE_CHROME_AT_RSS_MB}MB — closing Chrome to free memory (heap=${heapMB.toFixed(0)}MB)`);
+    // TIER 1: Cgroup memory > 380MB → close Chrome to free ~150-200MB
+    // This is the REAL memory check. Node's RSS alone (280MB) was never enough
+    // to trigger this — but Chrome's separate RSS pushes cgroup to 500MB+.
+    if (cgroupMB > _WATCHDOG_CLOSE_CHROME_AT_CGROUP_MB && !_watchdogChromeClosed) {
+      _watchdogChromeClosed = true;
+      console.error(`[WATCHDOG] CGROUP ${cgroupMB.toFixed(0)}MB > ${_WATCHDOG_CLOSE_CHROME_AT_CGROUP_MB}MB (nodeRSS=${nodeRssMB.toFixed(0)}MB) — closing Chrome to free ~150-200MB`);
       try {
-        // Try to close Chrome via the container — this frees ~100MB instantly
         const { container } = require('./container');
         const browserMod = container.get('browser', { required: false });
         if (browserMod?.closeBrowser) {
           browserMod.closeBrowser().catch(() => {}).then(() => {
-            console.error(`[WATCHDOG] Chrome closed — RSS should drop. Will allow relaunch on next cycle.`);
-            // Reset after 10s so the next cycle can relaunch Chrome
+            const afterMB = _readCgroupMemoryMB();
+            console.error(`[WATCHDOG] Chrome closed — cgroup was ${cgroupMB.toFixed(0)}MB, now ${afterMB.toFixed(0)}MB. Will allow relaunch on next cycle.`);
             setTimeout(() => { _watchdogChromeClosed = false; }, 10000).unref?.();
           });
         }
       } catch (e: any) {
         console.error(`[WATCHDOG] Failed to close Chrome: ${e.message}`);
       }
-      // Force GC
       if (global.gc) { try { global.gc(); } catch {} }
     }
 
-    // TIER 2: RSS > 380MB → exit immediately (kernel is about to kill us)
-    if (rssMB > _WATCHDOG_EXIT_AT_RSS_MB) {
-      console.error(`[FATAL] [WATCHDOG] RSS ${rssMB.toFixed(0)}MB > ${_WATCHDOG_EXIT_AT_RSS_MB}MB — kernel OOM imminent, exiting immediately (heap=${heapMB.toFixed(0)}MB)`);
+    // TIER 2: Cgroup memory > 430MB → exit immediately (kernel is about to kill us)
+    // 430MB gives 82MB headroom under 512MB. The kernel fires at ~510MB.
+    if (cgroupMB > _WATCHDOG_EXIT_AT_CGROUP_MB) {
+      console.error(`[FATAL] [WATCHDOG] CGROUP ${cgroupMB.toFixed(0)}MB > ${_WATCHDOG_EXIT_AT_CGROUP_MB}MB (nodeRSS=${nodeRssMB.toFixed(0)}MB heap=${heapMB.toFixed(0)}MB) — kernel OOM imminent, exiting immediately`);
       clearInterval(_watchdogInterval);
       clearInterval(_earlyOomInterval);
       process.exit(137);
