@@ -4,8 +4,17 @@ import type { Deps } from './types/di-types';
 
 // ─── npm packages + Node builtins only at top level ───
 const { chromium } = require('playwright');
-let sharp: any;
-try { sharp = require('sharp'); } catch (e: any) { sharp = null; }
+// TASK 131 (2026-10-28): sharp made LAZY to save ~30-50MB during boot.
+// Browser.ts is required by container.get('orchestrator') → cycleManager → 'browser' dep.
+// Loading sharp eagerly was contributing to the boot OOM crash loop.
+let _sharp: any = null;
+let _sharpLoaded = false;
+function _getSharp(): any {
+  if (_sharpLoaded) return _sharp;
+  _sharpLoaded = true;
+  try { _sharp = require('sharp'); } catch (e: any) { _sharp = null; }
+  return _sharp;
+}
 const crypto = require('crypto');
 
 // Utility modules — these have minimal/no project deps and will be
@@ -254,22 +263,6 @@ class BrowserManager {
     // BUG FIX (2026-09-07): Force HTTP/1.1 to avoid proxy HTTP/2 incompatibility.
     // Some proxies can't handle multiplexed HTTP/2 traffic, causing silent drops.
     flags.push('--disable-http2');
-    // BUGFIX (2026-10-26): Add memory-saving flags to reduce Chromium RSS.
-    // --disable-images: don't load image resources (saves ~20-40MB on image-heavy pages).
-    //   The bot takes screenshots of the page — images still render in the screenshot
-    //   because they're drawn by the GPU/compositor. This flag only prevents the
-    //   browser from caching decoded image data in memory.
-    // --disable-notifications: skip notification permission prompts
-    // BUGFIX (2026-10-27): REMOVED --disable-features=site-per-process,IsolateOrigins.
-    // Disabling site isolation breaks Flutter Web CanvasKit — it uses
-    // SharedArrayBuffer + WebGL which require site isolation to be enabled.
-    // With site isolation disabled, Flutter fails to initialize → BLANK screen
-    // → bot enters retry loop → accumulates memory → OOM.
-    // The memory savings (~50-80MB) are NOT worth a blank page.
-    flags.push('--disable-notifications');
-    flags.push('--disable-background-timer-throttling');
-    flags.push('--disable-renderer-backgrounding');
-    flags.push('--disable-backgrounding-occluded-windows');
     // BUG FIX (2026-09-08): Provide explicit fallbacks for DISPLAY_WIDTH/HEIGHT
     // at the call site (defense-in-depth — addWindowSizeFlags also validates,
     // but if browser-chrome-flags.ts is an older version, this protects us).
@@ -667,6 +660,7 @@ class BrowserManager {
   // mean less transient memory during parallel tribunal calls.
   async compressScreenshot(base64: string, maxWidth = 512, quality = 10) { 
     if (!base64) return base64;
+    const sharp = _getSharp();
     if (!sharp) return base64;
     try {
       const buffer = Buffer.from(base64, 'base64');
