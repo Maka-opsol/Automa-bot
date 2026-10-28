@@ -19,8 +19,24 @@
 //   - Groq priority is preserved for speed (Groq uses LPU inference
 //     and is typically the fastest vision provider)
 
-let sharp: any;
-try { sharp = require('sharp'); } catch (e: any) { sharp = null; }
+// ─── sharp (LAZY) ─────────────────────────────────────────────────────────
+// TASK 131 (2026-10-28): sharp is a heavy native module (~30-50MB RSS).
+// Loading it at module-eval time was contributing to the OOM crash loop
+// during boot (providers-vision-pipeline is transitively required by
+// providers-detection-* modules which are required by providers.ts which
+// is required by container.get('orchestrator')).
+//
+// Now sharp loads on first use. The first vision-pipeline call triggers
+// the native module load — by then we're past the boot phase and into
+// steady-state operation.
+let _sharp: any = null;
+let _sharpLoaded = false;
+function _getSharp(): any {
+  if (_sharpLoaded) return _sharp;
+  _sharpLoaded = true;
+  try { _sharp = require('sharp'); } catch (e: any) { _sharp = null; }
+  return _sharp;
+}
 
 // ─── Dependency Injection ───
 let _deps: Record<string, any> = {};
@@ -182,6 +198,7 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
   const session = await loadONNX();
   if (session) {
     try {
+      const sharp = _getSharp();
       if (!sharp) throw new Error('sharp not available');
       const buf = Buffer.from(compressedBase64, 'base64');
       const { data, info } = await sharp(buf).removeAlpha().resize(224, 224).raw().toBuffer({ resolveWithObject: true });
