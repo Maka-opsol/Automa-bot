@@ -161,4 +161,20 @@ HEALTHCHECK --interval=60s --timeout=30s --start-period=300s --retries=5 \
 # 448MB V8 + ~100-150MB Chromium RSS = 548-598MB total, which EXCEEDS the
 # 512MB container limit → kernel OOM killer fires. 384MB V8 + 128MB for
 # Chromium/OS = 512MB, fitting within the container.
-CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; exec node --expose-gc --max-old-space-size=384 --import tsx render-free-plan.ts"]
+# TASK 135 (2026-10-28): Raised Node V8 heap from 384MB to 448MB.
+# The bot was hitting V8's own OOM limit (384MB) during Playwright's
+# closeBrowser() teardown, which generates ~300MB of transient JS objects
+# (targetdestroyed events, response objects, page cleanup). Node's heap
+# would jump from 77MB to 380MB in <1 second, hitting the 384MB limit.
+# 448MB gives 64MB more headroom for these teardown spikes.
+# Total budget: 448MB Node V8 + ~64MB Chrome = 512MB (fits container).
+# TASK 136 (2026-10-28): Removed Xvfb from CMD. Chrome runs headless by default
+# (browser.ts line 284: `_headless = _forceHeaded ? false : true`). Xvfb was only
+# needed for the /api/browser/headed endpoint (human intervention). Since we
+# can't afford the 30MB Xvfb process on 512MB, headed mode is now disabled.
+# The bot can still complete questions in headless mode.
+#
+# Also: browser.ts now blocks canvaskit.wasm (Task 136), forcing Flutter to
+# use its HTML renderer instead of CanvasKit. This saves ~200MB of WASM
+# compile memory, which was the primary cause of the OOM crashes.
+CMD ["sh", "-c", "exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
