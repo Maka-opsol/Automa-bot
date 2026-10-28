@@ -23,21 +23,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxfixes3 libxext6 libxi6 libxtst6 \
     libxcursor1 libxss1 libdbus-1-3 libexpat1 \
     libglib2.0-0 \
-    python3 python3-pip make g++ \
+    python3 make g++ \
     curl \
     xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
-# TASK 121 (2026-10-21): Install Pix2Text for math OCR.
-# Pix2Text provides accurate OCR for math equations and formulas — far
-# better than the 5x7 pixel template fallback in pixel-fallback.ts.
-# We install with --no-cache-dir and --break-system-packages (Python 3.11+
-# on Debian Bookworm requires this flag for system pip installs).
-# TASK 125 (2026-10-22): Install torch FIRST (CPU-only), then pix2text.
-# torch must be installed before pix2text because pix2text depends on it.
-# Installing torch from the CPU index avoids pulling the 2GB+ CUDA wheels.
-RUN pip3 install --no-cache-dir --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu && \
-    pip3 install --no-cache-dir --break-system-packages pix2text
+# TASK 126 (2026-10-22): REMOVED Pix2Text and torch entirely.
+# Pix2Text + torch CPU wheels take 30-60+ minutes to install on Render's
+# free tier build environment, causing deployment timeouts.
+# The bot doesn't critically need Pix2Text — it has multiple other OCR paths:
+#   1. page.evaluate(() => document.body.innerText) — extracts text from
+#      the DOM directly (Flutter Web renders text in the DOM)
+#   2. Cloud vision providers (Groq, NVIDIA, z.ai, etc.) can read math
+#      from screenshots
+#   3. Wolfram solver can solve problems from text
+# Removing pix2text + torch saves ~2GB+ of image space and prevents build
+# timeouts. Python3 is still installed (needed by other potential scripts)
+# but no pip packages are installed.
+# If Pix2Text is needed in the future, install it as a separate optional
+# build stage or use a pre-built image.
 
 WORKDIR /app
 
@@ -110,6 +114,14 @@ ENV NODE_ENV=production \
     HEARTBEAT_FILE=/tmp/.heartbeat \
     CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion --js-flags=--max-old-space-size=96 --optimize-for-size --single-process"
 
+# TASK 131 (2026-10-28): Bumped start-period from 60s to 300s and timeout
+# from 10s to 30s. The render-free-plan.ts now DEFERS container.get('orchestrator')
+# until AFTER server.listen() fires — that load takes 5-15s and blocks the
+# event loop. HEALTHCHECK requests queue up in the OS TCP buffer during the
+# block, so the timeout needs to be long enough to survive it (30s).
+# The start-period of 300s gives Render 5 minutes of tolerance for the
+# orchestrator load + first cycle to spin up before health checks count
+# against the service.
 HEALTHCHECK --interval=60s --timeout=30s --start-period=300s --retries=5 \
     CMD curl -sf http://localhost:10000/health || exit 1
 
