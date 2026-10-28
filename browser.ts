@@ -428,6 +428,39 @@ class BrowserManager {
     this.pageInstance.setDefaultTimeout(getCONFIG().BROWSER_PAGE_TIMEOUT_MS || 30000);
     this.pageInstance.setDefaultNavigationTimeout(getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000);
     await this.pageInstance.addInitScript(this.getFingerprintSpoofScript());
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TASK 136 (2026-10-28): BLOCK CanvasKit WASM to prevent OOM.
+    // ═══════════════════════════════════════════════════════════════════════
+    // Flutter Web's CanvasKit renderer downloads a ~2MB WASM bundle and
+    // compiles it, spiking Chrome's RSS by 200-300MB. On a 512MB container
+    // this causes an OOM crash every time.
+    //
+    // By blocking the canvaskit.wasm download, Flutter falls back to its
+    // HTML renderer (if the app was built with `--web-renderer auto`).
+    // The HTML renderer uses DOM elements instead of WebGL, using ~50-100MB
+    // less memory. The AI providers can still read the page from screenshots.
+    //
+    // If the app was built with `--web-renderer canvaskit` only (no auto
+    // fallback), the page won't render — but it wasn't rendering anyway
+    // (OOM crash). So there's no loss.
+    //
+    // We also block other heavy Flutter assets that aren't needed:
+    //   - canvaskit.wasm (the WASM bundle itself)
+    //   - canvaskit.js (the loader)
+    //   - Flutter fonts (not needed for screenshots)
+    // ═══════════════════════════════════════════════════════════════════════
+    try {
+      await this.pageInstance.route('**/canvaskit*', (route: any) => {
+        const url = route.request().url();
+        log(`[TASK 136] Blocking CanvasKit asset: ${url}`, 'INFO', 'browser');
+        route.abort('blockedbyclient').catch(() => {});
+      });
+      log('[TASK 136] CanvasKit blocking route installed — Flutter will use HTML renderer', 'INFO', 'browser');
+    } catch (e: any) {
+      log(`[TASK 136] Failed to install CanvasKit blocking route: ${e.message}`, 'WARN', 'browser');
+    }
+
     this.pageInstance.on('crash', () => { log('Page crashed', 'ERROR', 'browser'); this.browserDisconnected = true; this.emit('crashed'); });
     this.pageInstance.on('error', (err: Error) => { logError('Page error', err); });
     const selectCalibration = getSelectCalibration();
