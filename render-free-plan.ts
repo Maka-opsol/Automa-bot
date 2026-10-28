@@ -41,12 +41,22 @@ const _earlyOomInterval = setInterval(() => {
     // TASK 41 (2026-09-10): Raised RSS limit from 450→480MB to match new 448MB V8 limit.
     // Old: 450MB RSS / 384MB V8 = 66MB non-V8 headroom
     // New: 480MB RSS / 448MB V8 = 32MB non-V8 headroom (tighter, but V8 now has more room)
-    // TASK 86 (2026-09-25): Reduced from 480MB to 450MB for new 384MB V8 limit.
-    // Old: 480MB RSS / 448MB V8 = only 32MB non-V8 headroom (too tight)
-    // New: 450MB RSS / 384MB V8 = 66MB non-V8 headroom (safer)
-    if (rssMB >= 450 && !_earlyOomTriggered) {
+    // TASK 132 (2026-10-28): Reduced from 450MB to 420MB.
+    // Old: 450MB RSS / 512MB container → only 62MB headroom before kernel SIGKILL
+    //   The bot was silently dying during the Flutter Web render phase because
+    //   Chrome's RSS would spike from 270MB to 490MB in <5s during CanvasKit
+    //   init, crossing the kernel OOM threshold before this 2s guard could fire.
+    // New: 420MB RSS / 512MB container = 92MB headroom.
+    //   If RSS crosses 420MB, we exit IMMEDIATELY (exit 137 = SIGKILL = Render
+    //   auto-restarts). This is better than letting the kernel kill us — at
+    //   least we log the reason and Render sees a clean exit code.
+    //
+    // This works in tandem with the runtime memory monitor (5s interval,
+    // L2 at 350MB, L3 at 400MB) which should catch most spikes BEFORE this
+    // early-oom guard fires. This guard is the LAST line of defense.
+    if (rssMB >= 420 && !_earlyOomTriggered) {
       _earlyOomTriggered = true;
-      console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 480MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
+      console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 420MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
       clearInterval(_earlyOomInterval);
       process.exit(137);
     }
@@ -146,8 +156,17 @@ if (!process.env.REGRESSION_BANK_DIR)   process.env.REGRESSION_BANK_DIR   = path
 // (800x600 vs 1280x800 = 480K pixels vs 1024K pixels).
 // JPEG quality 30 at 800x600 ≈ 15-25KB per screenshot vs 30-60KB at 1280x800.
 // The AI providers can still read math at this resolution.
-if (!process.env.DISPLAY_WIDTH)  process.env.DISPLAY_WIDTH  = '800';
-if (!process.env.DISPLAY_HEIGHT) process.env.DISPLAY_HEIGHT = '600';
+//
+// TASK 132 (2026-10-28): Reduced from 800x600 to 640x480.
+// Smaller viewport = smaller Chrome canvas = less memory for:
+//   - Chrome's backing store (canvas bitmap): 640x480x4 = 1.2MB (was 1.9MB at 800x600)
+//   - Flutter Web's CanvasKit: renders at device pixel ratio, so smaller
+//     viewport = smaller GPU texture = less GPU memory
+//   - Screenshot buffers: 640x480 = 307K pixels (was 480K at 800x600)
+// Saves ~10-30MB of Chrome RSS during the Flutter render phase.
+// AI providers can still read math at 640x480 — it's only 20% smaller than 800x600.
+if (!process.env.DISPLAY_WIDTH)  process.env.DISPLAY_WIDTH  = '640';
+if (!process.env.DISPLAY_HEIGHT) process.env.DISPLAY_HEIGHT = '480';
 
 // Memory — only set MAX_MEMORY_MB if not already set.
 // Render free plan = 512 MB total. Aggressive threshold to prevent OOM kills.
@@ -217,8 +236,8 @@ const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilien
   const _mem = process.memoryUsage();
   const _postContainerHeapMB = _mem.heapUsed / 1024 / 1024;
   const _postContainerRSSMB = _mem.rss / 1024 / 1024;
-  if (_postContainerRSSMB >= 480) {
-    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 480MB after container init. Kernel OOM imminent. Exiting immediately.`);
+  if (_postContainerRSSMB >= 420) {
+    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 420MB after container init. Kernel OOM imminent. Exiting immediately. [TASK 132]`);
     clearInterval(_earlyOomInterval);
     process.exit(137);
   }
@@ -675,8 +694,16 @@ function _startMemoryMonitor(): void {
     clearInterval(_memoryMonitorInterval);
     _memoryMonitorInterval = null;
   }
-  const intervalMs = memoryMode.getThresholds().monitorIntervalMs;
-  log(`Memory monitor starting (interval=${intervalMs}ms, mode=${memoryMode.getMode()})`, 'DEBUG', 'render-free-plan');
+  // TASK 132 (2026-10-28): Force 5s interval regardless of mode.
+  // The old code used memoryMode.getThresholds().monitorIntervalMs which was
+  // 20s in full_power mode. That's too slow — Chrome can spike 100MB of RSS
+  // in 5 seconds during the Flutter Web CanvasKit render phase. By the time
+  // the 20s monitor fires, the kernel has already SIGKILLed the process
+  // at ~490MB RSS.
+  //
+  // 5s gives us 4-5 chances to react before the kernel fires.
+  const intervalMs = 5000;
+  log(`Memory monitor starting (interval=${intervalMs}ms, mode=${memoryMode.getMode()}) [TASK 132: aggressive]`, 'INFO', 'render-free-plan');
   _memoryMonitorInterval = setInterval(() => {
     if (isShuttingDown) return;
     const mem = process.memoryUsage();
@@ -743,27 +770,61 @@ function _startMemoryMonitor(): void {
     //      memory_protection death loops when heap spiked to 320MB.
     // New: HARD_RESTART_HEAP_MB=380 (out of 448MB V8) → gives 68MB headroom.
     //      The bot typically runs at 280-350MB; 380MB only fires on real spikes.
-    // TASK 86 (2026-09-25): Reduced from 380MB to 330MB for new 384MB V8 limit.
-    // Old: 380MB / 448MB V8 = 68MB headroom
-    // New: 330MB / 384MB V8 = 54MB headroom
-    const HARD_RESTART_HEAP_MB = 330; // only fire if heap > 330MB (out of 384MB V8 limit)
-    // TASK 86 (2026-09-25): Reduced from 470MB to 460MB for new 384MB V8 limit.
-    // Old: 470MB RSS / 512MB container = 42MB headroom (too tight with 448MB V8)
-    // New: 460MB RSS / 512MB container = 52MB headroom (safer with 384MB V8)
-    const HARD_RSS_LIMIT_MB = 460;   // only fire if RSS > 460MB (out of 512MB container)
+    // TASK 132 (2026-10-28): Aggressive RSS thresholds to prevent kernel OOM
+    // during Flutter Web render phase.
+    //
+    // OLD (Task 86): HARD_RSS_LIMIT_MB=460, HARD_RESTART_HEAP_MB=330
+    //   → Kernel killed at ~490MB before our 20s monitor could fire
+    //
+    // NEW (Task 132): Three-tier response
+    //   RSS > 350MB → L2 (reload page) — frees Chrome's V8 heap
+    //   RSS > 400MB → L3 (close browser + relaunch) — fully resets Chrome
+    //   heap > 330MB → L2 (regardless of RSS) — Node V8 heap pressure
+    //
+    // Container limit: 512MB. Kernel OOM killer fires at ~490MB.
+    // 400MB gives 90MB headroom — safe even if Chrome spikes 50MB during reload.
+    const HARD_RESTART_HEAP_MB = 330; // unchanged — Node V8 heap limit
+    const HARD_RSS_LIMIT_MB = 400;   // was 460 — too late, kernel kills first
+    const RSS_PAGE_RELOAD_THRESHOLD_MB = 350; // NEW — L2 trigger (reload page)
     if (used > HARD_RESTART_HEAP_MB || rss > HARD_RSS_LIMIT_MB) {
-      log(`Memory CRITICAL (hard threshold): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'ERROR', 'render-free-plan');
-      // BUG FIX (2026-09-06): Cap maxLevel at L2 to prevent closing the browser.
-      // L3 closes the browser, which kills the page state and forces a re-launch
-      // + re-navigate cycle. This was causing a death loop: shed L3 → browser
-      // closed → re-launch → navigate → memory spike → shed L3 again.
-      // L2 (reload page + clear caches) is enough — it frees ~10-20MB without
-      // losing the browser session.
+      const midQuiz = memoryMode.isMidQuiz?.() ?? false;
+      log(`Memory CRITICAL (hard threshold): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${midQuiz})`, 'ERROR', 'render-free-plan');
+      // TASK 132: Allow L3 (browser restart) when RSS > 400MB AND not mid-quiz.
+      // The old code capped at L2 (reload page) which doesn't free Chrome's
+      // native memory — only its V8 heap. When Chrome's RSS is > 400MB, the
+      // native memory (skia, libcairo, font caches, etc.) is the culprit,
+      // and only a full browser restart frees it.
+      //
+      // L3 closes the browser and relaunches it. This loses the current page
+      // state, but it's better than a kernel SIGKILL that loses EVERYTHING.
+      //
+      // Exception: if mid-quiz, preserve browser (L2 only) — losing the quiz
+      // state is worse than risking OOM. The quiz will complete in 30-60s
+      // and then we can do a clean L3.
       memoryMode.shedMemory('render-monitor-critical', {
-        preserveBrowser: memoryMode.isMidQuiz?.() ?? false,
-        maxLevel: 2,  // BUG FIX: never L3 — don't close the browser
+        preserveBrowser: midQuiz,
+        maxLevel: midQuiz ? 2 : 3,  // TASK 132: L3 when not mid-quiz
       }).then(() => {
         // v5 FIX: Second GC AFTER browser cleanup actually completes
+        if (global.gc) { try { global.gc(); } catch {} }
+      }).catch(() => {});
+      if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
+      _memoryWarningCount = 0;
+      _lastRss = rss;
+    } else if (rss > RSS_PAGE_RELOAD_THRESHOLD_MB) {
+      // TASK 132: NEW intermediate tier — reload page when RSS > 350MB.
+      // This catches the Flutter Web render phase memory spike BEFORE it
+      // reaches the kernel-OOM threshold. Page reload forces Chrome to GC
+      // its V8 heap + drop native caches, freeing ~30-80MB.
+      //
+      // We do NOT close the browser here (L3) — that's reserved for the
+      // 400MB tier above. L2 (page reload) preserves the browser session
+      // while still freeing significant memory.
+      log(`Memory HIGH (page reload tier): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — L2 shed (reload page, frees Chrome V8 heap)`, 'WARN', 'render-free-plan');
+      memoryMode.shedMemory('render-monitor-rss-high', {
+        preserveBrowser: false,  // allow L2 (page reload)
+        maxLevel: 2,             // L2 only — don't close browser
+      }).then(() => {
         if (global.gc) { try { global.gc(); } catch {} }
       }).catch(() => {});
       if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
