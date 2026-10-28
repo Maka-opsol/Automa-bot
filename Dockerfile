@@ -112,7 +112,12 @@ ENV NODE_ENV=production \
     USER_DATA_DIR=/tmp/.browser-data \
     LOG_DIR=/tmp/mathu-logs \
     HEARTBEAT_FILE=/tmp/.heartbeat \
-    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion --js-flags=--max-old-space-size=96 --optimize-for-size --single-process"
+    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,BackForwardCache,SharedArrayBuffer --js-flags=--max-old-space-size=64 --optimize-for-size --single-process --purge-memory-policy --disable-features=V8VmFuture"
+
+# TASK 132 (2026-10-28): Chrome V8 heap lowered 96→64MB + memory flags added.
+# See CHROMIUM_FLAGS above. Combined with render-free-plan.ts aggressive
+# memory monitor (5s interval, L2 at RSS>350MB, L3 at RSS>400MB), this
+# prevents the kernel OOM kill during the Flutter Web CanvasKit render phase.
 
 # TASK 131 (2026-10-28): Bumped start-period from 60s to 300s and timeout
 # from 10s to 30s. The render-free-plan.ts now DEFERS container.get('orchestrator')
