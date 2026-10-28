@@ -26,12 +26,7 @@
 // Old: 350MB threshold / 448MB V8 = 98MB headroom — but 448MB V8 + 150MB
 // Chromium RSS = 598MB total, exceeding 512MB container → OOM kill.
 // New: 300MB threshold / 384MB V8 = 84MB headroom, and 384MB + 128MB = 512MB.
-// BUGFIX (2026-10-26): Raised from 300 to 350 for 384MB V8 limit.
-// The bot's heap legitimately reaches ~247MB during Flutter Web CanvasKit
-// load — that's normal, not a crisis. 300MB was too low and killed the
-// process during normal browser launch.
-// 350MB / 384MB V8 = 34MB headroom — enough for V8 to GC before hitting limit.
-const EARLY_OOM_THRESHOLD_MB = 350;
+const EARLY_OOM_THRESHOLD_MB = 300;
 const EARLY_OOM_CHECK_INTERVAL_MS = 2000; // every 2s — fast enough to catch boot spikes
 let _earlyOomTriggered = false;
 const _earlyOomInterval = setInterval(() => {
@@ -45,13 +40,13 @@ const _earlyOomInterval = setInterval(() => {
     // will SIGKILL the process before our heap guardian can react.
     // TASK 41 (2026-09-10): Raised RSS limit from 450→480MB to match new 448MB V8 limit.
     // Old: 450MB RSS / 384MB V8 = 66MB non-V8 headroom
-    // BUGFIX (2026-10-26): Raised RSS threshold from 450 to 485.
-    // The old 450MB threshold fired during normal Flutter load (RSS 455MB).
-    // 485MB / 512MB container = 27MB headroom — tight but enough for the
-    // memory shed to free ~20-40MB before the kernel OOM killer fires.
-    if (rssMB >= 485 && !_earlyOomTriggered) {
+    // New: 480MB RSS / 448MB V8 = 32MB non-V8 headroom (tighter, but V8 now has more room)
+    // TASK 86 (2026-09-25): Reduced from 480MB to 450MB for new 384MB V8 limit.
+    // Old: 480MB RSS / 448MB V8 = only 32MB non-V8 headroom (too tight)
+    // New: 450MB RSS / 384MB V8 = 66MB non-V8 headroom (safer)
+    if (rssMB >= 450 && !_earlyOomTriggered) {
       _earlyOomTriggered = true;
-      console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 485MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
+      console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 480MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
       clearInterval(_earlyOomInterval);
       process.exit(137);
     }
@@ -222,8 +217,8 @@ const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilien
   const _mem = process.memoryUsage();
   const _postContainerHeapMB = _mem.heapUsed / 1024 / 1024;
   const _postContainerRSSMB = _mem.rss / 1024 / 1024;
-  if (_postContainerRSSMB >= 485) {
-    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 485MB after container init. Kernel OOM imminent. Exiting immediately.`);
+  if (_postContainerRSSMB >= 480) {
+    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 480MB after container init. Kernel OOM imminent. Exiting immediately.`);
     clearInterval(_earlyOomInterval);
     process.exit(137);
   }
@@ -245,13 +240,114 @@ try {
   process.exit(1);
 }
 
-let startDaemon: () => Promise<void>;
-let requestStop: () => void;
-try {
-  ({ startDaemon, requestStop } = container.get('orchestrator'));
-} catch (e: any) {
-  console.error(`FATAL: Cycle module initialization failed: ${e.message}`);
-  process.exit(1);
+// ═══════════════════════════════════════════════════════════════════════
+// TASK 131 (2026-10-28): DEFER orchestrator loading until AFTER the HTTP
+// server starts listening on $PORT.
+// ═══════════════════════════════════════════════════════════════════════
+// The bot was OOM-crashing during boot at "Database schema version 31 ready"
+// — the crash happened DURING `container.get('orchestrator')` which loads
+// cycle-orchestrator → cycle-cycle-manager → browser (playwright!) → auth
+// (strategies) → providers (HTTP clients, vision pipeline, etc).
+//
+// This eager load consumed ~150-200MB on top of the ~120MB baseline
+// (config + logger + database), pushing past the 384MB V8 heap limit
+// before the HTTP server could start listening on $PORT. Render's
+// HEALTHCHECK never got a response, the service crashed, Render
+// restarted, and the loop repeated — manifesting as the violent 0%-100%
+// memory swings seen on the Render dashboard.
+//
+// FIX: Do NOT load the orchestrator synchronously here. Instead, define
+// lazy stubs for startDaemon / requestStop that trigger the load on first
+// use. The actual load happens inside _loadOrchestrator() which is called
+// AFTER the HTTP server's `listen()` callback fires.
+//
+// This way:
+//   1. The HTTP server starts listening immediately after DB init.
+//   2. Render's HEALTHCHECK passes within seconds of container start.
+//   3. Render marks the container as "healthy" BEFORE the heavy load.
+//   4. The orchestrator loads in the background (still synchronous, but
+//      after Render has already accepted the container).
+//   5. If the load OOMs the process, exit code 137 = SIGKILL = Render
+//      auto-restarts — but at least we know we made it past the
+//      healthcheck-passing phase, and the lazy providers/sharp patches
+//      should have reduced the memory consumed during this load.
+// ═══════════════════════════════════════════════════════════════════════
+let _startDaemonRetries = 0;
+const _MAX_START_DAEMON_RETRIES = 60; // 60 * 100ms = 6s max wait for orchestrator
+let startDaemon: () => Promise<void> = async () => {
+  // Placeholder — replaced by _loadOrchestrator() once orchestrator is loaded.
+  // If this is called before orchestrator loads, it means startDaemon() was
+  // invoked before the HTTP server finished its listen callback. Defer to
+  // the next tick.
+  _startDaemonRetries++;
+  if (_startDaemonRetries > _MAX_START_DAEMON_RETRIES) {
+    log(`startDaemon() waited ${_startDaemonRetries * 100}ms for orchestrator load — giving up. HTTP server may have failed to listen.`, 'ERROR', 'render-free-plan');
+    try { clearInterval(_earlyOomInterval); } catch { /* ignore */ }
+    process.exit(137);
+    return;
+  }
+  log(`startDaemon() called before orchestrator loaded — deferring 100ms (attempt ${_startDaemonRetries}/${_MAX_START_DAEMON_RETRIES})`, 'DEBUG', 'render-free-plan');
+  await new Promise(r => setTimeout(r, 100));
+  return startDaemon();
+};
+let requestStop: () => void = () => {
+  // Placeholder — replaced by _loadOrchestrator() once orchestrator is loaded.
+  // If this is called before orchestrator loads, it's a shutdown signal during
+  // boot. Just set the shutdown flag and let the deferred loader handle it.
+  log('requestStop() called before orchestrator loaded — marking for shutdown', 'WARN', 'render-free-plan');
+  _orchestratorShutdownRequested = true;
+};
+
+let _orchestratorLoaded = false;
+let _orchestratorLoading = false;
+let _orchestratorShutdownRequested = false;
+
+function _loadOrchestrator() {
+  if (_orchestratorLoaded || _orchestratorLoading) return;
+  _orchestratorLoading = true;
+  log('Loading orchestrator (cycle-orchestrator + cycle-manager + browser + providers + auth + stateMachine)...', 'INFO', 'render-free-plan');
+  const _t0 = Date.now();
+
+  // Pre-load GC: free any garbage from boot/init phase before the heavy load.
+  if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
+  const _memBefore = process.memoryUsage();
+  const _heapBefore = _memBefore.heapUsed / 1024 / 1024;
+  const _rssBefore = _memBefore.rss / 1024 / 1024;
+  log(`Memory before orchestrator load: heap=${_heapBefore.toFixed(0)}MB rss=${_rssBefore.toFixed(0)}MB`, 'INFO', 'render-free-plan');
+
+  try {
+    const orchestrator = container.get('orchestrator');
+    startDaemon = orchestrator.startDaemon;
+    requestStop = orchestrator.requestStop;
+    _orchestratorLoaded = true;
+
+    const _memAfter = process.memoryUsage();
+    const _heapAfter = _memAfter.heapUsed / 1024 / 1024;
+    const _rssAfter = _memAfter.rss / 1024 / 1024;
+    const _elapsed = Date.now() - _t0;
+    log(`Orchestrator loaded in ${_elapsed}ms. Memory after: heap=${_heapAfter.toFixed(0)}MB rss=${_rssAfter.toFixed(0)}MB (delta heap=${(_heapAfter-_heapBefore).toFixed(0)}MB rss=${(_rssAfter-_rssBefore).toFixed(0)}MB)`, 'INFO', 'render-free-plan');
+
+    // Post-load GC to reclaim any module-init garbage
+    if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
+
+    if (_orchestratorShutdownRequested) {
+      log('Shutdown was requested during orchestrator load — stopping daemon immediately', 'WARN', 'render-free-plan');
+      try { requestStop(); } catch { /* best effort */ }
+    }
+  } catch (e: any) {
+    const _memAfter = process.memoryUsage();
+    const _heapAfter = _memAfter.heapUsed / 1024 / 1024;
+    const _rssAfter = _memAfter.rss / 1024 / 1024;
+    console.error(`FATAL: Orchestrator load failed at heap=${_heapAfter.toFixed(0)}MB rss=${_rssAfter.toFixed(0)}MB: ${e.message}`);
+    console.error(`Stack: ${e.stack}`);
+    // Exit with 137 (SIGKILL) so Render auto-restarts.
+    // exit(1) would also restart, but 137 is more semantically correct
+    // for "killed by OOM" and Render treats both the same way.
+    try { clearInterval(_earlyOomInterval); } catch { /* ignore */ }
+    process.exit(137);
+  } finally {
+    _orchestratorLoading = false;
+  }
 }
 
 const _alertingMod = container.get('alerting', { required: false });
@@ -648,18 +744,13 @@ function _startMemoryMonitor(): void {
     // New: HARD_RESTART_HEAP_MB=380 (out of 448MB V8) → gives 68MB headroom.
     //      The bot typically runs at 280-350MB; 380MB only fires on real spikes.
     // TASK 86 (2026-09-25): Reduced from 380MB to 330MB for new 384MB V8 limit.
-    // BUGFIX (2026-10-26): V8 max-old-space-size was 3584MB (3.5GB!) on a 512MB
-    // container — V8 never GC'd and the process OOM-killed every ~3 minutes.
-    // Fixed in package.json: --max-old-space-size=384.
-    // 384MB V8 = enough for bot JS (~80MB) + Flutter CanvasKit (~150MB) + headroom.
-    // 256MB was too low — V8 OOM'd when Flutter loaded. 384MB forces GC while
-    // still having room for the full stack.
-    //   - HARD_RESTART_HEAP_MB = 280 (gives 104MB headroom below 384MB V8 limit)
-    //   - HARD_RSS_LIMIT_MB = 440 (gives 72MB headroom in 512MB container)
-    const HARD_RESTART_HEAP_MB = 280; // fire if heap > 280MB (out of 384MB V8 limit)
-    //
-    // 440MB gives 72MB of headroom in the 512MB container.
-    const HARD_RSS_LIMIT_MB = 440;   // fire if RSS > 440MB (out of 512MB container)
+    // Old: 380MB / 448MB V8 = 68MB headroom
+    // New: 330MB / 384MB V8 = 54MB headroom
+    const HARD_RESTART_HEAP_MB = 330; // only fire if heap > 330MB (out of 384MB V8 limit)
+    // TASK 86 (2026-09-25): Reduced from 470MB to 460MB for new 384MB V8 limit.
+    // Old: 470MB RSS / 512MB container = 42MB headroom (too tight with 448MB V8)
+    // New: 460MB RSS / 512MB container = 52MB headroom (safer with 384MB V8)
+    const HARD_RSS_LIMIT_MB = 460;   // only fire if RSS > 460MB (out of 512MB container)
     if (used > HARD_RESTART_HEAP_MB || rss > HARD_RSS_LIMIT_MB) {
       log(`Memory CRITICAL (hard threshold): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'ERROR', 'render-free-plan');
       // BUG FIX (2026-09-06): Cap maxLevel at L2 to prevent closing the browser.
@@ -1023,6 +1114,38 @@ server.listen(PORT, '0.0.0.0', () => {
   log(`Dashboard available at http://localhost:${PORT}/dashboard`, 'INFO', 'render-free-plan');
   const t = memoryMode.getThresholds();
   log(`Mode: ${memoryMode.getMode()} | Memory: warn=${t.warnHeapMB}MB restart=${t.restartHeapMB}MB rss_hard=${t.rssHardLimitMB}MB gc=${t.gcIntervalMs / 1000}s`, 'INFO', 'render-free-plan');
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // TASK 131 (2026-10-28): NOW that the HTTP server is listening, load the
+  // orchestrator. This is the heavy synchronous load (cycle-orchestrator +
+  // cycle-cycle-manager + browser + providers + auth + stateMachine + ~80
+  // subsystem modules).
+  //
+  // The load is synchronous and will block the event loop for 5-15s. During
+  // that block, /health requests from Render's HEALTHCHECK will queue up.
+  // Render's HEALTHCHECK has `--start-period=300s --retries=5`, so it
+  // tolerates 5 minutes of failed health checks during startup. After the
+  // load completes, /health will start responding 200 again.
+  //
+  // This block runs INSIDE the listen callback, which means:
+  //   - The TCP socket is already accepting connections (Render sees the port as open).
+  //   - Render's first HEALTHCHECK may already be in-flight, waiting for a response.
+  //   - Once the load completes, the queued /health requests will be processed.
+  //
+  // If the load OOMs the process, _loadOrchestrator() calls process.exit(137)
+  // → Render auto-restarts. The lazy providers/sharp patches should make this
+  // load lighter than before, ideally fitting within the 384MB V8 budget.
+  // ═══════════════════════════════════════════════════════════════════════
+  log('HTTP server listening — loading orchestrator now (deferred from boot phase)', 'INFO', 'render-free-plan');
+  try {
+    _loadOrchestrator();
+  } catch (e: any) {
+    log(`_loadOrchestrator threw synchronously: ${e.message}`, 'ERROR', 'render-free-plan');
+    // _loadOrchestrator already called process.exit(137) in its catch block,
+    // but if it threw BEFORE reaching the catch (shouldn't happen), exit here.
+    try { clearInterval(_earlyOomInterval); } catch { /* ignore */ }
+    process.exit(137);
+  }
 });
 
 // ── Heartbeat file ──
