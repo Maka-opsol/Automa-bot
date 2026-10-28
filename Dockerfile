@@ -38,8 +38,27 @@ RUN npx playwright install chromium
 # Copy source
 COPY . .
 
-# BUILD: Write a build script, then run it
-RUN echo 'const esbuild = require("esbuild"); const fs = require("fs"); const files = fs.readdirSync(".").filter(f => f.endsWith(".ts") && !f.endsWith(".test.ts") && !f.endsWith(".d.ts")); let ok = 0, fail = 0; for (const file of files) { try { const src = fs.readFileSync(file, "utf8"); const out = esbuild.transformSync(src, { loader: "ts", target: "node20", format: "cjs", sourcemap: false }); fs.writeFileSync("dist/" + file.replace(".ts", ".js"), out.code); ok++; } catch (e) { console.error("FAIL: " + file + " - " + e.message.slice(0, 80)); fail++; } } console.log("Compiled: " + ok + " files, " + fail + " failures"); if (fail > 0) process.exit(1);' > /tmp/build.js && node /tmp/build.js
+# BUILD: Compile all .ts to .js using esbuild
+# Write build script to /app/ (not /tmp/) so it can find node_modules
+RUN printf '%s\n' \
+  'const esbuild = require("esbuild");' \
+  'const fs = require("fs");' \
+  'const files = fs.readdirSync(".").filter(f => f.endsWith(".ts") && !f.endsWith(".test.ts") && !f.endsWith(".d.ts"));' \
+  'let ok = 0, fail = 0;' \
+  'for (const file of files) {' \
+  '  try {' \
+  '    const src = fs.readFileSync(file, "utf8");' \
+  '    const out = esbuild.transformSync(src, { loader: "ts", target: "node20", format: "cjs", sourcemap: false });' \
+  '    fs.writeFileSync("dist/" + file.replace(".ts", ".js"), out.code);' \
+  '    ok++;' \
+  '  } catch (e) {' \
+  '    console.error("FAIL: " + file + " - " + e.message.slice(0, 80));' \
+  '    fail++;' \
+  '  }' \
+  '}' \
+  'console.log("Compiled: " + ok + " files, " + fail + " failures");' \
+  'if (fail > 0) process.exit(1);' \
+  > build.js && node build.js && rm build.js
 
 # Runtime env
 ENV NODE_ENV=production \
