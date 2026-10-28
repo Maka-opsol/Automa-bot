@@ -54,7 +54,7 @@ ENV NODE_ENV=production \
     HEARTBEAT_FILE=/tmp/.heartbeat \
     CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion --js-flags=--max-old-space-size=96 --optimize-for-size --single-process"
 
-HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
+HEALTHCHECK --interval=60s --timeout=30s --start-period=300s --retries=5 \
     CMD curl -sf http://localhost:10000/health || exit 1
 
 # Run WITHOUT tsx — use pre-compiled dist/ JS
