@@ -73,6 +73,111 @@ const _earlyOomIntervalHandle: any = _earlyOomInterval;
 if (_earlyOomIntervalHandle.unref) _earlyOomIntervalHandle.unref();
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// TASK 133 (2026-10-28): ULTRA-FAST MEMORY WATCHDOG (500ms interval)
+// ═══════════════════════════════════════════════════════════════════════════════
+// The 2s early-oom guard and 5s runtime monitor were too slow to catch
+// Chrome's CanvasKit WASM compile spike. Chrome's RSS can jump 200MB in
+// <1 second during WASM compilation, and the kernel's cgroup OOM killer
+// fires INSTANTLY when the cgroup exceeds 512MB — no chance for our
+// 2s/5s intervals to react.
+//
+// This 500ms watchdog is the LAST line of defense. It:
+//   1. Checks RSS every 500ms
+//   2. If RSS > 320MB, attempts to close Chrome immediately (frees ~100MB)
+//   3. If RSS > 380MB, calls process.exit(137) before the kernel kills us
+//   4. Logs every 5s (10 polls) so we can see the memory trend
+//
+// The 320MB threshold is deliberately LOW — Chrome's CanvasKit compile
+// can spike 200MB in <1s, so we need to react at 320MB to stay under 512MB.
+// ═══════════════════════════════════════════════════════════════════════════════
+const _WATCHDOG_INTERVAL_MS = 500;
+const _WATCHDOG_CLOSE_CHROME_AT_RSS_MB = 320;  // close Chrome to free ~100MB
+const _WATCHDOG_EXIT_AT_RSS_MB = 380;            // exit before kernel kills us
+const _WATCHDOG_LOG_EVERY_N_POLLS = 10;          // log every 5s (10 * 500ms)
+let _watchdogPollCount = 0;
+let _watchdogChromeClosed = false;
+const _watchdogInterval = setInterval(() => {
+  try {
+    const mem = process.memoryUsage();
+    const heapMB = mem.heapUsed / 1024 / 1024;
+    const rssMB = mem.rss / 1024 / 1024;
+    _watchdogPollCount++;
+
+    // Log every 5s (10 polls) — gives us the memory trend
+    if (_watchdogPollCount % _WATCHDOG_LOG_EVERY_N_POLLS === 0) {
+      console.error(`[WATCHDOG] heap=${heapMB.toFixed(0)}MB rss=${rssMB.toFixed(0)}MB (poll #${_watchdogPollCount})`);
+    }
+
+    // TIER 1: RSS > 320MB → close Chrome to free ~100MB
+    if (rssMB > _WATCHDOG_CLOSE_CHROME_AT_RSS_MB && !_watchdogChromeClosed) {
+      _watchdogChromeClosed = true;  // only close once per spike
+      console.error(`[WATCHDOG] RSS ${rssMB.toFixed(0)}MB > ${_WATCHDOG_CLOSE_CHROME_AT_RSS_MB}MB — closing Chrome to free memory (heap=${heapMB.toFixed(0)}MB)`);
+      try {
+        // Try to close Chrome via the container — this frees ~100MB instantly
+        const { container } = require('./container');
+        const browserMod = container.get('browser', { required: false });
+        if (browserMod?.closeBrowser) {
+          browserMod.closeBrowser().catch(() => {}).then(() => {
+            console.error(`[WATCHDOG] Chrome closed — RSS should drop. Will allow relaunch on next cycle.`);
+            // Reset after 10s so the next cycle can relaunch Chrome
+            setTimeout(() => { _watchdogChromeClosed = false; }, 10000).unref?.();
+          });
+        }
+      } catch (e: any) {
+        console.error(`[WATCHDOG] Failed to close Chrome: ${e.message}`);
+      }
+      // Force GC
+      if (global.gc) { try { global.gc(); } catch {} }
+    }
+
+    // TIER 2: RSS > 380MB → exit immediately (kernel is about to kill us)
+    if (rssMB > _WATCHDOG_EXIT_AT_RSS_MB) {
+      console.error(`[FATAL] [WATCHDOG] RSS ${rssMB.toFixed(0)}MB > ${_WATCHDOG_EXIT_AT_RSS_MB}MB — kernel OOM imminent, exiting immediately (heap=${heapMB.toFixed(0)}MB)`);
+      clearInterval(_watchdogInterval);
+      clearInterval(_earlyOomInterval);
+      process.exit(137);
+    }
+  } catch (e: any) {
+    // Never let the watchdog crash the process
+  }
+}, _WATCHDOG_INTERVAL_MS);
+const _watchdogIntervalHandle: any = _watchdogInterval;
+if (_watchdogIntervalHandle.unref) _watchdogIntervalHandle.unref();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TASK 133: CRASH DIAGNOSTICS — log why the process dies
+// ═══════════════════════════════════════════════════════════════════════════════
+// The bot was dying silently with no log. These handlers will log the reason
+// before the process exits:
+//   - uncaughtException: synchronous throw that wasn't caught
+//   - unhandledRejection: async rejection that wasn't caught
+//   - SIGTERM/SIGKILL: sent by Render or the kernel
+//
+// NOTE: SIGKILL cannot be caught (it's immediate). But SIGTERM can be.
+// If we see "Received SIGTERM" in the logs, Render is killing us.
+// If we see "uncaughtException", our code has a bug.
+// If we see nothing, it's a SIGKILL from the kernel OOM killer.
+// ═══════════════════════════════════════════════════════════════════════════════
+process.on('uncaughtException', (err: any) => {
+  console.error(`[FATAL] [uncaughtException] ${err?.stack || err?.message || err}`);
+  console.error(`[FATAL] [uncaughtException] Memory at crash: ${JSON.stringify(process.memoryUsage())}`);
+  // Don't exit immediately — let the watchdog or early-oom handle it.
+  // But log it so we know what happened.
+});
+process.on('unhandledRejection', (reason: any, promise: any) => {
+  console.error(`[FATAL] [unhandledRejection] ${reason?.stack || reason?.message || reason}`);
+  console.error(`[FATAL] [unhandledRejection] Memory at crash: ${JSON.stringify(process.memoryUsage())}`);
+  // Don't exit — just log. Node 15+ exits on unhandledRejection by default,
+  // but we override that here to get the log before dying.
+});
+// SIGTERM handler — Render sends this before SIGKILL
+process.on('SIGTERM', () => {
+  console.error(`[FATAL] [SIGTERM] Received SIGTERM at ${new Date().toISOString()} — Render or kernel is killing us. Memory: ${JSON.stringify(process.memoryUsage())}`);
+  // Don't exit — let the existing gracefulShutdown handler deal with it.
+  // But log it FIRST so we know SIGTERM was received.
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MathU Bot v6 — Render Free Plan Entry Point (FULL FEATURES)
 // ═══════════════════════════════════════════════════════════════════════════════
 // Designed for Render free tier: 512 MB RAM, ephemeral disk,
