@@ -15,6 +15,29 @@ LABEL org.opencontainers.image.authors="U.S.J Sibiya"
 # to run Chromium in headed mode on a headless server. Xvfb provides a
 # virtual X server that Chromium can render to. xauth is needed for
 # DISPLAY-based authentication.
+# TASK 145 (2026-10-29): Added libvulkan1 + Mesa GL/Vulkan libraries.
+# Chrome's bundled SwiftShader (used via --use-angle=swiftshader) talks to
+# the SwiftShader Vulkan ICD through the SYSTEM Vulkan loader (libvulkan.so.1).
+# Without libvulkan1, Chrome cannot load the ICD → ANGLE fails → no WebGL
+# context → CanvasKit fails to compile → page stays permanently BLANK.
+#
+# This is the missing piece Task 144 (headless=false) needed to actually
+# work. headless=false got us full Chromium (which has WebGL support), but
+# WebGL itself still couldn't initialize because libvulkan1 wasn't installed.
+#
+# mesa-vulkan-drivers provides lavapipe (a software Vulkan ICD) as a
+# fallback in case Chrome's bundled SwiftShader Vulkan ICD fails to load.
+#
+# libgl1-mesa-dri provides Mesa's DRI drivers including llvmpipe (software
+# OpenGL rasterizer) — needed as a fallback for --use-gl=egl or
+# --use-angle=gl if SwiftShader Vulkan path fails.
+#
+# libegl1 + libegl-mesa0 + libgl1 + libgles2 provide the EGL/GLES runtime
+# that ANGLE uses for EGL surface management even when using SwiftShader.
+#
+# Memory cost: ~60MB on disk, ~0MB RAM until actually used. When
+# SwiftShader is active, expect ~30-50MB additional RAM (within the 90s
+# CanvasKit grace period Task 139 added).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
     libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
@@ -23,6 +46,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxfixes3 libxext6 libxi6 libxtst6 \
     libxcursor1 libxss1 libdbus-1-3 libexpat1 \
     libglib2.0-0 \
+    libvulkan1 mesa-vulkan-drivers \
+    libgl1-mesa-dri libegl1 libegl-mesa0 libgl1 libgles2 \
     python3 make g++ \
     curl \
     xvfb xauth \
@@ -112,7 +137,7 @@ ENV NODE_ENV=production \
     USER_DATA_DIR=/tmp/.browser-data \
     LOG_DIR=/tmp/mathu-logs \
     HEARTBEAT_FILE=/tmp/.heartbeat \
-    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,BackForwardCache,SharedArrayBuffer --js-flags=--max-old-space-size=64 --optimize-for-size --single-process --purge-memory-policy --use-gl=angle --use-angle=swiftshader"
+    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,BackForwardCache,SharedArrayBuffer --enable-features=Vulkan,UseSkiaRenderer,VulkanFromANGLE --js-flags=--max-old-space-size=64 --optimize-for-size --single-process --purge-memory-policy --use-gl=angle --use-angle=swiftshader"
 
 # TASK 140 (2026-10-29): Removed --disable-gpu and --disable-software-rasterizer
 # from CHROMIUM_FLAGS. These flags were KILLING the page — CanvasKit requires
@@ -188,4 +213,25 @@ HEALTHCHECK --interval=60s --timeout=30s --start-period=300s --retries=5 \
 #
 # The 30MB cost of Xvfb is worth it — a blank page that uses less memory
 # is useless. The bot needs to SEE the rendered page to complete questions.
-CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; export DISPLAY=:99; exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
+# TASK 145 (2026-10-29): Updated CMD to explicitly export VK_ICD_FILENAMES
+# before launching Chrome. Chrome's bundled SwiftShader Vulkan ICD lives at
+# /opt/pw-browsers/chromium-XXXX/chrome-linux/vk_swiftshader_icd.json.
+# Normally Chrome auto-registers this via --use-angle=swiftshader, but on
+# minimal Debian-slim images without a Vulkan ICD dispatcher, the
+# auto-registration can silently fail. Setting VK_ICD_FILENAMES explicitly
+# guarantees the SwiftShader ICD is discoverable by the Vulkan loader.
+#
+# mesa-vulkan-drivers (installed above) ALSO drops a lavapipe ICD at
+# /usr/share/vulkan/icd.d/radeon_icd.x86_64.json — if SwiftShader is
+# somehow missing or broken, lavapipe will be tried as a fallback (slower
+# but functional).
+#
+# Fallback chain if Vulkan/SwiftShader still fails:
+#   1. SwiftShader Vulkan ICD (Chrome's bundled, via libvulkan1 + VK_ICD_FILENAMES)
+#   2. Mesa lavapipe Vulkan ICD (mesa-vulkan-drivers)
+#   3. Mesa llvmpipe OpenGL (libgl1-mesa-dri, requires --use-gl=egl instead
+#      of --use-angle=swiftshader)
+#
+# Diagnostic logging (Task 145c, in browser.ts) will print WebGL availability
+# after page load so we can verify the chain actually works at runtime.
+CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; export DISPLAY=:99; export VK_ICD_FILENAMES=$(ls /opt/pw-browsers/chromium-*/chrome-linux/vk_swiftshader_icd.json 2>/dev/null | head -1); export VK_LAYER_PATH=$(dirname $(ls /opt/pw-browsers/chromium-*/chrome-linux/vk_swiftshader_icd.json 2>/dev/null | head -1)); echo \"[TASK 145] VK_ICD_FILENAMES=$VK_ICD_FILENAMES\"; exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
