@@ -230,9 +230,26 @@ const _watchdogInterval = setInterval(() => {
     }
 
     // TIER 2: Cgroup memory > 480MB → exit (UNLESS in grace period)
-    // During the 90s grace period, tolerate up to 510MB (just 2MB under the
-    // 512MB limit) to let CanvasKit's WASM compile finish.
-    const exitThreshold = inGracePeriod ? 510 : _WATCHDOG_EXIT_AT_CGROUP_MB;
+    // During the 90s grace period, tolerate up to 495MB (was 510MB).
+    //
+    // TASK 148 (2026-10-29): Lowered grace-period exit threshold from 510MB
+    // to 495MB. The previous 510MB threshold was only 2MB under the 512MB
+    // cgroup limit. If CanvasKit compile pushed cgroup to 511MB for even
+    // 500ms (between watchdog polls), the KERNEL OOM killer would fire
+    // and kill PID 1 — no graceful shutdown, no state saved, no log line.
+    //
+    // 495MB gives 17MB of kernel headroom. If cgroup approaches 495MB, the
+    // watchdog exits gracefully (saving state to Turso, logging the exit
+    // reason) BEFORE the kernel kills us. This means:
+    //   - Clean restart instead of crash recovery
+    //   - State preserved in Turso
+    //   - Restart guardian doesn't escalate (no "unexpected" restart)
+    //
+    // Combined with Task 148's Chrome flag cleanup (removed double GPU
+    // backend, lowered Chrome V8 heap), the peak should now be ~420-440MB,
+    // well under this threshold. The 495MB exit is a safety valve, not the
+    // normal operating point.
+    const exitThreshold = inGracePeriod ? 495 : _WATCHDOG_EXIT_AT_CGROUP_MB;
     if (cgroupMB > exitThreshold) {
       if (inGracePeriod) {
         console.error(`[FATAL] [WATCHDOG] CGROUP ${cgroupMB.toFixed(0)}MB > ${exitThreshold}MB EVEN IN GRACE PERIOD — kernel OOM truly imminent, exiting (grace: ${graceRemaining}s remaining)`);
