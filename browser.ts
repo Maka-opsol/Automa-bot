@@ -277,21 +277,25 @@ class BrowserManager {
     // initialize. Exiting." — the bot then cascades to reduced/minimal strategies
     // unnecessarily. Default to headless: true unless explicitly disabled.
     //
-    // TASK 143 (2026-10-29): Use headless=false + --headless=new flag.
-    // Playwright's headless:true uses chrome-headless-shell, which has NO
-    // WebGL support. CanvasKit requires WebGL to render. By using headless:false
-    // (which makes Playwright use the full Chromium binary) + --headless=new
-    // flag (which tells Chrome to run in the new headless mode that supports
-    // WebGL), CanvasKit can finally render the page.
+    // TASK 143 (2026-10-29): Use headless=true (headless-shell) with --enable-unsafe-swiftshader.
+    // Previous attempt used headless=false + --headless=new, but the full Chromium
+    // binary is NOT installed by Playwright (only chrome-headless-shell is).
+    // headless=false causes "browser failed to initialize" because there's no
+    // full chromium binary at /opt/pw-browsers/.
     //
-    // This requires Xvfb (which we restored in Task 141) because headless=false
-    // makes Chrome try to open a window. Xvfb provides the virtual display.
+    // Instead: headless-shell DOES support WebGL via SwiftShader if you pass
+    // --enable-unsafe-swiftshader flag. This was added in Playwright/Chrome 1248.
+    // The flag is already in Playwright's default flags (we see it in the launch
+    // log: --enable-unsafe-swiftshader). The issue was that headless-shell was
+    // crashing because Xvfb wasn't providing DISPLAY. Now that we have
+    // DISPLAY=:99 set in the Dockerfile CMD, headless-shell should be able to
+    // initialize SwiftShader WebGL via the X display.
     const _forceHeaded = !!(globalThis as any).__forceHeaded;
-    // Always use headless=false to get the full Chromium binary
-    const _headless = false;
-    // Add --headless=new to Chrome flags (new headless mode supports WebGL)
-    if (!flags.includes('--headless=new')) {
-      flags.push('--headless=new');
+    const _headless = _forceHeaded ? false : true;
+    // Ensure --enable-unsafe-swiftshader is in flags (it usually is by default,
+    // but make sure it's there for CanvasKit WebGL support)
+    if (!flags.includes('--enable-unsafe-swiftshader')) {
+      flags.push('--enable-unsafe-swiftshader');
     }
     const options: any = { headless: _headless, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 60000 };
     // BUG FIX (2026-09-08): Only set per-context proxy mode when a proxy is
@@ -858,3 +862,4 @@ module.exports = {
   getPage: () => getBrowserManager().pageInstance,
   // DI support
   _injectDependencies,
+};
