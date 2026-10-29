@@ -277,11 +277,22 @@ class BrowserManager {
     // initialize. Exiting." — the bot then cascades to reduced/minimal strategies
     // unnecessarily. Default to headless: true unless explicitly disabled.
     //
-    // TASK 35 (2026-09-09): Support `__forceHeaded` global to toggle headed mode
-    // for human intervention. When the user calls /api/browser/headed, this flag
-    // is set and the next browser launch will be headed (requires Xvfb on Render).
+    // TASK 143 (2026-10-29): Use headless=false + --headless=new flag.
+    // Playwright's headless:true uses chrome-headless-shell, which has NO
+    // WebGL support. CanvasKit requires WebGL to render. By using headless:false
+    // (which makes Playwright use the full Chromium binary) + --headless=new
+    // flag (which tells Chrome to run in the new headless mode that supports
+    // WebGL), CanvasKit can finally render the page.
+    //
+    // This requires Xvfb (which we restored in Task 141) because headless=false
+    // makes Chrome try to open a window. Xvfb provides the virtual display.
     const _forceHeaded = !!(globalThis as any).__forceHeaded;
-    const _headless = _forceHeaded ? false : (getCONFIG().HEADLESS === false ? false : true);
+    // Always use headless=false to get the full Chromium binary
+    const _headless = false;
+    // Add --headless=new to Chrome flags (new headless mode supports WebGL)
+    if (!flags.includes('--headless=new')) {
+      flags.push('--headless=new');
+    }
     const options: any = { headless: _headless, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 60000 };
     // BUG FIX (2026-09-08): Only set per-context proxy mode when a proxy is
     // actually active. When `__proxyDisabled` is true, DON'T pass
@@ -847,4 +858,3 @@ module.exports = {
   getPage: () => getBrowserManager().pageInstance,
   // DI support
   _injectDependencies,
-};
