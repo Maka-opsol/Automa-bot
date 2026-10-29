@@ -426,13 +426,19 @@ class BrowserManager {
     const logError = getLogError();
     const CONFIG = getCONFIG();
     if (!this.contextInstance) throw new Error('Context not available');
+    // TASK 147 (2026-10-29): Early diagnostic log — fires BEFORE newPage() so
+    // we can confirm browser.ts was deployed and configurePage() was entered.
+    // If this log doesn't appear, browser.ts changes weren't deployed.
+    log('[TASK147] configurePage() entered — creating new page...', 'INFO', 'browser');
     this.pageInstance = await Promise.race([
       this.contextInstance.newPage(),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Page creation timeout')), getCONFIG().BROWSER_PAGE_TIMEOUT_MS || 30000))
     ]);
     this.pageInstance.setDefaultTimeout(getCONFIG().BROWSER_PAGE_TIMEOUT_MS || 30000);
     this.pageInstance.setDefaultNavigationTimeout(getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000);
+    log('[TASK147] Page created — adding fingerprint spoof script...', 'INFO', 'browser');
     await this.pageInstance.addInitScript(this.getFingerprintSpoofScript());
+    log('[TASK147] Fingerprint spoof added — adding WebGL probe...', 'INFO', 'browser');
 
     // ═══════════════════════════════════════════════════════════════════════
     // TASK 139 (2026-10-29): REMOVED Task 138's Flutter loader injection.
@@ -543,6 +549,10 @@ class BrowserManager {
       setTimeout(function() { probe('3s'); }, 3000);
       setTimeout(function() { probe('8s'); }, 8000);
     });
+    // Node-side confirmation — if this log appears but the browser-side
+    // [TASK146] logs don't, the issue is in the page (initScript didn't
+    // fire, or page didn't load, or console handler didn't capture).
+    log('[TASK146] WebGL probe addInitScript registered (browser-side console.logs will follow once page loads)', 'INFO', 'browser');
     // ─── End Task 145c/146 diagnostic logging ───
 
     const selectCalibration = getSelectCalibration();
