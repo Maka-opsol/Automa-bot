@@ -112,8 +112,21 @@ ENV NODE_ENV=production \
     USER_DATA_DIR=/tmp/.browser-data \
     LOG_DIR=/tmp/mathu-logs \
     HEARTBEAT_FILE=/tmp/.heartbeat \
-    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,BackForwardCache,SharedArrayBuffer --js-flags=--max-old-space-size=64 --optimize-for-size --single-process --purge-memory-policy --disable-features=V8VmFuture"
+    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,BackForwardCache,SharedArrayBuffer --js-flags=--max-old-space-size=64 --optimize-for-size --single-process --purge-memory-policy"
 
+# TASK 140 (2026-10-29): Removed --disable-gpu and --disable-software-rasterizer
+# from CHROMIUM_FLAGS. These flags were KILLING the page — CanvasKit requires
+# WebGL to render. Without GPU (even software GPU/SwiftShader), CanvasKit
+# can't paint anything → page stays permanently BLANK.
+# Also removed --disable-features=V8VmFuture (was causing issues).
+#
+# Chrome in headless mode uses SwiftShader (software WebGL) by default.
+# This is slower than hardware GPU but works on headless servers.
+# SwiftShader uses ~30-50MB more memory than --disable-gpu, but
+# a blank page that uses less memory is USELESS — the bot needs to see
+# the rendered page to complete questions.
+#
+# The 90s CanvasKit compile grace period (Task 139) handles the memory spike.
 # TASK 132 (2026-10-28): Chrome V8 heap lowered 96→64MB + memory flags added.
 # See CHROMIUM_FLAGS above. Combined with render-free-plan.ts aggressive
 # memory monitor (5s interval, L2 at RSS>350MB, L3 at RSS>400MB), this
