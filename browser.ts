@@ -481,7 +481,9 @@ class BrowserManager {
             lower.includes('flutter') || lower.includes('shader') ||
             lower.includes('vulkan') || lower.includes('gl_') ||
             lower.includes('opengl') || lower.includes('angle') ||
-            lower.includes('swiftshader') || lower.includes('error')) {
+            lower.includes('swiftshader') || lower.includes('error') ||
+            lower.includes('task146') || lower.includes('task145') ||
+            lower.includes('probe')) {
           const type = msg.type?.() ?? 'log';
           const level = type === 'error' ? 'ERROR' : (type === 'warning' ? 'WARN' : 'INFO');
           log(`[PAGE-CONSOLE ${type.toUpperCase()}] ${String(text).substring(0, 400)}`, level, 'browser');
@@ -496,36 +498,52 @@ class BrowserManager {
 
     // WebGL probe — runs on every page navigation (addInitScript injects
     // BEFORE any page JS, so it survives across navigations too).
-    await this.pageInstance.addInitScript(() => {
-      // Run after DOM is parsed so canvases can exist.
-      const probe = () => {
+    //
+    // TASK 146 (2026-10-29): Rewrote in PURE JAVASCRIPT — no TypeScript
+    // syntax (no `as any`, no type annotations). The previous version had
+    // `gl as any` and `(e as Error).message` inside the callback. When
+    // Playwright serializes the function via toString(), the TypeScript
+    // syntax can survive transpilation in some configurations (tsx with
+    // source maps), causing a SyntaxError in the browser → probe never runs
+    // → we never see the WebGL diagnostic output.
+    //
+    // Pure JS guarantees the function parses in the browser. Also added
+    // "probe registered" and "probe running" log lines so we can confirm
+    // execution even if WebGL itself fails.
+    await this.pageInstance.addInitScript(function() {
+      console.log('[TASK146] WebGL probe script registered (will run at 500ms, 3s, 8s)');
+      var probe = function(when) {
         try {
-          const c = document.createElement('canvas');
-          const gl = c.getContext('webgl2') || c.getContext('webgl') ||
-                     c.getContext('experimental-webgl');
+          console.log('[TASK146] Probe running at ' + when);
+          var c = document.createElement('canvas');
+          var gl = c.getContext('webgl2') || c.getContext('webgl') || c.getContext('experimental-webgl');
           if (!gl) {
-            console.error('[TASK145] WebGL UNAVAILABLE — CanvasKit cannot render. Page will be blank.');
+            console.error('[TASK146] WebGL UNAVAILABLE at ' + when + ' — CanvasKit cannot render. Page will be blank.');
             return;
           }
-          const glAny = gl as any;
-          const dbg = glAny.getExtension('WEBGL_debug_renderer_info');
-          const vendor = dbg ? glAny.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : glAny.getParameter(glAny.VERSION);
-          const renderer = dbg ? glAny.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : '(masked)';
-          console.log('[TASK145] WebGL OK — vendor=' + vendor + ' renderer=' + renderer);
+          var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+          var vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VERSION);
+          var renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : '(masked)';
+          console.log('[TASK146] WebGL OK at ' + when + ' — vendor=' + vendor + ' renderer=' + renderer);
         } catch (e) {
-          console.error('[TASK145] WebGL probe exception: ' + (e as Error).message);
+          var msg = (e && e.message) ? e.message : String(e);
+          console.error('[TASK146] Probe exception at ' + when + ': ' + msg);
         }
       };
+      // Schedule probes at multiple times — CanvasKit may load after a delay.
+      // Reduced the 10s probe to 8s because the bot might OOM before 10s
+      // during CanvasKit compile.
       if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => setTimeout(probe, 500));
+        document.addEventListener('DOMContentLoaded', function() {
+          setTimeout(function() { probe('500ms'); }, 500);
+        });
       } else {
-        setTimeout(probe, 500);
+        setTimeout(function() { probe('500ms'); }, 500);
       }
-      // Also probe later — CanvasKit may load after a delay.
-      setTimeout(probe, 3000);
-      setTimeout(probe, 10000);
+      setTimeout(function() { probe('3s'); }, 3000);
+      setTimeout(function() { probe('8s'); }, 8000);
     });
-    // ─── End Task 145c diagnostic logging ───
+    // ─── End Task 145c/146 diagnostic logging ───
 
     const selectCalibration = getSelectCalibration();
     if (selectCalibration) {
