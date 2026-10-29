@@ -188,4 +188,4 @@ HEALTHCHECK --interval=60s --timeout=30s --start-period=300s --retries=5 \
 #
 # The 30MB cost of Xvfb is worth it — a blank page that uses less memory
 # is useless. The bot needs to SEE the rendered page to complete questions.
-CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
+CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; export DISPLAY=:99; exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
