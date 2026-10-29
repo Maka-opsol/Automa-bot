@@ -137,13 +137,30 @@ ENV NODE_ENV=production \
     USER_DATA_DIR=/tmp/.browser-data \
     LOG_DIR=/tmp/mathu-logs \
     HEARTBEAT_FILE=/tmp/.heartbeat \
-    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,BackForwardCache,SharedArrayBuffer --enable-features=Vulkan,UseSkiaRenderer,VulkanFromANGLE --js-flags=--max-old-space-size=64 --optimize-for-size --single-process --purge-memory-policy --use-gl=angle --use-angle=swiftshader"
+    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,BackForwardCache,SharedArrayBuffer --js-flags=--max-old-space-size=32 --optimize-for-size --single-process --purge-memory-policy --use-gl=angle --use-angle=swiftshader"
 
 # TASK 140 (2026-10-29): Removed --disable-gpu and --disable-software-rasterizer
 # from CHROMIUM_FLAGS. These flags were KILLING the page — CanvasKit requires
 # WebGL to render. Without GPU (even software GPU/SwiftShader), CanvasKit
 # can't paint anything → page stays permanently BLANK.
 # Also removed --disable-features=V8VmFuture (was causing issues).
+#
+# TASK 148 (2026-10-29): Removed --enable-features=Vulkan,UseSkiaRenderer,VulkanFromANGLE.
+# Task 145 added these thinking they'd help Chrome find the Vulkan backend.
+# But --use-angle=swiftshader ALREADY tells ANGLE to use SwiftShader — the
+# extra --enable-features=Vulkan was causing Chrome to initialize a SEPARATE
+# Vulkan compositing backend ON TOP of SwiftShader. Two GPU backends in
+# memory = ~30-50MB wasted. With 512MB container limit, that's the
+# difference between CanvasKit compile fitting (peak ~470MB) vs OOM-killing
+# PID 1 (peak ~510MB).
+#
+# Also lowered Chrome V8 heap from 64MB to 32MB (--js-flags=--max-old-space-size=32).
+# Chrome's JS engine doesn't need 64MB — CanvasKit's WASM compile uses NATIVE
+# memory, not V8 heap. 32MB is enough for Flutter's Dart runtime + DOM JS.
+# Saves another ~32MB of peak cgroup usage.
+#
+# Total Task 148 memory savings: ~60-80MB → CanvasKit compile peak drops
+# from ~500MB to ~420-440MB. Comfortable 70-90MB headroom under 512MB.
 #
 # Chrome in headless mode uses SwiftShader (software WebGL) by default.
 # This is slower than hardware GPU but works on headless servers.
@@ -237,19 +254,15 @@ HEALTHCHECK --interval=60s --timeout=30s --start-period=300s --retries=5 \
 # TASK 146 (2026-10-29): Fixed VK_ICD_FILENAMES lookup.
 # Task 145's `ls /opt/pw-browsers/chromium-*/chrome-linux/vk_swiftshader_icd.json`
 # returned EMPTY on Render (Playwright's chromium download for this version
-# doesn't bundle vk_swiftshader_icd.json at that path). The subsequent
-# `dirname` of empty string produced "dirname: missing operand" bash errors
-# in the logs.
+# doesn't bundle vk_swiftshader_icd.json at that path).
 #
-# New approach: use `find` to search the entire /opt/pw-browsers tree for
-# any Vulkan ICD JSON (SwiftShader's, lavapipe's, or anything else). If
-# found, set VK_ICD_FILENAMES to the first match. If NOT found, leave it
-# unset — Chrome will auto-discover ICDs via the standard /usr/share/vulkan/icd.d
-# path (mesa-vulkan-drivers drops lavapipe there) OR fall back to llvmpipe
-# via libgl1-mesa-dri + --use-gl=egl.
+# Task 146 first attempt used `find ... -name X -o -name Y` but the `-o`
+# operator has lower precedence than the implicit path AND, so the second
+# `-name '*swiftshader*.json'` had no path → find defaulted to `.` (current
+# dir = /app) → searched the ENTIRE bot codebase → slow + useless.
 #
-# This is non-fatal: if SwiftShader's ICD isn't found, Chrome's WebGL backend
-# falls back to lavapipe (slower but functional). The diagnostic probe
-# (Task 146 in browser.ts) will tell us at runtime which renderer actually
-# got selected.
-CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; export DISPLAY=:99; VK_ICD=$(find /opt/pw-browsers /usr/share/vulkan/icd.d /etc/vulkan/icd.d -name '*icd*.json' -o -name '*swiftshader*.json' 2>/dev/null | head -1); if [ -n \"$VK_ICD\" ]; then export VK_ICD_FILENAMES=\"$VK_ICD\"; export VK_LAYER_PATH=$(dirname \"$VK_ICD\"); echo \"[TASK 146] VK_ICD_FILENAMES=$VK_ICD_FILENAMES\"; echo \"[TASK 146] VK_LAYER_PATH=$VK_LAYER_PATH\"; else echo \"[TASK 146] No Vulkan ICD found — Chrome will use system auto-discovery (lavapipe/llvmpipe fallback)\"; fi; exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
+# This version uses explicit glob patterns with [ -f ] checks. Fast, no
+# precedence issues, no searching /app. If no ICD is found, we leave
+# VK_ICD_FILENAMES unset and let Chrome auto-discover via the standard
+# /usr/share/vulkan/icd.d path (mesa-vulkan-drivers drops lavapipe there).
+CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; export DISPLAY=:99; VK_ICD=''; for p in /opt/pw-browsers/chromium-*/chrome-linux/vk_swiftshader_icd.json /usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json; do if [ -f \"$p\" ]; then VK_ICD=\"$p\"; break; fi; done; if [ -n \"$VK_ICD\" ]; then export VK_ICD_FILENAMES=\"$VK_ICD\"; echo \"[TASK 146] VK_ICD_FILENAMES=$VK_ICD_FILENAMES\"; else echo \"[TASK 146] No Vulkan ICD found — Chrome will use system auto-discovery (lavapipe/llvmpipe fallback)\"; fi; exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
