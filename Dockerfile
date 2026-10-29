@@ -234,4 +234,22 @@ HEALTHCHECK --interval=60s --timeout=30s --start-period=300s --retries=5 \
 #
 # Diagnostic logging (Task 145c, in browser.ts) will print WebGL availability
 # after page load so we can verify the chain actually works at runtime.
-CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; export DISPLAY=:99; export VK_ICD_FILENAMES=$(ls /opt/pw-browsers/chromium-*/chrome-linux/vk_swiftshader_icd.json 2>/dev/null | head -1); export VK_LAYER_PATH=$(dirname $(ls /opt/pw-browsers/chromium-*/chrome-linux/vk_swiftshader_icd.json 2>/dev/null | head -1)); echo \"[TASK 145] VK_ICD_FILENAMES=$VK_ICD_FILENAMES\"; exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
+# TASK 146 (2026-10-29): Fixed VK_ICD_FILENAMES lookup.
+# Task 145's `ls /opt/pw-browsers/chromium-*/chrome-linux/vk_swiftshader_icd.json`
+# returned EMPTY on Render (Playwright's chromium download for this version
+# doesn't bundle vk_swiftshader_icd.json at that path). The subsequent
+# `dirname` of empty string produced "dirname: missing operand" bash errors
+# in the logs.
+#
+# New approach: use `find` to search the entire /opt/pw-browsers tree for
+# any Vulkan ICD JSON (SwiftShader's, lavapipe's, or anything else). If
+# found, set VK_ICD_FILENAMES to the first match. If NOT found, leave it
+# unset — Chrome will auto-discover ICDs via the standard /usr/share/vulkan/icd.d
+# path (mesa-vulkan-drivers drops lavapipe there) OR fall back to llvmpipe
+# via libgl1-mesa-dri + --use-gl=egl.
+#
+# This is non-fatal: if SwiftShader's ICD isn't found, Chrome's WebGL backend
+# falls back to lavapipe (slower but functional). The diagnostic probe
+# (Task 146 in browser.ts) will tell us at runtime which renderer actually
+# got selected.
+CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; export DISPLAY=:99; VK_ICD=$(find /opt/pw-browsers /usr/share/vulkan/icd.d /etc/vulkan/icd.d -name '*icd*.json' -o -name '*swiftshader*.json' 2>/dev/null | head -1); if [ -n \"$VK_ICD\" ]; then export VK_ICD_FILENAMES=\"$VK_ICD\"; export VK_LAYER_PATH=$(dirname \"$VK_ICD\"); echo \"[TASK 146] VK_ICD_FILENAMES=$VK_ICD_FILENAMES\"; echo \"[TASK 146] VK_LAYER_PATH=$VK_LAYER_PATH\"; else echo \"[TASK 146] No Vulkan ICD found — Chrome will use system auto-discovery (lavapipe/llvmpipe fallback)\"; fi; exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
