@@ -79,17 +79,14 @@ if (_isSmallInstance) {
     MODE_THRESHOLDS.full_power.rssHardLimitMB = maxSafeRSS;
     _log(`Clamped full_power RSS hard limit to ${maxSafeRSS}MB`, 'WARN');
   }
-  // BUGFIX (2026-10-26): DISABLED heap threshold clamping on small instances.
-  // The old formula (maxSafeHeap = _systemTotalMB - 300) assumed heap would
-  // stay below ~200MB on a 512MB container. But with Chromium --single-process,
-  // Flutter Web CanvasKit loads ~150MB INTO the V8 heap — total ~247MB during
-  // browser launch. The clamp was reducing restartHeapMB to 212MB, which is
-  // BELOW the normal Flutter load, causing the heap guardian to kill the
-  // process on every browser launch.
-  // The correct fix is to let the MODE_THRESHOLDS values (set above) be used
-  // as-is — they're already calibrated for the 384MB V8 limit.
-  // const maxSafeHeap = _systemTotalMB - 300;
-  // if (maxSafeHeap < MODE_THRESHOLDS.memory_protection.restartHeapMB) { ... }
+  // Also clamp heap thresholds — on 512MB, heap should never reach 200MB
+  // because Chrome needs ~200MB RSS and Node RSS ≈ heap + 70MB overhead
+  const maxSafeHeap = _systemTotalMB - 300; // leave 300MB for Chrome + system + Node overhead
+  if (maxSafeHeap < MODE_THRESHOLDS.memory_protection.restartHeapMB) {
+    MODE_THRESHOLDS.memory_protection.restartHeapMB = maxSafeHeap;
+    MODE_THRESHOLDS.memory_protection.warnHeapMB = Math.max(maxSafeHeap - 30, 80);
+    _log(`Clamped memory_protection heap thresholds: warn=${MODE_THRESHOLDS.memory_protection.warnHeapMB}MB restart=${MODE_THRESHOLDS.memory_protection.restartHeapMB}MB`, 'INFO');
+  }
 }
 
 const persistConfig = require('./persistent-config');
@@ -109,34 +106,35 @@ type MemoryMode = 'full_power' | 'memory_protection' | 'minimum';
 
 const MODE_THRESHOLDS = {
   full_power: {
-    // BUGFIX (2026-10-26): V8 max-old-space-size is now 384MB (was 3584MB).
-    // 384MB V8 = enough for bot JS (~80MB) + Flutter CanvasKit (~150MB) + headroom.
-    // 256MB was too low — V8 OOM'd when Flutter loaded.
-    warnHeapMB: 200,
-    restartHeapMB: 260,
-    rssHardLimitMB: 440,
-    gcIntervalMs: 30 * 1000,
-    monitorIntervalMs: 15 * 1000,
+    // TASK 86 (2026-09-25): Reduced from 350/400/420 to 300/330/450 for new 384MB V8 limit.
+    // Old: 350/400 with 448MB V8 = 48MB headroom (but 448+150 Chromium = 598 > 512 container → OOM)
+    // New: 300/330 with 384MB V8 = 54MB headroom (and 384+128 = 512, fits container)
+    warnHeapMB: 300,
+    restartHeapMB: 330,
+    rssHardLimitMB: 450,
+    gcIntervalMs: 90 * 1000,
+    monitorIntervalMs: 20 * 1000,
     warningStreak: 2,
   },
   memory_protection: {
-    // BUGFIX (2026-10-26): Flutter Web CanvasKit loads ~150MB into V8 heap.
-    // Bot code needs ~80MB. Total ~230-250MB during browser launch.
-    // Old thresholds (140/180) killed the process BEFORE Flutter finished loading.
-    // With 384MB V8 limit, these thresholds allow the Flutter spike:
-    warnHeapMB: 220,
-    restartHeapMB: 300,
-    rssHardLimitMB: 440,
-    gcIntervalMs: 10 * 1000,
+    // BUG FIX (2026-09-06): Set to 280/320 for 384MB V8 limit.
+    warnHeapMB: 280,
+    restartHeapMB: 320,
+    rssHardLimitMB: 380,
+    gcIntervalMs: 15 * 1000,
     monitorIntervalMs: 8 * 1000,
     warningStreak: 1,
   },
   minimum: {
-    // BUGFIX (2026-10-26): Match memory_protection.
-    warnHeapMB: 220,
-    restartHeapMB: 300,
-    rssHardLimitMB: 440,
-    gcIntervalMs: 10 * 1000,
+    // BUG FIX (2026-09-06): Match memory_protection thresholds.
+    // The old minimum thresholds (150/170) were so low that the bot couldn't
+    // function — it just looped "Memory CRITICAL" and closed the browser.
+    // Minimum mode now has the same thresholds as memory_protection — it just
+    // disables more modules. The thresholds should never cause a death loop.
+    warnHeapMB: 280,
+    restartHeapMB: 320,
+    rssHardLimitMB: 380,
+    gcIntervalMs: 15 * 1000,
     monitorIntervalMs: 8 * 1000,
     warningStreak: 1,
   },
@@ -1272,11 +1270,13 @@ function init(): void {
         _applyMode('memory_protection', 'auto:OOM_kill_recovery').catch(() => {});
         _log(`Detected ${oomCount} recent OOM kill(s) — starting in MEMORY PROTECTION mode`, 'WARN');
       } else {
-        // TASK 142: oomCount=0 but wasRecentlyOOMKilled returned true — this is
-        // just an unexpected restart (e.g., deploy), NOT an OOM kill. Start in
-        // full_power — the baseline heap is only ~48MB after the onnxruntime fix.
-        _applyMode('full_power', 'init_no_actual_oom').catch(() => {});
-        _log('Unexpected restart detected but NO actual OOM kills (oomCount=0) — starting in FULL POWER mode', 'INFO');
+        // TASK 142: oomCount=0 but wasRecentlyOOMKilled returned true — unexpected restart.
+        // On Render, start in MINIMUM mode to free ~100MB for CanvasKit/SwiftShader.
+        const _isRender2 = !!(process.env.RENDER_SERVICE_ID || process.env.RENDER);
+        const _mode2 = _isRender2 ? 'minimum' : 'full_power';
+        const _reason2 = _isRender2 ? 'init_render_free_tier_minimum' : 'init_no_actual_oom';
+        _applyMode(_mode2, _reason2).catch(() => {});
+        _log(`Unexpected restart, NO actual OOM kills — starting in ${_mode2.toUpperCase()} mode${_isRender2 ? ' (Render free tier)' : ''}`, 'INFO');
       }
     } else {
       // TASK 135 (2026-10-23): Default to full_power. With Task 124's fix
