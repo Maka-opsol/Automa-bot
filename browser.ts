@@ -453,6 +453,80 @@ class BrowserManager {
 
     this.pageInstance.on('crash', () => { log('Page crashed', 'ERROR', 'browser'); this.browserDisconnected = true; this.emit('crashed'); });
     this.pageInstance.on('error', (err: Error) => { logError('Page error', err); });
+
+    // ─── TASK 145c (2026-10-29): WebGL / CanvasKit diagnostic logging ───
+    // When the page comes up blank, the question is always "is WebGL actually
+    // available, or is CanvasKit failing silently?". This block captures the
+    // answer at runtime so we don't have to guess.
+    //
+    // Three sources of truth:
+    //   1. page.on('console') — CanvasKit prints "Could not initialize WebGL"
+    //      or "WebGL context creation failed" to the console when the ICD is
+    //      missing or the Vulkan loader can't find SwiftShader.
+    //   2. page.on('pageerror') — uncaught JS errors (e.g. "Cannot read
+    //      property 'createContext' of undefined" if WebGL is unavailable).
+    //   3. An init script that probes WebGL after DOMContentLoaded and logs
+    //      a one-liner with vendor/renderer — this is the smoking gun for
+    //      "WebGL is working, the issue is elsewhere" vs. "WebGL is broken".
+    //
+    // All three forward into the bot's normal INFO/WARN/ERROR log streams
+    // so they show up in the dashboard and Render logs.
+    this.pageInstance.on('console', (msg: any) => {
+      try {
+        const text = msg.text?.() ?? String(msg);
+        // Only log interesting messages — CanvasKit/Flutter errors and WebGL
+        // warnings. Skip routine console.debug spam.
+        const lower = String(text).toLowerCase();
+        if (lower.includes('webgl') || lower.includes('canvaskit') ||
+            lower.includes('flutter') || lower.includes('shader') ||
+            lower.includes('vulkan') || lower.includes('gl_') ||
+            lower.includes('opengl') || lower.includes('angle') ||
+            lower.includes('swiftshader') || lower.includes('error')) {
+          const type = msg.type?.() ?? 'log';
+          const level = type === 'error' ? 'ERROR' : (type === 'warning' ? 'WARN' : 'INFO');
+          log(`[PAGE-CONSOLE ${type.toUpperCase()}] ${String(text).substring(0, 400)}`, level, 'browser');
+        }
+      } catch { /* don't let console handler crash anything */ }
+    });
+    this.pageInstance.on('pageerror', (err: Error) => {
+      try {
+        log(`[PAGE-ERROR] ${err.message || String(err)}`, 'ERROR', 'browser');
+      } catch {}
+    });
+
+    // WebGL probe — runs on every page navigation (addInitScript injects
+    // BEFORE any page JS, so it survives across navigations too).
+    await this.pageInstance.addInitScript(() => {
+      // Run after DOM is parsed so canvases can exist.
+      const probe = () => {
+        try {
+          const c = document.createElement('canvas');
+          const gl = c.getContext('webgl2') || c.getContext('webgl') ||
+                     c.getContext('experimental-webgl');
+          if (!gl) {
+            console.error('[TASK145] WebGL UNAVAILABLE — CanvasKit cannot render. Page will be blank.');
+            return;
+          }
+          const glAny = gl as any;
+          const dbg = glAny.getExtension('WEBGL_debug_renderer_info');
+          const vendor = dbg ? glAny.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : glAny.getParameter(glAny.VERSION);
+          const renderer = dbg ? glAny.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : '(masked)';
+          console.log('[TASK145] WebGL OK — vendor=' + vendor + ' renderer=' + renderer);
+        } catch (e) {
+          console.error('[TASK145] WebGL probe exception: ' + (e as Error).message);
+        }
+      };
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => setTimeout(probe, 500));
+      } else {
+        setTimeout(probe, 500);
+      }
+      // Also probe later — CanvasKit may load after a delay.
+      setTimeout(probe, 3000);
+      setTimeout(probe, 10000);
+    });
+    // ─── End Task 145c diagnostic logging ───
+
     const selectCalibration = getSelectCalibration();
     if (selectCalibration) {
       const savedScale = selectCalibration.get('scaleFactor');
