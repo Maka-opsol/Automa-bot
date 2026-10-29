@@ -277,23 +277,13 @@ class BrowserManager {
     // initialize. Exiting." — the bot then cascades to reduced/minimal strategies
     // unnecessarily. Default to headless: true unless explicitly disabled.
     //
-    // TASK 143 (2026-10-29): Use headless=true (headless-shell) with --enable-unsafe-swiftshader.
-    // Previous attempt used headless=false + --headless=new, but the full Chromium
-    // binary is NOT installed by Playwright (only chrome-headless-shell is).
-    // headless=false causes "browser failed to initialize" because there's no
-    // full chromium binary at /opt/pw-browsers/.
-    //
-    // Instead: headless-shell DOES support WebGL via SwiftShader if you pass
-    // --enable-unsafe-swiftshader flag. This was added in Playwright/Chrome 1248.
-    // The flag is already in Playwright's default flags (we see it in the launch
-    // log: --enable-unsafe-swiftshader). The issue was that headless-shell was
-    // crashing because Xvfb wasn't providing DISPLAY. Now that we have
-    // DISPLAY=:99 set in the Dockerfile CMD, headless-shell should be able to
-    // initialize SwiftShader WebGL via the X display.
-    const _forceHeaded = !!(globalThis as any).__forceHeaded;
-    const _headless = _forceHeaded ? false : true;
-    // Ensure --enable-unsafe-swiftshader is in flags (it usually is by default,
-    // but make sure it's there for CanvasKit WebGL support)
+    // TASK 144 (2026-10-29): Use headless=false to get full Chromium (with WebGL).
+    // chrome-headless-shell (used by headless:true) does NOT support WebGL at all.
+    // --enable-unsafe-swiftshader only works on the full Chromium binary.
+    // Now that DISPLAY=:99 is set in Dockerfile CMD + Xvfb is running,
+    // headless=false will use the full Chromium binary which supports
+    // WebGL via SwiftShader. CanvasKit needs WebGL to render.
+    const _headless = false;
     if (!flags.includes('--enable-unsafe-swiftshader')) {
       flags.push('--enable-unsafe-swiftshader');
     }
