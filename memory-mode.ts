@@ -1249,11 +1249,32 @@ function init(): void {
     // Now: only restore 'memory_protection' from persistent storage. If the
     // persisted mode is 'minimum', ignore it and boot in memory_protection
     // (which has reasonable thresholds of 280/320MB).
-    if (persisted.current === 'memory_protection') {
+    //
+    // TASK 147 (2026-10-29): On Render free tier, ALWAYS boot in MINIMUM mode.
+    // The previous code cleared persisted MINIMUM mode and booted in FULL POWER
+    // ("stale_minimum_cleared"), thinking the minimum was from a death loop.
+    // But FULL POWER mode starts 30+ subsystems that consume ~100MB of Node RSS.
+    // With Chrome + SwiftShader + CanvasKit compile, the cgroup hits 493MB —
+    // right at the 512MB limit. The kernel OOM killer fires between watchdog
+    // polls (500ms interval can miss a 1-second spike).
+    //
+    // MINIMUM mode frees ~100MB, giving CanvasKit compile ~100MB of headroom.
+    // The bot CAN complete questions in minimum mode — the core cycle
+    // (screenshot → tribunal → action → execute) still works. It just doesn't
+    // have auxiliary self-heal/resilience/monitoring subsystems.
+    const _isRenderFreeTier = !!(process.env.RENDER_SERVICE_ID || process.env.RENDER);
+    if (_isRenderFreeTier) {
+      // TASK 147: Force MINIMUM mode on Render free tier — ALWAYS.
+      // Override all persisted state and restart guardian logic. The ~100MB
+      // savings is the difference between CanvasKit compile fitting in 512MB
+      // vs OOM-killing PID 1.
+      _applyMode('minimum', 'task147_render_free_always_minimum').catch(() => {});
+      _log('TASK 147: Render free tier detected — forcing MINIMUM mode (saves ~100MB for CanvasKit compile). Persisted state and restart guardian overridden.', 'INFO');
+    } else if (persisted.current === 'memory_protection') {
       _applyMode('memory_protection', sanitizeReason(persisted.reason || 'persist_restore')).catch(() => {});
       _log('Restored MEMORY PROTECTION mode from persistent storage', 'INFO');
     } else if (persisted.current === 'minimum') {
-      // Clear the stale minimum mode and boot in full_power instead
+      // Non-Render: clear stale minimum and boot in full_power
       _log('Persisted MINIMUM mode detected but IGNORED (was stuck in death loop). Booting in FULL POWER mode instead.', 'WARN');
       try { persistConfig.setMode('full_power', 'stale_minimum_cleared'); } catch {}
       _applyMode('full_power', 'stale_minimum_cleared').catch(() => {});
@@ -1279,14 +1300,31 @@ function init(): void {
         _log(`Unexpected restart, NO actual OOM kills — starting in ${_mode2.toUpperCase()} mode${_isRender2 ? ' (Render free tier)' : ''}`, 'INFO');
       }
     } else {
-      // TASK 135 (2026-10-23): Default to full_power. With Task 124's fix
-      // (onnxruntime-node no longer loaded at startup), the baseline heap is
-      // only ~48MB — there's plenty of headroom for all modules. Starting in
-      // MEMORY PROTECTION mode was disabling 20 heavy modules unnecessarily,
-      // making the bot weaker from the start. If OOM happens later, the
-      // heap guardian will shed memory dynamically.
-      _applyMode('full_power', 'init_default_full_power').catch(() => {});
-      _log('Starting in FULL POWER mode (Task 135: baseline heap is low enough after onnxruntime fix)', 'INFO');
+      // TASK 142 (2026-10-29): Start in MINIMUM mode on Render free tier.
+      // Task 135 changed this to full_power, but that was BEFORE we added
+      // SwiftShader (software WebGL) which Chrome needs for CanvasKit.
+      // SwiftShader adds ~50MB to Chrome's RSS. Full power mode also
+      // starts 30+ subsystems (self-heal, resilience, longevity) that
+      // consume ~100MB of Node RSS.
+      //
+      // Memory budget with minimum mode:
+      //   Node (minimum mode):  ~174MB (was 274MB in full_power — saves 100MB)
+      //   Chrome + SwiftShader: ~237MB
+      //   CanvasKit compile:    ~80MB (transient spike)
+      //   Xvfb:                  ~10MB
+      //   Peak during compile:  ~501MB — fits under 512MB!
+      //
+      // The bot CAN complete questions in minimum mode — it just doesn't have
+      // the auxiliary self-heal/resilience/monitoring subsystems. The core
+      // cycle (screenshot → tribunal → action → execute) still works.
+      const isRender = !!(process.env.RENDER_SERVICE_ID || process.env.RENDER);
+      if (isRender) {
+        _applyMode('minimum', 'init_render_free_tier_minimum').catch(() => {});
+        _log('Starting in MINIMUM mode on Render free tier (Task 142: frees ~100MB for CanvasKit WebGL/SwiftShader)', 'INFO');
+      } else {
+        _applyMode('full_power', 'init_default_full_power').catch(() => {});
+        _log('Starting in FULL POWER mode (non-Render environment)', 'INFO');
+      }
     }
   } catch (e: any) {
     _applyMode('memory_protection', 'init_fallback').catch(() => {});
