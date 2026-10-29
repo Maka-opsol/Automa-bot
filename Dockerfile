@@ -112,7 +112,7 @@ ENV NODE_ENV=production \
     USER_DATA_DIR=/tmp/.browser-data \
     LOG_DIR=/tmp/mathu-logs \
     HEARTBEAT_FILE=/tmp/.heartbeat \
-    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,BackForwardCache,SharedArrayBuffer --js-flags=--max-old-space-size=64 --optimize-for-size --single-process --purge-memory-policy"
+    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,BackForwardCache,SharedArrayBuffer --js-flags=--max-old-space-size=64 --optimize-for-size --single-process --purge-memory-policy --use-gl=angle --use-angle=swiftshader"
 
 # TASK 140 (2026-10-29): Removed --disable-gpu and --disable-software-rasterizer
 # from CHROMIUM_FLAGS. These flags were KILLING the page — CanvasKit requires
@@ -181,13 +181,11 @@ HEALTHCHECK --interval=60s --timeout=30s --start-period=300s --retries=5 \
 # would jump from 77MB to 380MB in <1 second, hitting the 384MB limit.
 # 448MB gives 64MB more headroom for these teardown spikes.
 # Total budget: 448MB Node V8 + ~64MB Chrome = 512MB (fits container).
-# TASK 136 (2026-10-28): Removed Xvfb from CMD. Chrome runs headless by default
-# (browser.ts line 284: `_headless = _forceHeaded ? false : true`). Xvfb was only
-# needed for the /api/browser/headed endpoint (human intervention). Since we
-# can't afford the 30MB Xvfb process on 512MB, headed mode is now disabled.
-# The bot can still complete questions in headless mode.
+# TASK 141 (2026-10-29): RESTORED Xvfb. Task 136 removed it to save 30MB,
+# but Xvfb is REQUIRED for Chrome's WebGL/SwiftShader to initialize. Without
+# a display, EGL fails with "eglInitialize SwANGLE failed" and Chrome crashes
+# with SIGTRAP. CanvasKit needs WebGL to render the page. No display = blank page.
 #
-# Also: browser.ts now blocks canvaskit.wasm (Task 136), forcing Flutter to
-# use its HTML renderer instead of CanvasKit. This saves ~200MB of WASM
-# compile memory, which was the primary cause of the OOM crashes.
-CMD ["sh", "-c", "exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
+# The 30MB cost of Xvfb is worth it — a blank page that uses less memory
+# is useless. The bot needs to SEE the rendered page to complete questions.
+CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
