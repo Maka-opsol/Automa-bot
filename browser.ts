@@ -430,53 +430,21 @@ class BrowserManager {
     await this.pageInstance.addInitScript(this.getFingerprintSpoofScript());
 
     // ═══════════════════════════════════════════════════════════════════════
-    // TASK 138 (2026-10-29): Inject Flutter config to use Chromium CanvasKit variant.
+    // TASK 139 (2026-10-29): REMOVED Task 138's Flutter loader injection.
     // ═══════════════════════════════════════════════════════════════════════
-    // Task 136 tried to BLOCK CanvasKit entirely — but that was WRONG. The
-    // MathU app was built with --web-renderer canvaskit (ONLY CanvasKit,
-    // no HTML fallback). Blocking it left the page permanently blank.
+    // Task 138 tried to inject a canvasKitVariant: "chromium" config by
+    // monkey-patching _flutter.loader.load(). But:
+    //   1. The injection set window._flutter.loader = {} BEFORE flutter.js
+    //      loaded. When flutter.js checked `window._flutter.loader || create`,
+    //      it found the empty object and SKIPPED creating the real loader.
+    //      → Flutter never initialized → page permanently BLANK.
+    //   2. The HTML calls loadEntrypoint(), not load(). The canvasKitVariant
+    //      config is only read by load(), so the injection was useless anyway.
     //
-    // Instead, we inject a Flutter initialization config that requests the
-    // "chromium" variant of CanvasKit. This is a smaller build that omits
-    // some Skia features not needed for typical Flutter apps:
-    //   Full CanvasKit:  7.2MB WASM → ~200MB Chrome RSS during compile
-    //   Chromium variant: 5.7MB WASM → ~150MB Chrome RSS during compile
-    //   Savings: ~1.5MB download, ~50MB RSS during compile
-    //
-    // We inject this BEFORE Flutter's loader runs, so when flutter.js calls
-    // _flutter.loader.load(), it picks up our config.
+    // REMOVED entirely. CanvasKit will load normally (full 7.2MB WASM).
+    // The watchdog now has a 90s grace period after navigation to let the
+    // WASM compile complete without being killed.
     // ═══════════════════════════════════════════════════════════════════════
-    try {
-      await this.pageInstance.addInitScript({
-        content: `
-          // TASK 138: Request Chromium CanvasKit variant (smaller, less memory)
-          window._flutter = window._flutter || {};
-          window._flutter.loader = window._flutter.loader || {};
-          // The config is read by flutter.js's load() method
-          // canvasKitVariant: "chromium" requests the smaller CanvasKit build
-          window.__flutterConfig = {
-            canvasKitVariant: "chromium",
-            // Don't use full CanvasKit — chromium variant is enough for MathU
-          };
-          // Monkey-patch the loader to inject our config
-          if (window._flutter.loader && !window._flutter.loader.__task138Patched) {
-            const origLoad = window._flutter.loader.load;
-            if (typeof origLoad === 'function') {
-              window._flutter.loader.load = function(config) {
-                config = config || {};
-                config.canvasKitVariant = config.canvasKitVariant || "chromium";
-                return origLoad.call(this, config);
-              };
-              window._flutter.loader.__task138Patched = true;
-              console.log('[TASK 138] Patched Flutter loader to use Chromium CanvasKit variant');
-            }
-          }
-        `,
-      });
-      log('[TASK 138] Injected Flutter Chromium CanvasKit variant config', 'INFO', 'browser');
-    } catch (e: any) {
-      log(`[TASK 138] Failed to inject CanvasKit variant config: ${e.message}`, 'WARN', 'browser');
-    }
 
     this.pageInstance.on('crash', () => { log('Page crashed', 'ERROR', 'browser'); this.browserDisconnected = true; this.emit('crashed'); });
     this.pageInstance.on('error', (err: Error) => { logError('Page error', err); });
