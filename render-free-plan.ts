@@ -54,17 +54,23 @@ const _earlyOomInterval = setInterval(() => {
     // This works in tandem with the runtime memory monitor (5s interval,
     // L2 at 350MB, L3 at 400MB) which should catch most spikes BEFORE this
     // early-oom guard fires. This guard is the LAST line of defense.
-    if (rssMB >= 420 && !_earlyOomTriggered) {
+    // TASK 137: Raised from 420MB to 480MB. The watchdog no longer closes Chrome
+    // (closing caused worse relaunch crashes). The early-oom guard is now the
+    // ONLY exit point — fires at 480MB cgroup (30MB headroom under 512MB).
+    if (rssMB >= 480 && !_earlyOomTriggered) {
       _earlyOomTriggered = true;
       console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 420MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
       clearInterval(_earlyOomInterval);
-      process.exit(137);
+      // TASK 135: Use _originalExit to bypass the process.exit interceptor.
+      const _eo1 = (process as any)._originalExit || process.exit.bind(process);
+      _eo1(137);
     }
     if (heapMB >= EARLY_OOM_THRESHOLD_MB && !_earlyOomTriggered) {
       _earlyOomTriggered = true;
       console.error(`[FATAL] [early-oom] Heap ${heapMB.toFixed(0)}MB >= ${EARLY_OOM_THRESHOLD_MB}MB threshold during boot. Exiting immediately to avoid V8 OOM crash.`);
       clearInterval(_earlyOomInterval);
-      process.exit(137);
+      const _eo2 = (process as any)._originalExit || process.exit.bind(process);
+      _eo2(137);
     }
   } catch { /* never let the guard crash the process */ }
 }, EARLY_OOM_CHECK_INTERVAL_MS);
@@ -153,57 +159,90 @@ function _logCgroupLimit() {
 _logCgroupLimit();
 
 const _WATCHDOG_INTERVAL_MS = 500;
-// TASK 134: These thresholds are for CGROUP memory (Node + Chrome + Xvfb).
-// Container limit: 512MB. Kernel kills at ~510MB.
-//   CGROUP > 380MB → close Chrome (frees ~150-200MB)
-//   CGROUP > 430MB → exit immediately (kernel is about to kill us)
-const _WATCHDOG_CLOSE_CHROME_AT_CGROUP_MB = 380;
-const _WATCHDOG_EXIT_AT_CGROUP_MB = 430;
-const _WATCHDOG_LOG_EVERY_N_POLLS = 10; // log every 5s
+// TASK 139 (2026-10-29): Added CanvasKit compile grace period.
+// CanvasKit's 7.2MB WASM compile causes a transient cgroup spike to
+// 460-510MB for ~10-30 seconds. Without a grace period, the watchdog
+// kills the process DURING the compile, preventing the page from ever
+// rendering. With the grace period, the bot survives the spike and the
+// page renders.
+//
+// The grace period is 90 seconds after navigation starts. During this
+// time, the watchdog WARNS but does NOT exit, even if cgroup > 480MB.
+// After 90s, normal exit behavior resumes.
+const _WATCHDOG_WARN_AT_CGROUP_MB = 380;
+const _WATCHDOG_EXIT_AT_CGROUP_MB = 480;
+const _WATCHDOG_GRACE_PERIOD_MS = 90000; // 90s after navigation
+const _WATCHDOG_LOG_EVERY_N_POLLS = 10;
 let _watchdogPollCount = 0;
-let _watchdogChromeClosed = false;
+let _watchdogWarned = false;
+let _watchdogNavigationTime = 0;
+
+// Export a function that the cycle code can call to start the grace period
+(globalThis as any).__notifyNavigationStart = function() {
+  _watchdogNavigationTime = Date.now();
+  console.error(`[WATCHDOG] Navigation started — 90s CanvasKit compile grace period active (cgroup spikes up to 510MB will be tolerated)`);
+};
+
+// TASK 139: Also auto-trigger grace period when cgroup crosses 350MB.
+// This catches the CanvasKit download phase (before the WASM compile spike).
+// We don't need the cycle code to call __notifyNavigationStart — the watchdog
+// detects the memory climb automatically.
+let _graceAutoTriggered = false;
+
 const _watchdogInterval = setInterval(() => {
   try {
     const mem = process.memoryUsage();
     const heapMB = mem.heapUsed / 1024 / 1024;
     const nodeRssMB = mem.rss / 1024 / 1024;
-    const cgroupMB = _readCgroupMemoryMB(); // ← THE KEY FIX: total container memory
+    const cgroupMB = _readCgroupMemoryMB();
     _watchdogPollCount++;
 
-    // Log every 5s (10 polls) — shows BOTH Node RSS and cgroup memory
+    // Check if we're in the CanvasKit compile grace period
+    const inGracePeriod = _watchdogNavigationTime > 0 &&
+      (Date.now() - _watchdogNavigationTime) < _WATCHDOG_GRACE_PERIOD_MS;
+    const graceRemaining = inGracePeriod ?
+      Math.round((_WATCHDOG_GRACE_PERIOD_MS - (Date.now() - _watchdogNavigationTime)) / 1000) : 0;
+
+    // TASK 139: Auto-trigger grace period when cgroup crosses 350MB.
+    // This is the CanvasKit download phase — the WASM compile spike follows
+    // ~5-10s later. By starting the grace period now, we tolerate the spike.
+    if (!inGracePeriod && !_graceAutoTriggered && cgroupMB > 350) {
+      _graceAutoTriggered = true;
+      _watchdogNavigationTime = Date.now();
+      console.error(`[WATCHDOG] Cgroup crossed 350MB (${cgroupMB.toFixed(0)}MB) — auto-starting 90s CanvasKit compile grace period`);
+      // Reset after 120s so the next navigation can trigger again
+      setTimeout(() => { _graceAutoTriggered = false; }, 120000).unref?.();
+    }
+
+    // Log every 5s (10 polls)
     if (_watchdogPollCount % _WATCHDOG_LOG_EVERY_N_POLLS === 0) {
-      console.error(`[WATCHDOG] nodeHeap=${heapMB.toFixed(0)}MB nodeRSS=${nodeRssMB.toFixed(0)}MB cgroup=${cgroupMB.toFixed(0)}MB (poll #${_watchdogPollCount})`);
+      const graceTag = inGracePeriod ? ` [GRACE: ${graceRemaining}s]` : '';
+      console.error(`[WATCHDOG] nodeHeap=${heapMB.toFixed(0)}MB nodeRSS=${nodeRssMB.toFixed(0)}MB cgroup=${cgroupMB.toFixed(0)}MB (poll #${_watchdogPollCount})${graceTag}`);
     }
 
-    // TIER 1: Cgroup memory > 380MB → close Chrome to free ~150-200MB
-    // This is the REAL memory check. Node's RSS alone (280MB) was never enough
-    // to trigger this — but Chrome's separate RSS pushes cgroup to 500MB+.
-    if (cgroupMB > _WATCHDOG_CLOSE_CHROME_AT_CGROUP_MB && !_watchdogChromeClosed) {
-      _watchdogChromeClosed = true;
-      console.error(`[WATCHDOG] CGROUP ${cgroupMB.toFixed(0)}MB > ${_WATCHDOG_CLOSE_CHROME_AT_CGROUP_MB}MB (nodeRSS=${nodeRssMB.toFixed(0)}MB) — closing Chrome to free ~150-200MB`);
-      try {
-        const { container } = require('./container');
-        const browserMod = container.get('browser', { required: false });
-        if (browserMod?.closeBrowser) {
-          browserMod.closeBrowser().catch(() => {}).then(() => {
-            const afterMB = _readCgroupMemoryMB();
-            console.error(`[WATCHDOG] Chrome closed — cgroup was ${cgroupMB.toFixed(0)}MB, now ${afterMB.toFixed(0)}MB. Will allow relaunch on next cycle.`);
-            setTimeout(() => { _watchdogChromeClosed = false; }, 10000).unref?.();
-          });
-        }
-      } catch (e: any) {
-        console.error(`[WATCHDOG] Failed to close Chrome: ${e.message}`);
-      }
+    // TIER 1: Cgroup memory > 380MB → LOG warning
+    if (cgroupMB > _WATCHDOG_WARN_AT_CGROUP_MB && !_watchdogWarned) {
+      _watchdogWarned = true;
+      const graceTag = inGracePeriod ? ` [IN GRACE PERIOD — ${graceRemaining}s remaining, NOT exiting]` : '';
+      console.error(`[WATCHDOG] CGROUP ${cgroupMB.toFixed(0)}MB > ${_WATCHDOG_WARN_AT_CGROUP_MB}MB${graceTag}`);
       if (global.gc) { try { global.gc(); } catch {} }
+      setTimeout(() => { _watchdogWarned = false; }, 30000).unref?.();
     }
 
-    // TIER 2: Cgroup memory > 430MB → exit immediately (kernel is about to kill us)
-    // 430MB gives 82MB headroom under 512MB. The kernel fires at ~510MB.
-    if (cgroupMB > _WATCHDOG_EXIT_AT_CGROUP_MB) {
-      console.error(`[FATAL] [WATCHDOG] CGROUP ${cgroupMB.toFixed(0)}MB > ${_WATCHDOG_EXIT_AT_CGROUP_MB}MB (nodeRSS=${nodeRssMB.toFixed(0)}MB heap=${heapMB.toFixed(0)}MB) — kernel OOM imminent, exiting immediately`);
+    // TIER 2: Cgroup memory > 480MB → exit (UNLESS in grace period)
+    // During the 90s grace period, tolerate up to 510MB (just 2MB under the
+    // 512MB limit) to let CanvasKit's WASM compile finish.
+    const exitThreshold = inGracePeriod ? 510 : _WATCHDOG_EXIT_AT_CGROUP_MB;
+    if (cgroupMB > exitThreshold) {
+      if (inGracePeriod) {
+        console.error(`[FATAL] [WATCHDOG] CGROUP ${cgroupMB.toFixed(0)}MB > ${exitThreshold}MB EVEN IN GRACE PERIOD — kernel OOM truly imminent, exiting (grace: ${graceRemaining}s remaining)`);
+      } else {
+        console.error(`[FATAL] [WATCHDOG] CGROUP ${cgroupMB.toFixed(0)}MB > ${exitThreshold}MB — kernel OOM imminent, exiting immediately`);
+      }
       clearInterval(_watchdogInterval);
       clearInterval(_earlyOomInterval);
-      process.exit(137);
+      const _origExit = (process as any)._originalExit || process.exit.bind(process);
+      _origExit(137);
     }
   } catch (e: any) {
     // Never let the watchdog crash the process
@@ -409,15 +448,17 @@ const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilien
   const _mem = process.memoryUsage();
   const _postContainerHeapMB = _mem.heapUsed / 1024 / 1024;
   const _postContainerRSSMB = _mem.rss / 1024 / 1024;
-  if (_postContainerRSSMB >= 420) {
-    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 420MB after container init. Kernel OOM imminent. Exiting immediately. [TASK 132]`);
+  if (_postContainerRSSMB >= 480) {
+    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 480MB after container init. Kernel OOM imminent. Exiting immediately. [TASK 137]`);
     clearInterval(_earlyOomInterval);
-    process.exit(137);
+    const _bo1 = (process as any)._originalExit || process.exit.bind(process);
+    _bo1(137);
   }
   if (_postContainerHeapMB >= 350) {
     console.error(`[FATAL] [boot-oom] Heap ${_postContainerHeapMB.toFixed(0)}MB >= 350MB after container init. Exiting immediately.`);
     clearInterval(_earlyOomInterval);
-    process.exit(137);
+    const _bo2 = (process as any)._originalExit || process.exit.bind(process);
+    _bo2(137);
   }
 }
 
@@ -475,7 +516,8 @@ let startDaemon: () => Promise<void> = async () => {
   if (_startDaemonRetries > _MAX_START_DAEMON_RETRIES) {
     log(`startDaemon() waited ${_startDaemonRetries * 100}ms for orchestrator load — giving up. HTTP server may have failed to listen.`, 'ERROR', 'render-free-plan');
     try { clearInterval(_earlyOomInterval); } catch { /* ignore */ }
-    process.exit(137);
+    const _sd1 = (process as any)._originalExit || process.exit.bind(process);
+    _sd1(137);
     return;
   }
   log(`startDaemon() called before orchestrator loaded — deferring 100ms (attempt ${_startDaemonRetries}/${_MAX_START_DAEMON_RETRIES})`, 'DEBUG', 'render-free-plan');
@@ -536,7 +578,8 @@ function _loadOrchestrator() {
     // exit(1) would also restart, but 137 is more semantically correct
     // for "killed by OOM" and Render treats both the same way.
     try { clearInterval(_earlyOomInterval); } catch { /* ignore */ }
-    process.exit(137);
+    const _or1 = (process as any)._originalExit || process.exit.bind(process);
+    _or1(137);
   } finally {
     _orchestratorLoading = false;
   }
@@ -956,64 +999,33 @@ function _startMemoryMonitor(): void {
     //
     // Container limit: 512MB. Kernel OOM killer fires at ~490MB.
     // 400MB gives 90MB headroom — safe even if Chrome spikes 50MB during reload.
-    const HARD_RESTART_HEAP_MB = 330; // unchanged — Node V8 heap limit
-    const HARD_RSS_LIMIT_MB = 400;   // was 460 — too late, kernel kills first
-    const RSS_PAGE_RELOAD_THRESHOLD_MB = 350; // NEW — L2 trigger (reload page)
+    // TASK 137 (2026-10-29): DISABLED all shedMemory calls in the 5s monitor.
+    // The 500ms watchdog (Task 137) is now the ONLY memory management.
+    // shedMemory was closing/reloading Chrome, which caused the cycle code to
+    // immediately relaunch Chrome on top of un-reclaimed memory → crash.
+    //
+    // The bot completed its first cycle ever with Task 136 (CanvasKit blocking).
+    // Chrome can survive at 380-480MB cgroup. We only exit at 480MB.
+    // No more L2 (page reload) or L3 (browser close) from this monitor.
+    const HARD_RESTART_HEAP_MB = 999; // disabled — was 330
+    const HARD_RSS_LIMIT_MB = 999;    // disabled — was 400
+    const RSS_PAGE_RELOAD_THRESHOLD_MB = 999; // disabled — was 350
     if (used > HARD_RESTART_HEAP_MB || rss > HARD_RSS_LIMIT_MB) {
-      const midQuiz = memoryMode.isMidQuiz?.() ?? false;
-      log(`Memory CRITICAL (hard threshold): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${midQuiz})`, 'ERROR', 'render-free-plan');
-      // TASK 132: Allow L3 (browser restart) when RSS > 400MB AND not mid-quiz.
-      // The old code capped at L2 (reload page) which doesn't free Chrome's
-      // native memory — only its V8 heap. When Chrome's RSS is > 400MB, the
-      // native memory (skia, libcairo, font caches, etc.) is the culprit,
-      // and only a full browser restart frees it.
-      //
-      // L3 closes the browser and relaunches it. This loses the current page
-      // state, but it's better than a kernel SIGKILL that loses EVERYTHING.
-      //
-      // Exception: if mid-quiz, preserve browser (L2 only) — losing the quiz
-      // state is worse than risking OOM. The quiz will complete in 30-60s
-      // and then we can do a clean L3.
-      memoryMode.shedMemory('render-monitor-critical', {
-        preserveBrowser: midQuiz,
-        maxLevel: midQuiz ? 2 : 3,  // TASK 132: L3 when not mid-quiz
-      }).then(() => {
-        // v5 FIX: Second GC AFTER browser cleanup actually completes
-        if (global.gc) { try { global.gc(); } catch {} }
-      }).catch(() => {});
-      if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
+      // This branch is now unreachable (thresholds set to 999).
+      // Kept for code structure — the 500ms watchdog handles everything.
+      log(`Memory CRITICAL (disabled tier): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — watchdog handles this`, 'ERROR', 'render-free-plan');
       _memoryWarningCount = 0;
       _lastRss = rss;
     } else if (rss > RSS_PAGE_RELOAD_THRESHOLD_MB) {
-      // TASK 132: NEW intermediate tier — reload page when RSS > 350MB.
-      // This catches the Flutter Web render phase memory spike BEFORE it
-      // reaches the kernel-OOM threshold. Page reload forces Chrome to GC
-      // its V8 heap + drop native caches, freeing ~30-80MB.
-      //
-      // We do NOT close the browser here (L3) — that's reserved for the
-      // 400MB tier above. L2 (page reload) preserves the browser session
-      // while still freeing significant memory.
-      log(`Memory HIGH (page reload tier): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — L2 shed (reload page, frees Chrome V8 heap)`, 'WARN', 'render-free-plan');
-      memoryMode.shedMemory('render-monitor-rss-high', {
-        preserveBrowser: false,  // allow L2 (page reload)
-        maxLevel: 2,             // L2 only — don't close browser
-      }).then(() => {
-        if (global.gc) { try { global.gc(); } catch {} }
-      }).catch(() => {});
-      if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
+      // This branch is also unreachable (threshold set to 999).
       _memoryWarningCount = 0;
       _lastRss = rss;
     } else if (used > activeWarn) {
+      // TASK 137: Don't shed memory here either — just log.
+      // The 500ms watchdog handles all memory management.
       _memoryWarningCount++;
       if (_memoryWarningCount >= activeStreak) {
-        log(`Memory warning persistent (${_memoryWarningCount}/${activeStreak}, mode=${memoryMode.getMode()}): heap=${used.toFixed(0)}MB — memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'WARN', 'render-free-plan');
-        // v5 FIX: shedMemory is async now
-        // v6 FIX: preserve browser if mid-quiz
-        memoryMode.shedMemory('render-monitor-warning', {
-          preserveBrowser: memoryMode.isMidQuiz?.() ?? false,
-        }).then(() => {
-          if (global.gc) { try { global.gc(); } catch {} }
-        }).catch(() => {});
+        log(`Memory warning persistent (${_memoryWarningCount}/${activeStreak}, mode=${memoryMode.getMode()}): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — NOT shedding (Task 137: watchdog handles memory)`, 'WARN', 'render-free-plan');
         if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
         _memoryWarningCount = 0;
         _lastRss = rss;
@@ -1378,7 +1390,8 @@ server.listen(PORT, '0.0.0.0', () => {
     // _loadOrchestrator already called process.exit(137) in its catch block,
     // but if it threw BEFORE reaching the catch (shouldn't happen), exit here.
     try { clearInterval(_earlyOomInterval); } catch { /* ignore */ }
-    process.exit(137);
+    const _or2 = (process as any)._originalExit || process.exit.bind(process);
+    _or2(137);
   }
 });
 
