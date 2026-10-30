@@ -112,13 +112,26 @@ ENV NODE_ENV=production \
     USER_DATA_DIR=/tmp/.browser-data \
     LOG_DIR=/tmp/mathu-logs \
     HEARTBEAT_FILE=/tmp/.heartbeat \
-    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,BackForwardCache,SharedArrayBuffer --js-flags=--max-old-space-size=32 --optimize-for-size --single-process --purge-memory-policy --use-gl=angle --use-angle=swiftshader"
+    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --disable-component-extensions-with-background-pages --disable-gpu --disable-software-rasterizer --disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,BackForwardCache,SharedArrayBuffer --js-flags=--max-old-space-size=32 --optimize-for-size --single-process --purge-memory-policy"
 
-# TASK 140 (2026-10-29): Removed --disable-gpu and --disable-software-rasterizer
-# from CHROMIUM_FLAGS. These flags were KILLING the page — CanvasKit requires
-# WebGL to render. Without GPU (even software GPU/SwiftShader), CanvasKit
-# can't paint anything → page stays permanently BLANK.
-# Also removed --disable-features=V8VmFuture (was causing issues).
+# TASK 150 (2026-10-30): RE-ADDED --disable-gpu and --disable-software-rasterizer.
+# Task 140 removed these because CanvasKit needs WebGL to render. But Task 150
+# blocks CanvasKit entirely (canvaskit.wasm + canvaskit.js are aborted via
+# page.route()). Without CanvasKit, there's no WebGL needed, so we can disable
+# the GPU process entirely. This saves ~50-80MB of Chrome memory (no GPU
+# process, no SwiftShader Vulkan ICD, no EGL context).
+#
+# Also REMOVED --use-gl=angle --use-angle=swiftshader (no longer needed).
+#
+# New memory budget (Task 150):
+#   Node RSS (minimum mode): ~165MB
+#   Chrome baseline (no GPU): ~100-130MB (was ~220MB with SwiftShader)
+#   No CanvasKit download/compile: saves ~150MB
+#   Total cgroup: ~265-295MB (was ~450MB)
+#   Headroom: ~217-247MB (was ~62MB)
+#
+# The bot now reads questions from Flutter DOM semantics nodes instead of
+# canvas screenshots. See Task 150 in browser.ts for details.
 #
 # Chrome in headless mode uses SwiftShader (software WebGL) by default.
 # This is slower than hardware GPU but works on headless servers.
