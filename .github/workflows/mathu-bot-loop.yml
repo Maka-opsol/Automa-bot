@@ -1,15 +1,14 @@
 # ═══════════════════════════════════════════════════════════════════════
-# MathU Bot — Perpetual Loop GitHub Actions Workflow (v3)
+# MathU Bot — Perpetual Loop GitHub Actions Workflow (v3 — improved logging)
 # ═══════════════════════════════════════════════════════════════════════
 #
-# v3 changes:
-#   - Uses GITHUB_TOKEN (auto-managed, no PAT needed) instead of PAT_TOKEN
-#   - Uses Playwright's install-deps command (handles Ubuntu 24.04 package renames)
-#   - Upgraded Node.js to 22 (silences deprecation warning)
+# HOW THIS WORKS (plain English):
 #
-# HOW THIS WORKS:
+# GitHub Actions has a hard 6-hour limit per job. To run the bot 24/7,
+# we use a "self-triggering loop":
+#
 #   1. This workflow starts and runs the bot for ~5.5 hours
-#   2. Before timeout, it triggers ANOTHER run of itself using gh CLI + GITHUB_TOKEN
+#   2. Before the timeout, it triggers ANOTHER run of itself
 #   3. The new run starts immediately, keeping the bot alive
 #   4. Repeat forever
 #
@@ -21,10 +20,18 @@
 #   - Private repo: 2,000 free minutes/month (~5.5 runs of 6 hours each)
 #   - Recommendation: make the repo PUBLIC for unlimited free runs
 #
+# LOGGING FEATURES (v3):
+#   - Live status every 2 minutes (last 10 bot log lines shown in Actions log)
+#   - Memory usage logged every 10 minutes
+#   - Full bot logs uploaded as downloadable artifacts after each run
+#   - Logs retained for 7 days
+#
 # SETUP REQUIRED:
-#   1. Add all bot env vars as repository secrets (see setup guide)
-#   2. NO Personal Access Token needed — uses built-in GITHUB_TOKEN
-#   3. Click "Run workflow" in the Actions tab to start the loop
+#   1. (Optional) Create a Personal Access Token (PAT) with "repo" scope
+#      → https://github.com/settings/tokens
+#      Add it as a repository secret named PAT_TOKEN
+#      OR use the built-in GITHUB_TOKEN (see "Trigger next iteration" step)
+#   2. Add all bot env vars as repository secrets (see SETUP.md)
 # ═══════════════════════════════════════════════════════════════════════
 
 name: MathU Bot Loop
@@ -32,13 +39,12 @@ name: MathU Bot Loop
 # Triggers:
 # - workflow_dispatch: manual start (you click "Run workflow" in GitHub)
 # - repository_dispatch: triggered by the previous run before it times out
-#   (kept for backwards compatibility, but we now use gh CLI for triggering)
 on:
   workflow_dispatch:
   repository_dispatch:
     types: [loop_trigger]
 
-# Grant the GITHUB_TOKEN permission to trigger workflows
+# Grant the GITHUB_TOKEN permission to trigger workflows (for the loop)
 permissions:
   actions: write
   contents: read
@@ -53,23 +59,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ─── Step 2: Set up Node.js 22 ───
-      # v3: Upgraded from 20 to 22 to silence deprecation warning
+      # ─── Step 2: Set up Node.js ───
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '20'
 
       # ─── Step 3: Install Chrome + WebGL dependencies ───
-      # v3: Uses Playwright's install-deps command which knows the correct
-      # package names for any Ubuntu version (handles 22.04 vs 24.04 differences
-      # like libasound2 vs libasound2t64 automatically).
-      # Then adds WebGL/Vulkan/Xvfb packages separately (Playwright doesn't include these).
+      # Uses Playwright's official dependency installer (handles Ubuntu version differences)
+      # Plus WebGL/Vulkan libraries for SwiftShader (CanvasKit needs WebGL)
       - name: Install Chrome + WebGL dependencies
         run: |
           # Playwright knows the exact packages Chrome needs for any Ubuntu version
           sudo npx playwright install-deps chromium
-          # Also install WebGL/Vulkan/Xvfb libs (Playwright doesn't include these)
+          # Also install WebGL/Vulkan libs (Playwright doesn't include these)
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libvulkan1 mesa-vulkan-drivers \
@@ -91,7 +94,12 @@ jobs:
       # ─── Step 6: Run the bot (with 5h30m timeout) ───
       # The runner script starts Xvfb (virtual display for Chrome WebGL),
       # then starts the bot. After 5h30m, it gracefully shuts down and
-      # the next step triggers the next iteration.
+      # triggers the next iteration.
+      #
+      # The runner script logs:
+      #   - Status every 2 minutes (last 10 bot log lines)
+      #   - Memory usage every 10 minutes
+      #   - Full bot stdout to /tmp/mathu-logs/bot-stdout.log
       - name: Run MathU Bot
         env:
           # Bot credentials (login for app.mathu.co.za via Microsoft auth)
@@ -139,10 +147,22 @@ jobs:
           chmod +x ./scripts/run-bot.sh
           ./scripts/run-bot.sh
 
-      # ─── Step 7: Trigger the next iteration ───
-      # v3: Uses the built-in GITHUB_TOKEN (no PAT needed!) to trigger a new
-      # workflow_dispatch run of this same workflow via the GitHub CLI.
-      # This is safer (auto-managed, expires after each run) and simpler.
+      # ─── Step 7: Upload bot logs as artifact ───
+      # This saves the full bot stdout log + screenshots so you can
+      # download them after each run for debugging.
+      - name: Upload bot logs
+        if: always()  # Upload even if the bot crashed
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-logs-${{ github.run_id }}
+          path: |
+            /tmp/mathu-logs/
+          retention-days: 7
+          if-no-files-found: warn
+
+      # ─── Step 8: Trigger the next iteration ───
+      # Uses the built-in GITHUB_TOKEN (no PAT needed!) to trigger a new
+      # workflow_dispatch run of this same workflow.
       - name: Trigger next iteration
         if: always()  # Run even if the bot step failed
         env:
@@ -151,5 +171,5 @@ jobs:
           echo "Triggering next MathU Bot Loop run..."
           gh workflow run mathu-bot-loop.yml \
             --repo ${{ github.repository }} \
-            --ref ${{ github.ref_name }}
+            --ref main
           echo "Next run triggered successfully."
