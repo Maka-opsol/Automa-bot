@@ -288,10 +288,23 @@ RESPOND ONLY in this exact JSON format:
 `;
 
 function getAuditorConfig() {
+  // TIER 1+ (2026-10-30): Support self-hosted LLM via Ollama
+  // When AUDITOR_PROVIDER=ollama, use the local Ollama server (no API calls)
   if (process.env.AUDITOR_USE_ACTIVE === 'false' && process.env.AUDITOR_MODEL) {
     const provider = process.env.AUDITOR_PROVIDER || 'openrouter';
-    const endpointMap = { openrouter: 'https://openrouter.ai/api/v1/chat/completions', mistral: 'https://api.mistral.ai/v1/chat/completions' };
-    return { provider, model: process.env.AUDITOR_MODEL, endpoint: (endpointMap as any)[provider] || endpointMap.openrouter, apiKey: process.env.AUDITOR_API_KEY };
+    // TIER 1+: Add Ollama to the endpoint map + support AUDITOR_ENDPOINT override
+    const endpointMap: Record<string, string> = {
+      openrouter: 'https://openrouter.ai/api/v1/chat/completions',
+      mistral: 'https://api.mistral.ai/v1/chat/completions',
+      ollama: process.env.AUDITOR_ENDPOINT || 'http://localhost:11434/v1/chat/completions',
+    };
+    const endpoint = endpointMap[provider] || endpointMap.openrouter;
+    // Ollama doesn't need a real API key — any string works. Use "ollama" if not set.
+    const apiKey = process.env.AUDITOR_API_KEY || (provider === 'ollama' ? 'ollama' : '');
+    if (provider === 'ollama') {
+      log(`[TIER1+] Auditor using LOCAL Ollama LLM: ${process.env.AUDITOR_MODEL} at ${endpoint}`, 'INFO', 'auditor');
+    }
+    return { provider, model: process.env.AUDITOR_MODEL, endpoint, apiKey };
   }
   const active = getGetActiveModel()?.get();
   if (active && active.model_id) {
@@ -316,6 +329,20 @@ function getAuditorConfig() {
  */
 function getNonCodegenAuditorConfigs(): Array<{ provider: string; model: string; endpoint: string; apiKey: string | null }> {
   const configs: Array<{ provider: string; model: string; endpoint: string; apiKey: string | null }> = [];
+
+  // TIER 1+ (2026-10-30): Add local Ollama LLM as the FIRST auditor
+  // (fastest, no rate limits, runs locally). If Ollama is configured, it
+  // gets the first vote. Cloud auditors provide additional votes for
+  // redundancy and cross-validation.
+  if (process.env.AUDITOR_PROVIDER === 'ollama' && process.env.AUDITOR_MODEL) {
+    configs.push({
+      provider: 'ollama',
+      model: process.env.AUDITOR_MODEL,
+      endpoint: process.env.AUDITOR_ENDPOINT || 'http://localhost:11434/v1/chat/completions',
+      apiKey: process.env.AUDITOR_API_KEY || 'ollama',
+    });
+    log('[TIER1+] Local Ollama LLM added as auditor voter', 'DEBUG', 'auditor');
+  }
 
   // OpenRouter (free tier)
   if (getCONFIG().OPENROUTER_API_KEY) {
