@@ -15,29 +15,6 @@ LABEL org.opencontainers.image.authors="U.S.J Sibiya"
 # to run Chromium in headed mode on a headless server. Xvfb provides a
 # virtual X server that Chromium can render to. xauth is needed for
 # DISPLAY-based authentication.
-# TASK 145 (2026-10-29): Added libvulkan1 + Mesa GL/Vulkan libraries.
-# Chrome's bundled SwiftShader (used via --use-angle=swiftshader) talks to
-# the SwiftShader Vulkan ICD through the SYSTEM Vulkan loader (libvulkan.so.1).
-# Without libvulkan1, Chrome cannot load the ICD → ANGLE fails → no WebGL
-# context → CanvasKit fails to compile → page stays permanently BLANK.
-#
-# This is the missing piece Task 144 (headless=false) needed to actually
-# work. headless=false got us full Chromium (which has WebGL support), but
-# WebGL itself still couldn't initialize because libvulkan1 wasn't installed.
-#
-# mesa-vulkan-drivers provides lavapipe (a software Vulkan ICD) as a
-# fallback in case Chrome's bundled SwiftShader Vulkan ICD fails to load.
-#
-# libgl1-mesa-dri provides Mesa's DRI drivers including llvmpipe (software
-# OpenGL rasterizer) — needed as a fallback for --use-gl=egl or
-# --use-angle=gl if SwiftShader Vulkan path fails.
-#
-# libegl1 + libegl-mesa0 + libgl1 + libgles2 provide the EGL/GLES runtime
-# that ANGLE uses for EGL surface management even when using SwiftShader.
-#
-# Memory cost: ~60MB on disk, ~0MB RAM until actually used. When
-# SwiftShader is active, expect ~30-50MB additional RAM (within the 90s
-# CanvasKit grace period Task 139 added).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
     libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
@@ -46,8 +23,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxfixes3 libxext6 libxi6 libxtst6 \
     libxcursor1 libxss1 libdbus-1-3 libexpat1 \
     libglib2.0-0 \
-    libvulkan1 mesa-vulkan-drivers \
-    libgl1-mesa-dri libegl1 libegl-mesa0 libgl1 libgles2 \
     python3 make g++ \
     curl \
     xvfb xauth \
@@ -145,23 +120,6 @@ ENV NODE_ENV=production \
 # can't paint anything → page stays permanently BLANK.
 # Also removed --disable-features=V8VmFuture (was causing issues).
 #
-# TASK 148 (2026-10-29): Removed --enable-features=Vulkan,UseSkiaRenderer,VulkanFromANGLE.
-# Task 145 added these thinking they'd help Chrome find the Vulkan backend.
-# But --use-angle=swiftshader ALREADY tells ANGLE to use SwiftShader — the
-# extra --enable-features=Vulkan was causing Chrome to initialize a SEPARATE
-# Vulkan compositing backend ON TOP of SwiftShader. Two GPU backends in
-# memory = ~30-50MB wasted. With 512MB container limit, that's the
-# difference between CanvasKit compile fitting (peak ~470MB) vs OOM-killing
-# PID 1 (peak ~510MB).
-#
-# Also lowered Chrome V8 heap from 64MB to 32MB (--js-flags=--max-old-space-size=32).
-# Chrome's JS engine doesn't need 64MB — CanvasKit's WASM compile uses NATIVE
-# memory, not V8 heap. 32MB is enough for Flutter's Dart runtime + DOM JS.
-# Saves another ~32MB of peak cgroup usage.
-#
-# Total Task 148 memory savings: ~60-80MB → CanvasKit compile peak drops
-# from ~500MB to ~420-440MB. Comfortable 70-90MB headroom under 512MB.
-#
 # Chrome in headless mode uses SwiftShader (software WebGL) by default.
 # This is slower than hardware GPU but works on headless servers.
 # SwiftShader uses ~30-50MB more memory than --disable-gpu, but
@@ -230,39 +188,4 @@ HEALTHCHECK --interval=60s --timeout=30s --start-period=300s --retries=5 \
 #
 # The 30MB cost of Xvfb is worth it — a blank page that uses less memory
 # is useless. The bot needs to SEE the rendered page to complete questions.
-# TASK 145 (2026-10-29): Updated CMD to explicitly export VK_ICD_FILENAMES
-# before launching Chrome. Chrome's bundled SwiftShader Vulkan ICD lives at
-# /opt/pw-browsers/chromium-XXXX/chrome-linux/vk_swiftshader_icd.json.
-# Normally Chrome auto-registers this via --use-angle=swiftshader, but on
-# minimal Debian-slim images without a Vulkan ICD dispatcher, the
-# auto-registration can silently fail. Setting VK_ICD_FILENAMES explicitly
-# guarantees the SwiftShader ICD is discoverable by the Vulkan loader.
-#
-# mesa-vulkan-drivers (installed above) ALSO drops a lavapipe ICD at
-# /usr/share/vulkan/icd.d/radeon_icd.x86_64.json — if SwiftShader is
-# somehow missing or broken, lavapipe will be tried as a fallback (slower
-# but functional).
-#
-# Fallback chain if Vulkan/SwiftShader still fails:
-#   1. SwiftShader Vulkan ICD (Chrome's bundled, via libvulkan1 + VK_ICD_FILENAMES)
-#   2. Mesa lavapipe Vulkan ICD (mesa-vulkan-drivers)
-#   3. Mesa llvmpipe OpenGL (libgl1-mesa-dri, requires --use-gl=egl instead
-#      of --use-angle=swiftshader)
-#
-# Diagnostic logging (Task 145c, in browser.ts) will print WebGL availability
-# after page load so we can verify the chain actually works at runtime.
-# TASK 146 (2026-10-29): Fixed VK_ICD_FILENAMES lookup.
-# Task 145's `ls /opt/pw-browsers/chromium-*/chrome-linux/vk_swiftshader_icd.json`
-# returned EMPTY on Render (Playwright's chromium download for this version
-# doesn't bundle vk_swiftshader_icd.json at that path).
-#
-# Task 146 first attempt used `find ... -name X -o -name Y` but the `-o`
-# operator has lower precedence than the implicit path AND, so the second
-# `-name '*swiftshader*.json'` had no path → find defaulted to `.` (current
-# dir = /app) → searched the ENTIRE bot codebase → slow + useless.
-#
-# This version uses explicit glob patterns with [ -f ] checks. Fast, no
-# precedence issues, no searching /app. If no ICD is found, we leave
-# VK_ICD_FILENAMES unset and let Chrome auto-discover via the standard
-# /usr/share/vulkan/icd.d path (mesa-vulkan-drivers drops lavapipe there).
-CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; export DISPLAY=:99; VK_ICD=''; for p in /opt/pw-browsers/chromium-*/chrome-linux/vk_swiftshader_icd.json /usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json; do if [ -f \"$p\" ]; then VK_ICD=\"$p\"; break; fi; done; if [ -n \"$VK_ICD\" ]; then export VK_ICD_FILENAMES=\"$VK_ICD\"; echo \"[TASK 146] VK_ICD_FILENAMES=$VK_ICD_FILENAMES\"; else echo \"[TASK 146] No Vulkan ICD found — Chrome will use system auto-discovery (lavapipe/llvmpipe fallback)\"; fi; exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
+CMD ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true; pkill -f 'Xvfb :99' 2>/dev/null || true; sleep 0.5; Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp 2>/dev/null & sleep 1; export DISPLAY=:99; exec node --expose-gc --max-old-space-size=448 --import tsx render-free-plan.ts"]
