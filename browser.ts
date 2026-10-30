@@ -529,35 +529,80 @@ class BrowserManager {
     });
     log('[TASK150] Flutter semantics init script injected', 'INFO', 'browser');
 
-    // (2) BLOCK canvaskit.wasm and canvaskit.js — don't download or compile
+    // (2) BLOCK canvaskit.wasm (don't download 7.2MB) + serve Proxy mock for canvaskit.js
+    //
+    // TASK 151 (2026-10-30): The Task 150 stub returned `null` for CanvasKit,
+    // which crashed Flutter's initialization — Dart code needs CanvasKit to
+    // build the widget tree (text layout, measurement, etc). Without CanvasKit,
+    // Flutter never creates semantics nodes → bot can't read questions.
+    //
+    // TASK 151 SOLUTION: Serve a JavaScript Proxy-based mock that returns
+    // a no-op function for ANY property access. When Flutter calls
+    // `CanvasKit.MakeSurface(...)`, the Proxy returns another Proxy (truthy).
+    // Flutter's Dart code treats it as a valid "surface" object and continues
+    // building the widget tree. Semantics nodes ARE created (they're a
+    // Dart-side feature, not CanvasKit). The canvas stays blank, but the
+    // DOM has the question text in <flt-semantics> elements.
+    //
+    // MEMORY: Zero WASM download, zero compile spike, zero WebGL context.
+    // Only ~2KB of JS for the Proxy mock.
     try {
       await this.pageInstance.route('**/canvaskit.wasm*', async (route: any) => {
         const url = route.request().url();
-        log(`[TASK150] BLOCKED canvaskit.wasm download (saved 7.2MB + ~150MB compile): ${url.substring(0, 80)}`, 'INFO', 'browser');
-        // Abort the request — Flutter will catch the load failure
+        log(`[TASK151] BLOCKED canvaskit.wasm download (saved 7.2MB + ~150MB compile): ${url.substring(0, 80)}`, 'INFO', 'browser');
         return route.abort();
       });
+      // The Proxy mock — returns a function-proxy for any property access,
+      // and calling any function returns another proxy. This makes CanvasKit
+      // API calls non-crashing but no-op.
+      const canvaskitMockJs = [
+        '// TASK 151: CanvasKit Proxy mock — no rendering, widget tree + semantics only',
+        'function makeMock() {',
+        '  var handler = {',
+        '    get: function(target, prop, receiver) {',
+        '      if (prop === Symbol.toPrimitive) return function() { return "[CanvasKitMock]"; };',
+        '      if (prop === "then") return undefined;',
+        '      if (prop === Symbol.iterator) return undefined;',
+        '      if (typeof prop === "string" && (prop === "length" || prop === "byteLength")) return 0;',
+        '      if (typeof prop === "string" && (prop === "width" || prop === "height")) return 0;',
+        '      if (typeof prop === "string" && prop.endsWith("Id")) return 0;',
+        '      if (prop in target) return target[prop];',
+        '      // Return a function that, when called, returns a recursive proxy',
+        '      var fn = function() { return new Proxy(function(){}, handler); };',
+        '      // Make the function itself proxy-able (so property access works on it)',
+        '      var fnProxy = new Proxy(fn, handler);',
+        '      return fnProxy;',
+        '    },',
+        '    apply: function(target, thisArg, args) {',
+        '      return new Proxy(function(){}, handler);',
+        '    },',
+        '    construct: function(target, args) {',
+        '      return new Proxy(function(){}, handler);',
+        '    }',
+        '  };',
+        '  return new Proxy(function(){}, handler);',
+        '}',
+        'export default function(opts) {',
+        '  console.log("[TASK151] CanvasKit Proxy mock invoked — widget tree will build, canvas will stay blank, semantics nodes will be created");',
+        '  return Promise.resolve(makeMock());',
+        '}',
+        'export {};'
+      ].join('\n');
       await this.pageInstance.route('**/canvaskit.js*', async (route: any) => {
         const url = route.request().url();
-        log(`[TASK150] BLOCKED canvaskit.js download: ${url.substring(0, 80)}`, 'INFO', 'browser');
-        // Fulfill with an empty module stub instead of aborting —
-        // this prevents the import() from throwing, which would crash Flutter
-        // before semantics can be created
+        log(`[TASK151] SERVING canvaskit.js Proxy mock (instead of 7.2MB real CanvasKit): ${url.substring(0, 80)}`, 'INFO', 'browser');
         return route.fulfill({
           status: 200,
           contentType: 'application/javascript',
-          body: '// TASK150: CanvasKit stub — rendering disabled, semantics only\n' +
-                'window.flutterCanvasKit = null;\n' +
-                'export default function() { return Promise.resolve(null); }\n' +
-                'export {};\n'
+          body: canvaskitMockJs
         });
       });
-      log('[TASK150] CanvasKit block routes installed (canvaskit.wasm → abort, canvaskit.js → stub)', 'INFO', 'browser');
+      log('[TASK151] CanvasKit Proxy mock routes installed (canvaskit.wasm → abort, canvaskit.js → Proxy mock)', 'INFO', 'browser');
     } catch (routeErr: any) {
-      log(`[TASK150] Route install failed (non-fatal): ${routeErr?.message}`, 'WARN', 'browser');
+      log(`[TASK151] Route install failed (non-fatal): ${routeErr?.message}`, 'WARN', 'browser');
     }
 
-    // (3) Expand console filter to catch TASK150 messages and Flutter errors
+    // (3) Expand console filter to catch TASK150/151 messages and Flutter errors
     this.pageInstance.on('console', (msg: any) => {
       try {
         const text = msg.text?.() ?? String(msg);
@@ -568,6 +613,7 @@ class BrowserManager {
             lower.includes('opengl') || lower.includes('angle') ||
             lower.includes('swiftshader') || lower.includes('error') ||
             lower.includes('task150') || lower.includes('task149') ||
+            lower.includes('task151') ||
             lower.includes('task146') || lower.includes('task148') ||
             lower.includes('probe') || lower.includes('semantic') ||
             lower.includes('engine') || lower.includes('render')) {
