@@ -1540,21 +1540,52 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // With CanvasKit blocked (Task 150), the canvas is blank but Flutter's
       // Dart code should still create DOM semantics nodes. Extract text from
       // the DOM to see if the Flutter app loaded and what content is visible.
+      //
+      // TASK 151 (2026-10-30): CanvasKit is now served as a Proxy mock (not
+      // null). Flutter's widget tree SHOULD build. But it takes time —
+      // main.dart.js is 6.3MB and needs to parse + execute. We extract DOM
+      // text immediately AND schedule a delayed extraction (15s) to catch
+      // semantics nodes created after Flutter finishes initializing.
       try {
         const browser = require('./browser');
         if (typeof browser.extractDomText === 'function') {
-          log('[TASK150] Extracting DOM text after navigation...', 'INFO', 'cycle');
+          log('[TASK151] Extracting DOM text after navigation (immediate)...', 'INFO', 'cycle');
           const domResult = await browser.extractDomText(page);
           if (domResult.text.length > 0) {
-            log(`[TASK150] ✅ DOM text extracted: ${domResult.nodeCount} nodes, ${domResult.text.length} chars`, 'INFO', 'cycle');
+            log(`[TASK151] ✅ DOM text extracted (immediate): ${domResult.nodeCount} nodes, ${domResult.text.length} chars`, 'INFO', 'cycle');
           } else {
-            log(`[TASK150] No DOM text yet — Flutter may still be initializing. hasCanvas=${domResult.hasCanvas}`, 'WARN', 'cycle');
+            log(`[TASK151] No DOM text yet (immediate) — Flutter still initializing. hasCanvas=${domResult.hasCanvas}. Will retry in 15s...`, 'WARN', 'cycle');
           }
+          // Schedule a delayed extraction — Flutter needs 10-30s to build widget tree
+          setTimeout(async () => {
+            try {
+              log('[TASK151] Extracting DOM text (delayed 15s)...', 'INFO', 'cycle');
+              const domResult2 = await browser.extractDomText(page);
+              if (domResult2.text.length > 0) {
+                log(`[TASK151] ✅ DOM text extracted (delayed): ${domResult2.nodeCount} nodes, ${domResult2.text.length} chars`, 'INFO', 'cycle');
+              } else {
+                log(`[TASK151] Still no DOM text (delayed 15s). hasFlutterSemantics=${domResult2.hasFlutterSemantics}, hasCanvas=${domResult2.hasCanvas}. Body preview: ${domResult2.bodyHTML.substring(0, 200)}`, 'WARN', 'cycle');
+              }
+            } catch (e2: any) {
+              log(`[TASK151] Delayed DOM extraction failed: ${e2?.message}`, 'WARN', 'cycle');
+            }
+          }, 15000).unref?.();
+          // Also schedule a 30s extraction as final attempt
+          setTimeout(async () => {
+            try {
+              log('[TASK151] Extracting DOM text (delayed 30s)...', 'INFO', 'cycle');
+              const domResult3 = await browser.extractDomText(page);
+              if (domResult3.text.length > 0) {
+                log(`[TASK151] ✅ DOM text extracted (30s): ${domResult3.nodeCount} nodes, ${domResult3.text.length} chars`, 'INFO', 'cycle');
+                log(`[TASK151] DOM text: ${domResult3.text.substring(0, 1000).replace(/\n/g, ' | ')}`, 'INFO', 'cycle');
+              }
+            } catch {}
+          }, 30000).unref?.();
         }
       } catch (e: any) {
-        log(`[TASK150] DOM text extraction skipped: ${e?.message || e}`, 'WARN', 'cycle');
+        log(`[TASK151] DOM text extraction skipped: ${e?.message || e}`, 'WARN', 'cycle');
       }
-      // ─── End Task 150 DOM text extraction ───
+      // ─── End Task 150/151 DOM text extraction ───
 
       log(`Fresh start: waiting for Flutter canvas to render...`, 'INFO', 'cycle');
       // TASK 123 (2026-10-22): Increased from 20s to 60s.
