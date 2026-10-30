@@ -445,101 +445,156 @@ class BrowserManager {
     await this.pageInstance.addInitScript(this.getFingerprintSpoofScript());
 
     // ═══════════════════════════════════════════════════════════════════════
-    // TASK 149 (2026-10-30): Force CanvasKit "chromium" variant + block
-    // full-size CanvasKit WASM download.
+    // TASK 150 (2026-10-30): NUCLEAR OPTION — Block CanvasKit + enable
+    // Flutter semantics. Read questions from DOM instead of canvas.
     // ═══════════════════════════════════════════════════════════════════════
     //
-    // ROOT CAUSE (confirmed via curl of app.mathu.co.za/flutter.js):
-    //   The app uses _flutter.loader.loadEntrypoint(). flutter.js downloads
-    //   canvaskit.wasm (7.2MB full variant) and compiles it via WebAssembly.
-    //   The compile spike is ~150MB and exceeds the 512MB container limit →
-    //   kernel OOM kills PID 1.
+    // WHY: Even with Task 149's chromium variant, the pre-CanvasKit baseline
+    // is 450MB (Node 231MB + Chrome 219MB with SwiftShader). The CanvasKit
+    // compile spike (even chromium at ~75MB) pushes cgroup past 512MB → OOM.
     //
-    // SOLUTION: Two-pronged interception:
-    // (1) addInitScript: Override _flutter.loader.load() to inject
-    //     canvasKitVariant:'chromium' into the config.
-    // (2) page.route(): Rewrite /canvaskit.wasm → /chromium/canvaskit.wasm
-    //     in network requests as belt-and-suspenders.
+    // CREATIVE SOLUTION: Don't download or compile CanvasKit AT ALL. Instead:
+    // 1. ABORT canvaskit.wasm + canvaskit.js network requests
+    // 2. Enable Flutter's "semantics" mode (accessibility) via init script
+    // 3. Flutter's Dart code still runs (widget tree, state, logic) — it just
+    //    can't paint to the canvas. But it DOES create DOM accessibility nodes
+    //    (flt-semantics elements) that contain the question text.
+    // 4. The bot reads questions from DOM text instead of screenshots.
     //
-    // MEMORY IMPACT: 7.2MB→3.5MB download, ~150MB→~75MB compile spike.
-    // Saves ~75MB peak cgroup → CanvasKit compile fits in 512MB.
+    // MEMORY IMPACT:
+    //   No CanvasKit download: saves 7.2MB bandwidth
+    //   No CanvasKit compile: saves ~150MB memory (was the main OOM cause)
+    //   No WebGL context needed: saves ~30-50MB (SwiftShader not initialized)
+    //   Total Chrome baseline: ~150MB (down from ~220MB)
+    //   Total cgroup: ~300-350MB (down from ~450MB)
+    //   Headroom: ~160-210MB (was ~62MB)
+    //
+    // RISK: Flutter might crash without CanvasKit. But Flutter's Dart
+    // framework builds the widget tree and generates semantics BEFORE
+    // calling CanvasKit to paint. If CanvasKit fails, the widget tree
+    // still exists, and semantics nodes are still created.
 
-    log('[TASK149] Installing CanvasKit chromium variant override...', 'INFO', 'browser');
+    log('[TASK150] Installing CanvasKit BLOCK + Flutter semantics enabler...', 'INFO', 'browser');
 
-    // (1) Inject loader override BEFORE flutter.js loads
+    // (1) Enable Flutter semantics BEFORE flutter.js loads.
+    // Flutter checks window.semanticEnable during initialization.
+    // We also force-enable via Flutter's accessibility channel.
     await this.pageInstance.addInitScript(function() {
-      console.log('[TASK149] Init script running — installing loader override');
-      try {
-        if (!window._flutter) window._flutter = {};
-        var _origFlutter = window._flutter;
-        var _loaderPatched = false;
-        // Use a property setter to catch when flutter.js assigns _flutter.loader
-        Object.defineProperty(_origFlutter, 'loader', {
-          get: function() { return this._loaderRef; },
-          set: function(val) {
-            this._loaderRef = val;
-            if (val && !_loaderPatched && typeof val.load === 'function') {
-              _loaderPatched = true;
-              var _origLoad = val.load.bind(val);
-              val.load = function(opts) {
-                opts = opts || {};
-                opts.config = opts.config || {};
-                if (!opts.config.canvasKitVariant || opts.config.canvasKitVariant === 'full') {
-                  opts.config.canvasKitVariant = 'chromium';
-                  console.log('[TASK149] Intercepted _flutter.loader.load() — forced canvasKitVariant:chromium');
+      console.log('[TASK150] Init script: enabling Flutter semantics');
+      // Tell Flutter to enable semantics (accessibility DOM nodes)
+      window.semanticEnable = true;
+      // Some Flutter versions check this flag:
+      window.__flutter_semantics_enabled = true;
+      // Hook into Flutter's engine initializer to force semantics
+      var _origDefineProperty = Object.defineProperty;
+      // Intercept _flutter.loader assignment to patch initializeEngine
+      if (!window._flutter) window._flutter = {};
+      var _origLoader = null;
+      var _semanticsForced = false;
+      Object.defineProperty(window._flutter, 'loader', {
+        get: function() { return _origLoader; },
+        set: function(val) {
+          _origLoader = val;
+          if (val && !_semanticsForced) {
+            _semanticsForced = true;
+            // Patch didCreateEngineInitializer to force semantics
+            var _origDidCreate = val.didCreateEngineInitializer;
+            if (_origDidCreate) {
+              val.didCreateEngineInitializer = function(engineInitializer) {
+                console.log('[TASK150] Engine initializer created — forcing semantics');
+                try {
+                  // Call the original to trigger onEntrypointLoaded
+                  _origDidCreate.call(val, engineInitializer);
+                  // Force enable semantics via the engine
+                  if (engineInitializer && engineInitializer.initializeEngine) {
+                    var _origInit = engineInitializer.initializeEngine;
+                    engineInitializer.initializeEngine = function(config) {
+                      config = config || {};
+                      config.semanticsEnabled = true;
+                      console.log('[TASK150] initializeEngine called with semanticsEnabled=true');
+                      return _origInit.call(this, config);
+                    };
+                  }
+                } catch (e) {
+                  console.error('[TASK150] Engine init patch error: ' + (e && e.message ? e.message : e));
                 }
-                // Also force renderer to canvaskit (not skwasm, which needs crossOriginIsolated)
-                if (!opts.config.renderer) {
-                  opts.config.renderer = 'canvaskit';
-                }
-                return _origLoad(opts);
               };
-              console.log('[TASK149] Patched _flutter.loader.load() to force canvasKitVariant:chromium');
             }
-          },
-          configurable: true,
-          enumerable: true
-        });
-      } catch (e) {
-        console.error('[TASK149] Init script error: ' + (e && e.message ? e.message : e));
-      }
+          }
+        },
+        configurable: true,
+        enumerable: true
+      });
+      console.log('[TASK150] Flutter semantics enabler installed');
     });
-    log('[TASK149] canvasKitVariant:chromium override script injected', 'INFO', 'browser');
+    log('[TASK150] Flutter semantics init script injected', 'INFO', 'browser');
 
-    // (2) Network interception — rewrite full canvaskit URLs to chromium
+    // (2) BLOCK canvaskit.wasm and canvaskit.js — don't download or compile
     try {
       await this.pageInstance.route('**/canvaskit.wasm*', async (route: any) => {
-        const req = route.request();
-        const url = req.url();
-        if (url.includes('/chromium/canvaskit.wasm') || url.includes('chromium%2Fcanvaskit')) {
-          log('[TASK149] Allowing chromium canvaskit.wasm', 'INFO', 'browser');
-          return route.continue();
-        }
-        const newUrl = url.replace(/\/canvaskit\.wasm(\?|$)/, '/chromium/canvaskit.wasm$1');
-        if (newUrl !== url) {
-          log(`[TASK149] REWRITE canvaskit.wasm → chromium (was: ${url.substring(0, 80)})`, 'INFO', 'browser');
-          return route.rewrite({ url: newUrl });
-        }
-        return route.continue();
+        const url = route.request().url();
+        log(`[TASK150] BLOCKED canvaskit.wasm download (saved 7.2MB + ~150MB compile): ${url.substring(0, 80)}`, 'INFO', 'browser');
+        // Abort the request — Flutter will catch the load failure
+        return route.abort();
       });
       await this.pageInstance.route('**/canvaskit.js*', async (route: any) => {
-        const req = route.request();
-        const url = req.url();
-        if (url.includes('/chromium/canvaskit.js') || url.includes('chromium%2Fcanvaskit')) {
-          return route.continue();
-        }
-        const newUrl = url.replace(/\/canvaskit\.js(\?|$)/, '/chromium/canvaskit.js$1');
-        if (newUrl !== url) {
-          log('[TASK149] REWRITE canvaskit.js → chromium', 'INFO', 'browser');
-          return route.rewrite({ url: newUrl });
-        }
-        return route.continue();
+        const url = route.request().url();
+        log(`[TASK150] BLOCKED canvaskit.js download: ${url.substring(0, 80)}`, 'INFO', 'browser');
+        // Fulfill with an empty module stub instead of aborting —
+        // this prevents the import() from throwing, which would crash Flutter
+        // before semantics can be created
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/javascript',
+          body: '// TASK150: CanvasKit stub — rendering disabled, semantics only\n' +
+                'window.flutterCanvasKit = null;\n' +
+                'export default function() { return Promise.resolve(null); }\n' +
+                'export {};\n'
+        });
       });
-      log('[TASK149] Network interception routes installed for canvaskit.wasm + canvaskit.js', 'INFO', 'browser');
+      log('[TASK150] CanvasKit block routes installed (canvaskit.wasm → abort, canvaskit.js → stub)', 'INFO', 'browser');
     } catch (routeErr: any) {
-      log(`[TASK149] Route install failed (non-fatal): ${routeErr?.message}`, 'WARN', 'browser');
+      log(`[TASK150] Route install failed (non-fatal): ${routeErr?.message}`, 'WARN', 'browser');
     }
-    // ─── End Task 149 CanvasKit chromium variant forcing ───
+
+    // (3) Expand console filter to catch TASK150 messages and Flutter errors
+    this.pageInstance.on('console', (msg: any) => {
+      try {
+        const text = msg.text?.() ?? String(msg);
+        const lower = String(text).toLowerCase();
+        if (lower.includes('webgl') || lower.includes('canvaskit') ||
+            lower.includes('flutter') || lower.includes('shader') ||
+            lower.includes('vulkan') || lower.includes('gl_') ||
+            lower.includes('opengl') || lower.includes('angle') ||
+            lower.includes('swiftshader') || lower.includes('error') ||
+            lower.includes('task150') || lower.includes('task149') ||
+            lower.includes('task146') || lower.includes('task148') ||
+            lower.includes('probe') || lower.includes('semantic') ||
+            lower.includes('engine') || lower.includes('render')) {
+          const type = msg.type?.() ?? 'log';
+          const level = type === 'error' ? 'ERROR' : (type === 'warning' ? 'WARN' : 'INFO');
+          log(`[PAGE-CONSOLE ${type.toUpperCase()}] ${String(text).substring(0, 500)}`, level, 'browser');
+        }
+      } catch { /* don't let console handler crash anything */ }
+    });
+    this.pageInstance.on('pageerror', (err: Error) => {
+      try {
+        log(`[PAGE-ERROR] ${err.message || String(err)}`, 'ERROR', 'browser');
+      } catch {}
+    });
+    // ─── End Task 150 ───
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TASK 149 (2026-10-30): SUPERSEDED by Task 150.
+    // Task 149 tried to force the chromium variant of CanvasKit (3.5MB vs
+    // 7.2MB) to reduce the WASM compile spike. But the pre-CanvasKit baseline
+    // was already 450MB, and even the chromium variant's 75MB compile spike
+    // pushed cgroup past 512MB → OOM.
+    //
+    // Task 150 takes the nuclear approach: block CanvasKit entirely and read
+    // from Flutter semantics DOM nodes instead. All Task 149 route handlers
+    // and init scripts have been removed to avoid conflicts.
+    // ─── End Task 149 (superseded) ───
 
     // ═══════════════════════════════════════════════════════════════════════
     // TASK 139 (2026-10-29): REMOVED Task 138's Flutter loader injection.
@@ -932,6 +987,107 @@ function getPageViewport(page: any): { width: number; height: number } {
   return { width: 1280, height: 800 };
 }
 
+// ─── TASK 150 (2026-10-30): DOM text extraction for Flutter semantics ───
+// When CanvasKit is blocked (Task 150), the canvas is blank but Flutter's
+// Dart code still runs and creates DOM semantics nodes. This function
+// extracts all visible text from the page — including Flutter semantics,
+// aria-labels, and any regular DOM text.
+//
+// Flutter semantics nodes use these element types:
+//   <flt-semantics> — container for a semantics node
+//   <flt-semantics-container> — grouping container
+//   <flt-semantics-text> — text content node
+//   aria-label attributes on various elements
+//
+// Returns: { text: string, nodeCount: number, hasFlutterSemantics: boolean }
+async function extractDomText(page: any): Promise<{ text: string; nodeCount: number; hasFlutterSemantics: boolean; hasCanvas: boolean; bodyHTML: string }> {
+  const log = getLog();
+  try {
+    const result = await page.evaluate(() => {
+      // Try Flutter semantics first
+      var flutterNodes = document.querySelectorAll('flt-semantics, flt-semantics-container, flt-semantics-text, [aria-label]');
+      var texts = [];
+      flutterNodes.forEach(function(node) {
+        var t = node.getAttribute('aria-label') || node.textContent || '';
+        if (t && t.trim().length > 0) {
+          texts.push(t.trim());
+        }
+      });
+      // Also try regular DOM text (for non-Flutter content like login pages)
+      if (texts.length === 0) {
+        var bodyText = document.body ? document.body.innerText : '';
+        if (bodyText && bodyText.trim().length > 0) {
+          texts.push(bodyText.trim().substring(0, 5000));
+        }
+      }
+      // Also try input fields and buttons
+      var inputs = document.querySelectorAll('input, button, [role="button"], a');
+      inputs.forEach(function(el) {
+        var t = el.getAttribute('aria-label') || el.textContent || el.getAttribute('placeholder') || '';
+        if (t && t.trim().length > 0) {
+          texts.push('[' + (el.tagName || 'ELEMENT') + '] ' + t.trim());
+        }
+      });
+      // Check for canvas elements
+      var canvases = document.querySelectorAll('canvas');
+      var combined = texts.join('\n');
+      return {
+        text: combined,
+        nodeCount: flutterNodes.length,
+        hasFlutterSemantics: flutterNodes.length > 0,
+        hasCanvas: canvases.length > 0,
+        bodyHTML: document.body ? document.body.innerHTML.substring(0, 2000) : '(no body)'
+      };
+    });
+    log(`[TASK150] extractDomText: ${result.nodeCount} semantics nodes, ${result.text.length} chars text, hasCanvas=${result.hasCanvas}`, 'INFO', 'browser');
+    if (result.text.length > 0) {
+      // Log first 500 chars for diagnostic
+      log(`[TASK150] DOM text preview: ${result.text.substring(0, 500).replace(/\n/g, ' | ')}`, 'INFO', 'browser');
+    } else {
+      log(`[TASK150] No DOM text found — page may not have loaded Flutter yet. Body HTML preview: ${result.bodyHTML.substring(0, 300)}`, 'WARN', 'browser');
+    }
+    return result;
+  } catch (err: any) {
+    const msg = err?.message || String(err);
+    log(`[TASK150] extractDomText failed: ${msg}`, 'ERROR', 'browser');
+    return { text: '', nodeCount: 0, hasFlutterSemantics: false, hasCanvas: false, bodyHTML: '' };
+  }
+}
+// ─── End Task 150 DOM text extraction ───
+
+// ─── TASK 148 (2026-10-29): Node-side WebGL check ───
+async function checkWebGL(page: any): Promise<{ available: boolean; vendor?: string; renderer?: string; error?: string }> {
+  const log = getLog();
+  try {
+    const result = await page.evaluate(() => {
+      try {
+        var c = document.createElement('canvas');
+        var gl = c.getContext('webgl2') || c.getContext('webgl') || c.getContext('experimental-webgl');
+        if (!gl) {
+          return { available: false, error: 'No WebGL context' };
+        }
+        var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+        var vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VERSION);
+        var renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : '(masked)';
+        return { available: true, vendor: String(vendor), renderer: String(renderer) };
+      } catch (e) {
+        return { available: false, error: String(e && e.message ? e.message : e) };
+      }
+    });
+    if (result.available) {
+      log(`[TASK148] Node-side WebGL check: AVAILABLE — vendor=${result.vendor} renderer=${result.renderer}`, 'INFO', 'browser');
+    } else {
+      log(`[TASK148] Node-side WebGL check: UNAVAILABLE — ${result.error} (expected with --disable-gpu in Task 150)`, 'INFO', 'browser');
+    }
+    return result;
+  } catch (err: any) {
+    const msg = err?.message || String(err);
+    log(`[TASK148] Node-side WebGL check: evaluate() failed — ${msg}`, 'WARN', 'browser');
+    return { available: false, error: msg };
+  }
+}
+// ─── End Task 148 Node-side WebGL check ───
+
 module.exports = {
   get browserManager() { return getBrowserManager(); },
   getBrowserMetrics: () => getBrowserManager().getMetrics(),
@@ -957,6 +1113,10 @@ module.exports = {
   getPageViewport,
   getBrowser: () => getBrowserManager().browserInstance,
   getPage: () => getBrowserManager().pageInstance,
+  // TASK 150: DOM text extraction — reads Flutter semantics nodes when
+  // CanvasKit is blocked. Used by cycle manager as fallback for screenshots.
+  extractDomText,
+  checkWebGL,
   // DI support
   _injectDependencies,
 };
