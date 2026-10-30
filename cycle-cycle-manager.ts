@@ -1360,12 +1360,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // Flutter Web loads ~150MB into the shared V8 heap (Chromium --single-process).
       // 66MB baseline + 150MB Flutter = 216MB. Allow up to 300MB heap / 430MB RSS
       // before bailing — gives 84MB headroom below V8's 384MB limit.
-      //
-      // BUGFIX (2026-10-26): V8 max-old-space-size is now 384MB (was 3584 → OOM, 256 → too low).
-      // With 384MB V8 heap, thresholds give room for Flutter load:
-      //   - Pre-nav heap > 200MB → bail (leaves ~184MB for Flutter)
-      //   - Pre-nav RSS > 400MB → bail (leaves ~112MB headroom)
-      if (_preNavHeapMB >= 200 || _preNavRSSMB >= 400) {
+      if (_preNavHeapMB >= 300 || _preNavRSSMB >= 430) {
         log(`FATAL: Memory too high before navigation (heap=${_preNavHeapMB.toFixed(0)}MB, rss=${_preNavRSSMB.toFixed(0)}MB). Exiting for clean restart.`, 'FATAL', 'cycle');
         try { require('./survival-restart-guardian').preserveBeforeExit?.('pre_nav_oom').catch(() => {}); } catch {}
         const origExit = (process as any)._originalExit || process.exit.bind(process);
@@ -1534,14 +1529,32 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const _postNavHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
       const _postNavRSSMB = process.memoryUsage().rss / 1024 / 1024;
       log(`Post-navigation memory: heap=${_postNavHeapMB.toFixed(0)}MB, rss=${_postNavRSSMB.toFixed(0)}MB`, 'INFO', 'cycle');
-      // BUGFIX (2026-10-26): With 384MB V8 limit, post-nav heap > 320MB → bail.
-      // RSS > 430MB → bail (leaves 82MB headroom in 512MB container).
-      if (_postNavHeapMB >= 320 || _postNavRSSMB >= 430) {
+      if (_postNavHeapMB >= 320 || _postNavRSSMB >= 440) {
         log(`FATAL: Memory too high after navigation (heap=${_postNavHeapMB.toFixed(0)}MB, rss=${_postNavRSSMB.toFixed(0)}MB). Exiting for clean restart.`, 'FATAL', 'cycle');
         try { require('./survival-restart-guardian').preserveBeforeExit?.('post_nav_oom').catch(() => {}); } catch {}
         const origExit = (process as any)._originalExit || process.exit.bind(process);
         origExit(137);
       }
+
+      // ─── TASK 150 (2026-10-30): Extract DOM text after navigation ───
+      // With CanvasKit blocked (Task 150), the canvas is blank but Flutter's
+      // Dart code should still create DOM semantics nodes. Extract text from
+      // the DOM to see if the Flutter app loaded and what content is visible.
+      try {
+        const browser = require('./browser');
+        if (typeof browser.extractDomText === 'function') {
+          log('[TASK150] Extracting DOM text after navigation...', 'INFO', 'cycle');
+          const domResult = await browser.extractDomText(page);
+          if (domResult.text.length > 0) {
+            log(`[TASK150] ✅ DOM text extracted: ${domResult.nodeCount} nodes, ${domResult.text.length} chars`, 'INFO', 'cycle');
+          } else {
+            log(`[TASK150] No DOM text yet — Flutter may still be initializing. hasCanvas=${domResult.hasCanvas}`, 'WARN', 'cycle');
+          }
+        }
+      } catch (e: any) {
+        log(`[TASK150] DOM text extraction skipped: ${e?.message || e}`, 'WARN', 'cycle');
+      }
+      // ─── End Task 150 DOM text extraction ───
 
       log(`Fresh start: waiting for Flutter canvas to render...`, 'INFO', 'cycle');
       // TASK 123 (2026-10-22): Increased from 20s to 60s.
