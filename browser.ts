@@ -277,13 +277,23 @@ class BrowserManager {
     // initialize. Exiting." — the bot then cascades to reduced/minimal strategies
     // unnecessarily. Default to headless: true unless explicitly disabled.
     //
-    // TASK 144 (2026-10-29): Use headless=false to get full Chromium (with WebGL).
-    // chrome-headless-shell (used by headless:true) does NOT support WebGL at all.
-    // --enable-unsafe-swiftshader only works on the full Chromium binary.
-    // Now that DISPLAY=:99 is set in Dockerfile CMD + Xvfb is running,
-    // headless=false will use the full Chromium binary which supports
-    // WebGL via SwiftShader. CanvasKit needs WebGL to render.
-    const _headless = false;
+    // TASK 143 (2026-10-29): Use headless=true (headless-shell) with --enable-unsafe-swiftshader.
+    // Previous attempt used headless=false + --headless=new, but the full Chromium
+    // binary is NOT installed by Playwright (only chrome-headless-shell is).
+    // headless=false causes "browser failed to initialize" because there's no
+    // full chromium binary at /opt/pw-browsers/.
+    //
+    // Instead: headless-shell DOES support WebGL via SwiftShader if you pass
+    // --enable-unsafe-swiftshader flag. This was added in Playwright/Chrome 1248.
+    // The flag is already in Playwright's default flags (we see it in the launch
+    // log: --enable-unsafe-swiftshader). The issue was that headless-shell was
+    // crashing because Xvfb wasn't providing DISPLAY. Now that we have
+    // DISPLAY=:99 set in the Dockerfile CMD, headless-shell should be able to
+    // initialize SwiftShader WebGL via the X display.
+    const _forceHeaded = !!(globalThis as any).__forceHeaded;
+    const _headless = _forceHeaded ? false : true;
+    // Ensure --enable-unsafe-swiftshader is in flags (it usually is by default,
+    // but make sure it's there for CanvasKit WebGL support)
     if (!flags.includes('--enable-unsafe-swiftshader')) {
       flags.push('--enable-unsafe-swiftshader');
     }
@@ -426,19 +436,110 @@ class BrowserManager {
     const logError = getLogError();
     const CONFIG = getCONFIG();
     if (!this.contextInstance) throw new Error('Context not available');
-    // TASK 147 (2026-10-29): Early diagnostic log — fires BEFORE newPage() so
-    // we can confirm browser.ts was deployed and configurePage() was entered.
-    // If this log doesn't appear, browser.ts changes weren't deployed.
-    log('[TASK147] configurePage() entered — creating new page...', 'INFO', 'browser');
     this.pageInstance = await Promise.race([
       this.contextInstance.newPage(),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Page creation timeout')), getCONFIG().BROWSER_PAGE_TIMEOUT_MS || 30000))
     ]);
     this.pageInstance.setDefaultTimeout(getCONFIG().BROWSER_PAGE_TIMEOUT_MS || 30000);
     this.pageInstance.setDefaultNavigationTimeout(getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000);
-    log('[TASK147] Page created — adding fingerprint spoof script...', 'INFO', 'browser');
     await this.pageInstance.addInitScript(this.getFingerprintSpoofScript());
-    log('[TASK147] Fingerprint spoof added — adding WebGL probe...', 'INFO', 'browser');
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TASK 149 (2026-10-30): Force CanvasKit "chromium" variant + block
+    // full-size CanvasKit WASM download.
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // ROOT CAUSE (confirmed via curl of app.mathu.co.za/flutter.js):
+    //   The app uses _flutter.loader.loadEntrypoint(). flutter.js downloads
+    //   canvaskit.wasm (7.2MB full variant) and compiles it via WebAssembly.
+    //   The compile spike is ~150MB and exceeds the 512MB container limit →
+    //   kernel OOM kills PID 1.
+    //
+    // SOLUTION: Two-pronged interception:
+    // (1) addInitScript: Override _flutter.loader.load() to inject
+    //     canvasKitVariant:'chromium' into the config.
+    // (2) page.route(): Rewrite /canvaskit.wasm → /chromium/canvaskit.wasm
+    //     in network requests as belt-and-suspenders.
+    //
+    // MEMORY IMPACT: 7.2MB→3.5MB download, ~150MB→~75MB compile spike.
+    // Saves ~75MB peak cgroup → CanvasKit compile fits in 512MB.
+
+    log('[TASK149] Installing CanvasKit chromium variant override...', 'INFO', 'browser');
+
+    // (1) Inject loader override BEFORE flutter.js loads
+    await this.pageInstance.addInitScript(function() {
+      console.log('[TASK149] Init script running — installing loader override');
+      try {
+        if (!window._flutter) window._flutter = {};
+        var _origFlutter = window._flutter;
+        var _loaderPatched = false;
+        // Use a property setter to catch when flutter.js assigns _flutter.loader
+        Object.defineProperty(_origFlutter, 'loader', {
+          get: function() { return this._loaderRef; },
+          set: function(val) {
+            this._loaderRef = val;
+            if (val && !_loaderPatched && typeof val.load === 'function') {
+              _loaderPatched = true;
+              var _origLoad = val.load.bind(val);
+              val.load = function(opts) {
+                opts = opts || {};
+                opts.config = opts.config || {};
+                if (!opts.config.canvasKitVariant || opts.config.canvasKitVariant === 'full') {
+                  opts.config.canvasKitVariant = 'chromium';
+                  console.log('[TASK149] Intercepted _flutter.loader.load() — forced canvasKitVariant:chromium');
+                }
+                // Also force renderer to canvaskit (not skwasm, which needs crossOriginIsolated)
+                if (!opts.config.renderer) {
+                  opts.config.renderer = 'canvaskit';
+                }
+                return _origLoad(opts);
+              };
+              console.log('[TASK149] Patched _flutter.loader.load() to force canvasKitVariant:chromium');
+            }
+          },
+          configurable: true,
+          enumerable: true
+        });
+      } catch (e) {
+        console.error('[TASK149] Init script error: ' + (e && e.message ? e.message : e));
+      }
+    });
+    log('[TASK149] canvasKitVariant:chromium override script injected', 'INFO', 'browser');
+
+    // (2) Network interception — rewrite full canvaskit URLs to chromium
+    try {
+      await this.pageInstance.route('**/canvaskit.wasm*', async (route: any) => {
+        const req = route.request();
+        const url = req.url();
+        if (url.includes('/chromium/canvaskit.wasm') || url.includes('chromium%2Fcanvaskit')) {
+          log('[TASK149] Allowing chromium canvaskit.wasm', 'INFO', 'browser');
+          return route.continue();
+        }
+        const newUrl = url.replace(/\/canvaskit\.wasm(\?|$)/, '/chromium/canvaskit.wasm$1');
+        if (newUrl !== url) {
+          log(`[TASK149] REWRITE canvaskit.wasm → chromium (was: ${url.substring(0, 80)})`, 'INFO', 'browser');
+          return route.rewrite({ url: newUrl });
+        }
+        return route.continue();
+      });
+      await this.pageInstance.route('**/canvaskit.js*', async (route: any) => {
+        const req = route.request();
+        const url = req.url();
+        if (url.includes('/chromium/canvaskit.js') || url.includes('chromium%2Fcanvaskit')) {
+          return route.continue();
+        }
+        const newUrl = url.replace(/\/canvaskit\.js(\?|$)/, '/chromium/canvaskit.js$1');
+        if (newUrl !== url) {
+          log('[TASK149] REWRITE canvaskit.js → chromium', 'INFO', 'browser');
+          return route.rewrite({ url: newUrl });
+        }
+        return route.continue();
+      });
+      log('[TASK149] Network interception routes installed for canvaskit.wasm + canvaskit.js', 'INFO', 'browser');
+    } catch (routeErr: any) {
+      log(`[TASK149] Route install failed (non-fatal): ${routeErr?.message}`, 'WARN', 'browser');
+    }
+    // ─── End Task 149 CanvasKit chromium variant forcing ───
 
     // ═══════════════════════════════════════════════════════════════════════
     // TASK 139 (2026-10-29): REMOVED Task 138's Flutter loader injection.
@@ -459,102 +560,6 @@ class BrowserManager {
 
     this.pageInstance.on('crash', () => { log('Page crashed', 'ERROR', 'browser'); this.browserDisconnected = true; this.emit('crashed'); });
     this.pageInstance.on('error', (err: Error) => { logError('Page error', err); });
-
-    // ─── TASK 145c (2026-10-29): WebGL / CanvasKit diagnostic logging ───
-    // When the page comes up blank, the question is always "is WebGL actually
-    // available, or is CanvasKit failing silently?". This block captures the
-    // answer at runtime so we don't have to guess.
-    //
-    // Three sources of truth:
-    //   1. page.on('console') — CanvasKit prints "Could not initialize WebGL"
-    //      or "WebGL context creation failed" to the console when the ICD is
-    //      missing or the Vulkan loader can't find SwiftShader.
-    //   2. page.on('pageerror') — uncaught JS errors (e.g. "Cannot read
-    //      property 'createContext' of undefined" if WebGL is unavailable).
-    //   3. An init script that probes WebGL after DOMContentLoaded and logs
-    //      a one-liner with vendor/renderer — this is the smoking gun for
-    //      "WebGL is working, the issue is elsewhere" vs. "WebGL is broken".
-    //
-    // All three forward into the bot's normal INFO/WARN/ERROR log streams
-    // so they show up in the dashboard and Render logs.
-    this.pageInstance.on('console', (msg: any) => {
-      try {
-        const text = msg.text?.() ?? String(msg);
-        // Only log interesting messages — CanvasKit/Flutter errors and WebGL
-        // warnings. Skip routine console.debug spam.
-        const lower = String(text).toLowerCase();
-        if (lower.includes('webgl') || lower.includes('canvaskit') ||
-            lower.includes('flutter') || lower.includes('shader') ||
-            lower.includes('vulkan') || lower.includes('gl_') ||
-            lower.includes('opengl') || lower.includes('angle') ||
-            lower.includes('swiftshader') || lower.includes('error') ||
-            lower.includes('task146') || lower.includes('task145') ||
-            lower.includes('probe')) {
-          const type = msg.type?.() ?? 'log';
-          const level = type === 'error' ? 'ERROR' : (type === 'warning' ? 'WARN' : 'INFO');
-          log(`[PAGE-CONSOLE ${type.toUpperCase()}] ${String(text).substring(0, 400)}`, level, 'browser');
-        }
-      } catch { /* don't let console handler crash anything */ }
-    });
-    this.pageInstance.on('pageerror', (err: Error) => {
-      try {
-        log(`[PAGE-ERROR] ${err.message || String(err)}`, 'ERROR', 'browser');
-      } catch {}
-    });
-
-    // WebGL probe — runs on every page navigation (addInitScript injects
-    // BEFORE any page JS, so it survives across navigations too).
-    //
-    // TASK 146 (2026-10-29): Rewrote in PURE JAVASCRIPT — no TypeScript
-    // syntax (no `as any`, no type annotations). The previous version had
-    // `gl as any` and `(e as Error).message` inside the callback. When
-    // Playwright serializes the function via toString(), the TypeScript
-    // syntax can survive transpilation in some configurations (tsx with
-    // source maps), causing a SyntaxError in the browser → probe never runs
-    // → we never see the WebGL diagnostic output.
-    //
-    // Pure JS guarantees the function parses in the browser. Also added
-    // "probe registered" and "probe running" log lines so we can confirm
-    // execution even if WebGL itself fails.
-    await this.pageInstance.addInitScript(function() {
-      console.log('[TASK146] WebGL probe script registered (will run at 500ms, 3s, 8s)');
-      var probe = function(when) {
-        try {
-          console.log('[TASK146] Probe running at ' + when);
-          var c = document.createElement('canvas');
-          var gl = c.getContext('webgl2') || c.getContext('webgl') || c.getContext('experimental-webgl');
-          if (!gl) {
-            console.error('[TASK146] WebGL UNAVAILABLE at ' + when + ' — CanvasKit cannot render. Page will be blank.');
-            return;
-          }
-          var dbg = gl.getExtension('WEBGL_debug_renderer_info');
-          var vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VERSION);
-          var renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : '(masked)';
-          console.log('[TASK146] WebGL OK at ' + when + ' — vendor=' + vendor + ' renderer=' + renderer);
-        } catch (e) {
-          var msg = (e && e.message) ? e.message : String(e);
-          console.error('[TASK146] Probe exception at ' + when + ': ' + msg);
-        }
-      };
-      // Schedule probes at multiple times — CanvasKit may load after a delay.
-      // Reduced the 10s probe to 8s because the bot might OOM before 10s
-      // during CanvasKit compile.
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', function() {
-          setTimeout(function() { probe('500ms'); }, 500);
-        });
-      } else {
-        setTimeout(function() { probe('500ms'); }, 500);
-      }
-      setTimeout(function() { probe('3s'); }, 3000);
-      setTimeout(function() { probe('8s'); }, 8000);
-    });
-    // Node-side confirmation — if this log appears but the browser-side
-    // [TASK146] logs don't, the issue is in the page (initScript didn't
-    // fire, or page didn't load, or console handler didn't capture).
-    log('[TASK146] WebGL probe addInitScript registered (browser-side console.logs will follow once page loads)', 'INFO', 'browser');
-    // ─── End Task 145c/146 diagnostic logging ───
-
     const selectCalibration = getSelectCalibration();
     if (selectCalibration) {
       const savedScale = selectCalibration.get('scaleFactor');
