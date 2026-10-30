@@ -1,61 +1,37 @@
 # ═══════════════════════════════════════════════════════════════════════
-# MathU Bot — Perpetual Loop GitHub Actions Workflow
+# MathU Bot — Perpetual Loop GitHub Actions Workflow (v2 — uses GITHUB_TOKEN)
 # ═══════════════════════════════════════════════════════════════════════
 #
-# HOW THIS WORKS (plain English):
-#
-# GitHub Actions has a hard 6-hour limit per job. To run the bot 24/7,
-# we use a "self-triggering loop":
-#
-#   1. This workflow starts and runs the bot for ~5.5 hours
-#   2. 5 minutes before the timeout, it triggers ANOTHER run of itself
-#   3. The new run starts immediately, keeping the bot alive
-#   4. Repeat forever
-#
-# MEMORY: GitHub's ubuntu-latest runners have 16GB RAM — plenty for
-# Chrome + CanvasKit + the bot (peak ~600MB, 15.4GB free).
-#
-# COST: 
-#   - Public repo: UNLIMITED free minutes ✅
-#   - Private repo: 2,000 free minutes/month (~5.5 runs of 6 hours each)
-#   - Recommendation: make the repo PUBLIC for unlimited free runs
-#
-# SETUP REQUIRED:
-#   1. Create a Personal Access Token (PAT) with "repo" scope
-#      → https://github.com/settings/tokens
-#   2. Add it as a repository secret named PAT_TOKEN
-#   3. Add all bot env vars as repository secrets (see setup guide)
+# v2: Replaced PAT_TOKEN + repository_dispatch with GITHUB_TOKEN + gh CLI.
+# This is safer (auto-managed, expires after each run) and simpler (no PAT).
 # ═══════════════════════════════════════════════════════════════════════
 
 name: MathU Bot Loop
 
-# Triggers:
-# - workflow_dispatch: manual start (you click "Run workflow" in GitHub)
-# - repository_dispatch: triggered by the previous run before it times out
 on:
   workflow_dispatch:
   repository_dispatch:
     types: [loop_trigger]
 
+# Grant the GITHUB_TOKEN permission to trigger workflows
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # 5h 50m — leaves 10 min for cleanup + trigger
+    timeout-minutes: 350
     
     steps:
-      # ─── Step 1: Check out the bot code ───
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ─── Step 2: Set up Node.js 20 ───
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # ─── Step 3: Install Chrome dependencies ───
-      # GitHub's ubuntu-latest already has Chrome installed, but we need
-      # the shared libraries for Playwright's Chromium + SwiftShader (WebGL)
       - name: Install Chrome + WebGL dependencies
         run: |
           sudo apt-get update
@@ -72,30 +48,24 @@ jobs:
             xvfb xauth
           sudo rm -rf /var/lib/apt/lists/*
 
-      # ─── Step 4: Install Playwright Chromium ───
       - name: Install Playwright Chromium
         run: npx playwright install chromium
 
-      # ─── Step 5: Install bot dependencies ───
       - name: Install bot npm dependencies
         run: |
           npm install --ignore-scripts
           npm install --ignore-scripts @esbuild/linux-x64
           npm rebuild better-sqlite3
 
-      # ─── Step 6: Run the bot (with 5h30m timeout) ───
-      # The runner script starts Xvfb (virtual display for Chrome WebGL),
-      # then starts the bot. After 5h30m, it gracefully shuts down and
-      # triggers the next iteration.
       - name: Run MathU Bot
         env:
-          # Bot credentials (login for app.mathu.co.za via Microsoft auth)
+          # Bot credentials
           MICROSOFT_EMAIL: ${{ secrets.MICROSOFT_EMAIL }}
           MICROSOFT_PASSWORD: ${{ secrets.MICROSOFT_PASSWORD }}
           # Turso database
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-          # AI providers (at least one needed)
+          # AI providers
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -105,18 +75,14 @@ jobs:
           DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY }}
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
           BRAIN_API_KEY: ${{ secrets.BRAIN_API_KEY }}
-          # Cloudflare (Workers AI) — uses CF_ACCOUNT_ID + CF_API_KEY
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_API_KEY: ${{ secrets.CF_API_KEY }}
-          # Screenshot storage (Cloudinary)
+          # Screenshot storage
           CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
           CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
           CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
           CLOUDINARY_FOLDER: ${{ secrets.CLOUDINARY_FOLDER }}
-          # GitHub token for self-triggering the next run
-          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          # Chrome flags — full WebGL support (16GB RAM, no limits needed)
+          # Chrome flags — full WebGL support
           CHROMIUM_FLAGS: "--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader --window-size=1280,800"
           DISPLAY: ":99"
           NODE_ENV: production
@@ -127,24 +93,22 @@ jobs:
           DB_PATH: /tmp/mathu-bot.db
           USER_DATA_DIR: /tmp/.browser-data
           LOG_DIR: /tmp/mathu-logs
-          # Tell the bot it's NOT on Render (don't force MINIMUM mode)
           RENDER: ""
           HF_SPACES: ""
-          # Disable forced restarts (GitHub Actions handles timeout)
           MAX_UPTIME_HOURS: 0
           MAX_CYCLES_BEFORE_RESTART: 999999
         run: |
           chmod +x ./scripts/run-bot.sh
           ./scripts/run-bot.sh
 
-      # ─── Step 7: Trigger the next iteration ───
-      # This fires a repository_dispatch event that starts this same workflow
-      # again. The new run starts immediately, keeping the bot alive.
+      # ─── Trigger next iteration using GITHUB_TOKEN (no PAT needed!) ───
       - name: Trigger next iteration
-        if: always()  # Run even if the bot step failed
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ secrets.PAT_TOKEN }}
-          event-type: loop_trigger
-          client-payload: |
-            {"previous_run_id": "${{ github.run_id }}", "timestamp": "${{ github.event.head_commit.timestamp }}"}
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Triggering next MathU Bot Loop run..."
+          gh workflow run mathu-bot-loop.yml \
+            --repo ${{ github.repository }} \
+            --ref main
+          echo "Next run triggered successfully."
