@@ -98,6 +98,7 @@ class BrowserManager {
   _disconnectedListeners: Array<(data?: any) => void>;
   _intentionalClose: boolean;
   _fpFonts: string[] | null;
+  _traceFile: string | null;  // TIER 1: Playwright trace file path
   _configInitialized: boolean;
 
   constructor() {
@@ -121,6 +122,7 @@ class BrowserManager {
     this._disconnectedListeners = [];
     this._intentionalClose = false;
     this._fpFonts = null;
+    this._traceFile = null;  // TIER 1: trace file initialized
     this._configInitialized = false;
   }
 
@@ -416,6 +418,33 @@ class BrowserManager {
       this.browserInstance.newContext(contextOptions),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Context creation timeout')), getCONFIG().BROWSER_CONTEXT_TIMEOUT_MS || 30000))
     ]);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TIER 1 (2026-10-30): Playwright trace recording
+    // ═══════════════════════════════════════════════════════════════════════
+    // Records every click, navigation, screenshot, and network request.
+    // The trace can be replayed with: npx playwright show-trace trace.zip
+    // Only enabled when ENABLE_TRACING=true env var is set (GitHub Actions).
+    if (process.env.ENABLE_TRACING === 'true') {
+      try {
+        const traceDir = process.env.TRACE_DIR || '/tmp/mathu-logs/traces';
+        const traceFile = `${traceDir}/trace-${Date.now()}.zip`;
+        // Ensure trace directory exists
+        try { require('fs').mkdirSync(traceDir, { recursive: true }); } catch {}
+        await this.contextInstance.tracing.start({
+          screenshots: true,
+          snapshots: true,
+          sources: true,
+          title: `MathU Bot Trace — ${new Date().toISOString()}`,
+        });
+        this._traceFile = traceFile;
+        log(`[TIER1] Playwright tracing started — trace will be saved to ${traceFile}`, 'INFO', 'browser');
+      } catch (traceErr: any) {
+        log(`[TIER1] Tracing failed to start (non-fatal): ${traceErr.message}`, 'WARN', 'browser');
+      }
+    }
+    // ─── End TIER 1 trace recording ───
+
     this.contextInstance.on('page', async (newPage: any) => {
       // CRITICAL FIX: In --single-process mode (Render free plan), closing any
       // page/popup kills the ENTIRE browser process because all pages share
@@ -673,10 +702,20 @@ class BrowserManager {
   }
 
   async cleanup() { 
+    // TIER 1: Try to save trace on emergency cleanup
+    if (process.env.ENABLE_TRACING === 'true' && this.contextInstance && this._traceFile) {
+      try {
+        const log = getLog();
+        log(`[TIER1] Saving trace on cleanup to ${this._traceFile}...`, 'INFO', 'browser');
+        await this.contextInstance.tracing.stop({ path: this._traceFile });
+        log('[TIER1] ✅ Trace saved on cleanup', 'INFO', 'browser');
+      } catch {}
+    }
     try { if (this.pageInstance && !this.pageInstance.isClosed()) { await this.pageInstance.close({ runBeforeUnload: false }).catch(() => {}); } } catch {}
     try { if (this.contextInstance) { await this.contextInstance.close().catch(() => {}); } } catch {}
     try { if (this.browserInstance && this.browserInstance.isConnected()) { await this.browserInstance.close().catch(() => {}); } } catch {}
     this.pageInstance = null; this.contextInstance = null; this.browserInstance = null; this.cdpSession = null;
+    this._traceFile = null;
   }
 
   async close() { 
@@ -686,6 +725,21 @@ class BrowserManager {
     this._intentionalClose = true;
     if (this._healthCheckInterval) { clearInterval(this._healthCheckInterval); this._healthCheckInterval = null; }
     if (this._memoryMonitorInterval) { clearInterval(this._memoryMonitorInterval); this._memoryMonitorInterval = null; }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TIER 1 (2026-10-30): Save Playwright trace before closing browser
+    // ═══════════════════════════════════════════════════════════════════════
+    if (process.env.ENABLE_TRACING === 'true' && this.contextInstance && this._traceFile) {
+      try {
+        log(`[TIER1] Saving Playwright trace to ${this._traceFile}...`, 'INFO', 'browser');
+        await this.contextInstance.tracing.stop({ path: this._traceFile });
+        log(`[TIER1] ✅ Trace saved (${require('fs').statSync(this._traceFile).size / 1024 / 1024 | 0}MB)`, 'INFO', 'browser');
+      } catch (traceErr: any) {
+        log(`[TIER1] Failed to save trace (non-fatal): ${traceErr.message}`, 'WARN', 'browser');
+      }
+    }
+    // ─── End TIER 1 trace saving ───
+
     // Skip session save if browser already disconnected (avoids Protocol error)
     if (this.contextInstance && !this.browserDisconnected && this.browserInstance?.isConnected()) {
       try { const storage = await this.contextInstance.storageState(); if (storage) { saveSession(storage); } } catch (err: any) { log(`Failed to save session on close: ${(err as Error).message}`, 'WARN', 'browser'); }
