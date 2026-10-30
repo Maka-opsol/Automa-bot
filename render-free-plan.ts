@@ -446,7 +446,7 @@ for (const dir of [
 // LOAD MODULES
 // ═══════════════════════════════════════════════════════════════════════
 
-const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilienceSubsystems, getContainerHealth, runStartupSmokeTests } = require('./container');
+const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilienceSubsystems, getContainerHealth, runStartupSmokeTests, spawnWorkers } = require('./container');
 
 // BUG FIX (2026-09-05): Synchronous memory check right after container init.
 // Checks BOTH heap AND RSS — the kernel OOM killer fires on RSS, not heap.
@@ -727,18 +727,65 @@ try {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// WORKER FALLBACK: Start rewardTracker in-process
+// TIER 1 (2026-10-30): Spawn worker threads for workerizable subsystems
 // ═══════════════════════════════════════════════════════════════════════
-log('Render: Running all subsystems in-process (no worker threads, saves ~90-150 MB)', 'INFO', 'render-free-plan');
-try {
-  const rtMod = container.get('rewardTracker', { required: false });
-  if (rtMod && typeof rtMod.start === 'function') {
-    rtMod.start(60 * 60 * 1000);
-    log('Reward tracker started in-process', 'INFO', 'render-free-plan');
+// On Render (512MB), workers were disabled to save ~90-150MB.
+// On GitHub Actions (16GB), we have plenty of RAM — spawn all 3 workers:
+//   - metrics worker (in-memory monitoring)
+//   - diary worker (documentation/logging)
+//   - rewardTracker worker (self-heal reward tracking)
+//
+// Workers run in separate threads, so they don't block the main event loop.
+// This makes the bot more responsive and isolates failures.
+//
+// Only spawn workers if we're NOT on Render (where memory is tight).
+// On GitHub Actions, RENDER env var is not set, so this runs.
+if (!process.env.RENDER_SERVICE_ID && !process.env.RENDER) {
+  log('[TIER1] Spawning worker threads (metrics, diary, rewardTracker)...', 'INFO', 'render-free-plan');
+  (async () => {
+    try {
+      const workerResults = await spawnWorkers(container, CONFIG);
+      if (workerResults.started.length > 0) {
+        log(`[TIER1] ✅ Workers spawned: ${workerResults.started.join(', ')} (${workerResults.failed.length} failed)`, 'INFO', 'render-free-plan');
+      } else {
+        log('[TIER1] ⚠️ No workers spawned — falling back to in-process modules', 'WARN', 'render-free-plan');
+      }
+      // Start reward tracker (whether worker or in-process)
+      try {
+        const rtMod = container.get('rewardTracker', { required: false });
+        if (rtMod && typeof rtMod.start === 'function') {
+          rtMod.start(60 * 60 * 1000);
+          log('[TIER1] Reward tracker started', 'INFO', 'render-free-plan');
+        }
+      } catch (e: any) {
+        log(`[TIER1] Reward tracker start failed: ${e.message}`, 'WARN', 'render-free-plan');
+      }
+    } catch (e: any) {
+      log(`[TIER1] Worker spawn failed (non-fatal, falling back to in-process): ${e.message}`, 'WARN', 'render-free-plan');
+      // Fallback: start rewardTracker in-process
+      try {
+        const rtMod = container.get('rewardTracker', { required: false });
+        if (rtMod && typeof rtMod.start === 'function') {
+          rtMod.start(60 * 60 * 1000);
+          log('[TIER1] Reward tracker started in-process (fallback)', 'INFO', 'render-free-plan');
+        }
+      } catch {}
+    }
+  })().catch(() => {});  // Non-blocking — don't hold up boot
+} else {
+  // Render: keep the old in-process behavior
+  log('Render: Running all subsystems in-process (no worker threads, saves ~90-150 MB)', 'INFO', 'render-free-plan');
+  try {
+    const rtMod = container.get('rewardTracker', { required: false });
+    if (rtMod && typeof rtMod.start === 'function') {
+      rtMod.start(60 * 60 * 1000);
+      log('Reward tracker started in-process', 'INFO', 'render-free-plan');
+    }
+  } catch (e: any) {
+    log(`Reward tracker in-process start failed: ${e.message}`, 'WARN', 'render-free-plan');
   }
-} catch (e: any) {
-  log(`Reward tracker in-process start failed: ${e.message}`, 'WARN', 'render-free-plan');
 }
+// ─── End TIER 1 worker spawning ───
 
 // Override MAX_UPTIME_HOURS to 0 (never forced restart)
 if (CONFIG.MAX_UPTIME_HOURS && CONFIG.MAX_UPTIME_HOURS > 0) {
@@ -1212,7 +1259,7 @@ a{color:#818cf8}a:hover{color:#a5b4fc}
 <div class="stat"><span class="stat-label">Heap Used</span><span class="stat-value">${memInfo.heapUsed}</span></div>
 <div class="stat"><span class="stat-label">RSS</span><span class="stat-value">${memInfo.rss} (${memInfo.rssPercent})</span></div>
 <div class="stat"><span class="stat-label">Node.js</span><span class="stat-value">${process.version}</span></div>
-<div class="stat"><span class="stat-label">Workers</span><span class="stat-value">0 (in-process)</span></div>
+<div class="stat"><span class="stat-label">Workers</span><span class="stat-value">${process.env.RENDER_SERVICE_ID ? '0 (in-process)' : '3 (metrics, diary, rewardTracker)'}</span></div>
 <div class="stat"><span class="stat-label">Platform</span><span class="stat-value">render-free-plan${IS_RENDER ? '' : ' (local)'}</span></div>
 <h2>Links</h2>
 <div class="stat"><span class="stat-label">Dashboard</span><span class="stat-value"><a href="${getDashboardLink(port)}">Open Dashboard</a></span></div>
@@ -1627,5 +1674,5 @@ try {
     log('Daemon crashed — will restart on next cycle iteration', 'ERROR', 'render-free-plan');
   });
 
-  log('MathU Bot v6 — Render Free Plan fully started (all features, no workers)', 'INFO', 'render-free-plan');
+  log(`MathU Bot v6 — ${IS_RENDER ? 'Render Free Plan' : 'GitHub Actions'} fully started (all features${IS_RENDER ? ', no workers' : ', 3 worker threads'})`, 'INFO', 'render-free-plan');
 })();
