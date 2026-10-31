@@ -13,101 +13,19 @@ let _diagnosticLogged = false;
 
 // FIX: Track which modules failed to load and WHY, for diagnostic logging.
 const _loadFailures: Array<{ name: string; error: string }> = [];
-// ═══════════════════════════════════════════════════════════════════════
-// TASK 131 (2026-10-28): LAZY-LOAD all provider modules.
-// ═══════════════════════════════════════════════════════════════════════
-// The bot was OOM-crashing during boot because container.get('orchestrator')
-// → container.get('providers') → require('./providers') → require('./providers-registry')
-// → ALL 10 provider modules loaded synchronously at module-eval time.
-// Each provider module transitively pulls in providers-base (lightweight)
-// plus provider-specific HTTP client code (heavier). The total eager load
-// consumed 50-100MB of heap before the bot ever ran a single cycle.
-//
-// Now each provider is loaded on FIRST USE only. The first cycle that
-// requests providers triggers the load — by then the HTTP server is up,
-// the dashboard is responding, and we're past Render's HEALTHCHECK
-// start-period window.
-//
-// This change saves ~50-100MB during the orchestrator's transitive load.
-// ═══════════════════════════════════════════════════════════════════════
-let GitHubGPTProvider: any = null;
-let GroqProvider: any = null;
-let ZAIProvider: any = null;
-let AgnesProvider: any = null;
-let NvidiaProvider: any = null;
-let CloudflareProvider: any = null;
-let CerebrasProvider: any = null;
-let GeminiProvider: any = null;
-let OpenRouterTribunalProvider: any = null;
-let DeepInfraProvider: any = null;
+let GitHubGPTProvider: any = null; try { ({ GitHubGPTProvider } = require('./providers-github-gpt')); } catch (e: any) { _loadFailures.push({ name: 'GitHub GPT', error: e.message }); console.error(`[registry] Failed to load providers-github-gpt: ${e.message}`); }
+let GroqProvider: any = null; try { ({ GroqProvider } = require('./providers-groq')); } catch (e: any) { _loadFailures.push({ name: 'Groq', error: e.message }); console.error(`[registry] Failed to load providers-groq: ${e.message}`); }
+let ZAIProvider: any = null; try { ({ ZAIProvider } = require('./providers-zai')); } catch (e: any) { _loadFailures.push({ name: 'z.ai', error: e.message }); console.error(`[registry] Failed to load providers-zai: ${e.message}`); }
+let AgnesProvider: any = null; try { ({ AgnesProvider } = require('./providers-agnes')); } catch (e: any) { _loadFailures.push({ name: 'Agnes', error: e.message }); console.error(`[registry] Failed to load providers-agnes: ${e.message}`); }
+let NvidiaProvider: any = null; try { ({ NvidiaProvider } = require('./providers-nvidia')); } catch (e: any) { _loadFailures.push({ name: 'NVIDIA', error: e.message }); console.error(`[registry] Failed to load providers-nvidia: ${e.message}`); }
+let CloudflareProvider: any = null; try { ({ CloudflareProvider } = require('./providers-cloudflare')); } catch (e: any) { _loadFailures.push({ name: 'Cloudflare', error: e.message }); console.error(`[registry] Failed to load providers-cloudflare: ${e.message}`); }
+let CerebrasProvider: any = null; try { ({ CerebrasProvider } = require('./providers-cerebras')); } catch (e: any) { _loadFailures.push({ name: 'Cerebras', error: e.message }); console.error(`[registry] Failed to load providers-cerebras: ${e.message}`); }
+let GeminiProvider: any = null; try { ({ GeminiProvider } = require('./providers-gemini')); } catch (e: any) { _loadFailures.push({ name: 'Gemini', error: e.message }); console.error(`[registry] Failed to load providers-gemini: ${e.message}`); }
+let OpenRouterTribunalProvider: any = null; try { ({ OpenRouterTribunalProvider } = require('./providers-openrouter-tribunal')); } catch (e: any) { _loadFailures.push({ name: 'OpenRouter', error: e.message }); console.error(`[registry] Failed to load providers-openrouter-tribunal: ${e.message}`); }
+let DeepInfraProvider: any = null; try { ({ DeepInfraProvider } = require('./providers-deepinfra')); } catch (e: any) { _loadFailures.push({ name: 'DeepInfra', error: e.message }); console.error(`[registry] Failed to load providers-deepinfra: ${e.message}`); }
 
-// Track which providers we've ATTEMPTED to load so we don't keep re-trying on every cycle.
-const _loadedProviders = new Set<string>();
-
-function _loadProvider(name: string, path: string): any {
-  if (_loadedProviders.has(name)) {
-    // Already attempted — return cached (null if it failed)
-    switch (name) {
-      case 'GitHub GPT': return GitHubGPTProvider;
-      case 'Groq': return GroqProvider;
-      case 'z.ai': return ZAIProvider;
-      case 'Agnes': return AgnesProvider;
-      case 'NVIDIA': return NvidiaProvider;
-      case 'Cloudflare': return CloudflareProvider;
-      case 'Cerebras': return CerebrasProvider;
-      case 'Gemini': return GeminiProvider;
-      case 'OpenRouter': return OpenRouterTribunalProvider;
-      case 'DeepInfra': return DeepInfraProvider;
-      default: return null;
-    }
-  }
-  _loadedProviders.add(name);
-  try {
-    const mod: any = require(path);
-    const provider: any = mod[name === 'GitHub GPT' ? 'GitHubGPTProvider'
-                         : name === 'z.ai' ? 'ZAIProvider'
-                         : name === 'OpenRouter' ? 'OpenRouterTribunalProvider'
-                         : name === 'NVIDIA' ? 'NvidiaProvider'
-                         : name + 'Provider'];
-    // Cache it on the right variable
-    switch (name) {
-      case 'GitHub GPT': GitHubGPTProvider = provider; break;
-      case 'Groq': GroqProvider = provider; break;
-      case 'z.ai': ZAIProvider = provider; break;
-      case 'Agnes': AgnesProvider = provider; break;
-      case 'NVIDIA': NvidiaProvider = provider; break;
-      case 'Cloudflare': CloudflareProvider = provider; break;
-      case 'Cerebras': CerebrasProvider = provider; break;
-      case 'Gemini': GeminiProvider = provider; break;
-      case 'OpenRouter': OpenRouterTribunalProvider = provider; break;
-      case 'DeepInfra': DeepInfraProvider = provider; break;
-    }
-    return provider;
-  } catch (e: any) {
-    _loadFailures.push({ name, error: e.message });
-    console.error(`[registry] Failed to load ${path}: ${e.message}`);
-    return null;
-  }
-}
-
-// Lazy accessors — each one calls _loadProvider on first use, then returns the cached value
-function _getGroq(): any { return GroqProvider !== null ? GroqProvider : _loadProvider('Groq', './providers-groq'); }
-function _getZAI(): any { return ZAIProvider !== null ? ZAIProvider : _loadProvider('z.ai', './providers-zai'); }
-function _getAgnes(): any { return AgnesProvider !== null ? AgnesProvider : _loadProvider('Agnes', './providers-agnes'); }
-function _getNvidia(): any { return NvidiaProvider !== null ? NvidiaProvider : _loadProvider('NVIDIA', './providers-nvidia'); }
-function _getCloudflare(): any { return CloudflareProvider !== null ? CloudflareProvider : _loadProvider('Cloudflare', './providers-cloudflare'); }
-function _getCerebras(): any { return CerebrasProvider !== null ? CerebrasProvider : _loadProvider('Cerebras', './providers-cerebras'); }
-function _getGemini(): any { return GeminiProvider !== null ? GeminiProvider : _loadProvider('Gemini', './providers-gemini'); }
-function _getOpenRouter(): any { return OpenRouterTribunalProvider !== null ? OpenRouterTribunalProvider : _loadProvider('OpenRouter', './providers-openrouter-tribunal'); }
-function _getDeepInfra(): any { return DeepInfraProvider !== null ? DeepInfraProvider : _loadProvider('DeepInfra', './providers-deepinfra'); }
-function _getGithubGpt(): any { return GitHubGPTProvider !== null ? GitHubGPTProvider : _loadProvider('GitHub GPT', './providers-github-gpt'); }
-
-// Eager-load ONE provider (Groq — typically the fastest + cheapest) so the
-// first cycle has something ready immediately. The rest load on first use.
-// This is a deliberate compromise: pure-lazy would mean the first cycle
-// takes 1-2s longer while providers load. We accept the small cost of
-// loading Groq eagerly so the first cycle is fast.
-try { _loadProvider('Groq', './providers-groq'); } catch { /* non-critical */ }
+// TIER 1+ (2026-10-31): Ollama local LLM — NEVER gets blacklisted, always available
+let OllamaProvider: any = null; try { OllamaProvider = require('./providers-ollama'); } catch (e: any) { _loadFailures.push({ name: 'Ollama', error: e.message }); console.error(`[registry] Failed to load providers-ollama: ${e.message}`); }
 
 // --- Dependency Injection ---------------------------------------------------
 let _deps: Record<string, any> = {};
@@ -146,17 +64,21 @@ interface ProviderEntry {
 }
 
 const PROVIDER_TABLE: ProviderEntry[] = [
-  { name: 'Groq', factory: () => _getGroq() },
-  { name: 'z.ai', factory: () => _getZAI() },
-  { name: 'Agnes', factory: () => _getAgnes() },
-  { name: 'NVIDIA', factory: () => _getNvidia() },
-  { name: 'Cloudflare', factory: () => _getCloudflare() },
+  { name: 'Groq', factory: GroqProvider },
+  { name: 'z.ai', factory: ZAIProvider },
+  { name: 'Agnes', factory: AgnesProvider },
+  { name: 'NVIDIA', factory: NvidiaProvider },
+  { name: 'Cloudflare', factory: CloudflareProvider },
   // Cerebras removed - free tier removed (2026-08-07)
   // DeepInfra removed - no longer free tier (2026-08-06)
-  { name: 'Gemini', factory: () => _getGemini() },
-  { name: 'OpenRouter', factory: () => _getOpenRouter() },
+  { name: 'Gemini', factory: GeminiProvider },
+  { name: 'OpenRouter', factory: OpenRouterTribunalProvider },
   // GitHub GPT is in the table but filtered by P9 (disabled by default)
-  { name: 'GitHub GPT', factory: () => _getGithubGpt() },
+  { name: 'GitHub GPT', factory: GitHubGPTProvider },
+  // TIER 1+ (2026-10-31): Ollama local LLM — always available, never blacklisted.
+  // This is the LAST resort but ALWAYS available. When all cloud providers
+  // are rate-limited/blacklisted, the bot uses Ollama instead of waiting.
+  { name: 'Ollama', factory: OllamaProvider ? { callOllama: OllamaProvider.callOllama } : null },
 ];
 
 // ===============================================================================
@@ -373,6 +295,11 @@ function addProviderFailure(name: string, err?: any) {
 }
 
 function isProviderBlacklisted(name: string): boolean { 
+  // TIER 1+ (2026-10-31): Ollama NEVER gets blacklisted — it's a local LLM,
+  // not subject to rate limits or cloud outages. This ensures the bot always
+  // has at least one provider available.
+  if (name === 'Ollama') return false;
+
   // Check cycle blacklist
   if (cycleBlacklist.has(name)) return true;
 
