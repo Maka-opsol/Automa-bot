@@ -474,164 +474,59 @@ class BrowserManager {
     await this.pageInstance.addInitScript(this.getFingerprintSpoofScript());
 
     // ═══════════════════════════════════════════════════════════════════════
-    // TASK 150 (2026-10-30): NUCLEAR OPTION — Block CanvasKit + enable
-    // Flutter semantics. Read questions from DOM instead of canvas.
+    // TIER 1+ (2026-10-31): Auto-click "Enable accessibility" on Flutter Web
     // ═══════════════════════════════════════════════════════════════════════
-    //
-    // WHY: Even with Task 149's chromium variant, the pre-CanvasKit baseline
-    // is 450MB (Node 231MB + Chrome 219MB with SwiftShader). The CanvasKit
-    // compile spike (even chromium at ~75MB) pushes cgroup past 512MB → OOM.
-    //
-    // CREATIVE SOLUTION: Don't download or compile CanvasKit AT ALL. Instead:
-    // 1. ABORT canvaskit.wasm + canvaskit.js network requests
-    // 2. Enable Flutter's "semantics" mode (accessibility) via init script
-    // 3. Flutter's Dart code still runs (widget tree, state, logic) — it just
-    //    can't paint to the canvas. But it DOES create DOM accessibility nodes
-    //    (flt-semantics elements) that contain the question text.
-    // 4. The bot reads questions from DOM text instead of screenshots.
-    //
-    // MEMORY IMPACT:
-    //   No CanvasKit download: saves 7.2MB bandwidth
-    //   No CanvasKit compile: saves ~150MB memory (was the main OOM cause)
-    //   No WebGL context needed: saves ~30-50MB (SwiftShader not initialized)
-    //   Total Chrome baseline: ~150MB (down from ~220MB)
-    //   Total cgroup: ~300-350MB (down from ~450MB)
-    //   Headroom: ~160-210MB (was ~62MB)
-    //
-    // RISK: Flutter might crash without CanvasKit. But Flutter's Dart
-    // framework builds the widget tree and generates semantics BEFORE
-    // calling CanvasKit to paint. If CanvasKit fails, the widget tree
-    // still exists, and semantics nodes are still created.
-
-    log('[TASK150] Installing CanvasKit BLOCK + Flutter semantics enabler...', 'INFO', 'browser');
-
-    // (1) Enable Flutter semantics BEFORE flutter.js loads.
-    // Flutter checks window.semanticEnable during initialization.
-    // We also force-enable via Flutter's accessibility channel.
+    // Flutter Web shows an "Enable accessibility" button on first load.
+    // Without clicking it, Flutter doesn't create semantics DOM nodes —
+    // the bot sees "Enable accessibility" instead of question text.
+    // This init script runs on every navigation and auto-clicks the button.
     await this.pageInstance.addInitScript(function() {
-      console.log('[TASK150] Init script: enabling Flutter semantics');
-      // Tell Flutter to enable semantics (accessibility DOM nodes)
-      window.semanticEnable = true;
-      // Some Flutter versions check this flag:
-      window.__flutter_semantics_enabled = true;
-      // Hook into Flutter's engine initializer to force semantics
-      var _origDefineProperty = Object.defineProperty;
-      // Intercept _flutter.loader assignment to patch initializeEngine
-      if (!window._flutter) window._flutter = {};
-      var _origLoader = null;
-      var _semanticsForced = false;
-      Object.defineProperty(window._flutter, 'loader', {
-        get: function() { return _origLoader; },
-        set: function(val) {
-          _origLoader = val;
-          if (val && !_semanticsForced) {
-            _semanticsForced = true;
-            // Patch didCreateEngineInitializer to force semantics
-            var _origDidCreate = val.didCreateEngineInitializer;
-            if (_origDidCreate) {
-              val.didCreateEngineInitializer = function(engineInitializer) {
-                console.log('[TASK150] Engine initializer created — forcing semantics');
-                try {
-                  // Call the original to trigger onEntrypointLoaded
-                  _origDidCreate.call(val, engineInitializer);
-                  // Force enable semantics via the engine
-                  if (engineInitializer && engineInitializer.initializeEngine) {
-                    var _origInit = engineInitializer.initializeEngine;
-                    engineInitializer.initializeEngine = function(config) {
-                      config = config || {};
-                      config.semanticsEnabled = true;
-                      console.log('[TASK150] initializeEngine called with semanticsEnabled=true');
-                      return _origInit.call(this, config);
-                    };
-                  }
-                } catch (e) {
-                  console.error('[TASK150] Engine init patch error: ' + (e && e.message ? e.message : e));
-                }
-              };
+      // Poll for the "Enable accessibility" button and click it
+      var clickInterval = setInterval(function() {
+        try {
+          // Flutter Web renders the button as a clickable text element
+          var els = document.querySelectorAll('flt-glass-pane, flt-semantics, [class*="semantics"], body *');
+          for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            var text = (el.textContent || '').trim();
+            if (text === 'Enable accessibility' || text.includes('Enable accessibility')) {
+              console.log('[TASK151] Auto-clicking "Enable accessibility" button');
+              el.click();
+              // Also dispatch key events (Flutter sometimes responds to keypress)
+              document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', code: 'Tab' }));
+              clearInterval(clickInterval);
+              return;
             }
           }
-        },
-        configurable: true,
-        enumerable: true
-      });
-      console.log('[TASK150] Flutter semantics enabler installed');
+        } catch (e) {}
+      }, 1000);
+      // Stop polling after 30 seconds
+      setTimeout(function() { clearInterval(clickInterval); }, 30000);
     });
-    log('[TASK150] Flutter semantics init script injected', 'INFO', 'browser');
+    // ─── End auto-click accessibility ───
 
-    // (2) BLOCK canvaskit.wasm (don't download 7.2MB) + serve Proxy mock for canvaskit.js
-    //
-    // TASK 151 (2026-10-30): The Task 150 stub returned `null` for CanvasKit,
-    // which crashed Flutter's initialization — Dart code needs CanvasKit to
-    // build the widget tree (text layout, measurement, etc). Without CanvasKit,
-    // Flutter never creates semantics nodes → bot can't read questions.
-    //
-    // TASK 151 SOLUTION: Serve a JavaScript Proxy-based mock that returns
-    // a no-op function for ANY property access. When Flutter calls
-    // `CanvasKit.MakeSurface(...)`, the Proxy returns another Proxy (truthy).
-    // Flutter's Dart code treats it as a valid "surface" object and continues
-    // building the widget tree. Semantics nodes ARE created (they're a
-    // Dart-side feature, not CanvasKit). The canvas stays blank, but the
-    // DOM has the question text in <flt-semantics> elements.
-    //
-    // MEMORY: Zero WASM download, zero compile spike, zero WebGL context.
-    // Only ~2KB of JS for the Proxy mock.
-    try {
-      await this.pageInstance.route('**/canvaskit.wasm*', async (route: any) => {
-        const url = route.request().url();
-        log(`[TASK151] BLOCKED canvaskit.wasm download (saved 7.2MB + ~150MB compile): ${url.substring(0, 80)}`, 'INFO', 'browser');
-        return route.abort();
-      });
-      // The Proxy mock — returns a function-proxy for any property access,
-      // and calling any function returns another proxy. This makes CanvasKit
-      // API calls non-crashing but no-op.
-      const canvaskitMockJs = [
-        '// TASK 151: CanvasKit Proxy mock — no rendering, widget tree + semantics only',
-        'function makeMock() {',
-        '  var handler = {',
-        '    get: function(target, prop, receiver) {',
-        '      if (prop === Symbol.toPrimitive) return function() { return "[CanvasKitMock]"; };',
-        '      if (prop === "then") return undefined;',
-        '      if (prop === Symbol.iterator) return undefined;',
-        '      if (typeof prop === "string" && (prop === "length" || prop === "byteLength")) return 0;',
-        '      if (typeof prop === "string" && (prop === "width" || prop === "height")) return 0;',
-        '      if (typeof prop === "string" && prop.endsWith("Id")) return 0;',
-        '      if (prop in target) return target[prop];',
-        '      // Return a function that, when called, returns a recursive proxy',
-        '      var fn = function() { return new Proxy(function(){}, handler); };',
-        '      // Make the function itself proxy-able (so property access works on it)',
-        '      var fnProxy = new Proxy(fn, handler);',
-        '      return fnProxy;',
-        '    },',
-        '    apply: function(target, thisArg, args) {',
-        '      return new Proxy(function(){}, handler);',
-        '    },',
-        '    construct: function(target, args) {',
-        '      return new Proxy(function(){}, handler);',
-        '    }',
-        '  };',
-        '  return new Proxy(function(){}, handler);',
-        '}',
-        'export default function(opts) {',
-        '  console.log("[TASK151] CanvasKit Proxy mock invoked — widget tree will build, canvas will stay blank, semantics nodes will be created");',
-        '  return Promise.resolve(makeMock());',
-        '}',
-        'export {};'
-      ].join('\n');
-      await this.pageInstance.route('**/canvaskit.js*', async (route: any) => {
-        const url = route.request().url();
-        log(`[TASK151] SERVING canvaskit.js Proxy mock (instead of 7.2MB real CanvasKit): ${url.substring(0, 80)}`, 'INFO', 'browser');
-        return route.fulfill({
-          status: 200,
-          contentType: 'application/javascript',
-          body: canvaskitMockJs
-        });
-      });
-      log('[TASK151] CanvasKit Proxy mock routes installed (canvaskit.wasm → abort, canvaskit.js → Proxy mock)', 'INFO', 'browser');
-    } catch (routeErr: any) {
-      log(`[TASK151] Route install failed (non-fatal): ${routeErr?.message}`, 'WARN', 'browser');
-    }
+    // ═══════════════════════════════════════════════════════════════════════
+    // TASK 150/151 (2026-10-30): SUPERSEDED — CanvasKit blocking REMOVED.
+    // On GitHub Actions (16GB RAM), CanvasKit loads normally with SwiftShader.
+    // The Proxy mock + canvaskit.wasm blocking was only needed on Render (512MB).
+    // Real CanvasKit = real rendering = screenshots have content = tribunal works.
+    // ─── End Task 150/151 (superseded) ───
 
-    // (3) Expand console filter to catch TASK150/151 messages and Flutter errors
+    // ═══════════════════════════════════════════════════════════════════════
+    // TASK 150/151 CanvasKit blocking code — REMOVED (was Render-only workaround)
+    // On GitHub Actions with 16GB RAM, CanvasKit loads and renders normally.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TASK 139 (2026-10-29): REMOVED Task 138's Flutter loader injection.
+    // CanvasKit loads normally now — no blocking, no Proxy mock, no semantics forcing.
+    // The bot takes screenshots of the REAL rendered page and sends them to the tribunal.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    this.pageInstance.on('crash', () => { log('Page crashed', 'ERROR', 'browser'); this.browserDisconnected = true; this.emit('crashed'); });
+    this.pageInstance.on('error', (err: Error) => { logError('Page error', err); });
+
+    // Console message capture for debugging
     this.pageInstance.on('console', (msg: any) => {
       try {
         const text = msg.text?.() ?? String(msg);
@@ -642,10 +537,10 @@ class BrowserManager {
             lower.includes('opengl') || lower.includes('angle') ||
             lower.includes('swiftshader') || lower.includes('error') ||
             lower.includes('task150') || lower.includes('task149') ||
-            lower.includes('task151') ||
             lower.includes('task146') || lower.includes('task148') ||
-            lower.includes('probe') || lower.includes('semantic') ||
-            lower.includes('engine') || lower.includes('render')) {
+            lower.includes('task151') || lower.includes('probe') ||
+            lower.includes('semantic') || lower.includes('engine') ||
+            lower.includes('render')) {
           const type = msg.type?.() ?? 'log';
           const level = type === 'error' ? 'ERROR' : (type === 'warning' ? 'WARN' : 'INFO');
           log(`[PAGE-CONSOLE ${type.toUpperCase()}] ${String(text).substring(0, 500)}`, level, 'browser');
@@ -657,7 +552,6 @@ class BrowserManager {
         log(`[PAGE-ERROR] ${err.message || String(err)}`, 'ERROR', 'browser');
       } catch {}
     });
-    // ─── End Task 150 ───
 
     // ═══════════════════════════════════════════════════════════════════════
     // TASK 149 (2026-10-30): SUPERSEDED by Task 150.
