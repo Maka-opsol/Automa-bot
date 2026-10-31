@@ -350,8 +350,29 @@ class BrowserManager {
     const log = getLog();
     const logError = getLogError();
     if (!this.browserInstance) return;
-    this.browserInstance.on('disconnected', () => { if (!this._intentionalClose && !this.launching) { log('Browser process disconnected unexpectedly', 'ERROR', 'browser'); } this.browserDisconnected = true; this.emit('disconnected'); });
-    this.browserInstance.on('error', (err: Error) => { logError('Browser process error', err); this.browserDisconnected = true; });
+    this.browserInstance.on('disconnected', () => {
+      if (!this._intentionalClose && !this.launching) {
+        log('Browser process disconnected unexpectedly', 'ERROR', 'browser');
+      }
+      this.browserDisconnected = true;
+      this.emit('disconnected');
+    });
+    this.browserInstance.on('error', (err: Error) => {
+      logError('Browser process error', err);
+      this.browserDisconnected = true;
+    });
+    // TIER 1+ (2026-10-31): Log Chrome process lifecycle events for debugging
+    // These help diagnose why the browser keeps disconnecting
+    try {
+      const cp = require('child_process');
+      // Check if Chrome left zombie processes after disconnect
+      this.browserInstance.on('disconnected', () => {
+        try {
+          const result = cp.execSync('pgrep -c chrome 2>/dev/null || echo 0', { timeout: 2000 }).toString().trim();
+          log(`[BROWSER] Chrome zombie processes after disconnect: ${result}`, 'WARN', 'browser');
+        } catch {}
+      });
+    } catch {}
   }
 
   async setupContext() {
