@@ -418,7 +418,7 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   // safeCall with retries. Call providers directly with basic timeout.
   const safeCall = base?.safeCall || ((fn: any, _label: any, opts: any) => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error('timeout')), opts?.timeoutMs || 60000);
+    const timer = setTimeout(() => controller.abort(new Error('timeout')), opts?.timeoutMs || 300000); // 5 min for Ollama
     (opts?.signal || signal)?.addEventListener?.('abort', () => controller.abort(), { once: true });
     return fn(controller.signal).finally(() => clearTimeout(timer));
   });
@@ -499,7 +499,12 @@ async function runTribunal(base64Image: any, pageUrl: any = null, uiMap: any = n
   // across restarts), call ONE provider at a time, most trusted first.
   // Stop as soon as one succeeds — saves free-tier API quota.
   // Otherwise, call ALL providers in parallel (original behavior).
-  const TRIBUNAL_TIMEOUT_MS = 120000; // 120s total
+  // TIER 1+ (2026-10-31): Increased from 120s to 300s (5 min).
+  // Ollama (local LLM on CPU) can take 30-60s per inference. The old 120s
+  // timeout was too short when multiple providers were slow. With 300s,
+  // Ollama has time to finish even if it's the last provider to respond.
+  // The tribunal waits for ALL providers to finish before consensus.
+  const TRIBUNAL_TIMEOUT_MS = 300000; // 300s (5 min) — allows Ollama to finish
   const tribunalController = new AbortController();
   const tribunalTimeout = setTimeout(() => tribunalController.abort(), TRIBUNAL_TIMEOUT_MS);
   if (signal) {
