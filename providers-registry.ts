@@ -25,7 +25,7 @@ let OpenRouterTribunalProvider: any = null; try { ({ OpenRouterTribunalProvider 
 let DeepInfraProvider: any = null; try { ({ DeepInfraProvider } = require('./providers-deepinfra')); } catch (e: any) { _loadFailures.push({ name: 'DeepInfra', error: e.message }); console.error(`[registry] Failed to load providers-deepinfra: ${e.message}`); }
 
 // TIER 1+ (2026-10-31): Ollama local LLM — NEVER gets blacklisted, always available
-let OllamaProvider: any = null; try { OllamaProvider = require('./providers-ollama'); } catch (e: any) { _loadFailures.push({ name: 'Ollama', error: e.message }); console.error(`[registry] Failed to load providers-ollama: ${e.message}`); }
+let OllamaProvider: any = null; try { ({ OllamaProvider } = require('./providers-ollama')); } catch (e: any) { _loadFailures.push({ name: 'Ollama', error: e.message }); console.error(`[registry] Failed to load providers-ollama: ${e.message}`); }
 
 // --- Dependency Injection ---------------------------------------------------
 let _deps: Record<string, any> = {};
