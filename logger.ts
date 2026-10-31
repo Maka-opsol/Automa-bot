@@ -405,6 +405,7 @@ function log(message: any, level = 'INFO', module = 'main') {
     child[lvl](safeMessage);
 
     // TIER 1+ (2026-10-31): Ship log to Render dashboard (live viewing)
+    // v2: Added URL validation + better error handling
     // Non-blocking, non-fatal — if the dashboard is down, logs still work locally
     try {
       const shipper = require('./dashboard-shipper');
