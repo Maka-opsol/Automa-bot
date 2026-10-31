@@ -404,14 +404,14 @@ function log(message: any, level = 'INFO', module = 'main') {
     if (!child) { child = logger.child({ module: safeModule }); _childLoggerCache.set(safeModule, child); }
     child[lvl](safeMessage);
 
-    // TIER 1+ (2026-10-31): Ship log to external viewer (Replit log viewer)
-    // Non-blocking, non-fatal — if the shipper fails, logs still work locally
+    // TIER 1+ (2026-10-31): Ship log to Render dashboard (live viewing)
+    // Non-blocking, non-fatal — if the dashboard is down, logs still work locally
     try {
-      const shipper = require('./log-shipper');
+      const shipper = require('./dashboard-shipper');
       if (shipper && typeof shipper.shipLog === 'function') {
         shipper.shipLog(level, safeMessage, safeModule);
       }
-    } catch { /* log shipper not available — non-fatal */ }
+    } catch { /* dashboard shipper not available — non-fatal */ }
   } catch (err: any) {
     console.error(`Log failure: ${err.message}`, { originalMessage: String(message)?.substring(0, 100) });
   }
