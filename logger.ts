@@ -403,6 +403,15 @@ function log(message: any, level = 'INFO', module = 'main') {
     let child = _childLoggerCache.get(safeModule);
     if (!child) { child = logger.child({ module: safeModule }); _childLoggerCache.set(safeModule, child); }
     child[lvl](safeMessage);
+
+    // TIER 1+ (2026-10-31): Ship log to external viewer (Replit log viewer)
+    // Non-blocking, non-fatal — if the shipper fails, logs still work locally
+    try {
+      const shipper = require('./log-shipper');
+      if (shipper && typeof shipper.shipLog === 'function') {
+        shipper.shipLog(level, safeMessage, safeModule);
+      }
+    } catch { /* log shipper not available — non-fatal */ }
   } catch (err: any) {
     console.error(`Log failure: ${err.message}`, { originalMessage: String(message)?.substring(0, 100) });
   }
