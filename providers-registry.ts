@@ -78,7 +78,7 @@ const PROVIDER_TABLE: ProviderEntry[] = [
   // TIER 1+ (2026-10-31): Ollama local LLM — always available, never blacklisted.
   // This is the LAST resort but ALWAYS available. When all cloud providers
   // are rate-limited/blacklisted, the bot uses Ollama instead of waiting.
-  { name: 'Ollama', factory: OllamaProvider ? { callOllama: OllamaProvider.callOllama } : null },
+  { name: 'Ollama', factory: OllamaProvider },
 ];
 
 // ===============================================================================
