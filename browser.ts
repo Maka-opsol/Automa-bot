@@ -498,34 +498,85 @@ class BrowserManager {
     await this.pageInstance.addInitScript(this.getFingerprintSpoofScript());
 
     // ═══════════════════════════════════════════════════════════════════════
-    // TIER 1+ (2026-10-31): Auto-click "Enable accessibility" on Flutter Web
+    // TIER 1+ (2026-11-01): Enable Flutter accessibility via JavaScript API
     // ═══════════════════════════════════════════════════════════════════════
-    // Flutter Web shows an "Enable accessibility" button on first load.
-    // Without clicking it, Flutter doesn't create semantics DOM nodes —
-    // the bot sees "Enable accessibility" instead of question text.
-    // This init script runs on every navigation and auto-clicks the button.
+    // Flutter Web shows "Enable accessibility | [FLT-SEMANTICS-PLACEHOLDER]"
+    // until accessibility is enabled. You can't click it — it's not a real
+    // button. Flutter enables accessibility via:
+    //   1. A keyboard event (Tab key) — triggers Flutter's a11y shortcut
+    //   2. Setting window._flutter.semanticsEnabled = true BEFORE flutter.js loads
+    //   3. Calling the Flutter accessibility channel after engine init
+    //
+    // We do ALL THREE to maximize the chance of it working.
     await this.pageInstance.addInitScript(function() {
-      // Poll for the "Enable accessibility" button and click it
-      var clickInterval = setInterval(function() {
+      // Method 1: Set the flag before flutter.js loads
+      window._flutter = window._flutter || {};
+      window._flutter.semanticsEnabled = true;
+      // Also set the global flag some Flutter versions check
+      window.semanticEnable = true;
+      window.__flutter_semantics_enabled = true;
+
+      console.log('[TASK151] Flutter accessibility flags set (pre-load)');
+
+      // Method 2: Dispatch keyboard events to trigger Flutter's a11y shortcut
+      // Flutter enables accessibility when it detects a Tab keypress or
+      // screen reader. We simulate this.
+      setTimeout(function() {
         try {
-          // Flutter Web renders the button as a clickable text element
-          var els = document.querySelectorAll('flt-glass-pane, flt-semantics, [class*="semantics"], body *');
-          for (var i = 0; i < els.length; i++) {
-            var el = els[i];
-            var text = (el.textContent || '').trim();
-            if (text === 'Enable accessibility' || text.includes('Enable accessibility')) {
-              console.log('[TASK151] Auto-clicking "Enable accessibility" button');
-              el.click();
-              // Also dispatch key events (Flutter sometimes responds to keypress)
-              document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', code: 'Tab' }));
-              clearInterval(clickInterval);
-              return;
+          // Dispatch Tab key — Flutter's shortcut for enabling accessibility
+          document.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Tab', code: 'Tab', keyCode: 9, which: 9,
+            bubbles: true, cancelable: true,
+          }));
+          document.dispatchEvent(new KeyboardEvent('keyup', {
+            key: 'Tab', code: 'Tab', keyCode: 9, which: 9,
+            bubbles: true, cancelable: true,
+          }));
+          console.log('[TASK151] Dispatched Tab key to enable Flutter accessibility');
+        } catch (e) {
+          console.error('[TASK151] Keyboard dispatch failed: ' + e.message);
+        }
+      }, 2000);
+
+      // Method 3: Poll for Flutter engine and call enableAccessibility
+      var enableInterval = setInterval(function() {
+        try {
+          // Check if Flutter engine is ready
+          if (window._flutter && window._flutter.loader) {
+            // Try to enable via the engine's accessibility channel
+            // Flutter's Dart code checks window._flutter.semanticsEnabled
+            // on each frame — setting it should trigger accessibility
+            window._flutter.semanticsEnabled = true;
+
+            // Also try to find and call the Flutter view's accessibility API
+            var flutterViews = document.querySelectorAll('flt-glass-pane, flutter-view');
+            flutterViews.forEach(function(view) {
+              // Some Flutter versions expose enableAccessibility on the view
+              if (view.enableAccessibility) {
+                view.enableAccessibility();
+                console.log('[TASK151] Called view.enableAccessibility()');
+              }
+              // Dispatch a click event on the glass pane — some Flutter versions
+              // enable accessibility when they detect user interaction
+              if (view.dispatchEvent) {
+                view.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+              }
+            });
+
+            // Check if accessibility is now enabled
+            var semanticsNodes = document.querySelectorAll('flt-semantics, flt-semantics-text, [role="button"]');
+            if (semanticsNodes.length > 1) {
+              console.log('[TASK151] ✅ Flutter accessibility enabled — ' + semanticsNodes.length + ' semantics nodes found');
+              clearInterval(enableInterval);
             }
           }
-        } catch (e) {}
+        } catch (e) {
+          // Non-fatal — keep trying
+        }
       }, 1000);
-      // Stop polling after 30 seconds
-      setTimeout(function() { clearInterval(clickInterval); }, 30000);
+
+      // Stop polling after 60 seconds
+      setTimeout(function() { clearInterval(enableInterval); }, 60000);
     });
     // ─── End auto-click accessibility ───
 
