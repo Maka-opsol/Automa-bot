@@ -1224,6 +1224,18 @@ function createContainer(): DIContainerType {
     ['network-ip-rotator', 'networkIpRotator', ['config', 'logger', 'database'], ['alerting', 'providers']],
     // R16: No-browser fallback
     ['browser-ghost-mode', 'browserGhostMode', ['config', 'logger']],
+    // R17: Stealth operations coordinator — centralises detection-signal
+    // aggregation, risk scoring, stealth-level escalation, timing jitter,
+    // fingerprint coherence, and decoy traffic. Other modules report
+    // signals here and read getLevel() to scale their own behaviour.
+    ['stealth-operations', 'stealthOperations', ['config', 'logger'], ['alerting']],
+    // R18: Normalcy engine — proactive behavioral mimicry. Tracks pace,
+    // dwell, session rhythm, circadian phase, and page-sequence
+    // naturalness; suggests human-like behaviors (idle, scroll, wander,
+    // take-break) to keep the bot's action stream looking human. Pairs
+    // with stealth-operations: stealth is reactive (escalate on
+    // detection), normalcy is proactive (stay human to avoid detection).
+    ['normalcy', 'normalcy', ['config', 'logger'], ['alerting']],
   ];
 
   for (const tuple of resilienceModules) {
