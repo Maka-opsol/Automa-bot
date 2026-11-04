@@ -279,18 +279,15 @@ class BrowserManager {
     // initialize. Exiting." — the bot then cascades to reduced/minimal strategies
     // unnecessarily. Default to headless: true unless explicitly disabled.
     //
-    // TIER 1+ (2026-10-31): Use headless: 'new' (Chrome's new headless mode).
-    // The old headless=true uses "chrome-headless-shell" which has LIMITED WebGL
-    // support — CanvasKit renders partially or blank. The new headless mode
-    // uses the FULL Chrome binary with proper WebGL/SwiftShader support.
-    // This requires the full Chromium binary (installed via `npx playwright install chromium`).
+    // TIER 1+ (2026-11-01): Use headless: false (headed mode with Xvfb).
+    // Playwright's headless:true uses chrome-headless-shell which has LIMITED
+    // WebGL support — CanvasKit renders partially or blank.
+    // headless:false uses the FULL Chrome binary with proper WebGL via SwiftShader.
+    // This requires Xvfb (DISPLAY=:99, set in run-bot.sh) — which we have.
     //
-    // Combined with Xvfb (DISPLAY=:99), this gives us:
-    //   - Full WebGL via SwiftShader (CanvasKit renders properly)
-    //   - Proper page rendering (no blank pages)
-    //   - Screenshots with real content
-    //   - GPU compositing path (software, but functional)
-    const _headless = (process.env.HEADLESS === 'false') ? false : 'new';
+    // NOTE: headless:'new' is NOT a valid Playwright option in v1.40.
+    // It's treated as truthy = headless:true (old shell). Don't use it.
+    const _headless = false;
     if (!flags.includes('--enable-unsafe-swiftshader')) {
       flags.push('--enable-unsafe-swiftshader');
     }
