@@ -221,10 +221,60 @@ async function startDaemon() {
       // sleep instead of the normal 15-30 min. This lets the bot retry
       // quickly when providers might have recovered, instead of sleeping
       // for 23 minutes while the bot is stuck.
+      // TIER 1+ (2026-11-01): When the bot completes 0 questions, it's failing
+      // at its entire purpose. Instead of blindly retrying, take corrective action:
+      //   1st 0-question cycle: Short 2-min retry (maybe providers recovered)
+      //   2nd consecutive: Restart the browser (maybe Chrome is stuck)
+      //   3rd consecutive: Run self-heal (maybe the code needs a patch)
+      //   5th consecutive: Navigate fresh to app.mathu.co.za (maybe session expired)
       if ((globalThis as any).__cycleZeroQuestions) {
-        sleepMs = 2 * 60 * 1000; // 2 minutes
-        (globalThis as any).__cycleZeroQuestions = false; // reset for next cycle
-        log(`Cycle ended with 0 questions — using SHORT retry delay (${sleepMs / 60000} min) instead of normal sleep. Vision providers may have recovered.`, 'INFO', 'orchestrator');
+        (globalThis as any).__consecutiveZeroCycles = ((globalThis as any).__consecutiveZeroCycles || 0) + 1;
+        const zeroCount = (globalThis as any).__consecutiveZeroCycles;
+        
+        if (zeroCount >= 5) {
+          // 5th consecutive failure — full reset
+          log(`⚠️ 0 questions for ${zeroCount} consecutive cycles — forcing full browser restart + fresh navigation`, 'WARN', 'orchestrator');
+          try {
+            const browserMod = require('./browser');
+            await browserMod.closeBrowser?.();
+            await new Promise(r => setTimeout(r, 3000)); // Wait for Chrome to die
+            (globalThis as any).__consecutiveZeroCycles = 0;
+          } catch (e: any) {
+            log(`Browser restart failed: ${e.message}`, 'WARN', 'orchestrator');
+          }
+          sleepMs = 30000; // 30s before next cycle
+        } else if (zeroCount >= 3) {
+          // 3rd consecutive — trigger self-heal
+          log(`⚠️ 0 questions for ${zeroCount} consecutive cycles — triggering self-heal`, 'WARN', 'orchestrator');
+          try {
+            const selfHeal = _deps.selfHeal;
+            if (selfHeal && typeof selfHeal.performSelfHeal === 'function') {
+              await selfHeal.performSelfHeal({ reason: `0 questions for ${zeroCount} cycles` });
+            }
+          } catch (e: any) {
+            log(`Self-heal failed: ${e.message}`, 'WARN', 'orchestrator');
+          }
+          sleepMs = 60000; // 1 min
+        } else if (zeroCount >= 2) {
+          // 2nd consecutive — restart browser
+          log(`⚠️ 0 questions for ${zeroCount} consecutive cycles — restarting browser`, 'WARN', 'orchestrator');
+          try {
+            const browserMod = require('./browser');
+            await browserMod.closeBrowser?.();
+            await new Promise(r => setTimeout(r, 2000));
+          } catch (e: any) {
+            log(`Browser restart failed: ${e.message}`, 'WARN', 'orchestrator');
+          }
+          sleepMs = 10000; // 10s
+        } else {
+          // 1st consecutive — short retry
+          sleepMs = 2 * 60 * 1000; // 2 minutes
+          log(`Cycle ended with 0 questions — using SHORT retry delay (${sleepMs / 60000} min)`, 'INFO', 'orchestrator');
+        }
+        (globalThis as any).__cycleZeroQuestions = false;
+      } else {
+        // Cycle completed questions — reset counter
+        (globalThis as any).__consecutiveZeroCycles = 0;
       }
 
       const sleepMin = (sleepMs / 60000).toFixed(0);
