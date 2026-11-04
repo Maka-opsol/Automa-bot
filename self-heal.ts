@@ -1338,6 +1338,9 @@ async function performSelfHeal(options?: SelfHealOptions) {
   // Use the /tmp overlay system: patches are written to /tmp/self-heal-overlay/,
   // and a require() interceptor makes Node load them instead of the read-only
   // originals. The overlay is repopulated from patch_history DB on each boot.
+  // TIER 1+ (2026-11-01): On GitHub Actions, the FS IS writable (ephemeral disk).
+  // Patches can be applied directly. The overlay system is NOT needed.
+  // Also: we don't need RENDER check — GitHub Actions has no RENDER env var.
   const isReadOnlyFs = !!(process.env.RENDER || process.env.RENDER_SERVICE_ID);
   let overlay: any = null;
   if (isReadOnlyFs) {
@@ -1413,14 +1416,15 @@ async function performSelfHeal(options?: SelfHealOptions) {
     // the previous attempt, AND we're already past the fallback threshold
     // (attempt >= 2 means non-codegen fallback was already tried), retrying
     // is pointless — the outcome won't change.
-    try {
-      const blLimiter = require('./bazaarlink-rate-limiter');
-      if (blLimiter.isExhausted() && lastTribunalError !== null && attempts >= 2) {
-        log(`Fast-fail: BazaarLink budget exhausted + previous failure (${lastTribunalError}) + non-codegen fallback already attempted. Retrying won't help.`, 'ERROR', 'self-heal');
-        memoryMode.appendSelfHealProgress?.('fast_fail', { reason: 'bl_exhausted_plus_fallback_failed', lastError: lastTribunalError, attempt: attempts });
-        break;
-      }
-    } catch {}
+    // TIER 1+ (2026-11-01): Removed BazaarLink fast-fail. We have Ollama
+      // as a fallback provider — the tribunal can always generate a fix.
+      // The old fast-fail broke self-heal when BazaarLink wasn't configured.
+      try {
+        const blLimiter = require('./bazaarlink-rate-limiter');
+        if (blLimiter.isExhausted() && lastTribunalError !== null && attempts >= 2) {
+          log(`BazaarLink exhausted, but Ollama fallback is available — continuing anyway`, 'INFO', 'self-heal');
+        }
+      } catch {}
 
     // ─── EXECUTIVE MODE & ACCEPT_ANY_FIX ─────────────────────────────
     // EXECUTIVE_KEY: Nuclear option — must be INPUT on dashboard to activate.
@@ -1508,11 +1512,14 @@ async function performSelfHeal(options?: SelfHealOptions) {
     // Reset for THIS attempt — will be set if this attempt fails
     lastTribunalError = null;
     try {
+    // TIER 1+ (2026-11-01): Always allow non-codegen fallback from attempt 1.
+      // We have Ollama (llava:7b) running locally — it's always available.
+      // Waiting until attempt 2 wastes time when codegen providers are down.
       fixes = await getGenerateCodeFixViaTribunal()(
         finalInvestigation,
         errorLogs + (patchContext ? '\n\n' + patchContext : ''),
         tribunalSignal,
-        { allowNonCodegenFallback: attempts >= 2, feedbackInfo },
+        { allowNonCodegenFallback: true, feedbackInfo },
       );
     } catch (err: any) {
       if (err.name === 'TimeoutError' || err.name === 'AbortError') {
