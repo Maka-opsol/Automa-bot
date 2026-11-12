@@ -26,7 +26,12 @@
 // Old: 350MB threshold / 448MB V8 = 98MB headroom — but 448MB V8 + 150MB
 // Chromium RSS = 598MB total, exceeding 512MB container → OOM kill.
 // New: 300MB threshold / 384MB V8 = 84MB headroom, and 384MB + 128MB = 512MB.
-const EARLY_OOM_THRESHOLD_MB = 300;
+// BUGFIX (2026-10-26): Raised from 300 to 350 for 384MB V8 limit.
+// The bot's heap legitimately reaches ~247MB during Flutter Web CanvasKit
+// load — that's normal, not a crisis. 300MB was too low and killed the
+// process during normal browser launch.
+// 350MB / 384MB V8 = 34MB headroom — enough for V8 to GC before hitting limit.
+const EARLY_OOM_THRESHOLD_MB = 350;
 const EARLY_OOM_CHECK_INTERVAL_MS = 2000; // every 2s — fast enough to catch boot spikes
 let _earlyOomTriggered = false;
 const _earlyOomInterval = setInterval(() => {
@@ -40,255 +45,27 @@ const _earlyOomInterval = setInterval(() => {
     // will SIGKILL the process before our heap guardian can react.
     // TASK 41 (2026-09-10): Raised RSS limit from 450→480MB to match new 448MB V8 limit.
     // Old: 450MB RSS / 384MB V8 = 66MB non-V8 headroom
-    // New: 480MB RSS / 448MB V8 = 32MB non-V8 headroom (tighter, but V8 now has more room)
-    // TASK 132 (2026-10-28): Reduced from 450MB to 420MB.
-    // Old: 450MB RSS / 512MB container → only 62MB headroom before kernel SIGKILL
-    //   The bot was silently dying during the Flutter Web render phase because
-    //   Chrome's RSS would spike from 270MB to 490MB in <5s during CanvasKit
-    //   init, crossing the kernel OOM threshold before this 2s guard could fire.
-    // New: 420MB RSS / 512MB container = 92MB headroom.
-    //   If RSS crosses 420MB, we exit IMMEDIATELY (exit 137 = SIGKILL = Render
-    //   auto-restarts). This is better than letting the kernel kill us — at
-    //   least we log the reason and Render sees a clean exit code.
-    //
-    // This works in tandem with the runtime memory monitor (5s interval,
-    // L2 at 350MB, L3 at 400MB) which should catch most spikes BEFORE this
-    // early-oom guard fires. This guard is the LAST line of defense.
-    // TASK 137: Raised from 420MB to 480MB. The watchdog no longer closes Chrome
-    // (closing caused worse relaunch crashes). The early-oom guard is now the
-    // ONLY exit point — fires at 480MB cgroup (30MB headroom under 512MB).
-    if (rssMB >= 480 && !_earlyOomTriggered) {
+    // BUGFIX (2026-10-26): Raised RSS threshold from 450 to 485.
+    // The old 450MB threshold fired during normal Flutter load (RSS 455MB).
+    // 485MB / 512MB container = 27MB headroom — tight but enough for the
+    // memory shed to free ~20-40MB before the kernel OOM killer fires.
+    if (rssMB >= 485 && !_earlyOomTriggered) {
       _earlyOomTriggered = true;
-      console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 420MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
+      console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 485MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
       clearInterval(_earlyOomInterval);
-      // TASK 135: Use _originalExit to bypass the process.exit interceptor.
-      const _eo1 = (process as any)._originalExit || process.exit.bind(process);
-      _eo1(137);
+      process.exit(137);
     }
     if (heapMB >= EARLY_OOM_THRESHOLD_MB && !_earlyOomTriggered) {
       _earlyOomTriggered = true;
       console.error(`[FATAL] [early-oom] Heap ${heapMB.toFixed(0)}MB >= ${EARLY_OOM_THRESHOLD_MB}MB threshold during boot. Exiting immediately to avoid V8 OOM crash.`);
       clearInterval(_earlyOomInterval);
-      const _eo2 = (process as any)._originalExit || process.exit.bind(process);
-      _eo2(137);
+      process.exit(137);
     }
   } catch { /* never let the guard crash the process */ }
 }, EARLY_OOM_CHECK_INTERVAL_MS);
 // Don't let this interval keep the process alive if nothing else is running
 const _earlyOomIntervalHandle: any = _earlyOomInterval;
 if (_earlyOomIntervalHandle.unref) _earlyOomIntervalHandle.unref();
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// TASK 134 (2026-10-28): CGROUP MEMORY WATCHDOG (reads TOTAL container memory)
-// ═══════════════════════════════════════════════════════════════════════════════
-// TASK 133's watchdog was blind! It only measured Node's RSS (process.memoryUsage().rss)
-// — but Chrome is a SEPARATE process (Playwright launches it as a child process,
-// even with --single-process). Xvfb is also separate. So:
-//
-//   Node RSS (what we measured):  ~280MB
-//   Chrome RSS (NOT measured):   ~200-300MB (CanvasKit WASM compile)
-//   Xvfb RSS (NOT measured):     ~20-30MB
-//   Total cgroup:                ~500-610MB → kernel OOM kill at 512MB!
-//
-// The watchdog never fired because Node's RSS never crossed 320MB. But the
-// CGROUP memory crossed 512MB and the kernel SIGKILLed the process.
-//
-// FIX: Read the actual cgroup memory usage from /sys/fs/cgroup/. This includes
-// ALL processes in the container (Node + Chrome + Xvfb). When cgroup memory
-// is high, close Chrome BEFORE the kernel kills us.
-//
-// Cgroup v1 path: /sys/fs/cgroup/memory/memory.usage_in_bytes
-// Cgroup v2 path: /sys/fs/cgroup/memory.current
-// We try both, plus /proc/meminfo as a fallback.
-// ═══════════════════════════════════════════════════════════════════════════════
-const fs_watchdog = require('fs');
-function _readCgroupMemoryMB(): number {
-  // Try cgroup v2 first (modern Docker/K8s)
-  try {
-    const v2 = fs_watchdog.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim();
-    const bytes = parseInt(v2, 10);
-    if (bytes > 0) return bytes / 1024 / 1024;
-  } catch {}
-  // Try cgroup v1
-  try {
-    const v1 = fs_watchdog.readFileSync('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'utf8').trim();
-    const bytes = parseInt(v1, 10);
-    if (bytes > 0) return bytes / 1024 / 1024;
-  } catch {}
-  // Fallback: use /proc/meminfo (MemTotal - MemAvailable = used)
-  // This is less accurate but works without cgroup support
-  try {
-    const meminfo = fs_watchdog.readFileSync('/proc/meminfo', 'utf8');
-    const totalMatch = meminfo.match(/MemTotal:\s+(\d+)\s+kB/);
-    const availMatch = meminfo.match(/MemAvailable:\s+(\d+)\s+kB/);
-    if (totalMatch && availMatch) {
-      const totalKB = parseInt(totalMatch[1], 10);
-      const availKB = parseInt(availMatch[1], 10);
-      return (totalKB - availKB) / 1024;
-    }
-  } catch {}
-  // Last resort: return Node's RSS (inaccurate but better than nothing)
-  return process.memoryUsage().rss / 1024 / 1024;
-}
-
-// Log the cgroup memory limit once at startup so we know the actual container limit
-function _logCgroupLimit() {
-  try {
-    // cgroup v2
-    const v2max = fs_watchdog.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
-    if (v2max && v2max !== 'max') {
-      const maxMB = parseInt(v2max, 10) / 1024 / 1024;
-      console.error(`[WATCHDOG] Cgroup v2 memory limit: ${maxMB.toFixed(0)}MB (from /sys/fs/cgroup/memory.max)`);
-      return;
-    } else if (v2max === 'max') {
-      console.error(`[WATCHDOG] Cgroup v2 memory limit: UNLIMITED (no cgroup limit)`);
-      return;
-    }
-  } catch {}
-  try {
-    // cgroup v1
-    const v1limit = fs_watchdog.readFileSync('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8').trim();
-    const limitMB = parseInt(v1limit, 10) / 1024 / 1024;
-    if (limitMB > 0 && limitMB < 100000) { // sanity check — if > 100GB, it's not a real limit
-      console.error(`[WATCHDOG] Cgroup v1 memory limit: ${limitMB.toFixed(0)}MB (from /sys/fs/cgroup/memory/memory.limit_in_bytes)`);
-      return;
-    }
-  } catch {}
-  console.error(`[WATCHDOG] Could not read cgroup memory limit — using /proc/meminfo fallback`);
-}
-_logCgroupLimit();
-
-const _WATCHDOG_INTERVAL_MS = 500;
-// TASK 139 (2026-10-29): Added CanvasKit compile grace period.
-// CanvasKit's 7.2MB WASM compile causes a transient cgroup spike to
-// 460-510MB for ~10-30 seconds. Without a grace period, the watchdog
-// kills the process DURING the compile, preventing the page from ever
-// rendering. With the grace period, the bot survives the spike and the
-// page renders.
-//
-// The grace period is 90 seconds after navigation starts. During this
-// time, the watchdog WARNS but does NOT exit, even if cgroup > 480MB.
-// After 90s, normal exit behavior resumes.
-const _WATCHDOG_WARN_AT_CGROUP_MB = 380;
-const _WATCHDOG_EXIT_AT_CGROUP_MB = 480;
-const _WATCHDOG_GRACE_PERIOD_MS = 90000; // 90s after navigation
-const _WATCHDOG_LOG_EVERY_N_POLLS = 10;
-let _watchdogPollCount = 0;
-let _watchdogWarned = false;
-let _watchdogNavigationTime = 0;
-
-// Export a function that the cycle code can call to start the grace period
-(globalThis as any).__notifyNavigationStart = function() {
-  _watchdogNavigationTime = Date.now();
-  console.error(`[WATCHDOG] Navigation started — 90s CanvasKit compile grace period active (cgroup spikes up to 510MB will be tolerated)`);
-};
-
-// TASK 139: Also auto-trigger grace period when cgroup crosses 350MB.
-// This catches the CanvasKit download phase (before the WASM compile spike).
-// We don't need the cycle code to call __notifyNavigationStart — the watchdog
-// detects the memory climb automatically.
-let _graceAutoTriggered = false;
-
-const _watchdogInterval = setInterval(() => {
-  try {
-    const mem = process.memoryUsage();
-    const heapMB = mem.heapUsed / 1024 / 1024;
-    const nodeRssMB = mem.rss / 1024 / 1024;
-    const cgroupMB = _readCgroupMemoryMB();
-    _watchdogPollCount++;
-
-    // Check if we're in the CanvasKit compile grace period
-    const inGracePeriod = _watchdogNavigationTime > 0 &&
-      (Date.now() - _watchdogNavigationTime) < _WATCHDOG_GRACE_PERIOD_MS;
-    const graceRemaining = inGracePeriod ?
-      Math.round((_WATCHDOG_GRACE_PERIOD_MS - (Date.now() - _watchdogNavigationTime)) / 1000) : 0;
-
-    // TASK 139: Auto-trigger grace period when cgroup crosses 350MB.
-    // This is the CanvasKit download phase — the WASM compile spike follows
-    // ~5-10s later. By starting the grace period now, we tolerate the spike.
-    if (!inGracePeriod && !_graceAutoTriggered && cgroupMB > 350) {
-      _graceAutoTriggered = true;
-      _watchdogNavigationTime = Date.now();
-      console.error(`[WATCHDOG] Cgroup crossed 350MB (${cgroupMB.toFixed(0)}MB) — auto-starting 90s CanvasKit compile grace period`);
-      // Reset after 120s so the next navigation can trigger again
-      setTimeout(() => { _graceAutoTriggered = false; }, 120000).unref?.();
-    }
-
-    // Log every 5s (10 polls)
-    if (_watchdogPollCount % _WATCHDOG_LOG_EVERY_N_POLLS === 0) {
-      const graceTag = inGracePeriod ? ` [GRACE: ${graceRemaining}s]` : '';
-      console.error(`[WATCHDOG] nodeHeap=${heapMB.toFixed(0)}MB nodeRSS=${nodeRssMB.toFixed(0)}MB cgroup=${cgroupMB.toFixed(0)}MB (poll #${_watchdogPollCount})${graceTag}`);
-    }
-
-    // TIER 1: Cgroup memory > 380MB → LOG warning
-    if (cgroupMB > _WATCHDOG_WARN_AT_CGROUP_MB && !_watchdogWarned) {
-      _watchdogWarned = true;
-      const graceTag = inGracePeriod ? ` [IN GRACE PERIOD — ${graceRemaining}s remaining, NOT exiting]` : '';
-      console.error(`[WATCHDOG] CGROUP ${cgroupMB.toFixed(0)}MB > ${_WATCHDOG_WARN_AT_CGROUP_MB}MB${graceTag}`);
-      if (global.gc) { try { global.gc(); } catch {} }
-      setTimeout(() => { _watchdogWarned = false; }, 30000).unref?.();
-    }
-
-    // TIER 2: Cgroup memory > 480MB → exit (UNLESS in grace period)
-    // During the 90s grace period, tolerate up to 490MB.
-    //
-    // TASK 149 (2026-10-30): Lowered grace-period exit threshold from 510MB
-    // to 490MB. Combined with Task 149's chromium CanvasKit variant (halves
-    // WASM compile memory from ~150MB to ~75MB), peak cgroup should now be
-    // ~420-440MB. 490MB gives 22MB of kernel headroom — if we approach the
-    // limit, the watchdog exits gracefully (saving state) BEFORE the kernel
-    // OOM killer fires.
-    const exitThreshold = inGracePeriod ? 490 : _WATCHDOG_EXIT_AT_CGROUP_MB;
-    if (cgroupMB > exitThreshold) {
-      if (inGracePeriod) {
-        console.error(`[FATAL] [WATCHDOG] CGROUP ${cgroupMB.toFixed(0)}MB > ${exitThreshold}MB EVEN IN GRACE PERIOD — kernel OOM truly imminent, exiting (grace: ${graceRemaining}s remaining)`);
-      } else {
-        console.error(`[FATAL] [WATCHDOG] CGROUP ${cgroupMB.toFixed(0)}MB > ${exitThreshold}MB — kernel OOM imminent, exiting immediately`);
-      }
-      clearInterval(_watchdogInterval);
-      clearInterval(_earlyOomInterval);
-      const _origExit = (process as any)._originalExit || process.exit.bind(process);
-      _origExit(137);
-    }
-  } catch (e: any) {
-    // Never let the watchdog crash the process
-  }
-}, _WATCHDOG_INTERVAL_MS);
-const _watchdogIntervalHandle: any = _watchdogInterval;
-if (_watchdogIntervalHandle.unref) _watchdogIntervalHandle.unref();
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// TASK 133: CRASH DIAGNOSTICS — log why the process dies
-// ═══════════════════════════════════════════════════════════════════════════════
-// The bot was dying silently with no log. These handlers will log the reason
-// before the process exits:
-//   - uncaughtException: synchronous throw that wasn't caught
-//   - unhandledRejection: async rejection that wasn't caught
-//   - SIGTERM/SIGKILL: sent by Render or the kernel
-//
-// NOTE: SIGKILL cannot be caught (it's immediate). But SIGTERM can be.
-// If we see "Received SIGTERM" in the logs, Render is killing us.
-// If we see "uncaughtException", our code has a bug.
-// If we see nothing, it's a SIGKILL from the kernel OOM killer.
-// ═══════════════════════════════════════════════════════════════════════════════
-process.on('uncaughtException', (err: any) => {
-  console.error(`[FATAL] [uncaughtException] ${err?.stack || err?.message || err}`);
-  console.error(`[FATAL] [uncaughtException] Memory at crash: ${JSON.stringify(process.memoryUsage())}`);
-  // Don't exit immediately — let the watchdog or early-oom handle it.
-  // But log it so we know what happened.
-});
-process.on('unhandledRejection', (reason: any, promise: any) => {
-  console.error(`[FATAL] [unhandledRejection] ${reason?.stack || reason?.message || reason}`);
-  console.error(`[FATAL] [unhandledRejection] Memory at crash: ${JSON.stringify(process.memoryUsage())}`);
-  // Don't exit — just log. Node 15+ exits on unhandledRejection by default,
-  // but we override that here to get the log before dying.
-});
-// SIGTERM handler — Render sends this before SIGKILL
-process.on('SIGTERM', () => {
-  console.error(`[FATAL] [SIGTERM] Received SIGTERM at ${new Date().toISOString()} — Render or kernel is killing us. Memory: ${JSON.stringify(process.memoryUsage())}`);
-  // Don't exit — let the existing gracefulShutdown handler deal with it.
-  // But log it FIRST so we know SIGTERM was received.
-});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MathU Bot v6 — Render Free Plan Entry Point (FULL FEATURES)
@@ -374,17 +151,8 @@ if (!process.env.REGRESSION_BANK_DIR)   process.env.REGRESSION_BANK_DIR   = path
 // (800x600 vs 1280x800 = 480K pixels vs 1024K pixels).
 // JPEG quality 30 at 800x600 ≈ 15-25KB per screenshot vs 30-60KB at 1280x800.
 // The AI providers can still read math at this resolution.
-//
-// TASK 132 (2026-10-28): Reduced from 800x600 to 640x480.
-// Smaller viewport = smaller Chrome canvas = less memory for:
-//   - Chrome's backing store (canvas bitmap): 640x480x4 = 1.2MB (was 1.9MB at 800x600)
-//   - Flutter Web's CanvasKit: renders at device pixel ratio, so smaller
-//     viewport = smaller GPU texture = less GPU memory
-//   - Screenshot buffers: 640x480 = 307K pixels (was 480K at 800x600)
-// Saves ~10-30MB of Chrome RSS during the Flutter render phase.
-// AI providers can still read math at 640x480 — it's only 20% smaller than 800x600.
-if (!process.env.DISPLAY_WIDTH)  process.env.DISPLAY_WIDTH  = '640';
-if (!process.env.DISPLAY_HEIGHT) process.env.DISPLAY_HEIGHT = '480';
+if (!process.env.DISPLAY_WIDTH)  process.env.DISPLAY_WIDTH  = '800';
+if (!process.env.DISPLAY_HEIGHT) process.env.DISPLAY_HEIGHT = '600';
 
 // Memory — only set MAX_MEMORY_MB if not already set.
 // Render free plan = 512 MB total. Aggressive threshold to prevent OOM kills.
@@ -446,7 +214,7 @@ for (const dir of [
 // LOAD MODULES
 // ═══════════════════════════════════════════════════════════════════════
 
-const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilienceSubsystems, getContainerHealth, runStartupSmokeTests, spawnWorkers } = require('./container');
+const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilienceSubsystems, getContainerHealth, runStartupSmokeTests } = require('./container');
 
 // BUG FIX (2026-09-05): Synchronous memory check right after container init.
 // Checks BOTH heap AND RSS — the kernel OOM killer fires on RSS, not heap.
@@ -454,17 +222,15 @@ const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilien
   const _mem = process.memoryUsage();
   const _postContainerHeapMB = _mem.heapUsed / 1024 / 1024;
   const _postContainerRSSMB = _mem.rss / 1024 / 1024;
-  if (_postContainerRSSMB >= 480) {
-    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 480MB after container init. Kernel OOM imminent. Exiting immediately. [TASK 137]`);
+  if (_postContainerRSSMB >= 485) {
+    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 485MB after container init. Kernel OOM imminent. Exiting immediately.`);
     clearInterval(_earlyOomInterval);
-    const _bo1 = (process as any)._originalExit || process.exit.bind(process);
-    _bo1(137);
+    process.exit(137);
   }
   if (_postContainerHeapMB >= 350) {
     console.error(`[FATAL] [boot-oom] Heap ${_postContainerHeapMB.toFixed(0)}MB >= 350MB after container init. Exiting immediately.`);
     clearInterval(_earlyOomInterval);
-    const _bo2 = (process as any)._originalExit || process.exit.bind(process);
-    _bo2(137);
+    process.exit(137);
   }
 }
 
@@ -479,116 +245,13 @@ try {
   process.exit(1);
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// TASK 131 (2026-10-28): DEFER orchestrator loading until AFTER the HTTP
-// server starts listening on $PORT.
-// ═══════════════════════════════════════════════════════════════════════
-// The bot was OOM-crashing during boot at "Database schema version 31 ready"
-// — the crash happened DURING `container.get('orchestrator')` which loads
-// cycle-orchestrator → cycle-cycle-manager → browser (playwright!) → auth
-// (strategies) → providers (HTTP clients, vision pipeline, etc).
-//
-// This eager load consumed ~150-200MB on top of the ~120MB baseline
-// (config + logger + database), pushing past the 384MB V8 heap limit
-// before the HTTP server could start listening on $PORT. Render's
-// HEALTHCHECK never got a response, the service crashed, Render
-// restarted, and the loop repeated — manifesting as the violent 0%-100%
-// memory swings seen on the Render dashboard.
-//
-// FIX: Do NOT load the orchestrator synchronously here. Instead, define
-// lazy stubs for startDaemon / requestStop that trigger the load on first
-// use. The actual load happens inside _loadOrchestrator() which is called
-// AFTER the HTTP server's `listen()` callback fires.
-//
-// This way:
-//   1. The HTTP server starts listening immediately after DB init.
-//   2. Render's HEALTHCHECK passes within seconds of container start.
-//   3. Render marks the container as "healthy" BEFORE the heavy load.
-//   4. The orchestrator loads in the background (still synchronous, but
-//      after Render has already accepted the container).
-//   5. If the load OOMs the process, exit code 137 = SIGKILL = Render
-//      auto-restarts — but at least we know we made it past the
-//      healthcheck-passing phase, and the lazy providers/sharp patches
-//      should have reduced the memory consumed during this load.
-// ═══════════════════════════════════════════════════════════════════════
-let _startDaemonRetries = 0;
-const _MAX_START_DAEMON_RETRIES = 60; // 60 * 100ms = 6s max wait for orchestrator
-let startDaemon: () => Promise<void> = async () => {
-  // Placeholder — replaced by _loadOrchestrator() once orchestrator is loaded.
-  // If this is called before orchestrator loads, it means startDaemon() was
-  // invoked before the HTTP server finished its listen callback. Defer to
-  // the next tick.
-  _startDaemonRetries++;
-  if (_startDaemonRetries > _MAX_START_DAEMON_RETRIES) {
-    log(`startDaemon() waited ${_startDaemonRetries * 100}ms for orchestrator load — giving up. HTTP server may have failed to listen.`, 'ERROR', 'render-free-plan');
-    try { clearInterval(_earlyOomInterval); } catch { /* ignore */ }
-    const _sd1 = (process as any)._originalExit || process.exit.bind(process);
-    _sd1(137);
-    return;
-  }
-  log(`startDaemon() called before orchestrator loaded — deferring 100ms (attempt ${_startDaemonRetries}/${_MAX_START_DAEMON_RETRIES})`, 'DEBUG', 'render-free-plan');
-  await new Promise(r => setTimeout(r, 100));
-  return startDaemon();
-};
-let requestStop: () => void = () => {
-  // Placeholder — replaced by _loadOrchestrator() once orchestrator is loaded.
-  // If this is called before orchestrator loads, it's a shutdown signal during
-  // boot. Just set the shutdown flag and let the deferred loader handle it.
-  log('requestStop() called before orchestrator loaded — marking for shutdown', 'WARN', 'render-free-plan');
-  _orchestratorShutdownRequested = true;
-};
-
-let _orchestratorLoaded = false;
-let _orchestratorLoading = false;
-let _orchestratorShutdownRequested = false;
-
-function _loadOrchestrator() {
-  if (_orchestratorLoaded || _orchestratorLoading) return;
-  _orchestratorLoading = true;
-  log('Loading orchestrator (cycle-orchestrator + cycle-manager + browser + providers + auth + stateMachine)...', 'INFO', 'render-free-plan');
-  const _t0 = Date.now();
-
-  // Pre-load GC: free any garbage from boot/init phase before the heavy load.
-  if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
-  const _memBefore = process.memoryUsage();
-  const _heapBefore = _memBefore.heapUsed / 1024 / 1024;
-  const _rssBefore = _memBefore.rss / 1024 / 1024;
-  log(`Memory before orchestrator load: heap=${_heapBefore.toFixed(0)}MB rss=${_rssBefore.toFixed(0)}MB`, 'INFO', 'render-free-plan');
-
-  try {
-    const orchestrator = container.get('orchestrator');
-    startDaemon = orchestrator.startDaemon;
-    requestStop = orchestrator.requestStop;
-    _orchestratorLoaded = true;
-
-    const _memAfter = process.memoryUsage();
-    const _heapAfter = _memAfter.heapUsed / 1024 / 1024;
-    const _rssAfter = _memAfter.rss / 1024 / 1024;
-    const _elapsed = Date.now() - _t0;
-    log(`Orchestrator loaded in ${_elapsed}ms. Memory after: heap=${_heapAfter.toFixed(0)}MB rss=${_rssAfter.toFixed(0)}MB (delta heap=${(_heapAfter-_heapBefore).toFixed(0)}MB rss=${(_rssAfter-_rssBefore).toFixed(0)}MB)`, 'INFO', 'render-free-plan');
-
-    // Post-load GC to reclaim any module-init garbage
-    if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
-
-    if (_orchestratorShutdownRequested) {
-      log('Shutdown was requested during orchestrator load — stopping daemon immediately', 'WARN', 'render-free-plan');
-      try { requestStop(); } catch { /* best effort */ }
-    }
-  } catch (e: any) {
-    const _memAfter = process.memoryUsage();
-    const _heapAfter = _memAfter.heapUsed / 1024 / 1024;
-    const _rssAfter = _memAfter.rss / 1024 / 1024;
-    console.error(`FATAL: Orchestrator load failed at heap=${_heapAfter.toFixed(0)}MB rss=${_rssAfter.toFixed(0)}MB: ${e.message}`);
-    console.error(`Stack: ${e.stack}`);
-    // Exit with 137 (SIGKILL) so Render auto-restarts.
-    // exit(1) would also restart, but 137 is more semantically correct
-    // for "killed by OOM" and Render treats both the same way.
-    try { clearInterval(_earlyOomInterval); } catch { /* ignore */ }
-    const _or1 = (process as any)._originalExit || process.exit.bind(process);
-    _or1(137);
-  } finally {
-    _orchestratorLoading = false;
-  }
+let startDaemon: () => Promise<void>;
+let requestStop: () => void;
+try {
+  ({ startDaemon, requestStop } = container.get('orchestrator'));
+} catch (e: any) {
+  console.error(`FATAL: Cycle module initialization failed: ${e.message}`);
+  process.exit(1);
 }
 
 const _alertingMod = container.get('alerting', { required: false });
@@ -713,6 +376,33 @@ startSelfHealV2Subsystems(CONFIG);
 startResilienceSubsystems();
 
 // ═══════════════════════════════════════════════════════════════════════
+// Stealth ⇄ Normalcy bidirectional coupling
+// ═══════════════════════════════════════════════════════════════════════
+// Both modules are auto-started by startResilienceSubsystems() above (both
+// tagged 'resilience' in container-modules.ts). Here we register the
+// single boot-time listener that pushes stealth-level changes into normalcy
+// so it can widen idle durations and shorten work bursts at MAXIMUM.
+try {
+  const stealth = require('./stealth-operations');
+  const normalcy = require('./normalcy');
+  if (typeof stealth.onLevelChange === 'function' && typeof normalcy.setStealthLevel === 'function') {
+    // Seed normalcy with the current level (in case stealth already escalated at boot).
+    try { normalcy.setStealthLevel(stealth.getLevel?.() || 'NORMAL'); } catch {}
+    stealth.onLevelChange('normalcy-coupling', (newLevel: string, _prevLevel: string) => {
+      try {
+        normalcy.setStealthLevel(newLevel);
+        log(`Normalcy: stealth level → ${newLevel}`, 'INFO', 'render-free-plan');
+      } catch (e: any) {
+        log(`Normalcy setStealthLevel failed: ${e.message}`, 'WARN', 'render-free-plan');
+      }
+    });
+    log('Stealth → Normalcy level coupling registered', 'INFO', 'render-free-plan');
+  }
+} catch (e: any) {
+  log(`Stealth/normalcy coupling setup failed: ${e.message}`, 'WARN', 'render-free-plan');
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // TASK 95 (2026-09-27): Memory Warfare — aggressive GC + leak detection
 // ═══════════════════════════════════════════════════════════════════════
 // User: "The bot needs to be constantly at war with its memory."
@@ -727,65 +417,35 @@ try {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// TIER 1 (2026-10-30): Spawn worker threads for workerizable subsystems
+// GitHub Log Shipper — pushes bot logs to a GitHub repo branch so the
+// operator can browse them at github.com/<owner>/<repo>/tree/bot-logs/logs
+// without SSH-ing into the host. No-op if GITHUB_LOGS_TOKEN/OWNER/REPO
+// env vars aren't set — see github-log-shipper.ts header for setup.
 // ═══════════════════════════════════════════════════════════════════════
-// On Render (512MB), workers were disabled to save ~90-150MB.
-// On GitHub Actions (16GB), we have plenty of RAM — spawn all 3 workers:
-//   - metrics worker (in-memory monitoring)
-//   - diary worker (documentation/logging)
-//   - rewardTracker worker (self-heal reward tracking)
-//
-// Workers run in separate threads, so they don't block the main event loop.
-// This makes the bot more responsive and isolates failures.
-//
-// Only spawn workers if we're NOT on Render (where memory is tight).
-// On GitHub Actions, RENDER env var is not set, so this runs.
-if (!process.env.RENDER_SERVICE_ID && !process.env.RENDER) {
-  log('[TIER1] Spawning worker threads (metrics, diary, rewardTracker)...', 'INFO', 'render-free-plan');
-  (async () => {
-    try {
-      const workerResults = await spawnWorkers(container, CONFIG);
-      if (workerResults.started.length > 0) {
-        log(`[TIER1] ✅ Workers spawned: ${workerResults.started.join(', ')} (${workerResults.failed.length} failed)`, 'INFO', 'render-free-plan');
-      } else {
-        log('[TIER1] ⚠️ No workers spawned — falling back to in-process modules', 'WARN', 'render-free-plan');
-      }
-      // Start reward tracker (whether worker or in-process)
-      try {
-        const rtMod = container.get('rewardTracker', { required: false });
-        if (rtMod && typeof rtMod.start === 'function') {
-          rtMod.start(60 * 60 * 1000);
-          log('[TIER1] Reward tracker started', 'INFO', 'render-free-plan');
-        }
-      } catch (e: any) {
-        log(`[TIER1] Reward tracker start failed: ${e.message}`, 'WARN', 'render-free-plan');
-      }
-    } catch (e: any) {
-      log(`[TIER1] Worker spawn failed (non-fatal, falling back to in-process): ${e.message}`, 'WARN', 'render-free-plan');
-      // Fallback: start rewardTracker in-process
-      try {
-        const rtMod = container.get('rewardTracker', { required: false });
-        if (rtMod && typeof rtMod.start === 'function') {
-          rtMod.start(60 * 60 * 1000);
-          log('[TIER1] Reward tracker started in-process (fallback)', 'INFO', 'render-free-plan');
-        }
-      } catch {}
-    }
-  })().catch(() => {});  // Non-blocking — don't hold up boot
-} else {
-  // Render: keep the old in-process behavior
-  log('Render: Running all subsystems in-process (no worker threads, saves ~90-150 MB)', 'INFO', 'render-free-plan');
-  try {
-    const rtMod = container.get('rewardTracker', { required: false });
-    if (rtMod && typeof rtMod.start === 'function') {
-      rtMod.start(60 * 60 * 1000);
-      log('Reward tracker started in-process', 'INFO', 'render-free-plan');
-    }
-  } catch (e: any) {
-    log(`Reward tracker in-process start failed: ${e.message}`, 'WARN', 'render-free-plan');
+try {
+  const githubShipper = require('./github-log-shipper');
+  githubShipper._injectDependencies?.({ logger: log, config: CONFIG });
+  if (typeof githubShipper.start === 'function') {
+    githubShipper.start();
+    log(`GitHub log shipper: ${githubShipper.getStatus().enabled ? 'enabled' : 'disabled (no GITHUB_LOGS_* env vars)'}`, 'INFO', 'render-free-plan');
   }
+} catch (e: any) {
+  log(`GitHub log shipper failed to start: ${e.message}`, 'WARN', 'render-free-plan');
 }
-// ─── End TIER 1 worker spawning ───
+
+// ═══════════════════════════════════════════════════════════════════════
+// WORKER FALLBACK: Start rewardTracker in-process
+// ═══════════════════════════════════════════════════════════════════════
+log('Render: Running all subsystems in-process (no worker threads, saves ~90-150 MB)', 'INFO', 'render-free-plan');
+try {
+  const rtMod = container.get('rewardTracker', { required: false });
+  if (rtMod && typeof rtMod.start === 'function') {
+    rtMod.start(60 * 60 * 1000);
+    log('Reward tracker started in-process', 'INFO', 'render-free-plan');
+  }
+} catch (e: any) {
+  log(`Reward tracker in-process start failed: ${e.message}`, 'WARN', 'render-free-plan');
+}
 
 // Override MAX_UPTIME_HOURS to 0 (never forced restart)
 if (CONFIG.MAX_UPTIME_HOURS && CONFIG.MAX_UPTIME_HOURS > 0) {
@@ -907,6 +567,16 @@ async function gracefulShutdown(signal: string) {
   } catch {
     try { closeDatabase(); } catch { /* best effort */ }
   }
+  // Flush remaining logs to GitHub before exiting (best-effort, 5s timeout).
+  try {
+    const githubShipper = require('./github-log-shipper');
+    if (typeof githubShipper.flushNow === 'function') {
+      await Promise.race([
+        githubShipper.flushNow(),
+        new Promise(r => setTimeout(r, 5000)),
+      ]);
+    }
+  } catch { /* best effort — never block shutdown */ }
   originalExit(0);
 }
 
@@ -963,16 +633,8 @@ function _startMemoryMonitor(): void {
     clearInterval(_memoryMonitorInterval);
     _memoryMonitorInterval = null;
   }
-  // TASK 132 (2026-10-28): Force 5s interval regardless of mode.
-  // The old code used memoryMode.getThresholds().monitorIntervalMs which was
-  // 20s in full_power mode. That's too slow — Chrome can spike 100MB of RSS
-  // in 5 seconds during the Flutter Web CanvasKit render phase. By the time
-  // the 20s monitor fires, the kernel has already SIGKILLed the process
-  // at ~490MB RSS.
-  //
-  // 5s gives us 4-5 chances to react before the kernel fires.
-  const intervalMs = 5000;
-  log(`Memory monitor starting (interval=${intervalMs}ms, mode=${memoryMode.getMode()}) [TASK 132: aggressive]`, 'INFO', 'render-free-plan');
+  const intervalMs = memoryMode.getThresholds().monitorIntervalMs;
+  log(`Memory monitor starting (interval=${intervalMs}ms, mode=${memoryMode.getMode()})`, 'DEBUG', 'render-free-plan');
   _memoryMonitorInterval = setInterval(() => {
     if (isShuttingDown) return;
     const mem = process.memoryUsage();
@@ -1039,46 +701,48 @@ function _startMemoryMonitor(): void {
     //      memory_protection death loops when heap spiked to 320MB.
     // New: HARD_RESTART_HEAP_MB=380 (out of 448MB V8) → gives 68MB headroom.
     //      The bot typically runs at 280-350MB; 380MB only fires on real spikes.
-    // TASK 132 (2026-10-28): Aggressive RSS thresholds to prevent kernel OOM
-    // during Flutter Web render phase.
+    // TASK 86 (2026-09-25): Reduced from 380MB to 330MB for new 384MB V8 limit.
+    // BUGFIX (2026-10-26): V8 max-old-space-size was 3584MB (3.5GB!) on a 512MB
+    // container — V8 never GC'd and the process OOM-killed every ~3 minutes.
+    // Fixed in package.json: --max-old-space-size=384.
+    // 384MB V8 = enough for bot JS (~80MB) + Flutter CanvasKit (~150MB) + headroom.
+    // 256MB was too low — V8 OOM'd when Flutter loaded. 384MB forces GC while
+    // still having room for the full stack.
+    //   - HARD_RESTART_HEAP_MB = 280 (gives 104MB headroom below 384MB V8 limit)
+    //   - HARD_RSS_LIMIT_MB = 440 (gives 72MB headroom in 512MB container)
+    const HARD_RESTART_HEAP_MB = 280; // fire if heap > 280MB (out of 384MB V8 limit)
     //
-    // OLD (Task 86): HARD_RSS_LIMIT_MB=460, HARD_RESTART_HEAP_MB=330
-    //   → Kernel killed at ~490MB before our 20s monitor could fire
-    //
-    // NEW (Task 132): Three-tier response
-    //   RSS > 350MB → L2 (reload page) — frees Chrome's V8 heap
-    //   RSS > 400MB → L3 (close browser + relaunch) — fully resets Chrome
-    //   heap > 330MB → L2 (regardless of RSS) — Node V8 heap pressure
-    //
-    // Container limit: 512MB. Kernel OOM killer fires at ~490MB.
-    // 400MB gives 90MB headroom — safe even if Chrome spikes 50MB during reload.
-    // TASK 137 (2026-10-29): DISABLED all shedMemory calls in the 5s monitor.
-    // The 500ms watchdog (Task 137) is now the ONLY memory management.
-    // shedMemory was closing/reloading Chrome, which caused the cycle code to
-    // immediately relaunch Chrome on top of un-reclaimed memory → crash.
-    //
-    // The bot completed its first cycle ever with Task 136 (CanvasKit blocking).
-    // Chrome can survive at 380-480MB cgroup. We only exit at 480MB.
-    // No more L2 (page reload) or L3 (browser close) from this monitor.
-    const HARD_RESTART_HEAP_MB = 999; // disabled — was 330
-    const HARD_RSS_LIMIT_MB = 999;    // disabled — was 400
-    const RSS_PAGE_RELOAD_THRESHOLD_MB = 999; // disabled — was 350
+    // 440MB gives 72MB of headroom in the 512MB container.
+    const HARD_RSS_LIMIT_MB = 440;   // fire if RSS > 440MB (out of 512MB container)
     if (used > HARD_RESTART_HEAP_MB || rss > HARD_RSS_LIMIT_MB) {
-      // This branch is now unreachable (thresholds set to 999).
-      // Kept for code structure — the 500ms watchdog handles everything.
-      log(`Memory CRITICAL (disabled tier): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — watchdog handles this`, 'ERROR', 'render-free-plan');
-      _memoryWarningCount = 0;
-      _lastRss = rss;
-    } else if (rss > RSS_PAGE_RELOAD_THRESHOLD_MB) {
-      // This branch is also unreachable (threshold set to 999).
+      log(`Memory CRITICAL (hard threshold): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'ERROR', 'render-free-plan');
+      // BUG FIX (2026-09-06): Cap maxLevel at L2 to prevent closing the browser.
+      // L3 closes the browser, which kills the page state and forces a re-launch
+      // + re-navigate cycle. This was causing a death loop: shed L3 → browser
+      // closed → re-launch → navigate → memory spike → shed L3 again.
+      // L2 (reload page + clear caches) is enough — it frees ~10-20MB without
+      // losing the browser session.
+      memoryMode.shedMemory('render-monitor-critical', {
+        preserveBrowser: memoryMode.isMidQuiz?.() ?? false,
+        maxLevel: 2,  // BUG FIX: never L3 — don't close the browser
+      }).then(() => {
+        // v5 FIX: Second GC AFTER browser cleanup actually completes
+        if (global.gc) { try { global.gc(); } catch {} }
+      }).catch(() => {});
+      if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
       _memoryWarningCount = 0;
       _lastRss = rss;
     } else if (used > activeWarn) {
-      // TASK 137: Don't shed memory here either — just log.
-      // The 500ms watchdog handles all memory management.
       _memoryWarningCount++;
       if (_memoryWarningCount >= activeStreak) {
-        log(`Memory warning persistent (${_memoryWarningCount}/${activeStreak}, mode=${memoryMode.getMode()}): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — NOT shedding (Task 137: watchdog handles memory)`, 'WARN', 'render-free-plan');
+        log(`Memory warning persistent (${_memoryWarningCount}/${activeStreak}, mode=${memoryMode.getMode()}): heap=${used.toFixed(0)}MB — memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'WARN', 'render-free-plan');
+        // v5 FIX: shedMemory is async now
+        // v6 FIX: preserve browser if mid-quiz
+        memoryMode.shedMemory('render-monitor-warning', {
+          preserveBrowser: memoryMode.isMidQuiz?.() ?? false,
+        }).then(() => {
+          if (global.gc) { try { global.gc(); } catch {} }
+        }).catch(() => {});
         if (global.gc) { try { global.gc(); } catch { /* ignore */ } }
         _memoryWarningCount = 0;
         _lastRss = rss;
@@ -1259,7 +923,7 @@ a{color:#818cf8}a:hover{color:#a5b4fc}
 <div class="stat"><span class="stat-label">Heap Used</span><span class="stat-value">${memInfo.heapUsed}</span></div>
 <div class="stat"><span class="stat-label">RSS</span><span class="stat-value">${memInfo.rss} (${memInfo.rssPercent})</span></div>
 <div class="stat"><span class="stat-label">Node.js</span><span class="stat-value">${process.version}</span></div>
-<div class="stat"><span class="stat-label">Workers</span><span class="stat-value">${process.env.RENDER_SERVICE_ID ? '0 (in-process)' : '3 (metrics, diary, rewardTracker)'}</span></div>
+<div class="stat"><span class="stat-label">Workers</span><span class="stat-value">0 (in-process)</span></div>
 <div class="stat"><span class="stat-label">Platform</span><span class="stat-value">render-free-plan${IS_RENDER ? '' : ' (local)'}</span></div>
 <h2>Links</h2>
 <div class="stat"><span class="stat-label">Dashboard</span><span class="stat-value"><a href="${getDashboardLink(port)}">Open Dashboard</a></span></div>
@@ -1413,39 +1077,6 @@ server.listen(PORT, '0.0.0.0', () => {
   log(`Dashboard available at http://localhost:${PORT}/dashboard`, 'INFO', 'render-free-plan');
   const t = memoryMode.getThresholds();
   log(`Mode: ${memoryMode.getMode()} | Memory: warn=${t.warnHeapMB}MB restart=${t.restartHeapMB}MB rss_hard=${t.rssHardLimitMB}MB gc=${t.gcIntervalMs / 1000}s`, 'INFO', 'render-free-plan');
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // TASK 131 (2026-10-28): NOW that the HTTP server is listening, load the
-  // orchestrator. This is the heavy synchronous load (cycle-orchestrator +
-  // cycle-cycle-manager + browser + providers + auth + stateMachine + ~80
-  // subsystem modules).
-  //
-  // The load is synchronous and will block the event loop for 5-15s. During
-  // that block, /health requests from Render's HEALTHCHECK will queue up.
-  // Render's HEALTHCHECK has `--start-period=300s --retries=5`, so it
-  // tolerates 5 minutes of failed health checks during startup. After the
-  // load completes, /health will start responding 200 again.
-  //
-  // This block runs INSIDE the listen callback, which means:
-  //   - The TCP socket is already accepting connections (Render sees the port as open).
-  //   - Render's first HEALTHCHECK may already be in-flight, waiting for a response.
-  //   - Once the load completes, the queued /health requests will be processed.
-  //
-  // If the load OOMs the process, _loadOrchestrator() calls process.exit(137)
-  // → Render auto-restarts. The lazy providers/sharp patches should make this
-  // load lighter than before, ideally fitting within the 384MB V8 budget.
-  // ═══════════════════════════════════════════════════════════════════════
-  log('HTTP server listening — loading orchestrator now (deferred from boot phase)', 'INFO', 'render-free-plan');
-  try {
-    _loadOrchestrator();
-  } catch (e: any) {
-    log(`_loadOrchestrator threw synchronously: ${e.message}`, 'ERROR', 'render-free-plan');
-    // _loadOrchestrator already called process.exit(137) in its catch block,
-    // but if it threw BEFORE reaching the catch (shouldn't happen), exit here.
-    try { clearInterval(_earlyOomInterval); } catch { /* ignore */ }
-    const _or2 = (process as any)._originalExit || process.exit.bind(process);
-    _or2(137);
-  }
 });
 
 // ── Heartbeat file ──
@@ -1674,5 +1305,5 @@ try {
     log('Daemon crashed — will restart on next cycle iteration', 'ERROR', 'render-free-plan');
   });
 
-  log(`MathU Bot v6 — ${IS_RENDER ? 'Render Free Plan' : 'GitHub Actions'} fully started (all features${IS_RENDER ? ', no workers' : ', 3 worker threads'})`, 'INFO', 'render-free-plan');
+  log('MathU Bot v6 — Render Free Plan fully started (all features, no workers)', 'INFO', 'render-free-plan');
 })();
