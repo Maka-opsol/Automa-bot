@@ -793,3 +793,5 @@ async function _executeActionInner(page: any, action: any) {
   // Track progress
   progressTracker.trackProgress?.({ action: action.actionType, state: action.currentState });
 }
+
+module.exports = { executeAction, _injectDependencies };
