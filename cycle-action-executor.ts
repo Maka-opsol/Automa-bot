@@ -767,8 +767,29 @@ async function _executeActionInner(page: any, action: any) {
     await sleep(CONFIG.BETWEEN_STEPS_MS * wm);
   }
 
+  // ─── Normalcy: record the action for pace / sequence naturalness scoring ───
+  // Best-effort: never crashes action execution. Maps the codebase's 16
+  // action types → normalcy's 9 record types. Records page URL when
+  // available so normalcy can also track page-sequence naturalness.
+  try {
+    const normalcy = require('./normalcy');
+    if (typeof normalcy.recordAction === 'function') {
+      const _map: Record<string, 'click'|'submit'|'navigate'|'scroll'|'input'|'screenshot'|'vision_call'|'wait'|'other'> = {
+        click: 'click', flutter_tap: 'click', double_click: 'click', hover: 'click', long_press: 'click',
+        type_text: 'input', input_email: 'input', input_password: 'input', keypad_input: 'submit', select_option: 'input',
+        flutter_swipe: 'scroll', drag: 'scroll', scroll_vertical: 'scroll', scroll_horizontal: 'scroll',
+        press_key: 'other',
+        navigate_back: 'navigate', reload_browser: 'navigate',
+        wait: 'wait',
+        request_human_intervention: 'other',
+      };
+      const mapped = _map[action.actionType] || 'other';
+      let pageUrl: string | undefined;
+      try { pageUrl = page?.url?.(); } catch { /* page may not be available */ }
+      normalcy.recordAction(mapped, pageUrl);
+    }
+  } catch { /* normalcy must never crash action execution */ }
+
   // Track progress
   progressTracker.trackProgress?.({ action: action.actionType, state: action.currentState });
 }
-
-module.exports = { executeAction, _injectDependencies };
