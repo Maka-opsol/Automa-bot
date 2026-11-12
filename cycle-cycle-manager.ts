@@ -1,3 +1,4 @@
+
 'use strict';
 
 const fs = require('fs');
@@ -1149,7 +1150,18 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
         if (cycleSleepMs > 0) {
           const { sleep } = require('./utils-sleep');
           log(`Degradation level ${degradationLevelName}: sleeping ${cycleSleepMs}ms between cycles`, 'INFO', 'cycle');
-          await sleep(cycleSleepMs);
+          // Stealth-aware jitter: scale sleep by current stealth level.
+          // At MAXIMUM stealth, jitterSleep returns ~2x base + 500ms floor with
+          // wider spread — makes the inter-cycle gap look less robotic.
+          try {
+            const stealth = getDep('stealthOperations');
+            if (stealth?.jitterSleep) {
+              const slept = await stealth.jitterSleep(cycleSleepMs, 0.3);
+              log(`Stealth-aware inter-cycle sleep: ${slept}ms (base ${cycleSleepMs}ms)`, 'DEBUG', 'cycle');
+            } else {
+              await sleep(cycleSleepMs);
+            }
+          } catch { await sleep(cycleSleepMs); /* stealth unavailable */ }
         }
         // DORMANT level: skip AI-dependent parts but still run pixel-only
         // Pixel fallback and explorer cost no API quota and can make progress
@@ -1360,7 +1372,12 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       // Flutter Web loads ~150MB into the shared V8 heap (Chromium --single-process).
       // 66MB baseline + 150MB Flutter = 216MB. Allow up to 300MB heap / 430MB RSS
       // before bailing — gives 84MB headroom below V8's 384MB limit.
-      if (_preNavHeapMB >= 300 || _preNavRSSMB >= 430) {
+      //
+      // BUGFIX (2026-10-26): V8 max-old-space-size is now 384MB (was 3584 → OOM, 256 → too low).
+      // With 384MB V8 heap, thresholds give room for Flutter load:
+      //   - Pre-nav heap > 200MB → bail (leaves ~184MB for Flutter)
+      //   - Pre-nav RSS > 400MB → bail (leaves ~112MB headroom)
+      if (_preNavHeapMB >= 200 || _preNavRSSMB >= 400) {
         log(`FATAL: Memory too high before navigation (heap=${_preNavHeapMB.toFixed(0)}MB, rss=${_preNavRSSMB.toFixed(0)}MB). Exiting for clean restart.`, 'FATAL', 'cycle');
         try { require('./survival-restart-guardian').preserveBeforeExit?.('pre_nav_oom').catch(() => {}); } catch {}
         const origExit = (process as any)._originalExit || process.exit.bind(process);
@@ -1459,6 +1476,9 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           _initialNavOk = true;
           _navAttemptOutcomes.push({ attempt: _navAttempt, mode: _mode, ok: true });
           log(`Navigation attempt ${_navAttempt} succeeded [${_mode}].`, 'INFO', 'cycle');
+          // Normalcy: record the page visit so it can score page-sequence
+          // naturalness. Best-effort — never blocks navigation.
+          try { getDep('normalcy')?.recordPageVisit?.(targetUrl); } catch { /* normalcy unavailable */ }
         } catch (navErr: any) {
           const _errMsg = navErr?.message || String(navErr);
           // Categorize the error for dashboard + decision-making
@@ -1529,63 +1549,14 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       const _postNavHeapMB = process.memoryUsage().heapUsed / 1024 / 1024;
       const _postNavRSSMB = process.memoryUsage().rss / 1024 / 1024;
       log(`Post-navigation memory: heap=${_postNavHeapMB.toFixed(0)}MB, rss=${_postNavRSSMB.toFixed(0)}MB`, 'INFO', 'cycle');
-      if (_postNavHeapMB >= 320 || _postNavRSSMB >= 440) {
+      // BUGFIX (2026-10-26): With 384MB V8 limit, post-nav heap > 320MB → bail.
+      // RSS > 430MB → bail (leaves 82MB headroom in 512MB container).
+      if (_postNavHeapMB >= 320 || _postNavRSSMB >= 430) {
         log(`FATAL: Memory too high after navigation (heap=${_postNavHeapMB.toFixed(0)}MB, rss=${_postNavRSSMB.toFixed(0)}MB). Exiting for clean restart.`, 'FATAL', 'cycle');
         try { require('./survival-restart-guardian').preserveBeforeExit?.('post_nav_oom').catch(() => {}); } catch {}
         const origExit = (process as any)._originalExit || process.exit.bind(process);
         origExit(137);
       }
-
-      // ─── TASK 150 (2026-10-30): Extract DOM text after navigation ───
-      // With CanvasKit blocked (Task 150), the canvas is blank but Flutter's
-      // Dart code should still create DOM semantics nodes. Extract text from
-      // the DOM to see if the Flutter app loaded and what content is visible.
-      //
-      // TASK 151 (2026-10-30): CanvasKit is now served as a Proxy mock (not
-      // null). Flutter's widget tree SHOULD build. But it takes time —
-      // main.dart.js is 6.3MB and needs to parse + execute. We extract DOM
-      // text immediately AND schedule a delayed extraction (15s) to catch
-      // semantics nodes created after Flutter finishes initializing.
-      try {
-        const browser = require('./browser');
-        if (typeof browser.extractDomText === 'function') {
-          log('[TASK151] Extracting DOM text after navigation (immediate)...', 'INFO', 'cycle');
-          const domResult = await browser.extractDomText(page);
-          if (domResult.text.length > 0) {
-            log(`[TASK151] ✅ DOM text extracted (immediate): ${domResult.nodeCount} nodes, ${domResult.text.length} chars`, 'INFO', 'cycle');
-          } else {
-            log(`[TASK151] No DOM text yet (immediate) — Flutter still initializing. hasCanvas=${domResult.hasCanvas}. Will retry in 15s...`, 'WARN', 'cycle');
-          }
-          // Schedule a delayed extraction — Flutter needs 10-30s to build widget tree
-          setTimeout(async () => {
-            try {
-              log('[TASK151] Extracting DOM text (delayed 15s)...', 'INFO', 'cycle');
-              const domResult2 = await browser.extractDomText(page);
-              if (domResult2.text.length > 0) {
-                log(`[TASK151] ✅ DOM text extracted (delayed): ${domResult2.nodeCount} nodes, ${domResult2.text.length} chars`, 'INFO', 'cycle');
-              } else {
-                log(`[TASK151] Still no DOM text (delayed 15s). hasFlutterSemantics=${domResult2.hasFlutterSemantics}, hasCanvas=${domResult2.hasCanvas}. Body preview: ${domResult2.bodyHTML.substring(0, 200)}`, 'WARN', 'cycle');
-              }
-            } catch (e2: any) {
-              log(`[TASK151] Delayed DOM extraction failed: ${e2?.message}`, 'WARN', 'cycle');
-            }
-          }, 15000).unref?.();
-          // Also schedule a 30s extraction as final attempt
-          setTimeout(async () => {
-            try {
-              log('[TASK151] Extracting DOM text (delayed 30s)...', 'INFO', 'cycle');
-              const domResult3 = await browser.extractDomText(page);
-              if (domResult3.text.length > 0) {
-                log(`[TASK151] ✅ DOM text extracted (30s): ${domResult3.nodeCount} nodes, ${domResult3.text.length} chars`, 'INFO', 'cycle');
-                log(`[TASK151] DOM text: ${domResult3.text.substring(0, 1000).replace(/\n/g, ' | ')}`, 'INFO', 'cycle');
-              }
-            } catch {}
-          }, 30000).unref?.();
-        }
-      } catch (e: any) {
-        log(`[TASK151] DOM text extraction skipped: ${e?.message || e}`, 'WARN', 'cycle');
-      }
-      // ─── End Task 150/151 DOM text extraction ───
 
       log(`Fresh start: waiting for Flutter canvas to render...`, 'INFO', 'cycle');
       // TASK 123 (2026-10-22): Increased from 20s to 60s.
@@ -1857,6 +1828,56 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
 
     while (questionsCompleted < CONFIG.MAX_QUESTIONS && !stopRequested) {
       try { fs.writeFileSync(CONFIG.HEARTBEAT_FILE, String(Date.now())); } catch (_e: any) { /* best-effort heartbeat write */ }
+
+      // ─── Normalcy: ask for the next human-like behavior ────────────────
+      // Best-effort: never crashes the cycle. High-confidence suggestions
+      // (>=0.7) that pause the bot are respected inline; low-confidence
+      // ones are logged but ignored. The cycle's actual work continues
+      // normally when normalcy says 'continue'.
+      try {
+        const normalcy = getDep('normalcy');
+        if (normalcy?.suggestBehavior) {
+          const suggestion = normalcy.suggestBehavior();
+          if (suggestion?.confidence >= 0.7) {
+            const k = suggestion.kind;
+            if (k === 'take_break') {
+              const dur = Math.min(suggestion.durationMs || 5 * 60 * 1000, 60_000);
+              log(`Normalcy: taking ${Math.round(dur / 1000)}s break — ${suggestion.reason}`, 'INFO', 'cycle');
+              try { normalcy.startBreak?.(); } catch {}
+              await new Promise(r => setTimeout(r, dur));
+              continue;
+            } else if (k === 'end_session') {
+              log(`Normalcy: end-session suggested — ${suggestion.reason}`, 'INFO', 'cycle');
+              break;
+            } else if (k === 'idle') {
+              const dur = Math.min(suggestion.durationMs || 15_000, 30_000);
+              log(`Normalcy: idling ${dur}ms — ${suggestion.reason}`, 'DEBUG', 'cycle');
+              // startIdle() was already called by suggestBehavior when it
+              // returned 'idle' — we just wait, then end the idle.
+              await new Promise(r => setTimeout(r, dur));
+              try { normalcy.endIdle?.(); } catch {}
+            } else if (k === 'slow_down') {
+              const stealth = getDep('stealthOperations');
+              if (stealth?.jitterSleep) {
+                await stealth.jitterSleep(suggestion.durationMs || 2000, 0.4);
+              } else {
+                const { sleep } = require('./utils-sleep');
+                await sleep(suggestion.durationMs || 2000);
+              }
+            }
+          }
+        }
+      } catch { /* normalcy must never crash the cycle */ }
+
+      // ─── Stealth: small jitter at the top of each iteration ────────────
+      // When elevated/maximum, add a small randomized pause to break up
+      // the action rhythm. NORMAL level = no extra pause (fast path).
+      try {
+        const stealth = getDep('stealthOperations');
+        if (stealth?.jitterSleep && stealth.isElevated?.()) {
+          await stealth.jitterSleep(500, 0.5);
+        }
+      } catch { /* stealth unavailable */ }
 
       // ─────────────────────────────────────────────────────────────────────
       // HUMAN INTERVENTION PAUSE (Task 35, 2026-09-09)
