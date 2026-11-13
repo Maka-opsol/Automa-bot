@@ -264,6 +264,24 @@ async function callChatCompletionWithRollback(
       }
     }
 
+    // Stealth signal — report provider HTTP failure for risk scoring.
+    // Cheap and best-effort: never breaks the provider call. The signal
+    // decays on its own TTL inside stealth-operations.
+    try {
+      const stealth = require('./stealth-operations');
+      if (stealth?.reportSignal) {
+        const _status = response.status;
+        const _detail = `${providerName} HTTP ${_status}: ${errorText.slice(0, 120)}`;
+        if (_status === 429) {
+          stealth.reportSignal('rate_limited', `providers:${providerName}`, _detail, 40);
+        } else if (_status === 403 || _status === 401) {
+          stealth.reportSignal('http_block', `providers:${providerName}`, _detail, 60);
+        } else if (_status >= 500) {
+          stealth.reportSignal('http_block', `providers:${providerName}`, _detail, 20);
+        }
+      }
+    } catch { /* stealth unavailable — never break provider call */ }
+
     throw new Error(`HTTP_ERROR_${response.status}: ${errorText}`);
   }
 
@@ -762,6 +780,14 @@ module.exports = {
   safeCall,
   coalescer,
   callChatCompletionWithRollback,
+  // Backward-compat alias: callers built before the v2 rename (e.g.
+  // services-model-evolution-v2.ts, self-documenting-diary.ts,
+  // meta-learner-reflection.ts, critical-patch-consensus.ts,
+  // protocol-chameleon.ts, provider-quota-bargain.ts) still look up
+  // `callChatCompletion`. Without this alias they get `undefined` and
+  // silently no-op every provider call — which is what caused the
+  // "callChatCompletion not available for model testing" log storm.
+  callChatCompletion: callChatCompletionWithRollback,
   fetchWithTimeout,
   sanitizeErrorText,
   getFallbackModels,
