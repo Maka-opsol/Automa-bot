@@ -171,6 +171,16 @@ async function gracefulShutdown(signal: string) {
   } catch {
     try { closeDatabase(); } catch { /* best effort */ }
   }
+  // Flush remaining logs to GitHub before exiting (best-effort, 5s timeout).
+  try {
+    const githubShipper = require('./github-log-shipper');
+    if (typeof githubShipper.flushNow === 'function') {
+      await Promise.race([
+        githubShipper.flushNow(),
+        new Promise(r => setTimeout(r, 5000)),
+      ]);
+    }
+  } catch { /* best effort — never block shutdown */ }
   originalExit(0);
 }
 
@@ -439,7 +449,14 @@ setInterval(() => checkAndRunEvolution().catch(() => {}), 6 * 60 * 60 * 1000).un
 // ── Template cache pruning ──
 const { pruneTemplateCache } = container.get('database');
 setTimeout(() => { pruneTemplateCache(); }, 3600000);
-setInterval(() => { pruneTemplateCache(); }, 30 * 24 * 60 * 60 * 1000).unref();
+// FIX: 30-day interval (30 * 24 * 60 * 60 * 1000 = 2,592,000,000 ms)
+// exceeds Node's setTimeout/setInterval 32-bit signed-integer limit
+// (2^31 - 1 = 2,147,483,647 ms ≈ 24.8 days). Node silently coerces
+// the overflow to 1ms, firing the timer ~30 billion times more often
+// than intended (and emitting TimeoutOverflowWarning on startup).
+// Use a 24-day interval instead — safely under the limit, and pruning
+// once a month vs once every 24 days makes no practical difference.
+setInterval(() => { pruneTemplateCache(); }, 24 * 24 * 60 * 60 * 1000).unref();
 
 // ── Autonomous features (non-critical) ──
 container.get('reflection', { required: false })?.startReflectionScheduler?.();
