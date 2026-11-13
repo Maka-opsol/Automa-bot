@@ -205,6 +205,22 @@ async function checkIpLocation() {
       const countryMatch = result.country.toLowerCase().includes((CONFIG.EXPECTED_IP_COUNTRY || '').toLowerCase());
       if (!cityMatch || !countryMatch) {
         log(`IP location mismatch! Expected "${CONFIG.EXPECTED_IP_CITY}, ${CONFIG.EXPECTED_IP_COUNTRY}" but got "${result.city}, ${result.country}"`, 'WARN', 'ip-check');
+        // Stealth signal: a wrong-region IP is a strong suspicion indicator.
+        // The platform may detect that the bot's claimed location doesn't
+        // match its real IP. Push weight 50 so a single mismatch bumps stealth
+        // to ELEVATED, with a long TTL (1h) since the IP won't change without
+        // a proxy rotation. Best-effort — never breaks IP check.
+        try {
+          const stealth = require('./stealth-operations');
+          if (stealth?.reportSignal) {
+            stealth.reportSignal(
+              'ip_block', 'services-ip-check',
+              `IP location mismatch: expected ${CONFIG.EXPECTED_IP_CITY}, ${CONFIG.EXPECTED_IP_COUNTRY} but got ${result.city}, ${result.country} (IP ${result.ip})`,
+              50,                       // medium-high weight — single event escalates to ELEVATED
+              60 * 60 * 1000            // 1h TTL (proxy rotation is the only fix; that takes time)
+            );
+          }
+        } catch { /* stealth unavailable */ }
         if (CONFIG.ALERT_ON_ERROR) {
           const { sendAlert } = require('./alerting');
           // TASK 61: Removed alert — routine event.
