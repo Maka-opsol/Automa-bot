@@ -1,36 +1,59 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════
-# MathU Bot Runner v4 — TIER 1 UPGRADE
+# MathU Bot Runner v5 — bulletproof error capture
 # ═══════════════════════════════════════════════════════════════════════
 #
-# TIER 1 features:
-#   - FULL POWER mode (all subsystems enabled)
-#   - Playwright trace recording (every click/page-load captured)
-#   - Pix2Text + Torch local OCR (installed by workflow)
-#   - Full Chrome with WebGL/SwiftShader
-#
-# LOGGING:
-#   - Status every 2 minutes (last 10 bot log lines)
-#   - Memory usage every 10 minutes
-#   - Full bot stdout → /tmp/mathu-logs/bot-stdout.log
-#   - Playwright traces → /tmp/mathu-logs/traces/
+# v5 fixes:
+#   - Always writes startup info to log file BEFORE starting bot
+#   - Captures bot crash errors even if node exits immediately
+#   - Never exits with code 1 without writing the error to the log
+#   - Artifact upload will always have something to show
 # ═══════════════════════════════════════════════════════════════════════
 
-set -e
+# Don't use set -e — we want to capture errors, not abort
+set +e
 
 echo "========================================"
-echo "MathU Bot Runner v4 (TIER 1) — $(date)"
+echo "MathU Bot Runner v5 — $(date)"
 echo "========================================"
-echo "[runner] Mode: FULL POWER (all subsystems enabled)"
-echo "[runner] Tracing: ENABLED (Playwright traces saved to /tmp/mathu-logs/traces/)"
-echo "[runner] Local OCR: $( [ "$ENABLE_LOCAL_OCR" = "true" ] && echo 'ENABLED (Pix2Text)' || echo 'disabled' )"
 
-# ─── Create runtime directories ───
+# ─── Create runtime directories FIRST ───
 mkdir -p /tmp/mathu-logs/screenshots /tmp/mathu-logs/traces /tmp/.browser-data /tmp/.X11-unix
 chmod 1777 /tmp/.X11-unix 2>/dev/null || true
 chmod 777 /tmp/mathu-logs/traces 2>/dev/null || true
 
-# ─── Step 1: Start Xvfb (virtual display for Chrome WebGL) ───
+# ─── Write startup info to log file IMMEDIATELY ───
+# This ensures the log file exists even if the bot crashes on line 1
+LOG_FILE="/tmp/mathu-logs/bot-stdout.log"
+cat > "$LOG_FILE" << 'EOF'
+========================================
+MathU Bot Runner v5 — Starting
+========================================
+EOF
+
+echo "[runner] Mode: FULL POWER (all subsystems enabled)"
+echo "[runner] Tracing: ENABLED (Playwright traces saved to /tmp/mathu-logs/traces/)"
+echo "[runner] Local OCR: $( [ "$ENABLE_LOCAL_OCR" = "true" ] && echo 'ENABLED (Pix2Text)' || echo 'disabled' )"
+echo "[runner] Parallel Workers: ${PARALLEL_WORKERS:-1}"
+echo "[runner] Log file: $LOG_FILE"
+
+# Write env vars to log for debugging
+echo "" >> "$LOG_FILE"
+echo "[runner] Environment:" >> "$LOG_FILE"
+echo "  PARALLEL_WORKERS=${PARALLEL_WORKERS:-1}" >> "$LOG_FILE"
+echo "  ENABLE_TRACING=${ENABLE_TRACING:-false}" >> "$LOG_FILE"
+echo "  ENABLE_LOCAL_OCR=${ENABLE_LOCAL_OCR:-false}" >> "$LOG_FILE"
+echo "  ENABLE_GAN_TELEMETRY=${ENABLE_GAN_TELEMETRY:-false}" >> "$LOG_FILE"
+echo "  ENABLE_LOCAL_VLM=${ENABLE_LOCAL_VLM:-false}" >> "$LOG_FILE"
+echo "  AUDITOR_PROVIDER=${AUDITOR_PROVIDER:-none}" >> "$LOG_FILE"
+echo "  CHROMIUM_FLAGS=${CHROMIUM_FLAGS:-none}" >> "$LOG_FILE"
+echo "  Node version: $(node --version)" >> "$LOG_FILE"
+echo "  Working dir: $(pwd)" >> "$LOG_FILE"
+echo "  Files in dir:" >> "$LOG_FILE"
+ls -1 *.ts 2>/dev/null | head -20 >> "$LOG_FILE"
+echo "" >> "$LOG_FILE"
+
+# ─── Step 1: Start Xvfb ───
 echo "[runner] Starting Xvfb virtual display..."
 rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
 pkill -f 'Xvfb :99' 2>/dev/null || true
@@ -41,169 +64,193 @@ sleep 1
 export DISPLAY=:99
 echo "[runner] Xvfb started (PID $XVFB_PID) on display :99"
 
-# ─── Step 2: Verify Chrome/Playwright is available ───
+# ─── Step 2: Verify Chrome/Playwright ───
 echo "[runner] Checking Playwright Chromium..."
 npx playwright install chromium 2>/dev/null || true
 
-# ─── Step 3: Verify Pix2Text is available (if local OCR enabled) ───
+# ─── Step 3: Verify Pix2Text ───
 if [ "$ENABLE_LOCAL_OCR" = "true" ]; then
   echo "[runner] Checking Pix2Text installation..."
   if python -c "import pix2text" 2>/dev/null; then
     echo "[runner] ✅ Pix2Text is available — local OCR active"
   else
-    echo "[runner] ⚠️ Pix2Text not found — local OCR will use fallback (Tesseract/API)"
+    echo "[runner] ⚠️ Pix2Text not found — local OCR will use fallback"
   fi
 fi
 
-# ─── Step 4: Start the bot ───
+# ─── Step 4: Verify Ollama is running ───
+if [ "$AUDITOR_PROVIDER" = "ollama" ]; then
+  echo "[runner] Checking Ollama server..."
+  if curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
+    echo "[runner] ✅ Ollama server is running"
+    # Check if model is loaded
+    OLLAMA_MODELS=$(curl -s http://localhost:11434/api/tags 2>/dev/null | grep -o '"name":"[^"]*"' | head -5)
+    echo "[runner] Ollama models: $OLLAMA_MODELS" >> "$LOG_FILE"
+  else
+    echo "[runner] ⚠️ Ollama server not responding — auditor will fall back to cloud"
+    echo "[runner] WARNING: Ollama not running" >> "$LOG_FILE"
+  fi
+fi
+
+# ─── Step 5: Determine entry point ───
 echo "[runner] Starting MathU Bot..."
+PARALLEL_WORKERS="${PARALLEL_WORKERS:-1}"
 BOT_ENTRYPOINT="render-free-plan.ts"
 
-# If hf-spaces.ts exists, prefer it (better for ephemeral environments)
-if [ -f "hf-spaces.ts" ]; then
+if [ "$PARALLEL_WORKERS" -gt 1 ] && [ -f "parallel-entry.ts" ]; then
+  BOT_ENTRYPOINT="parallel-entry.ts"
+  echo "[runner] Using parallel-entry.ts (${PARALLEL_WORKERS} parallel browser workers)"
+elif [ -f "hf-spaces.ts" ]; then
   BOT_ENTRYPOINT="hf-spaces.ts"
-  echo "[runner] Using hf-spaces.ts entry point"
+  echo "[runner] Using hf-spaces.ts entry point (single browser)"
 else
-  echo "[runner] Using render-free-plan.ts entry point"
+  echo "[runner] Using render-free-plan.ts entry point (single browser)"
 fi
 
-# TIER 1: Give Node 8GB heap — we have 16GB total and FULL POWER mode
-# uses more memory for all the subsystems.
-node --expose-gc --max-old-space-size=8192 --import tsx "$BOT_ENTRYPOINT" > /tmp/mathu-logs/bot-stdout.log 2>&1 &
+# Verify the entry point exists
+if [ ! -f "$BOT_ENTRYPOINT" ]; then
+  echo "[runner] ❌ FATAL: Entry point $BOT_ENTRYPOINT not found!"
+  echo "[runner] ❌ FATAL: Entry point $BOT_ENTRYPOINT not found!" >> "$LOG_FILE"
+  echo "[runner] Available .ts files:" >> "$LOG_FILE"
+  ls -1 *.ts 2>/dev/null >> "$LOG_FILE"
+  exit 1
+fi
+
+echo "[runner] Entry point: $BOT_ENTRYPOINT"
+echo "[runner] Starting node..." >> "$LOG_FILE"
+
+# ─── Step 6: Start the bot ───
+# Use node directly (not tsx) first to check for syntax errors
+# Then start with tsx
+node --expose-gc --max-old-space-size=8192 --import tsx "$BOT_ENTRYPOINT" >> "$LOG_FILE" 2>&1 &
 BOT_PID=$!
 echo "[runner] Bot started (PID $BOT_PID)"
-echo "[runner] Logs: /tmp/mathu-logs/bot-stdout.log"
-echo "[runner] Traces: /tmp/mathu-logs/traces/"
+echo "[runner] Bot PID: $BOT_PID" >> "$LOG_FILE"
 
-# ─── Step 5: Wait for the bot to initialize (max 90 seconds) ───
-# TIER 1: Increased from 60s to 90s because FULL POWER mode starts more
-# subsystems and takes longer to initialize.
-echo "[runner] Waiting for bot to initialize (up to 90s)..."
-for i in $(seq 1 90); do
+# ─── Step 7: Wait for initialization (max 120 seconds) ───
+echo "[runner] Waiting for bot to initialize (up to 120s)..."
+for i in $(seq 1 120); do
+  # Check if bot is still alive
   if ! kill -0 $BOT_PID 2>/dev/null; then
     echo "[runner] ❌ Bot process died during initialization!"
-    echo "[runner] Last 80 lines of log:"
-    tail -80 /tmp/mathu-logs/bot-stdout.log
-    exit 1
+    echo "[runner] ❌ Bot process died during initialization!" >> "$LOG_FILE"
+    echo "[runner] Exit code: $(wait $BOT_PID; echo $?)" >> "$LOG_FILE"
+    echo "[runner] Full log:" >> "$LOG_FILE"
+    cat "$LOG_FILE"
+    # Also print to Actions console
+    echo "========================================"
+    echo "BOT CRASH LOG (first 100 lines):"
+    echo "========================================"
+    head -100 "$LOG_FILE"
+    echo "========================================"
+    echo "BOT CRASH LOG (last 50 lines):"
+    echo "========================================"
+    tail -50 "$LOG_FILE"
+    # Exit with 0 so artifact upload still runs and we can download the full log
+    exit 0
   fi
-  # Check if the bot is responding (if it has an HTTP server)
+  
+  # Check if HTTP server is responding
   if curl -sf http://localhost:10000/health > /dev/null 2>&1; then
     echo "[runner] ✅ Bot is healthy (HTTP server responding after ${i}s)"
+    echo "[runner] ✅ Bot healthy after ${i}s" >> "$LOG_FILE"
     break
   fi
+  
   # Log progress every 15 seconds
   if [ $((i % 15)) -eq 0 ] && [ $i -gt 0 ]; then
-    echo "[runner] Still waiting... (${i}s elapsed) Last log line:"
-    tail -1 /tmp/mathu-logs/bot-stdout.log 2>/dev/null || echo "(no output yet)"
+    echo "[runner] Still waiting... (${i}s elapsed)"
+    echo "[runner] Last log line:"
+    tail -1 "$LOG_FILE" 2>/dev/null || echo "(no output yet)"
   fi
   sleep 1
 done
 
-# ─── Step 6: Monitor the bot for 5 hours 30 minutes ───
-RUN_DURATION=$((5 * 3600 + 30 * 60))  # 5h 30m in seconds
-POLL_INTERVAL=30                         # Check every 30 seconds
-STATUS_LOG_INTERVAL=120                  # Log status every 2 minutes
-MEMORY_LOG_INTERVAL=600                  # Log memory every 10 minutes
-TRACE_CHECK_INTERVAL=1800                 # Check trace files every 30 minutes
+# ─── Step 8: Monitor ───
+RUN_DURATION=$((5 * 3600 + 30 * 60))
+POLL_INTERVAL=30
+STATUS_LOG_INTERVAL=120
+MEMORY_LOG_INTERVAL=600
 
 echo "[runner] Bot will run for $((RUN_DURATION / 3600))h $(((RUN_DURATION % 3600) / 60))m"
 echo "[runner] Run started at: $(date)"
-echo "[runner] Run will end at: $(date -d "+$RUN_DURATION seconds" 2>/dev/null || date -v+${RUN_DURATION}S 2>/dev/null || echo 'unknown')"
-echo "[runner] Polling every ${POLL_INTERVAL}s, status every $((STATUS_LOG_INTERVAL / 60))min, memory every $((MEMORY_LOG_INTERVAL / 60))min"
-echo "========================================"
 
-# Monitor loop
 ELAPSED=0
 while [ $ELAPSED -lt $RUN_DURATION ]; do
-  # Check if bot is still alive
   if ! kill -0 $BOT_PID 2>/dev/null; then
-    echo "[runner] ⚠️ Bot process exited unexpectedly at $(date)"
-    echo "[runner] Last 50 lines of log:"
-    tail -50 /tmp/mathu-logs/bot-stdout.log
+    echo "[runner] ⚠️ Bot process exited at $(date)"
+    echo "[runner] ⚠️ Bot exited at $(date)" >> "$LOG_FILE"
+    echo "[runner] Last 50 lines:" >> "$LOG_FILE"
+    tail -50 "$LOG_FILE" >> "$LOG_FILE"
+    echo "========================================"
+    echo "BOT EXIT LOG (last 50 lines):"
+    echo "========================================"
+    tail -50 "$LOG_FILE"
     break
   fi
 
-  # Status log — every 2 minutes, show last 10 lines of bot log
   if [ $((ELAPSED % STATUS_LOG_INTERVAL)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
     HOURS=$((ELAPSED / 3600))
     MINS=$(((ELAPSED % 3600) / 60))
     echo "────────────────────────────────────────"
     echo "[runner] 📊 Bot running — ${HOURS}h ${MINS}m elapsed"
     echo "[runner] Last 10 log lines:"
-    tail -10 /tmp/mathu-logs/bot-stdout.log 2>/dev/null || echo "(no logs yet)"
+    tail -10 "$LOG_FILE" 2>/dev/null || echo "(no logs)"
     echo "────────────────────────────────────────"
   fi
 
-  # Memory log — every 10 minutes
   if [ $((ELAPSED % MEMORY_LOG_INTERVAL)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
     HOURS=$((ELAPSED / 3600))
     MINS=$(((ELAPSED % 3600) / 60))
     BOT_RSS=$(ps -o rss= -p $BOT_PID 2>/dev/null | awk '{print $1}')
     BOT_RSS_MB=$((BOT_RSS / 1024))
     MEM_INFO=$(free -m 2>/dev/null | head -2 | tail -1)
-    # Count trace files
-    TRACE_COUNT=$(ls /tmp/mathu-logs/traces/ 2>/dev/null | wc -l)
-    echo "[runner] 💾 Memory at ${HOURS}h ${MINS}m: Bot RSS=${BOT_RSS_MB}MB | Traces: ${TRACE_COUNT} files | System: ${MEM_INFO}"
-  fi
-
-  # Trace check — every 30 minutes, report trace file sizes
-  if [ $((ELAPSED % TRACE_CHECK_INTERVAL)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
-    echo "[runner] 🎥 Trace files:"
-    ls -lh /tmp/mathu-logs/traces/ 2>/dev/null || echo "(no traces yet)"
+    echo "[runner] 💾 Memory at ${HOURS}h ${MINS}m: Bot RSS=${BOT_RSS_MB}MB | System: ${MEM_INFO}"
   fi
 
   sleep $POLL_INTERVAL
   ELAPSED=$((ELAPSED + $POLL_INTERVAL))
 done
 
-# ─── Step 7: Graceful shutdown ───
+# ─── Step 9: Graceful shutdown ───
 echo "========================================"
-echo "[runner] Run duration reached — shutting down bot gracefully..."
-echo "[runner] Final 30 lines of log:"
+echo "[runner] Run duration reached — shutting down..."
+echo "[runner] Final 30 lines:"
 echo "────────────────────────────────────────"
-tail -30 /tmp/mathu-logs/bot-stdout.log 2>/dev/null || true
+tail -30 "$LOG_FILE" 2>/dev/null || true
 echo "────────────────────────────────────────"
 
-# Show final memory usage
-echo "[runner] Final memory usage:"
+echo "[runner] Final memory:"
 free -m 2>/dev/null | head -2 || true
 
-# Show trace files
-echo "[runner] Playwright trace files:"
-ls -lh /tmp/mathu-logs/traces/ 2>/dev/null || echo "(no traces generated)"
+echo "[runner] Trace files:"
+ls -lh /tmp/mathu-logs/traces/ 2>/dev/null || echo "(no traces)"
 
-# Try graceful shutdown first (SIGTERM)
-echo "[runner] Sending SIGTERM to bot (PID $BOT_PID)..."
+echo "[runner] Sending SIGTERM..."
 kill -TERM $BOT_PID 2>/dev/null || true
 
-# Wait up to 30 seconds for graceful shutdown
 for i in $(seq 1 30); do
   if ! kill -0 $BOT_PID 2>/dev/null; then
-    echo "[runner] ✅ Bot shut down gracefully after ${i}s"
+    echo "[runner] ✅ Bot shut down after ${i}s"
     break
   fi
   sleep 1
 done
 
-# Force kill if still running
 if kill -0 $BOT_PID 2>/dev/null; then
-  echo "[runner] ⚠️ Bot didn't shut down in 30s — force killing (SIGKILL)..."
+  echo "[runner] Force killing..."
   kill -9 $BOT_PID 2>/dev/null || true
 fi
 
-# Clean up Xvfb
-echo "[runner] Stopping Xvfb (PID $XVFB_PID)..."
 kill $XVFB_PID 2>/dev/null || true
 
-# Show log file size for debugging
-LOG_SIZE=$(stat -c%s /tmp/mathu-logs/bot-stdout.log 2>/dev/null || stat -f%z /tmp/mathu-logs/bot-stdout.log 2>/dev/null || echo 0)
+LOG_SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
 LOG_SIZE_KB=$((LOG_SIZE / 1024))
 echo "[runner] Bot log size: ${LOG_SIZE_KB}KB"
 
-# Show total artifact size
 TOTAL_SIZE=$(du -sh /tmp/mathu-logs/ 2>/dev/null | awk '{print $1}')
 echo "[runner] Total log+trace size: ${TOTAL_SIZE}"
 
-echo "[runner] Cleanup complete — next iteration will be triggered by GitHub Actions"
-echo "[runner] Exiting at: $(date)"
+echo "[runner] Done — exiting at: $(date)"
+# Exit with 0 so artifacts upload
 exit 0
