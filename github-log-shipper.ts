@@ -259,8 +259,8 @@ async function _getFileSha(cfg: ShipperConfig, repoPath: string): Promise<string
       log(`getFileSha(${repoPath}): HTTP ${res.status}`, 'DEBUG');
       return null;
     }
-    const data = await res.json();
-    const sha = data?.sha || null;
+    const data: any = await res.json();
+    const sha: string | null = data?.sha || null;
     if (sha) _shaCache.set(cacheKey, sha);
     return sha;
   } catch (err: any) {
@@ -309,8 +309,8 @@ async function _putFile(
       return { ok: false, error: `HTTP ${res.status}: ${errText.slice(0, 200)}` };
     }
 
-    const data = await res.json();
-    const newSha = data?.content?.sha;
+    const data: any = await res.json();
+    const newSha: string | undefined = data?.content?.sha;
     if (newSha) {
       const cacheKey = `${cfg.owner}/${cfg.repo}/${cfg.branch}/${repoPath}`;
       _shaCache.set(cacheKey, newSha);
@@ -333,8 +333,14 @@ async function _githubFetch(cfg: ShipperConfig, url: string, init: RequestInit &
     'Accept': 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
     'User-Agent': 'mathu-bot-github-log-shipper/1.0',
-    ...(init.headers || {}),
   };
+  if (init.headers) {
+    // Merge caller-provided headers (e.g. Content-Type for PUT with body).
+    const callerHeaders = init.headers as Record<string, string>;
+    for (const k of Object.keys(callerHeaders)) {
+      headers[k] = callerHeaders[k];
+    }
+  }
 
   try {
     return await fetch(url, {
@@ -471,6 +477,8 @@ function start(): void {
 
   _config = _resolveConfig();
   if (!_config) {
+  const cfg = _resolveConfig();
+  if (!cfg) {
     _skippedNoConfig = true;
     if (!_firstStartLogged) {
       _firstStartLogged = true;
@@ -482,10 +490,12 @@ function start(): void {
     return;
   }
 
+  _config = cfg;
   _started = true;
   _skippedNoConfig = false;
   log(
     `Started — pushing to github.com/${_config.owner}/${_config.repo}/tree/${_config.branch}/${_config.pathPrefix} every ${Math.round(_config.intervalMs / 1000)}s`,
+    `Started — pushing to github.com/${cfg.owner}/${cfg.repo}/tree/${cfg.branch}/${cfg.pathPrefix} every ${Math.round(cfg.intervalMs / 1000)}s`,
     'INFO'
   );
 
@@ -494,6 +504,7 @@ function start(): void {
     _tick().catch(() => {});
     // Then on the regular interval
     _timer = setInterval(() => { _tick().catch(() => {}); }, _config.intervalMs);
+    _timer = setInterval(() => { _tick().catch(() => {}); }, cfg.intervalMs);
     if (_timer.unref) _timer.unref();
   }, 30 * 1000);
 }
@@ -514,17 +525,18 @@ async function flushNow(): Promise<{ ok: boolean; bytesPushed: number; results: 
 }
 
 function getStatus(): ShipperStatus {
+  const config = _config;
   return {
-    enabled: !!_config,
+    enabled: !!config,
     started: _started,
-    config: _config ? {
-      owner: _config.owner,
-      repo: _config.repo,
-      branch: _config.branch,
-      pathPrefix: _config.pathPrefix,
+    config: config ? {
+      owner: config.owner,
+      repo: config.repo,
+      branch: config.branch,
+      pathPrefix: config.pathPrefix,
     } : null,
-    sourceFiles: _config?.sourceFiles || [],
-    intervalMs: _config?.intervalMs || 0,
+    sourceFiles: config?.sourceFiles || [],
+    intervalMs: config?.intervalMs || 0,
     lastPushAt: _lastPushAt,
     lastPushOk: _lastPushOk,
     lastPushError: _lastPushError,
