@@ -747,6 +747,41 @@ function createContainer(): DIContainerType {
     tags: ['longevity'],
   });
 
+  // v6-fix (2026-11-15): Hang watchdog — independent heartbeat-stall detector.
+  // Checks the heartbeat file's mtime every 5 min; if stale > 30 min, forces
+  // process.exit(1) (Render auto-restarts; HF Spaces resets in-memory state).
+  // Catches deadlocks/hangs that the cycle's own progress-timeout can't
+  // detect (e.g., stuck Playwright await outside the cycle loop). Auto-starts
+  // via startSubsystemGroup('longevity') because it exports start().
+  c.register('hangWatchdog', {
+    factory: (deps: any) => {
+      const mod = require('./survival-hang-watchdog');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger'],
+    critical: false,
+    tags: ['longevity'],
+  });
+
+  // v6-fix (2026-11-15): Methodology rotator — replaces "dumb retry" with
+  // methodology escalation. After N consecutive zero-question cycles (or
+  // error-cycles), switches to a fundamentally different approach: invalidate
+  // templates, switch model, reload page, restart browser, skip question.
+  // State persists across restarts (calibration table) so an OOM/hang-watchdog
+  // restart continues the escalation instead of resetting to dumb retry.
+  // Auto-starts via startSubsystemGroup('longevity') because it exports start().
+  c.register('methodologyRotator', {
+    factory: (deps: any) => {
+      const mod = require('./methodology-rotator');
+      mod._injectDependencies(deps);
+      return mod;
+    },
+    deps: ['config', 'logger', 'database'],
+    critical: false,
+    tags: ['longevity'],
+  });
+
   c.register('nodeMonitor', {
     factory: (deps: any) => {
       const mod = require('./longevity-node-monitor');
@@ -1236,6 +1271,14 @@ function createContainer(): DIContainerType {
     // with stealth-operations: stealth is reactive (escalate on
     // detection), normalcy is proactive (stay human to avoid detection).
     ['normalcy', 'normalcy', ['config', 'logger'], ['alerting']],
+    // R19: Last-resort mode — when a cycle ends with 0 questions completed and
+    // self-heal has failed, this module coordinates the aggressive retry:
+    // bypasses stealth, normalcy, progress-timeout, and self-heal re-trigger
+    // guards so the bot runs at maximum aggression until at least one question
+    // completes. Safety valve: after 5 consecutive failed efforts, the
+    // orchestrator forces a process restart. Replaces the old "stopRequested =
+    // true" behavior (bot used to STOP WORKING when self-heal failed).
+    ['last-resort-mode', 'lastResortMode', ['config', 'logger'], []],
   ];
 
   for (const tuple of resilienceModules) {
