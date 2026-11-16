@@ -34,9 +34,49 @@ const RETENTION_DAYS = {
   db_quarantine: 30,       // DB quarantine entries
   dependency_health: 7,   // Dependency health snapshots
   discovered_states: 30,   // Discovered UI states
+  // v6-fix (2026-11-15): Previously missing tables — would grow forever
+  state_history: 7,        // State transitions — high volume, keep 1 week
+  self_heal_events: 90,    // Self-heal audit trail — keep 3 months
+  selector_versions: 90,   // Selector version history (rollback) — keep 3 months
+  critical_patch_audit: 90, // Critical patch audit (non-pending only) — keep 3 months
+  blackbox_full: 30,       // Screenshot BLOBs — keep 1 month (BIG disk consumer)
   // NEVER auto-delete: completed_modules, calibration, model_registry, q_values,
   // blocked_modules, schema_version, coordinator_lock, workers, assigned_tasks,
   // runtime_versions, provider_schemas, ui_baselines, provider_registry
+};
+
+// v6-fix (2026-11-15): cleanupTable() previously used `WHERE timestamp < ?` for
+// ALL tables, but many tables use a DIFFERENT timestamp column name. Those
+// tables' cleanup SILENTLY FAILED (prepare threw, caught by try/catch, returned
+// 0) every run for the entire life of the bot. This mapping specifies the
+// correct column for each table. Tables marked "(BROKEN)" were in
+// RETENTION_DAYS but never actually pruned due to the wrong column name.
+const TABLE_TIMESTAMP_COL: Record<string, string> = {
+  blackbox: 'timestamp',
+  network_intercept_log: 'timestamp',
+  progress_log: 'timestamp',
+  state_history: 'timestamp',             // NEW
+  semantics_snapshots: 'timestamp',
+  flutter_semantics_cache: 'timestamp',
+  patch_history: 'timestamp',
+  gitops_rollback_chain: 'timestamp',
+  performance_profile: 'recorded_at',     // (BROKEN — was: timestamp)
+  exploration_maps: 'created_at',          // (BROKEN — was: timestamp)
+  reflection_history: 'timestamp',
+  experiment_results: 'promoted_at',       // (BROKEN — was: timestamp)
+  template_cache: 'last_used',             // (BROKEN — was: timestamp)
+  config_reconciliation: 'timestamp',
+  patch_embeddings: 'created_at',          // (BROKEN — was: timestamp)
+  heal_model_metrics: 'created_at',        // (BROKEN — was: timestamp)
+  degradation_log: 'timestamp',
+  critical_consensus: 'timestamp',
+  critical_patch_audit: 'requested_at',   // NEW
+  db_quarantine: 'quarantined_at',         // (BROKEN — was: timestamp)
+  dependency_health: 'last_checked',       // (BROKEN — was: timestamp)
+  discovered_states: 'added_at',           // (BROKEN — was: timestamp)
+  self_heal_events: 'timestamp',           // NEW
+  selector_versions: 'created_at',         // NEW
+  blackbox_full: 'captured_at',            // NEW
 };
 
 const JANITOR_INTERVAL_MS = 6 * 60 * 60 * 1000; // Run every 6 hours
@@ -51,17 +91,34 @@ const ALLOWED_CLEANUP_TABLES = new Set([
   'config_reconciliation', 'patch_embeddings', 'heal_model_metrics',
   'degradation_log', 'critical_consensus', 'db_quarantine',
   'dependency_health', 'discovered_states',
+  // v6-fix (2026-11-15): Previously missing tables
+  'state_history', 'self_heal_events', 'selector_versions',
+  'critical_patch_audit', 'blackbox_full',
 ]);
 
-function cleanupTable(tableName: any, retentionDays: any) { 
+function cleanupTable(tableName: any, retentionDays: any) {
   try {
     if (!ALLOWED_CLEANUP_TABLES.has(tableName)) return 0;
 
+    // v6-fix (2026-11-15): Use the correct timestamp column for each table.
+    // Previously hardcoded `timestamp`, which silently failed for tables
+    // using created_at, requested_at, quarantined_at, etc.
+    const col = TABLE_TIMESTAMP_COL[tableName] || 'timestamp';
     const cutoff = Date.now() - (retentionDays * 24 * 60 * 60 * 1000);
-    const stmt = getDb()?.prepare(`DELETE FROM ${tableName} WHERE timestamp < ?`);
+
+    // critical_patch_audit: only prune RESOLVED items (status != 'pending').
+    // Pending audits must stay until resolved, even if old.
+    let sql: string;
+    if (tableName === 'critical_patch_audit') {
+      sql = `DELETE FROM ${tableName} WHERE ${col} < ? AND status != 'pending'`;
+    } else {
+      sql = `DELETE FROM ${tableName} WHERE ${col} < ?`;
+    }
+
+    const stmt = getDb()?.prepare(sql);
     const info = stmt.run(cutoff);
     if (info.changes > 0) {
-      log(`Janitor: deleted ${info.changes} old rows from ${tableName} (retention: ${retentionDays}d)`, 'INFO', 'db-janitor');
+      log(`Janitor: deleted ${info.changes} old rows from ${tableName} (retention: ${retentionDays}d, col: ${col})`, 'INFO', 'db-janitor');
     }
     return info.changes;
   } catch (err: any) {
@@ -166,7 +223,30 @@ function cleanupPatchHistorySmart() {
   }
 }
 
-function runJanitor() { 
+/**
+ * v6-fix (2026-11-15): Prune orphaned blackbox_full rows — screenshot BLOBs
+ * left behind after blackbox pruning. blackbox_full has a foreign key to
+ * blackbox(id), so when blackbox rows are deleted, their blackbox_full
+ * children become orphans. These are the BIGGEST disk consumers (screenshots
+ * stored as BLOBs), so orphan cleanup is critical for multi-year operation.
+ */
+function cleanupBlackboxFullOrphans() {
+  try {
+    const db = getDb();
+    if (!db) return 0;
+    const info = db.prepare(
+      `DELETE FROM blackbox_full WHERE blackbox_id NOT IN (SELECT id FROM blackbox)`
+    ).run();
+    if (info.changes > 0) {
+      log(`Janitor: deleted ${info.changes} orphaned blackbox_full rows (screenshot BLOBs)`, 'INFO', 'db-janitor');
+    }
+    return info.changes;
+  } catch (err: any) {
+    return 0;
+  }
+}
+
+function runJanitor() {
   log('Running database janitor...', 'DEBUG', 'db-janitor');
   let totalDeleted = 0;
 
@@ -178,6 +258,11 @@ function runJanitor() {
 
   // Smart patch_history cleanup (status-aware, much more aggressive than 365d)
   totalDeleted += cleanupPatchHistorySmart();
+
+  // v6-fix (2026-11-15): Clean up orphaned screenshot BLOBs after blackbox pruning.
+  // These are the biggest disk consumers — without this, blackbox_full grows
+  // unbounded even though blackbox itself is pruned.
+  totalDeleted += cleanupBlackboxFullOrphans();
 
   cleanupProviderQuotas();
 
@@ -217,6 +302,71 @@ function getStatus() {
   } catch (e: any) { return { error: e.message }; }
 }
 
-module.exports = { startDatabaseJanitor, stopJanitor, runJanitor, getStatus, RETENTION_DAYS ,
+/**
+ * v6-fix (2026-11-15): Self-test for the janitor. Verifies that every table
+ * in RETENTION_DAYS has a matching entry in TABLE_TIMESTAMP_COL (so cleanup
+ * won't silently fail due to a wrong column name) and is in
+ * ALLOWED_CLEANUP_TABLES. Also verifies the interval is safe (< 2^31 ms).
+ */
+function selfTest(): Record<string, any> {
+  const checks: string[] = [];
+  const retentionTables = Object.keys(RETENTION_DAYS);
+  const colTables = Object.keys(TABLE_TIMESTAMP_COL);
+
+  // These tables are in RETENTION_DAYS for documentation but are handled by
+  // dedicated functions (not the blanket cleanupTable loop), so they're
+  // intentionally NOT in TABLE_TIMESTAMP_COL or ALLOWED_CLEANUP_TABLES.
+  const separatelyHandled = new Set(['provider_quotas', 'patch_history']);
+
+  // Every retention table must have a column mapping (unless separately handled)
+  for (const table of retentionTables) {
+    if (separatelyHandled.has(table)) continue;
+    if (!TABLE_TIMESTAMP_COL[table]) {
+      checks.push(`${table} in RETENTION_DAYS but missing from TABLE_TIMESTAMP_COL (cleanup would use wrong column)`);
+    }
+    if (!ALLOWED_CLEANUP_TABLES.has(table)) {
+      checks.push(`${table} in RETENTION_DAYS but missing from ALLOWED_CLEANUP_TABLES (cleanup would skip it)`);
+    }
+  }
+
+  // Interval must be safe (< 2^31 ms)
+  if (JANITOR_INTERVAL_MS >= 2147483647) {
+    checks.push('JANITOR_INTERVAL_MS would overflow 32-bit timer');
+  }
+
+  // blackbox_full orphan cleanup must exist
+  if (typeof cleanupBlackboxFullOrphans !== 'function') {
+    checks.push('cleanupBlackboxFullOrphans function missing');
+  }
+
+  return {
+    ok: checks.length === 0,
+    checks,
+    retentionTableCount: retentionTables.length,
+    columnMappingCount: colTables.length,
+    allowedCleanupCount: ALLOWED_CLEANUP_TABLES.size,
+    intervalMs: JANITOR_INTERVAL_MS,
+  };
+}
+
+module.exports = {
+  // v6-fix (2026-11-15): Add `start`/`stop` aliases so the subsystem runner's
+  // startSubsystemGroup('longevity') auto-starts the janitor. Previously the
+  // janitor exported only `startDatabaseJanitor` (not `start`), so the
+  // subsystem runner silently skipped it — the pruning interval NEVER ran,
+  // and the DB grew unbounded despite the module existing and being registered.
+  start: startDatabaseJanitor,
+  stop: stopJanitor,
+  startDatabaseJanitor,
+  stopJanitor,
+  runJanitor,
+  getStatus,
+  selfTest,
+  RETENTION_DAYS,
+  TABLE_TIMESTAMP_COL,
+  ALLOWED_CLEANUP_TABLES,
+  cleanupTable,
+  cleanupBlackboxFullOrphans,
+  cleanupPatchHistorySmart,
   _injectDependencies,
 };
