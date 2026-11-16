@@ -67,6 +67,7 @@ let _evolutionMetrics = {
 
 /**
  * Known provider endpoints. Extended from just openrouter/mistral.
+ * Ollama: local fallback — no real API key (uses dummy 'ollama').
  */
 const PROVIDER_ENDPOINTS: Record<string, { endpoint: string; apiKeyFn: (cfg: any) => string | null }> = {
   openrouter: {
@@ -81,15 +82,23 @@ const PROVIDER_ENDPOINTS: Record<string, { endpoint: string; apiKeyFn: (cfg: any
     endpoint: 'https://api.groq.com/openai/v1/chat/completions',
     apiKeyFn: (cfg) => cfg.GROQ_API_KEY || null,
   },
+  ollama: {
+    endpoint: 'http://localhost:11434/v1/chat/completions',
+    // Local Ollama needs no real key — dummy 'ollama' satisfies the header.
+    apiKeyFn: (cfg) => cfg.OLLAMA_API_KEY || 'ollama',
+  },
 };
 
 /**
  * Get endpoint + API key for the currently active model's provider.
+ * Normalizes provider to lowercase for PROVIDER_ENDPOINTS lookup — the
+ * model_registry stores 'Ollama' (capitalized, matching PROVIDER_TABLE) but
+ * PROVIDER_ENDPOINTS uses lowercase keys.
  */
 function getActiveProviderDetails(): { endpoint: string; apiKey: string | null; model: string; provider: string } | null {
   const activeModel = getGetActiveModel()?.get();
   if (!activeModel) return null;
-  const provider = activeModel.provider || 'openrouter';
+  const provider = (activeModel.provider || 'openrouter').toLowerCase();
   const cfg = _getCONFIG();
   const entry = PROVIDER_ENDPOINTS[provider];
   if (!entry) return null;
