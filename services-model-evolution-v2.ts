@@ -1,3 +1,4 @@
+
 'use strict';
 
 // ─── Dependency Injection ───
@@ -53,6 +54,11 @@ const PROVIDER_ENDPOINTS: Record<string, { endpoint: string; apiKeyKey: string }
   openrouter: { endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKeyKey: 'OPENROUTER_API_KEY' },
   mistral: { endpoint: 'https://api.mistral.ai/v1/chat/completions', apiKeyKey: 'MISTRAL_CODE_API_KEY' },
   groq: { endpoint: 'https://api.groq.com/openai/v1/chat/completions', apiKeyKey: 'GROQ_API_KEY' },
+  // Ollama: local fallback. No real API key — uses a dummy 'ollama' that
+  // satisfies the Authorization header. getApiKey() returns cfg['OLLAMA_API_KEY']
+  // or falls back to 'ollama' so the codegen pipeline can route to it when
+  // the methodology rotator switches the active model to Ollama.
+  ollama: { endpoint: 'http://localhost:11434/v1/chat/completions', apiKeyKey: 'OLLAMA_API_KEY' },
 };
 
 // ─── Evolution State & Metrics ───
@@ -76,11 +82,17 @@ let _evolutionMetrics = {
 /**
  * Get API key for a provider from CONFIG.
  * Extended to support Groq in addition to OpenRouter and Mistral.
+ * Ollama needs no real key — returns a dummy 'ollama' so the codegen
+ * pipeline can route to the local server.
  */
 function getApiKey(provider: string): string | null {
   const cfg = _getCONFIG();
   const entry = PROVIDER_ENDPOINTS[provider];
   if (!entry) return null;
+  if (provider === 'ollama') {
+    // Local Ollama needs no real key — use a dummy to satisfy the header.
+    return cfg[entry.apiKeyKey] || 'ollama';
+  }
   return cfg[entry.apiKeyKey] || null;
 }
 
@@ -113,7 +125,10 @@ async function runModelTribunal(candidates: Array<{ id: string; provider: string
     return [];
   }
 
-  const provider = active.provider || 'openrouter';
+  // Normalize provider to lowercase for PROVIDER_ENDPOINTS lookup — the
+  // model_registry stores 'Ollama' (capitalized, matching PROVIDER_TABLE) but
+  // PROVIDER_ENDPOINTS uses lowercase keys ('ollama', 'openrouter', etc.).
+  const provider = (active.provider || 'openrouter').toLowerCase();
   const apiKey = getApiKey(provider);
   if (!apiKey) {
     _log(`No API key for provider ${provider}, using first candidates`, 'WARN', 'evolution');
