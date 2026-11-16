@@ -174,9 +174,25 @@ setInterval(() => {
 // NOTE: Direct require('./database') is safe here because database is already
 // initialized by the DI container above (lines 18-20). Using container.get('database')
 // would re-invoke the factory, so we require the cached module directly.
-const { getActiveModel, upsertModel } = require('./database');
+const { getActiveModel, upsertModel, getFallbackModel } = require('./database');
 const active = getActiveModel.get();
 if (!active) { log('Seeding initial active model: openrouter/free', 'INFO', 'agent'); upsertModel.run('openrouter', 'openrouter/free', 1, 1, 'active', Date.now(), Date.now(), 0); }
+
+// Seed Ollama as the ultimate fallback (the last-hope local model).
+// Ollama runs on localhost:11434 — no cloud dependency. When every cloud
+// provider is down, the methodology rotator's switch_model_fallback promotes
+// this row to active and the bot keeps running on local hardware. If Ollama
+// isn't running on this host, the provider factory returns null (reachability
+// probe fails) and isProviderHealthy('Ollama') stays false, so the rotator
+// skips it until Ollama comes online. No harm in seeding the row regardless.
+try {
+  const fallback = getFallbackModel.get();
+  if (!fallback) {
+    const ollamaModel = process.env.OLLAMA_MODEL || 'qwen2.5vl:7b';
+    log(`Seeding Ollama as fallback model: ${ollamaModel} (the last-hope local provider — auto-activates when cloud providers are down)`, 'INFO', 'agent');
+    upsertModel.run('Ollama', ollamaModel, 1, 1, 'fallback', Date.now(), Date.now(), 0);
+  }
+} catch (e: any) { /* best-effort — never block startup */ }
 
 let isShuttingDown = false;
 
@@ -361,7 +377,20 @@ setInterval(() => { checkAndRunEvolution().catch(() => {}); }, 6 * 60 * 60 * 100
 
 // ─── Template cache pruning ───
 setTimeout(() => { pruneTemplateCache(); log('Initial template cache pruning completed.', 'INFO', 'agent'); }, 3600000);
-setInterval(() => { pruneTemplateCache(); log('Monthly template cache pruning completed.', 'INFO', 'agent'); }, 30 * 24 * 60 * 60 * 1000).unref();
+// Monthly template cache pruning. NOTE: setInterval with 30*24*60*60*1000
+// (2.59e9 ms) overflows Node's 32-bit signed-int limit (2.15e9), which
+// Node silently coerces to 1ms — firing the timer ~30 billion times more
+// often than intended. Use a daily check that conditionally runs the
+// monthly prune instead.
+const _MONTHLY_PRUNE_MS = 30 * 24 * 60 * 60 * 1000;
+let _lastMonthlyPruneAt = Date.now();
+setInterval(() => {
+  if (Date.now() - _lastMonthlyPruneAt >= _MONTHLY_PRUNE_MS) {
+    pruneTemplateCache();
+    log('Monthly template cache pruning completed.', 'INFO', 'agent');
+    _lastMonthlyPruneAt = Date.now();
+  }
+}, 24 * 60 * 60 * 1000).unref(); // daily check (86.4M ms — safely under 2^31)
 
 // ─── Remote brain ───
 const remoteBrain = container.get('remoteBrain', { required: false });
