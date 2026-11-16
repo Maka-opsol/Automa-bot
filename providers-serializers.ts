@@ -1,3 +1,4 @@
+
 'use strict';
 // Last modified: 2026-08-05 — Response 20: Fixed Groq/NVIDIA vision flags, added DeepInfra, updated text-only patterns
 
@@ -142,6 +143,20 @@ const PROVIDER_CAPABILITIES: Record<string, ProviderCapabilities> = {
     supportsResponseFormat: false,
     requiresPaidPlan: false,
     freeTier: true,
+    enabled: true,
+    serializerType: 'openai',
+  },
+  // Ollama: the last-hope local fallback. OpenAI-compatible /v1/chat/completions.
+  // Vision-capable (default model qwen2.5vl:7b). Supports multipart image_url
+  // content (same format as OpenRouter/z.ai). No API key required (local).
+  'Ollama': {
+    name: 'Ollama',
+    supportsVision: true,  // qwen2.5vl:7b and other vision models
+    supportsMultipartContent: true,  // OpenAI-compatible image_url format
+    supportsSystemRole: true,
+    supportsResponseFormat: false,  // small local models don't reliably support JSON mode
+    requiresPaidPlan: false,
+    freeTier: true,  // it's local — free by definition
     enabled: true,
     serializerType: 'openai',
   },
