@@ -165,6 +165,19 @@ const DEFAULTS: Record<string, ProviderDefault> = {
       'deepseek/deepseek-r1-distill-llama-70b:free',
     ],
   },
+  // Ollama: the last-hope local fallback. Runs on localhost:11434 — no API
+  // key required (envKeys is empty; the factory gates on a reachability
+  // probe instead). OpenAI-compatible /v1/chat/completions endpoint. The
+  // default model MUST be vision-capable (the tribunal sends a screenshot
+  // with every call). Override with OLLAMA_MODEL env var. The user must
+  // `ollama pull qwen2.5vl:7b` (or their chosen model) before use.
+  'Ollama': {
+    endpoint: 'http://localhost:11434/v1/chat/completions',
+    model: 'qwen2.5vl:7b',
+    envKeys: [],  // no key required for local; factory gates on reachability
+    visionCapable: true,
+    fallbackModels: ['llama3.2-vision:11b', 'minicpm-v:8b'],
+  },
 };
 
 // ===============================================================================
