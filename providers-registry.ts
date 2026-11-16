@@ -23,8 +23,6 @@ let CerebrasProvider: any = null; try { ({ CerebrasProvider } = require('./provi
 let GeminiProvider: any = null; try { ({ GeminiProvider } = require('./providers-gemini')); } catch (e: any) { _loadFailures.push({ name: 'Gemini', error: e.message }); console.error(`[registry] Failed to load providers-gemini: ${e.message}`); }
 let OpenRouterTribunalProvider: any = null; try { ({ OpenRouterTribunalProvider } = require('./providers-openrouter-tribunal')); } catch (e: any) { _loadFailures.push({ name: 'OpenRouter', error: e.message }); console.error(`[registry] Failed to load providers-openrouter-tribunal: ${e.message}`); }
 let DeepInfraProvider: any = null; try { ({ DeepInfraProvider } = require('./providers-deepinfra')); } catch (e: any) { _loadFailures.push({ name: 'DeepInfra', error: e.message }); console.error(`[registry] Failed to load providers-deepinfra: ${e.message}`); }
-
-// TIER 1+ (2026-10-31): Ollama local LLM — NEVER gets blacklisted, always available
 let OllamaProvider: any = null; try { ({ OllamaProvider } = require('./providers-ollama')); } catch (e: any) { _loadFailures.push({ name: 'Ollama', error: e.message }); console.error(`[registry] Failed to load providers-ollama: ${e.message}`); }
 
 // --- Dependency Injection ---------------------------------------------------
@@ -73,12 +71,17 @@ const PROVIDER_TABLE: ProviderEntry[] = [
   // DeepInfra removed - no longer free tier (2026-08-06)
   { name: 'Gemini', factory: GeminiProvider },
   { name: 'OpenRouter', factory: OpenRouterTribunalProvider },
+  // Ollama: the last-hope local fallback. Runs on localhost:11434 — no API
+  // key, no cloud dependency. Auto-detected via reachability probe (factory
+  // returns null when Ollama isn't running, so the registry skips it cleanly).
+  // When all cloud providers are down, the methodology rotator switches the
+  // active model to Ollama (role='fallback' in model_registry) and the bot
+  // keeps running on local hardware. Receives the SAME prompt/context as
+  // every cloud provider (the tribunal flattens system prompt + math context
+  // into the prompt string passed to all providers).
+  { name: 'Ollama', factory: OllamaProvider },
   // GitHub GPT is in the table but filtered by P9 (disabled by default)
   { name: 'GitHub GPT', factory: GitHubGPTProvider },
-  // TIER 1+ (2026-10-31): Ollama local LLM — always available, never blacklisted.
-  // This is the LAST resort but ALWAYS available. When all cloud providers
-  // are rate-limited/blacklisted, the bot uses Ollama instead of waiting.
-  { name: 'Ollama', factory: OllamaProvider },
 ];
 
 // ===============================================================================
@@ -295,11 +298,6 @@ function addProviderFailure(name: string, err?: any) {
 }
 
 function isProviderBlacklisted(name: string): boolean { 
-  // TIER 1+ (2026-10-31): Ollama NEVER gets blacklisted — it's a local LLM,
-  // not subject to rate limits or cloud outages. This ensures the bot always
-  // has at least one provider available.
-  if (name === 'Ollama') return false;
-
   // Check cycle blacklist
   if (cycleBlacklist.has(name)) return true;
 
