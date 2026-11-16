@@ -107,6 +107,45 @@ jobs:
           npm install --ignore-scripts @esbuild/linux-x64
           npm rebuild better-sqlite3
 
+      # ─── Step 5.5: Setup Ollama + pull vision model ───
+      # Installs Ollama on the runner, starts the server, and pulls a
+      # vision-capable model. The bot's tribunal sends screenshots, so the
+      # model MUST be vision-capable (qwen2.5vl:7b by default — matches the
+      # default in providers-ollama.ts, .env.example, and bootstrap-calibration.ts).
+      #
+      # Non-fatal: continue-on-error true + `|| exit 0` guards mean if Ollama
+      # fails to install or the model pull times out, the bot still runs and
+      # falls back to cloud providers (AUDITOR_PROVIDER stays set but the
+      # reachability probe in providers-ollama.ts will skip Ollama cleanly).
+      - name: Setup Ollama + vision model
+        continue-on-error: true
+        run: |
+          echo "Installing Ollama..."
+          curl -fsSL https://ollama.com/install.sh | sh || { echo "⚠️ Ollama install failed — bot will use cloud providers"; exit 0; }
+          echo "Starting Ollama server..."
+          nohup ollama serve > /tmp/ollama.log 2>&1 &
+          sleep 3
+          # Wait for Ollama to be ready (30s timeout)
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
+              echo "✅ Ollama server is ready"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
+            echo "⚠️ Ollama server failed to start — bot will use cloud providers"
+            echo "Ollama log:"
+            cat /tmp/ollama.log 2>/dev/null || true
+            exit 0
+          fi
+          # Pull the vision model (qwen2.5vl:7b — vision-capable, ~4.7GB)
+          MODEL="${OLLAMA_MODEL:-qwen2.5vl:7b}"
+          echo "Pulling model: $MODEL (~4.7GB)..."
+          ollama pull "$MODEL" || { echo "⚠️ Model pull failed — bot will use cloud providers"; exit 0; }
+          echo "Available models:"
+          ollama list || true
+
       # ─── Step 6: Run the bot (with 5h30m timeout) ───
       # The runner script starts Xvfb (virtual display for Chrome WebGL),
       # then starts the bot. After 5h30m, it gracefully shuts down and
@@ -157,6 +196,15 @@ jobs:
           # Disable forced restarts (GitHub Actions handles timeout)
           MAX_UPTIME_HOURS: 0
           MAX_CYCLES_BEFORE_RESTART: 999999
+          # ─── Ollama (local vision fallback — installed in Step 5.5) ───
+          # AUDITOR_PROVIDER=ollama tells run-bot.sh to verify the server is
+          # up before starting the bot. OLLAMA_MODEL pins the vision model
+          # (must match what Step 5.5 pulled). The reachability probe in
+          # providers-ollama.ts auto-detects the server on localhost:11434;
+          # if Step 5.5 failed (continue-on-error), the probe fails and the
+          # bot silently falls back to cloud providers.
+          AUDITOR_PROVIDER: ollama
+          OLLAMA_MODEL: qwen2.5vl:7b
           # ─── v4: GitHub log shipper (live logs → bot-logs branch) ───
           # PAT_TOKEN is optional here — the shipper falls back to the
           # auto-injected GITHUB_TOKEN (which works on Actions thanks to
