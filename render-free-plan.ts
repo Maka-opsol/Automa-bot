@@ -1,3 +1,4 @@
+
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1297,6 +1298,38 @@ try {
       log('Proxy DISABLED on startup — using direct connection (Task 135: proxy delivers blank pages)', 'INFO', 'render-free-plan');
     }
   } catch { /* ip-rotator not loaded */ }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // BOOTSTRAP CALIBRATION GATE (2026-11-15)
+  // Before the bot engages any cloud providers, subsystems, or external
+  // services, it must prove the basic algorithm works: open browser →
+  // screenshot → Ollama → action → repeat → reach the assignment page.
+  // Only on success (or graceful non-strict skip) does the daemon start.
+  // See bootstrap-calibration.ts for the loop + failure semantics.
+  // ═══════════════════════════════════════════════════════════════════════
+  try {
+    const { runBootstrap } = require('./bootstrap-calibration');
+    const bootstrapResult = await runBootstrap({ container, log, logError });
+    if (!bootstrapResult.success) {
+      // Strict-mode failure — the calibration did not pass and BOOTSTRAP_STRICT=1.
+      // Do NOT engage the daemon. Exit so the process supervisor can restart
+      // and retry the bootstrap from a clean state.
+      logError(
+        `Bootstrap calibration FAILED (${bootstrapResult.reason}) — STRICT mode, refusing to start daemon. Exiting.`,
+        new Error('bootstrap_strict_failure'),
+      );
+      try { if (typeof requestStop === 'function') requestStop(); } catch { /* best effort */ }
+      try { if (typeof closeDatabase === 'function') await closeDatabase(); } catch { /* best effort */ }
+      process.exit(1);
+    }
+    log(
+      `Bootstrap calibration ${bootstrapResult.skipped ? 'skipped' : 'passed'} (${bootstrapResult.iterations} iter` +
+      (bootstrapResult.reason ? `, reason=${bootstrapResult.reason}` : '') + ') — engaging daemon',
+      'INFO', 'render-free-plan',
+    );
+  } catch (bootstrapErr: any) {
+    logError('Bootstrap calibration threw — proceeding to daemon (non-fatal)', bootstrapErr);
+  }
 
   log('Starting daemon loop (background, all features)...', 'INFO', 'render-free-plan');
   startDaemon().catch(err => {
