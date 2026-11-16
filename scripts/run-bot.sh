@@ -53,6 +53,33 @@ echo "  Files in dir:" >> "$LOG_FILE"
 ls -1 *.ts 2>/dev/null | head -20 >> "$LOG_FILE"
 echo "" >> "$LOG_FILE"
 
+# ─── Secret presence check (values NOT logged — security) ───
+# Logs whether each secret/env var arrived NON-EMPTY in the runner's
+# environment. Goes to BOTH stdout (visible in the GitHub Actions step
+# log) and the log file. If a secret shows EMPTY here but you set it in
+# GitHub Settings → Secrets and variables → Actions, the secret NAME in
+# GitHub doesn't match what the workflow's env: block references (GitHub
+# silently substitutes an empty string for an unknown secret name — it
+# does NOT error). Compare the names exactly (case-sensitive, no spaces).
+echo "[runner] Secret presence check (values redacted):"
+echo "[runner] Secret presence check (values redacted):" >> "$LOG_FILE"
+for key in MICROSOFT_EMAIL MICROSOFT_PASSWORD TURSO_DATABASE_URL TURSO_AUTH_TOKEN \
+           GROQ_API_KEY ZAI_API_KEY AGNES_API_KEY NVIDIA_API_KEY GEMINI_API_KEY \
+           OPENROUTER_API_KEY CEREBRAS_API_KEY DEEPINFRA_API_KEY BRAIN_API_KEY \
+           CF_API_KEY CF_ACCOUNT_ID CLOUDINARY_CLOUD_NAME CLOUDINARY_API_KEY \
+           CLOUDINARY_API_SECRET PAT_TOKEN; do
+  val="${!key}"
+  if [ -n "$val" ]; then
+    line="  ✅ $key — SET (length: ${#val})"
+  else
+    line="  ❌ $key — EMPTY (not in env or secret name mismatch)"
+  fi
+  echo "$line"
+  echo "$line" >> "$LOG_FILE"
+done
+echo ""
+echo "" >> "$LOG_FILE"
+
 # ─── Step 1: Start Xvfb ───
 echo "[runner] Starting Xvfb virtual display..."
 rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
@@ -122,7 +149,24 @@ echo "[runner] Starting node..." >> "$LOG_FILE"
 # ─── Step 6: Start the bot ───
 # Use node directly (not tsx) first to check for syntax errors
 # Then start with tsx
-node --expose-gc --max-old-space-size=8192 --import tsx "$BOT_ENTRYPOINT" >> "$LOG_FILE" 2>&1 &
+
+# Load .env file if it exists (written by the workflow's "Write .env from
+# BOT_ENV_FILE secret" step). Node 22+ supports --env-file which loads
+# the file into process.env BEFORE the bot starts. This restores the
+# BOT_ENV_FILE mechanism from the old bot-runner.yml workflow: the user
+# stores the entire .env (all API keys, creds) as a single secret.
+# If .env doesn't exist, the bot relies on individual secrets from the
+# workflow's env: block (the secondary mechanism).
+ENV_FILE_FLAG=""
+if [ -f ".env" ]; then
+  ENV_FILE_FLAG="--env-file=.env"
+  echo "[runner] Loading .env file via --env-file" >> "$LOG_FILE"
+  KEY_COUNT=$(grep -cE '^[A-Z_]+=' .env 2>/dev/null || echo 0)
+  echo "[runner] .env contains $KEY_COUNT keys" >> "$LOG_FILE"
+else
+  echo "[runner] No .env file found — relying on workflow env: block secrets" >> "$LOG_FILE"
+fi
+node --expose-gc --max-old-space-size=8192 --import tsx $ENV_FILE_FLAG "$BOT_ENTRYPOINT" >> "$LOG_FILE" 2>&1 &
 BOT_PID=$!
 echo "[runner] Bot started (PID $BOT_PID)"
 echo "[runner] Bot PID: $BOT_PID" >> "$LOG_FILE"
