@@ -482,16 +482,51 @@ if (!smokeResult.passed && CONFIG.ALERT_ON_ERROR) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// START THE DAEMON (non-blocking — runs in background)
+// BOOTSTRAP CALIBRATION GATE (2026-11-15)
+// Before the bot engages any cloud providers, subsystems, or external
+// services, it must prove the basic algorithm works: open browser →
+// screenshot → Ollama → action → repeat → reach the assignment page.
+// Only on success (or graceful non-strict skip) does the daemon start.
+// The daemon is chained AFTER the bootstrap so it cannot engage until the
+// calibration resolves. See bootstrap-calibration.ts for the loop + semantics.
 // ═══════════════════════════════════════════════════════════════════════════
+const { runBootstrap } = require('./bootstrap-calibration');
+runBootstrap({ container, log, logError }).then((bootstrapResult: any) => {
+  if (!bootstrapResult.success) {
+    // Strict-mode failure — the calibration did not pass and BOOTSTRAP_STRICT=1.
+    // Do NOT engage the daemon. HF Spaces: do NOT process.exit (the HTTP server
+    // must stay alive for keepalive pings) — log the error and wait.
+    logError(
+      `Bootstrap calibration FAILED (${bootstrapResult.reason}) — STRICT mode, daemon will NOT start. HTTP server stays alive for diagnosis.`,
+      new Error('bootstrap_strict_failure'),
+    );
+    try { if (typeof requestStop === 'function') requestStop(); } catch { /* best effort */ }
+    return;
+  }
+  log(
+    `Bootstrap calibration ${bootstrapResult.skipped ? 'skipped' : 'passed'} (${bootstrapResult.iterations} iter` +
+    (bootstrapResult.reason ? `, reason=${bootstrapResult.reason}` : '') + ') — engaging daemon',
+    'INFO', 'hf-spaces',
+  );
 
-log('Starting daemon loop (background)...', 'INFO', 'hf-spaces');
-startDaemon().catch(err => {
-  logError('Fatal daemon error', err);
-  if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Fatal daemon error: ${err.message}`); } catch { /* non-critical */ }
-  // HF Spaces: Do NOT process.exit — the HTTP server must stay alive
-  // for keepalive pings. Log and let error-handler deal with it.
-  log('Daemon crashed — will restart on next cycle iteration', 'ERROR', 'hf-spaces');
+  // ═══════════════════════════════════════════════════════════════════════════
+  // START THE DAEMON (non-blocking — runs in background)
+  // ═══════════════════════════════════════════════════════════════════════════
+  log('Starting daemon loop (background)...', 'INFO', 'hf-spaces');
+  startDaemon().catch(err => {
+    logError('Fatal daemon error', err);
+    if (CONFIG.ALERT_ON_ERROR) try { sendAlert(`Fatal daemon error: ${err.message}`); } catch { /* non-critical */ }
+    // HF Spaces: Do NOT process.exit — the HTTP server must stay alive
+    // for keepalive pings. Log and let error-handler deal with it.
+    log('Daemon crashed — will restart on next cycle iteration', 'ERROR', 'hf-spaces');
+  });
+
+  log('MathU Bot v5 — HF Spaces edition fully started', 'INFO', 'hf-spaces');
+}).catch((bootstrapErr: any) => {
+  logError('Bootstrap calibration threw — starting daemon anyway (non-fatal)', bootstrapErr);
+  startDaemon().catch(err => {
+    logError('Fatal daemon error', err);
+    log('Daemon crashed — will restart on next cycle iteration', 'ERROR', 'hf-spaces');
+  });
+  log('MathU Bot v5 — HF Spaces edition fully started', 'INFO', 'hf-spaces');
 });
-
-log('MathU Bot v5 — HF Spaces edition fully started', 'INFO', 'hf-spaces');
