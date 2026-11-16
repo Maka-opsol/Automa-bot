@@ -146,6 +146,33 @@ jobs:
           echo "Available models:"
           ollama list || true
 
+      # ─── Step 5.6: Write .env from BOT_ENV_FILE secret ───
+      # Restores the mechanism from the old bot-runner.yml workflow: the user
+      # stores the ENTIRE .env file (all API keys, Microsoft creds, Turso, etc.)
+      # as a single secret named BOT_ENV_FILE. This step writes it to .env on
+      # disk, and run-bot.sh loads it via `node --env-file=.env` (Node 22+).
+      #
+      # This is the PRIMARY secret mechanism — if BOT_ENV_FILE is set, it
+      # provides ALL keys at once. The individual secrets in the next step's
+      # env: block are a SECONDARY mechanism (for users who prefer per-key
+      # secrets). Both work together; BOT_ENV_FILE takes precedence because
+      # --env-file loads BEFORE process.env is merged.
+      - name: Write .env from BOT_ENV_FILE secret
+        env:
+          BOT_ENV_FILE: ${{ secrets.BOT_ENV_FILE }}
+        run: |
+          if [ -z "$BOT_ENV_FILE" ]; then
+            echo "::notice::BOT_ENV_FILE secret not set — relying on individual secrets in the next step"
+            exit 0
+          fi
+          echo "$BOT_ENV_FILE" > .env
+          echo "✓ .env written from BOT_ENV_FILE secret"
+          # Show which keys are present (values NOT logged — security)
+          echo "  Keys in .env:"
+          grep -oE '^[A-Z_]+=' .env | sed 's/=//' | while read k; do
+            echo "    ✅ $k"
+          done
+
       # ─── Step 6: Run the bot (with 5h30m timeout) ───
       # The runner script starts Xvfb (virtual display for Chrome WebGL),
       # then starts the bot. After 5h30m, it gracefully shuts down and
@@ -156,29 +183,29 @@ jobs:
       - name: Run MathU Bot
         env:
           # Bot credentials (login for app.mathu.co.za via Microsoft auth)
-          MICROSOFT_EMAIL: ${{ secrets.MICROSOFT_EMAIL }}
-          MICROSOFT_PASSWORD: ${{ secrets.MICROSOFT_PASSWORD }}
+          MICROSOFT_EMAIL: ${{ secrets.MICROSOFT_EMAIL || vars.MICROSOFT_EMAIL }}
+          MICROSOFT_PASSWORD: ${{ secrets.MICROSOFT_PASSWORD || vars.MICROSOFT_PASSWORD }}
           # Turso database
-          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
-          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL || vars.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN || vars.TURSO_AUTH_TOKEN }}
           # AI providers (at least one needed)
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY }}
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-          BRAIN_API_KEY: ${{ secrets.BRAIN_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY || vars.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY || vars.OPENROUTER_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || vars.GEMINI_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY || vars.ZAI_API_KEY }}
+          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY || vars.AGNES_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY || vars.NVIDIA_API_KEY }}
+          DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY || vars.DEEPINFRA_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY || vars.CEREBRAS_API_KEY }}
+          BRAIN_API_KEY: ${{ secrets.BRAIN_API_KEY || vars.BRAIN_API_KEY }}
           # Cloudflare (Workers AI) — uses CF_ACCOUNT_ID + CF_API_KEY
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || vars.CF_ACCOUNT_ID }}
+          CF_API_KEY: ${{ secrets.CF_API_KEY || vars.CF_API_KEY }}
           # Screenshot storage (Cloudinary)
-          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
-          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
-          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
-          CLOUDINARY_FOLDER: ${{ secrets.CLOUDINARY_FOLDER }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME || vars.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY || vars.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET || vars.CLOUDINARY_API_SECRET }}
+          CLOUDINARY_FOLDER: ${{ secrets.CLOUDINARY_FOLDER || vars.CLOUDINARY_FOLDER }}
           # Chrome flags — full WebGL support (16GB RAM, no limits needed)
           CHROMIUM_FLAGS: "--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader --window-size=1280,800"
           DISPLAY: ":99"
@@ -211,13 +238,35 @@ jobs:
           # `permissions: contents: write` above). Set PAT_TOKEN only if
           # you also run the bot on HF Spaces/Render, where there's no
           # auto-injected GITHUB_TOKEN.
-          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN || vars.PAT_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
           GHLOGS_OWNER: ${{ github.repository_owner }}
           GHLOGS_REPO: ${{ github.event.repository.name }}
           GHLOGS_BRANCH: bot-logs
           GHLOGS_PATH: logs
         run: |
+          # ─── Secret presence check (values NOT logged — security) ───
+          # Runs BEFORE run-bot.sh so it's independent of the script version.
+          # If a key shows EMPTY here but you set it in GitHub Settings →
+          # Secrets and variables → Actions → Secrets, then either (a) the
+          # secret NAME in GitHub doesn't match exactly (case-sensitive), or
+          # (b) the secret is on a different repo/environment, or (c) this
+          # workflow file on GitHub is an older copy without the env: block.
+          echo "=== Secret presence check (values redacted) ==="
+          for key in MICROSOFT_EMAIL MICROSOFT_PASSWORD TURSO_DATABASE_URL TURSO_AUTH_TOKEN \
+                     GROQ_API_KEY ZAI_API_KEY AGNES_API_KEY NVIDIA_API_KEY GEMINI_API_KEY \
+                     OPENROUTER_API_KEY CEREBRAS_API_KEY DEEPINFRA_API_KEY BRAIN_API_KEY \
+                     CF_API_KEY CF_ACCOUNT_ID CLOUDINARY_CLOUD_NAME CLOUDINARY_API_KEY \
+                     CLOUDINARY_API_SECRET PAT_TOKEN; do
+            val="${!key}"
+            if [ -n "$val" ]; then
+              echo "  ✅ $key — SET (length: ${#val})"
+            else
+              echo "  ❌ $key — EMPTY"
+            fi
+          done
+          echo "=== End secret presence check ==="
+          echo ""
           chmod +x ./scripts/run-bot.sh
           ./scripts/run-bot.sh
 
