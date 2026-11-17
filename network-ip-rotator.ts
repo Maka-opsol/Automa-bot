@@ -411,7 +411,14 @@ async function ensureValidProxy(): Promise<'current' | 'rotated' | 'bypassed' | 
   }
 
   // Validate the current proxy
-  const result = await validateProxy(currentProxy);
+  // FIX (2026-11-17): Validate against APP_URL (app.mathu.co.za), NOT the
+  // default api.ipify.org. The proxy passed the IP check but failed with
+  // ERR_TUNNEL_CONNECTION_FAILED when navigating to app.mathu.co.za — the
+  // proxy can reach ipify but can't tunnel HTTPS to the actual target.
+  // Validating against the real target ensures dead-for-mathu proxies get
+  // rotated before the bot wastes 30s navigation timeouts on them.
+  const appUrl = getCONFIG().APP_URL || 'https://app.mathu.co.za';
+  const result = await validateProxy(currentProxy, appUrl);
   if (result.ok) {
     _recordProxyOutcome({
       timestamp: Date.now(),
@@ -542,6 +549,19 @@ function report403(providerName: string): void {
     _consecutive403s >= _getIpBlockThreshold() ? 'ERROR' : 'WARN'
   );
 
+  // Stealth signal: low-weight per-403. The threshold-crossing event
+  // in _declareIpBlocked() carries the heavy weight that escalates level.
+  try {
+    const stealth = require('./stealth-operations');
+    if (stealth?.reportSignal) {
+      stealth.reportSignal(
+        'ip_block', `providers:${providerName}`,
+        `403 consecutive=${_consecutive403s}/${_getIpBlockThreshold()}`,
+        20  // low weight per-403; threshold-crossing event carries the heavy weight
+      );
+    }
+  } catch { /* stealth unavailable */ }
+
   if (_consecutive403s >= _getIpBlockThreshold() && !_isIpBlocked) {
     _declareIpBlocked();
   }
@@ -558,6 +578,20 @@ function _declareIpBlocked(): void {
     `[IP] IP BLOCKED: ${_consecutive403s} providers returned 403. Current IP: ${_currentIp || 'unknown'}`,
     'ERROR'
   );
+
+  // Stealth signal: IP is definitively blocked — escalate to MAXIMUM-fast.
+  // High weight + long TTL so a single block drives the level up for ~30 min.
+  try {
+    const stealth = require('./stealth-operations');
+    if (stealth?.reportSignal) {
+      stealth.reportSignal(
+        'ip_block', 'network-ip-rotator',
+        `IP ${_currentIp || 'unknown'} blocked after ${_consecutive403s}x403`,
+        80,                       // very high weight — single event should drive level up
+        30 * 60 * 1000            // 30-min TTL (matches DEFAULT_COOLDOWN_MS)
+      );
+    }
+  } catch { /* stealth unavailable */ }
 
   // Try proxy rotation
   if (_proxyUrls.length > 0) {
@@ -723,6 +757,31 @@ async function start(): Promise<void> {
   if (_proxyRefreshTimer && typeof (_proxyRefreshTimer as any).unref === 'function') {
     (_proxyRefreshTimer as any).unref();
   }
+
+  // Stealth coupling: when level escalates to MAXIMUM, force-rotate the
+  // proxy immediately. The bot is being actively blocked — sitting on
+  // the same IP will only make it worse. Idempotent (start() runs once).
+  // Bypass guard: __proxyDisabled means platform-level proxy block (Render);
+  // we still rotate because stealth MAXIMUM means we're being blocked on
+  // the current IP regardless of platform.
+  try {
+    const stealth = require('./stealth-operations');
+    if (stealth?.onLevelChange && typeof rotateProxy === 'function') {
+      stealth.onLevelChange('network-ip-rotator', (newLevel: string, prevLevel: string) => {
+        if (newLevel === 'MAXIMUM' && prevLevel !== 'MAXIMUM') {
+          log('[IP] Stealth level escalated to MAXIMUM — force-rotating proxy', 'WARN');
+          const next = rotateProxy();
+          if (next) {
+            process.env.HTTP_PROXY = next;
+            process.env.HTTPS_PROXY = next;
+            log(`[IP] Stealth MAXIMUM: rotated to ${next}`, 'INFO');
+          } else {
+            log('[IP] Stealth MAXIMUM: no proxies available to rotate to', 'WARN');
+          }
+        }
+      });
+    }
+  } catch { /* stealth unavailable */ }
 }
 
 module.exports = {
