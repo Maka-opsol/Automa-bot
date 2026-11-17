@@ -4,17 +4,8 @@ import type { Deps } from './types/di-types';
 
 // ─── npm packages + Node builtins only at top level ───
 const { chromium } = require('playwright');
-// TASK 131 (2026-10-28): sharp made LAZY to save ~30-50MB during boot.
-// Browser.ts is required by container.get('orchestrator') → cycleManager → 'browser' dep.
-// Loading sharp eagerly was contributing to the boot OOM crash loop.
-let _sharp: any = null;
-let _sharpLoaded = false;
-function _getSharp(): any {
-  if (_sharpLoaded) return _sharp;
-  _sharpLoaded = true;
-  try { _sharp = require('sharp'); } catch (e: any) { _sharp = null; }
-  return _sharp;
-}
+let sharp: any;
+try { sharp = require('sharp'); } catch (e: any) { sharp = null; }
 const crypto = require('crypto');
 
 // Utility modules — these have minimal/no project deps and will be
@@ -98,7 +89,6 @@ class BrowserManager {
   _disconnectedListeners: Array<(data?: any) => void>;
   _intentionalClose: boolean;
   _fpFonts: string[] | null;
-  _traceFile: string | null;  // TIER 1: Playwright trace file path
   _configInitialized: boolean;
 
   constructor() {
@@ -122,7 +112,6 @@ class BrowserManager {
     this._disconnectedListeners = [];
     this._intentionalClose = false;
     this._fpFonts = null;
-    this._traceFile = null;  // TIER 1: trace file initialized
     this._configInitialized = false;
   }
 
@@ -265,6 +254,23 @@ class BrowserManager {
     // BUG FIX (2026-09-07): Force HTTP/1.1 to avoid proxy HTTP/2 incompatibility.
     // Some proxies can't handle multiplexed HTTP/2 traffic, causing silent drops.
     flags.push('--disable-http2');
+    // BUGFIX (2026-10-26): Add memory-saving flags to reduce Chromium RSS.
+    // --disable-images: don't load image resources (saves ~20-40MB on image-heavy pages).
+    //   The bot takes screenshots of the page — images still render in the screenshot
+    //   because they're drawn by the GPU/compositor. This flag only prevents the
+    //   browser from caching decoded image data in memory.
+    // --disable-notifications: skip notification permission prompts
+    // --disable-features=site-per-process: disable site isolation (saves ~50-80MB).
+    //   Site isolation spawns a separate renderer process per origin — on a 512MB
+    //   container with --single-process mode, this is unnecessary and wastes memory.
+    // --memory-pressure-off: don't throttle based on system memory pressure
+    //   (we handle memory ourselves via the heap guardian)
+    // --disable-background-timer-throttling: keep timers running in background tabs
+    flags.push('--disable-notifications');
+    flags.push('--disable-features=site-per-process,IsolateOrigins');
+    flags.push('--disable-background-timer-throttling');
+    flags.push('--disable-renderer-backgrounding');
+    flags.push('--disable-backgrounding-occluded-windows');
     // BUG FIX (2026-09-08): Provide explicit fallbacks for DISPLAY_WIDTH/HEIGHT
     // at the call site (defense-in-depth — addWindowSizeFlags also validates,
     // but if browser-chrome-flags.ts is an older version, this protects us).
@@ -279,26 +285,11 @@ class BrowserManager {
     // initialize. Exiting." — the bot then cascades to reduced/minimal strategies
     // unnecessarily. Default to headless: true unless explicitly disabled.
     //
-    // TIER 1+ (2026-11-01): Use headless: false (headed mode with Xvfb).
-    // Playwright's headless:true uses chrome-headless-shell which has LIMITED
-    // WebGL support — CanvasKit renders partially or blank.
-    // headless:false uses the FULL Chrome binary with proper WebGL via SwiftShader.
-    // This requires Xvfb (DISPLAY=:99, set in run-bot.sh) — which we have.
-    //
-    // NOTE: headless:'new' is NOT a valid Playwright option in v1.40.
-    // It's treated as truthy = headless:true (old shell). Don't use it.
-    const _headless = false;
-    if (!flags.includes('--enable-unsafe-swiftshader')) {
-      flags.push('--enable-unsafe-swiftshader');
-    }
-    // Remove --disable-gpu and --disable-software-rasterizer if present —
-    // they kill WebGL which CanvasKit needs. With headless:'new' + Xvfb,
-    // Chrome's software GPU (SwiftShader) works properly without these flags.
-    flags = flags.filter((f: string) => f !== '--disable-gpu' && f !== '--disable-software-rasterizer');
-    // Add flags for proper WebGL rendering
-    if (!flags.includes('--use-gl=angle')) flags.push('--use-gl=angle');
-    if (!flags.includes('--use-angle=swiftshader')) flags.push('--use-angle=swiftshader');
-    if (!flags.includes('--ignore-gpu-blocklist')) flags.push('--ignore-gpu-blocklist');
+    // TASK 35 (2026-09-09): Support `__forceHeaded` global to toggle headed mode
+    // for human intervention. When the user calls /api/browser/headed, this flag
+    // is set and the next browser launch will be headed (requires Xvfb on Render).
+    const _forceHeaded = !!(globalThis as any).__forceHeaded;
+    const _headless = _forceHeaded ? false : (getCONFIG().HEADLESS === false ? false : true);
     const options: any = { headless: _headless, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 60000 };
     // BUG FIX (2026-09-08): Only set per-context proxy mode when a proxy is
     // actually active. When `__proxyDisabled` is true, DON'T pass
@@ -350,29 +341,8 @@ class BrowserManager {
     const log = getLog();
     const logError = getLogError();
     if (!this.browserInstance) return;
-    this.browserInstance.on('disconnected', () => {
-      if (!this._intentionalClose && !this.launching) {
-        log('Browser process disconnected unexpectedly', 'ERROR', 'browser');
-      }
-      this.browserDisconnected = true;
-      this.emit('disconnected');
-    });
-    this.browserInstance.on('error', (err: Error) => {
-      logError('Browser process error', err);
-      this.browserDisconnected = true;
-    });
-    // TIER 1+ (2026-10-31): Log Chrome process lifecycle events for debugging
-    // These help diagnose why the browser keeps disconnecting
-    try {
-      const cp = require('child_process');
-      // Check if Chrome left zombie processes after disconnect
-      this.browserInstance.on('disconnected', () => {
-        try {
-          const result = cp.execSync('pgrep -c chrome 2>/dev/null || echo 0', { timeout: 2000 }).toString().trim();
-          log(`[BROWSER] Chrome zombie processes after disconnect: ${result}`, 'WARN', 'browser');
-        } catch {}
-      });
-    } catch {}
+    this.browserInstance.on('disconnected', () => { if (!this._intentionalClose && !this.launching) { log('Browser process disconnected unexpectedly', 'ERROR', 'browser'); } this.browserDisconnected = true; this.emit('disconnected'); });
+    this.browserInstance.on('error', (err: Error) => { logError('Browser process error', err); this.browserDisconnected = true; });
   }
 
   async setupContext() {
@@ -439,34 +409,22 @@ class BrowserManager {
       this.browserInstance.newContext(contextOptions),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Context creation timeout')), getCONFIG().BROWSER_CONTEXT_TIMEOUT_MS || 30000))
     ]);
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // TIER 1 (2026-10-30): Playwright trace recording
-    // ═══════════════════════════════════════════════════════════════════════
-    // Records every click, navigation, screenshot, and network request.
-    // The trace can be replayed with: npx playwright show-trace trace.zip
-    // Only enabled when ENABLE_TRACING=true env var is set (GitHub Actions).
-    if (process.env.ENABLE_TRACING === 'true') {
-      try {
-        const traceDir = process.env.TRACE_DIR || '/tmp/mathu-logs/traces';
-        const traceFile = `${traceDir}/trace-${Date.now()}.zip`;
-        // Ensure trace directory exists
-        try { require('fs').mkdirSync(traceDir, { recursive: true }); } catch {}
-        await this.contextInstance.tracing.start({
-          screenshots: true,
-          snapshots: true,
-          sources: true,
-          title: `MathU Bot Trace — ${new Date().toISOString()}`,
-        });
-        this._traceFile = traceFile;
-        log(`[TIER1] Playwright tracing started — trace will be saved to ${traceFile}`, 'INFO', 'browser');
-      } catch (traceErr: any) {
-        log(`[TIER1] Tracing failed to start (non-fatal): ${traceErr.message}`, 'WARN', 'browser');
-      }
-    }
-    // ─── End TIER 1 trace recording ───
-
     this.contextInstance.on('page', async (newPage: any) => {
+      // CRITICAL FIX (2026-11-17): Closing a page during the launch phase
+      // tears down the browser context. Chrome auto-creates a page when the
+      // context opens; if we close it, the context/browser dies, and the
+      // subsequent addInitScript call in configurePage() fails with
+      // "Target page, context or browser has been closed" — causing ALL
+      // launch strategies (full/reduced/minimal) to fail and the bot to
+      // crash on startup. Fix: skip closing until the main page is set up,
+      // and NEVER close the main page itself.
+      if (!this.pageInstance) {
+        log('Page opened during launch phase — ignoring (closing would tear down context)', 'DEBUG', 'browser');
+        return;
+      }
+      if (newPage === this.pageInstance) {
+        return; // Never close the main page
+      }
       // CRITICAL FIX: In --single-process mode (Render free plan), closing any
       // page/popup kills the ENTIRE browser process because all pages share
       // one OS process. We must NOT close popups — just ignore them.
@@ -493,167 +451,6 @@ class BrowserManager {
     this.pageInstance.setDefaultTimeout(getCONFIG().BROWSER_PAGE_TIMEOUT_MS || 30000);
     this.pageInstance.setDefaultNavigationTimeout(getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000);
     await this.pageInstance.addInitScript(this.getFingerprintSpoofScript());
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // TIER 1+ (2026-11-01): Enable Flutter accessibility via JavaScript API
-    // ═══════════════════════════════════════════════════════════════════════
-    // Flutter Web shows "Enable accessibility | [FLT-SEMANTICS-PLACEHOLDER]"
-    // until accessibility is enabled. You can't click it — it's not a real
-    // button. Flutter enables accessibility via:
-    //   1. A keyboard event (Tab key) — triggers Flutter's a11y shortcut
-    //   2. Setting window._flutter.semanticsEnabled = true BEFORE flutter.js loads
-    //   3. Calling the Flutter accessibility channel after engine init
-    //
-    // We do ALL THREE to maximize the chance of it working.
-    await this.pageInstance.addInitScript(function() {
-      // Method 1: Set the flag before flutter.js loads
-      window._flutter = window._flutter || {};
-      window._flutter.semanticsEnabled = true;
-      // Also set the global flag some Flutter versions check
-      window.semanticEnable = true;
-      window.__flutter_semantics_enabled = true;
-
-      console.log('[TASK151] Flutter accessibility flags set (pre-load)');
-
-      // Method 2: Dispatch keyboard events to trigger Flutter's a11y shortcut
-      // Flutter enables accessibility when it detects a Tab keypress or
-      // screen reader. We simulate this.
-      setTimeout(function() {
-        try {
-          // Dispatch Tab key — Flutter's shortcut for enabling accessibility
-          document.dispatchEvent(new KeyboardEvent('keydown', {
-            key: 'Tab', code: 'Tab', keyCode: 9, which: 9,
-            bubbles: true, cancelable: true,
-          }));
-          document.dispatchEvent(new KeyboardEvent('keyup', {
-            key: 'Tab', code: 'Tab', keyCode: 9, which: 9,
-            bubbles: true, cancelable: true,
-          }));
-          console.log('[TASK151] Dispatched Tab key to enable Flutter accessibility');
-        } catch (e) {
-          console.error('[TASK151] Keyboard dispatch failed: ' + e.message);
-        }
-      }, 2000);
-
-      // Method 3: Poll for Flutter engine and call enableAccessibility
-      var enableInterval = setInterval(function() {
-        try {
-          // Check if Flutter engine is ready
-          if (window._flutter && window._flutter.loader) {
-            // Try to enable via the engine's accessibility channel
-            // Flutter's Dart code checks window._flutter.semanticsEnabled
-            // on each frame — setting it should trigger accessibility
-            window._flutter.semanticsEnabled = true;
-
-            // Also try to find and call the Flutter view's accessibility API
-            var flutterViews = document.querySelectorAll('flt-glass-pane, flutter-view');
-            flutterViews.forEach(function(view) {
-              // Some Flutter versions expose enableAccessibility on the view
-              if (view.enableAccessibility) {
-                view.enableAccessibility();
-                console.log('[TASK151] Called view.enableAccessibility()');
-              }
-              // Dispatch a click event on the glass pane — some Flutter versions
-              // enable accessibility when they detect user interaction
-              if (view.dispatchEvent) {
-                view.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-              }
-            });
-
-            // Check if accessibility is now enabled
-            var semanticsNodes = document.querySelectorAll('flt-semantics, flt-semantics-text, [role="button"]');
-            if (semanticsNodes.length > 1) {
-              console.log('[TASK151] ✅ Flutter accessibility enabled — ' + semanticsNodes.length + ' semantics nodes found');
-              clearInterval(enableInterval);
-            }
-          }
-        } catch (e) {
-          // Non-fatal — keep trying
-        }
-      }, 1000);
-
-      // Stop polling after 60 seconds
-      setTimeout(function() { clearInterval(enableInterval); }, 60000);
-    });
-    // ─── End auto-click accessibility ───
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // TASK 150/151 (2026-10-30): SUPERSEDED — CanvasKit blocking REMOVED.
-    // On GitHub Actions (16GB RAM), CanvasKit loads normally with SwiftShader.
-    // The Proxy mock + canvaskit.wasm blocking was only needed on Render (512MB).
-    // Real CanvasKit = real rendering = screenshots have content = tribunal works.
-    // ─── End Task 150/151 (superseded) ───
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // TASK 150/151 CanvasKit blocking code — REMOVED (was Render-only workaround)
-    // On GitHub Actions with 16GB RAM, CanvasKit loads and renders normally.
-    // ═══════════════════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // TASK 139 (2026-10-29): REMOVED Task 138's Flutter loader injection.
-    // CanvasKit loads normally now — no blocking, no Proxy mock, no semantics forcing.
-    // The bot takes screenshots of the REAL rendered page and sends them to the tribunal.
-    // ═══════════════════════════════════════════════════════════════════════
-
-    this.pageInstance.on('crash', () => { log('Page crashed', 'ERROR', 'browser'); this.browserDisconnected = true; this.emit('crashed'); });
-    this.pageInstance.on('error', (err: Error) => { logError('Page error', err); });
-
-    // Console message capture for debugging
-    this.pageInstance.on('console', (msg: any) => {
-      try {
-        const text = msg.text?.() ?? String(msg);
-        const lower = String(text).toLowerCase();
-        if (lower.includes('webgl') || lower.includes('canvaskit') ||
-            lower.includes('flutter') || lower.includes('shader') ||
-            lower.includes('vulkan') || lower.includes('gl_') ||
-            lower.includes('opengl') || lower.includes('angle') ||
-            lower.includes('swiftshader') || lower.includes('error') ||
-            lower.includes('task150') || lower.includes('task149') ||
-            lower.includes('task146') || lower.includes('task148') ||
-            lower.includes('task151') || lower.includes('probe') ||
-            lower.includes('semantic') || lower.includes('engine') ||
-            lower.includes('render')) {
-          const type = msg.type?.() ?? 'log';
-          const level = type === 'error' ? 'ERROR' : (type === 'warning' ? 'WARN' : 'INFO');
-          log(`[PAGE-CONSOLE ${type.toUpperCase()}] ${String(text).substring(0, 500)}`, level, 'browser');
-        }
-      } catch { /* don't let console handler crash anything */ }
-    });
-    this.pageInstance.on('pageerror', (err: Error) => {
-      try {
-        log(`[PAGE-ERROR] ${err.message || String(err)}`, 'ERROR', 'browser');
-      } catch {}
-    });
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // TASK 149 (2026-10-30): SUPERSEDED by Task 150.
-    // Task 149 tried to force the chromium variant of CanvasKit (3.5MB vs
-    // 7.2MB) to reduce the WASM compile spike. But the pre-CanvasKit baseline
-    // was already 450MB, and even the chromium variant's 75MB compile spike
-    // pushed cgroup past 512MB → OOM.
-    //
-    // Task 150 takes the nuclear approach: block CanvasKit entirely and read
-    // from Flutter semantics DOM nodes instead. All Task 149 route handlers
-    // and init scripts have been removed to avoid conflicts.
-    // ─── End Task 149 (superseded) ───
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // TASK 139 (2026-10-29): REMOVED Task 138's Flutter loader injection.
-    // ═══════════════════════════════════════════════════════════════════════
-    // Task 138 tried to inject a canvasKitVariant: "chromium" config by
-    // monkey-patching _flutter.loader.load(). But:
-    //   1. The injection set window._flutter.loader = {} BEFORE flutter.js
-    //      loaded. When flutter.js checked `window._flutter.loader || create`,
-    //      it found the empty object and SKIPPED creating the real loader.
-    //      → Flutter never initialized → page permanently BLANK.
-    //   2. The HTML calls loadEntrypoint(), not load(). The canvasKitVariant
-    //      config is only read by load(), so the injection was useless anyway.
-    //
-    // REMOVED entirely. CanvasKit will load normally (full 7.2MB WASM).
-    // The watchdog now has a 90s grace period after navigation to let the
-    // WASM compile complete without being killed.
-    // ═══════════════════════════════════════════════════════════════════════
-
     this.pageInstance.on('crash', () => { log('Page crashed', 'ERROR', 'browser'); this.browserDisconnected = true; this.emit('crashed'); });
     this.pageInstance.on('error', (err: Error) => { logError('Page error', err); });
     const selectCalibration = getSelectCalibration();
@@ -668,20 +465,10 @@ class BrowserManager {
   }
 
   async cleanup() { 
-    // TIER 1: Try to save trace on emergency cleanup
-    if (process.env.ENABLE_TRACING === 'true' && this.contextInstance && this._traceFile) {
-      try {
-        const log = getLog();
-        log(`[TIER1] Saving trace on cleanup to ${this._traceFile}...`, 'INFO', 'browser');
-        await this.contextInstance.tracing.stop({ path: this._traceFile });
-        log('[TIER1] ✅ Trace saved on cleanup', 'INFO', 'browser');
-      } catch {}
-    }
     try { if (this.pageInstance && !this.pageInstance.isClosed()) { await this.pageInstance.close({ runBeforeUnload: false }).catch(() => {}); } } catch {}
     try { if (this.contextInstance) { await this.contextInstance.close().catch(() => {}); } } catch {}
     try { if (this.browserInstance && this.browserInstance.isConnected()) { await this.browserInstance.close().catch(() => {}); } } catch {}
     this.pageInstance = null; this.contextInstance = null; this.browserInstance = null; this.cdpSession = null;
-    this._traceFile = null;
   }
 
   async close() { 
@@ -691,21 +478,6 @@ class BrowserManager {
     this._intentionalClose = true;
     if (this._healthCheckInterval) { clearInterval(this._healthCheckInterval); this._healthCheckInterval = null; }
     if (this._memoryMonitorInterval) { clearInterval(this._memoryMonitorInterval); this._memoryMonitorInterval = null; }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // TIER 1 (2026-10-30): Save Playwright trace before closing browser
-    // ═══════════════════════════════════════════════════════════════════════
-    if (process.env.ENABLE_TRACING === 'true' && this.contextInstance && this._traceFile) {
-      try {
-        log(`[TIER1] Saving Playwright trace to ${this._traceFile}...`, 'INFO', 'browser');
-        await this.contextInstance.tracing.stop({ path: this._traceFile });
-        log(`[TIER1] ✅ Trace saved (${require('fs').statSync(this._traceFile).size / 1024 / 1024 | 0}MB)`, 'INFO', 'browser');
-      } catch (traceErr: any) {
-        log(`[TIER1] Failed to save trace (non-fatal): ${traceErr.message}`, 'WARN', 'browser');
-      }
-    }
-    // ─── End TIER 1 trace saving ───
-
     // Skip session save if browser already disconnected (avoids Protocol error)
     if (this.contextInstance && !this.browserDisconnected && this.browserInstance?.isConnected()) {
       try { const storage = await this.contextInstance.storageState(); if (storage) { saveSession(storage); } } catch (err: any) { log(`Failed to save session on close: ${(err as Error).message}`, 'WARN', 'browser'); }
@@ -911,7 +683,6 @@ class BrowserManager {
   // mean less transient memory during parallel tribunal calls.
   async compressScreenshot(base64: string, maxWidth = 512, quality = 10) { 
     if (!base64) return base64;
-    const sharp = _getSharp();
     if (!sharp) return base64;
     try {
       const buffer = Buffer.from(base64, 'base64');
@@ -1053,107 +824,6 @@ function getPageViewport(page: any): { width: number; height: number } {
   return { width: 1280, height: 800 };
 }
 
-// ─── TASK 150 (2026-10-30): DOM text extraction for Flutter semantics ───
-// When CanvasKit is blocked (Task 150), the canvas is blank but Flutter's
-// Dart code still runs and creates DOM semantics nodes. This function
-// extracts all visible text from the page — including Flutter semantics,
-// aria-labels, and any regular DOM text.
-//
-// Flutter semantics nodes use these element types:
-//   <flt-semantics> — container for a semantics node
-//   <flt-semantics-container> — grouping container
-//   <flt-semantics-text> — text content node
-//   aria-label attributes on various elements
-//
-// Returns: { text: string, nodeCount: number, hasFlutterSemantics: boolean }
-async function extractDomText(page: any): Promise<{ text: string; nodeCount: number; hasFlutterSemantics: boolean; hasCanvas: boolean; bodyHTML: string }> {
-  const log = getLog();
-  try {
-    const result = await page.evaluate(() => {
-      // Try Flutter semantics first
-      var flutterNodes = document.querySelectorAll('flt-semantics, flt-semantics-container, flt-semantics-text, [aria-label]');
-      var texts = [];
-      flutterNodes.forEach(function(node) {
-        var t = node.getAttribute('aria-label') || node.textContent || '';
-        if (t && t.trim().length > 0) {
-          texts.push(t.trim());
-        }
-      });
-      // Also try regular DOM text (for non-Flutter content like login pages)
-      if (texts.length === 0) {
-        var bodyText = document.body ? document.body.innerText : '';
-        if (bodyText && bodyText.trim().length > 0) {
-          texts.push(bodyText.trim().substring(0, 5000));
-        }
-      }
-      // Also try input fields and buttons
-      var inputs = document.querySelectorAll('input, button, [role="button"], a');
-      inputs.forEach(function(el) {
-        var t = el.getAttribute('aria-label') || el.textContent || el.getAttribute('placeholder') || '';
-        if (t && t.trim().length > 0) {
-          texts.push('[' + (el.tagName || 'ELEMENT') + '] ' + t.trim());
-        }
-      });
-      // Check for canvas elements
-      var canvases = document.querySelectorAll('canvas');
-      var combined = texts.join('\n');
-      return {
-        text: combined,
-        nodeCount: flutterNodes.length,
-        hasFlutterSemantics: flutterNodes.length > 0,
-        hasCanvas: canvases.length > 0,
-        bodyHTML: document.body ? document.body.innerHTML.substring(0, 2000) : '(no body)'
-      };
-    });
-    log(`[TASK150] extractDomText: ${result.nodeCount} semantics nodes, ${result.text.length} chars text, hasCanvas=${result.hasCanvas}`, 'INFO', 'browser');
-    if (result.text.length > 0) {
-      // Log first 500 chars for diagnostic
-      log(`[TASK150] DOM text preview: ${result.text.substring(0, 500).replace(/\n/g, ' | ')}`, 'INFO', 'browser');
-    } else {
-      log(`[TASK150] No DOM text found — page may not have loaded Flutter yet. Body HTML preview: ${result.bodyHTML.substring(0, 300)}`, 'WARN', 'browser');
-    }
-    return result;
-  } catch (err: any) {
-    const msg = err?.message || String(err);
-    log(`[TASK150] extractDomText failed: ${msg}`, 'ERROR', 'browser');
-    return { text: '', nodeCount: 0, hasFlutterSemantics: false, hasCanvas: false, bodyHTML: '' };
-  }
-}
-// ─── End Task 150 DOM text extraction ───
-
-// ─── TASK 148 (2026-10-29): Node-side WebGL check ───
-async function checkWebGL(page: any): Promise<{ available: boolean; vendor?: string; renderer?: string; error?: string }> {
-  const log = getLog();
-  try {
-    const result = await page.evaluate(() => {
-      try {
-        var c = document.createElement('canvas');
-        var gl = c.getContext('webgl2') || c.getContext('webgl') || c.getContext('experimental-webgl');
-        if (!gl) {
-          return { available: false, error: 'No WebGL context' };
-        }
-        var dbg = gl.getExtension('WEBGL_debug_renderer_info');
-        var vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VERSION);
-        var renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : '(masked)';
-        return { available: true, vendor: String(vendor), renderer: String(renderer) };
-      } catch (e) {
-        return { available: false, error: String(e && e.message ? e.message : e) };
-      }
-    });
-    if (result.available) {
-      log(`[TASK148] Node-side WebGL check: AVAILABLE — vendor=${result.vendor} renderer=${result.renderer}`, 'INFO', 'browser');
-    } else {
-      log(`[TASK148] Node-side WebGL check: UNAVAILABLE — ${result.error} (expected with --disable-gpu in Task 150)`, 'INFO', 'browser');
-    }
-    return result;
-  } catch (err: any) {
-    const msg = err?.message || String(err);
-    log(`[TASK148] Node-side WebGL check: evaluate() failed — ${msg}`, 'WARN', 'browser');
-    return { available: false, error: msg };
-  }
-}
-// ─── End Task 148 Node-side WebGL check ───
-
 module.exports = {
   get browserManager() { return getBrowserManager(); },
   getBrowserMetrics: () => getBrowserManager().getMetrics(),
@@ -1179,10 +849,6 @@ module.exports = {
   getPageViewport,
   getBrowser: () => getBrowserManager().browserInstance,
   getPage: () => getBrowserManager().pageInstance,
-  // TASK 150: DOM text extraction — reads Flutter semantics nodes when
-  // CanvasKit is blocked. Used by cycle manager as fallback for screenshots.
-  extractDomText,
-  checkWebGL,
   // DI support
   _injectDependencies,
 };
