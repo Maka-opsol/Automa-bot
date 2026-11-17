@@ -53,6 +53,46 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { PROJECT_ROOT } = require('./project-root');
 
+// ─── Load .env file from CWD (if it exists) ──────────────────────────────────
+// The workflow's "Write .env from BOT_ENV_FILE secret" step writes the entire
+// .env file (all API keys, Microsoft creds, Turso, Cloudinary, etc.) to disk.
+// envalid.cleanEnv() does NOT auto-load .env files (verified: envalid 7.3.1's
+// cleanEnv only uses options.reporter, no dotEnvPath/file reading). Without
+// this loader, the .env file written by BOT_ENV_FILE is never read, and all
+// providers report "missing env". This loader parses .env manually using the
+// already-required fs module — no new dependency (dotenv) needed.
+// Only sets vars NOT already in process.env, so workflow env: block secrets
+// and individual GitHub secrets take precedence over .env file values.
+try {
+  const _envPath = path.join(process.cwd(), '.env');
+  if (fs.existsSync(_envPath)) {
+    const _envContent = fs.readFileSync(_envPath, 'utf8');
+    let _loaded = 0;
+    for (const _line of _envContent.split('\n')) {
+      const _trimmed = _line.trim();
+      if (!_trimmed || _trimmed.startsWith('#')) continue;
+      const _eq = _trimmed.indexOf('=');
+      if (_eq === -1) continue;
+      const _key = _trimmed.slice(0, _eq).trim();
+      let _val = _trimmed.slice(_eq + 1).trim();
+      // Strip surrounding quotes (single or double)
+      if ((_val.startsWith('"') && _val.endsWith('"')) ||
+          (_val.startsWith("'") && _val.endsWith("'"))) {
+        _val = _val.slice(1, -1);
+      }
+      if (_key && !process.env[_key]) {
+        process.env[_key] = _val;
+        _loaded++;
+      }
+    }
+    if (_loaded > 0) {
+      console.log(`[CONFIG] Loaded ${_loaded} env vars from .env file`);
+    }
+  }
+} catch (_e: any) {
+  // Non-fatal — .env is optional
+}
+
 // ─── Crypto constants ────────────────────────────────────────────────────────
 
 const ALGORITHM: string = 'aes-256-gcm';
