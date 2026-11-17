@@ -13,8 +13,19 @@ async function testSelectors(componentName, url) {
     testedAt: new Date().toISOString(),
     results: []
   };
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  const { proxyLaunchOptions, proxyContextOptions, safeBrowserError } = require('./browser-proxy');
+  const config = require('./get-config');
+  let browser;
+  try { browser = await chromium.launch({ headless: true, ...proxyLaunchOptions(config) }); }
+  catch (err) { throw new Error(safeBrowserError(err, config)); }
+  let page;
+  try {
+    const context = await browser.newContext(proxyContextOptions(config));
+    page = await context.newPage();
+  } catch (err) {
+    await browser.close().catch(() => {});
+    throw new Error(safeBrowserError(err, config));
+  }
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(2000);
@@ -25,10 +36,11 @@ async function testSelectors(componentName, url) {
         const duration = Date.now() - startTime;
         results.results.push({ name, selector, found: !!element, duration, status: element ? 'pass' : 'fail' });
       } catch (err) {
-        results.results.push({ name, selector, found: false, error: err.message, duration: Date.now() - startTime, status: 'error' });
+        results.results.push({ name, selector, found: false, error: safeBrowserError(err, config), duration: Date.now() - startTime, status: 'error' });
       }
     }
-  } finally { await browser.close(); }
+  } catch (err) { throw new Error(safeBrowserError(err, config)); }
+  finally { await browser.close(); }
   const passed = results.results.filter(r => r.status === 'pass').length;
   const total = results.results.length;
   log(`✅ Selector test complete: ${passed}/${total} passed`, 'INFO', 'selector-tester');
