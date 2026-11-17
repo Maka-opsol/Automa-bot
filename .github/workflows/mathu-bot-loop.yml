@@ -1,3 +1,4 @@
+
 # ═══════════════════════════════════════════════════════════════════════
 # MathU Bot — Perpetual Loop GitHub Actions Workflow (v4)
 # ═══════════════════════════════════════════════════════════════════════
@@ -66,6 +67,12 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 350  # 5h 50m — leaves 10 min for cleanup + trigger
+    # CRITICAL: loads secrets from the "Automa-bot" GitHub Environment
+    # (Settings → Environments → Automa-bot). Without this line, all
+    # ${{ secrets.X }} references resolve to EMPTY because the secrets are
+    # stored in the environment, not in repository secrets. This was present
+    # in v5.2 (last working) and removed in v4 (broke the bot).
+    environment: Automa-bot
 
     steps:
       # ─── Step 1: Check out the bot code ───
@@ -139,8 +146,11 @@ jobs:
             cat /tmp/ollama.log 2>/dev/null || true
             exit 0
           fi
-          # Pull the vision model (qwen2.5vl:7b — vision-capable, ~4.7GB)
-          MODEL="${OLLAMA_MODEL:-qwen2.5vl:7b}"
+          # Pull llava:7b — handles BOTH vision (screenshots) AND code review.
+          # Matches v5.2 (last working config): one model for both tasks saves
+          # ~4.7GB disk vs pulling a separate coder model. GitHub runners have
+          # ~7GB free — one model fits, two don't.
+          MODEL="llava:7b"
           echo "Pulling model: $MODEL (~4.7GB)..."
           ollama pull "$MODEL" || { echo "⚠️ Model pull failed — bot will use cloud providers"; exit 0; }
           echo "Available models:"
@@ -223,15 +233,38 @@ jobs:
           # Disable forced restarts (GitHub Actions handles timeout)
           MAX_UPTIME_HOURS: 0
           MAX_CYCLES_BEFORE_RESTART: 999999
-          # ─── Ollama (local vision fallback — installed in Step 5.5) ───
-          # AUDITOR_PROVIDER=ollama tells run-bot.sh to verify the server is
-          # up before starting the bot. OLLAMA_MODEL pins the vision model
-          # (must match what Step 5.5 pulled). The reachability probe in
-          # providers-ollama.ts auto-detects the server on localhost:11434;
-          # if Step 5.5 failed (continue-on-error), the probe fails and the
-          # bot silently falls back to cloud providers.
-          AUDITOR_PROVIDER: ollama
-          OLLAMA_MODEL: qwen2.5vl:7b
+          # ─── v5.1: Live dashboard on Render — ship logs, stats, screenshots ───
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+          DASHBOARD_KEY: ${{ secrets.DASHBOARD_KEY }}
+          # ─── v5.2: Scheduled patch system — bot checks dashboard for patches ───
+          SCHEDULED_PATCH_TIMES: "12,0"  # 12pm and 12am (SAST hours)
+          SCHEDULED_PATCH_TIMEZONE: "Africa/Johannesburg"
+          # ─── TIER 1: Enable Playwright trace recording ───
+          ENABLE_TRACING: "true"
+          TRACE_DIR: /tmp/mathu-logs/traces
+          # ─── TIER 1: Enable local OCR (Pix2Text) ───
+          ENABLE_LOCAL_OCR: "true"
+          # ─── TIER 1+: Enable GAN telemetry (mouse movement GAN) ───
+          ENABLE_GAN_TELEMETRY: "true"
+          GAN_MODEL_PATH: "./models/mouse-gan.onnx"
+          # ─── TIER 1+: Disable local VLM (HuggingFace 401 on download) ───
+          # Ollama (llava:7b) handles vision locally instead.
+          ENABLE_LOCAL_VLM: "false"
+          # ─── TIER 2: Parallel browser mode — 3 contexts solving simultaneously ───
+          PARALLEL_WORKERS: "3"
+          # ─── Ollama (local vision + code review — installed in Step 5.5) ───
+          # llava:7b handles BOTH vision (screenshots) AND code review.
+          # Matches v5.2 (last working config). The reachability probe in
+          # providers-ollama.ts auto-detects localhost:11434; if Step 5.5
+          # failed (continue-on-error), the probe fails and the bot silently
+          # falls back to cloud providers.
+          AUDITOR_USE_ACTIVE: "false"
+          AUDITOR_PROVIDER: "ollama"
+          AUDITOR_MODEL: "llava:7b"
+          AUDITOR_API_KEY: "ollama"
+          AUDITOR_ENDPOINT: "http://localhost:11434/v1/chat/completions"
+          OLLAMA_MODEL: "llava:7b"
+          OLLAMA_VISION_MODEL: "llava:7b"
           # ─── v4: GitHub log shipper (live logs → bot-logs branch) ───
           # PAT_TOKEN is optional here — the shipper falls back to the
           # auto-injected GITHUB_TOKEN (which works on Actions thanks to
