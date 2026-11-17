@@ -1,4 +1,3 @@
-
 'use strict';
 
 const { DIContainer } = require('./container-container');
@@ -117,11 +116,22 @@ function startSelfHealV2Subsystems(
   // points (e.g. parallel-entry.ts) call this without passing a valid CONFIG
   // object, which caused "Cannot read properties of undefined (reading
   // 'PREDICTIVE_HEAL_ENABLED')" at the CONFIG[config.flag] access below.
-  // When CONFIG is missing, skip all flag-gated subsystems gracefully rather
-  // than crashing — the subsystems that don't require a flag will still run.
+  // Instead of skipping entirely, try to load CONFIG from the config module
+  // (which IS loaded by the DI container and should be available via require).
+  // This enables all the flag-gated self-heal subsystems in parallel mode.
   if (!CONFIG || typeof CONFIG !== 'object') {
-    _logger()?.log('Self-heal v2: CONFIG is undefined — skipping flag-gated subsystems', 'WARN', 'subsystem-runner');
-    return { started: [], failed: [] };
+    try {
+      const configModule = require('./config');
+      CONFIG = (configModule.CONFIG || configModule) as Record<string, unknown>;
+    } catch {
+      _logger()?.log('Self-heal v2: CONFIG not passed and require("./config") failed — skipping flag-gated subsystems', 'WARN', 'subsystem-runner');
+      return { started: [], failed: [] };
+    }
+    if (!CONFIG || typeof CONFIG !== 'object') {
+      _logger()?.log('Self-heal v2: CONFIG still undefined after require — skipping flag-gated subsystems', 'WARN', 'subsystem-runner');
+      return { started: [], failed: [] };
+    }
+    _logger()?.log('Self-heal v2: CONFIG loaded from require("./config") — enabling flag-gated subsystems', 'INFO', 'subsystem-runner');
   }
 
   const selfHealV2 = container.getByTag('self-heal-v2');
