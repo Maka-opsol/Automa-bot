@@ -454,7 +454,7 @@ async function investigatePage() {
         usingCycleBrowser = false;
       }
     } catch (cycleErr: any) {
-      log(`Investigation: cycle browser not available (${cycleErr.message}) — falling back to isolated browser`, 'DEBUG', 'self-heal');
+      log(`Investigation: cycle browser not available (${require('./browser-proxy').safeBrowserError(cycleErr, getCONFIG())}) — falling back to isolated browser`, 'DEBUG', 'self-heal');
     }
 
     // FALLBACK: Launch an isolated browser for investigation
@@ -473,6 +473,8 @@ async function investigatePage() {
 
     isolatedBrowser = await chromium.launch({
       headless: true,
+      ...require('./browser-proxy').proxyLaunchOptions(config),
+      ...(config.CHROMIUM_EXECUTABLE_PATH ? { executablePath: config.CHROMIUM_EXECUTABLE_PATH } : {}),
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -482,6 +484,7 @@ async function investigatePage() {
       ],
     });
     const context = await isolatedBrowser.newContext({
+      ...require('./browser-proxy').proxyContextOptions(config),
       viewport: { width: 1280, height: 720 },
       userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       ignoreHTTPSErrors: true,
@@ -500,14 +503,15 @@ async function investigatePage() {
         if (type === 'error' || type === 'warning') {
           const text = msg.text();
           if (text && text.length > 0 && text.length < 500) {
-            consoleMessages.push({ type, text, url: msg.location()?.url });
+            const safeText = require('./browser-proxy').safeBrowserError(text, config);
+            consoleMessages.push({ type, text: safeText, url: require('./browser-proxy').configuredProxyUrl(config) ? undefined : msg.location()?.url });
           }
         }
       });
       page.on('pageerror', (err: Error) => {
         const text = err?.message || String(err);
         if (text && text.length > 0 && text.length < 500) {
-          pageErrors.push(text);
+          pageErrors.push(require('./browser-proxy').safeBrowserError(text, config));
         }
       });
     } catch { /* best effort — listener setup shouldn't fail investigation */ }
@@ -527,7 +531,7 @@ async function investigatePage() {
       // causing every self-heal investigation to fail with "Timeout 30000ms exceeded".
       await page.goto(_investigateUrl, { waitUntil: 'load', timeout: 60000 });
     } catch (navErr: any) {
-      const _msg = String(navErr?.message || navErr);
+      const _msg = require('./browser-proxy').safeBrowserError(navErr, config);
       log(`Investigation navigation to ${_investigateUrl} failed: ${_msg.substring(0, 200)}`, 'WARN', 'self-heal');
       // Record the network error for dashboard
       try {
@@ -588,7 +592,7 @@ async function investigatePage() {
       domStats,
     };
   } catch (err: any) {
-    logError('Investigation failed', err);
+    logError('Investigation failed', new Error(require('./browser-proxy').safeBrowserError(err, getCONFIG())));
     return null;
   } finally {
     // TASK 94 (2026-09-27): Only close the ISOLATED browser — never touch
@@ -2291,6 +2295,7 @@ module.exports = {
   // v9: Expose runtime heal separately for fast-path use from cycle-manager
   // (bypasses /tmp overlay, code patches, daily limits, and cooldown).
   performRuntimeHeal,
+  investigatePage, // deterministic recovery-path testing and diagnostics
   setAcceptAnyFixSession,
   isAcceptAnyFixSession,
   pushSelfHealError,

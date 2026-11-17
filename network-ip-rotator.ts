@@ -173,24 +173,9 @@ async function _fetchProxyScrapeProxies(): Promise<string[]> {
  * Load proxies from ProxyScrape API + PROXY_URLS env var.
  */
 async function _loadProxyUrls(): Promise<void> {
-  // First, check for manual PROXY_URLS env var (static list)
-  const CONFIG = getCONFIG();
-  const proxyEnv = String(CONFIG.PROXY_URLS || process.env.PROXY_URLS || '');
-  if (proxyEnv.trim()) {
-    _proxyUrls = proxyEnv.split(',').map(u => u.trim()).filter(u => u.length > 0);
-    log(`[IP] Loaded ${_proxyUrls.length} proxy URLs from PROXY_URLS env var`, 'INFO');
-    return;
-  }
-
-  // Otherwise, fetch from ProxyScrape API
-  const scrapeProxies = await _fetchProxyScrapeProxies();
-  if (scrapeProxies.length > 0) {
-    _proxyUrls = scrapeProxies;
-    log(`[IP] Loaded ${_proxyUrls.length} ZA proxies from ProxyScrape`, 'INFO');
-  } else {
-    _proxyUrls = [];
-    log('[IP] No proxies available (ProxyScrape returned empty)', 'WARN');
-  }
+  // Browser proxy selection is explicit and handled by browser-proxy.ts.
+  // Never automatically discover or activate untrusted public proxies.
+  _proxyUrls = [];
 }
 
 // ─── Core API ───
@@ -450,45 +435,18 @@ async function rotateToValidatedProxy(maxToTry: number = 5): Promise<string | nu
 }
 
 /**
- * Bypass the proxy — FULLY shut it down so no code path uses it anymore.
- *
- * BUG FIX (2026-09-09): The old `bypassProxy()` only set `__proxyDisabled = true`
- * but did NOT clear:
- *   - `process.env.HTTP_PROXY` / `process.env.HTTPS_PROXY` — Node's `fetch()`
- *     (used by vision providers, self-heal, ip-rotator's own validateProxy, etc.)
- *     respects these env vars and STILL routes through the dead proxy.
- *   - `_currentProxyIndex` — `getCurrentProxy()` still returns the old proxy URL,
- *     so any code that checks it thinks a proxy is active.
- *
- * This was causing `ERR_PROXY_CONNECTION_FAILED` and `ERR_EMPTY_RESPONSE` even
- * AFTER the proxy was "disabled" — the bot kept using the dead proxy via env vars.
- *
- * Now `bypassProxy()` is the SINGLE canonical way to disable the proxy. It:
- *   1. Sets `__proxyDisabled = true` (stops Playwright context from using proxy)
- *   2. Clears `process.env.HTTP_PROXY` / `HTTPS_PROXY` (stops Node fetch)
- *   3. Resets `_currentProxyIndex = -1` (stops `getCurrentProxy()` from returning stale proxy)
- *   4. Records the bypass in the proxy outcome log
+ * Disable the rotator's proxy and set the browser runtime policy. Explicitly
+ * configured browser proxies fail closed under this policy. Independent HTTP
+ * client environment settings are left untouched; this is not a global bypass.
  */
 function bypassProxy(reason: string): void {
   const wasActive = !!(globalThis as any).__proxyDisabled === false && getCurrentProxy();
   if (!(globalThis as any).__proxyDisabled) {
     (globalThis as any).__proxyDisabled = true;
-    log(`[IP] Proxy BYPASSED — reason: ${reason}. Fully shutting down proxy (env vars + state).`, 'WARN');
+    log(`[IP] Rotator proxy disabled — reason: ${reason}. Independent HTTP proxy settings are unchanged.`, 'WARN');
   }
-  // Clear environment variables so Node's fetch() / HTTP clients stop using the proxy
-  if (process.env.HTTP_PROXY) {
-    const _oldProxy = process.env.HTTP_PROXY;
-    delete process.env.HTTP_PROXY;
-    log(`[IP] Cleared process.env.HTTP_PROXY (was: ${_oldProxy})`, 'DEBUG');
-  }
-  if (process.env.HTTPS_PROXY) {
-    delete process.env.HTTPS_PROXY;
-    log('[IP] Cleared process.env.HTTPS_PROXY', 'DEBUG');
-  }
-  if (process.env.NO_PROXY) {
-    delete process.env.NO_PROXY;
-    log('[IP] Cleared process.env.NO_PROXY', 'DEBUG');
-  }
+  // HTTP_PROXY, HTTPS_PROXY and NO_PROXY belong to independent clients.
+  // Leave them untouched; this module no longer activates discovered proxies.
   // Reset the ip-rotator state so getCurrentProxy() returns null
   const _oldIndex = _currentProxyIndex;
   _currentProxyIndex = -1;
@@ -564,38 +522,39 @@ async function ensureValidProxy(): Promise<'current' | 'rotated' | 'bypassed' | 
  * Categorizes the error and records it for dashboard display.
  */
 function recordNetworkError(error: any, context?: { url?: string; cycleCount?: number }): void {
-  const msg = String(error?.message || error);
+  const rawMessage = String(error?.message || error);
+  const msg = require('./browser-proxy').safeBrowserError(error, getCONFIG());
   let errorType = 'UNKNOWN';
 
-  // Categorize common Playwright / Node network errors
-  if (/ERR_CONNECTION_CLOSED/i.test(msg)) errorType = 'ERR_CONNECTION_CLOSED';
-  else if (/ERR_CONNECTION_RESET/i.test(msg)) errorType = 'ERR_CONNECTION_RESET';
-  else if (/ERR_CONNECTION_REFUSED/i.test(msg)) errorType = 'ERR_CONNECTION_REFUSED';
-  else if (/ERR_CONNECTION_TIMED_OUT|ERR_TIMED_OUT/i.test(msg)) errorType = 'ERR_CONNECTION_TIMED_OUT';
-  else if (/ERR_NAME_NOT_RESOLVED/i.test(msg)) errorType = 'ERR_NAME_NOT_RESOLVED';
-  else if (/ERR_PROXY_CONNECTION_FAILED/i.test(msg)) errorType = 'ERR_PROXY_CONNECTION_FAILED';
-  else if (/ERR_TUNNEL_CONNECTION_FAILED/i.test(msg)) errorType = 'ERR_TUNNEL_CONNECTION_FAILED';
-  else if (/ERR_INTERNET_DISCONNECTED/i.test(msg)) errorType = 'ERR_INTERNET_DISCONNECTED';
-  else if (/ERR_BLOCKED_BY_CLIENT/i.test(msg)) errorType = 'ERR_BLOCKED_BY_CLIENT';
-  else if (/ERR_CERT/i.test(msg)) errorType = 'ERR_CERT';
-  else if (/chrome-error/i.test(msg)) errorType = 'CHROME_ERROR_PAGE';
-  else if (/Timeout \d+ms exceeded/i.test(msg)) errorType = 'NAV_TIMEOUT';
-  else if (/Target closed|Target page.*closed/i.test(msg)) errorType = 'TARGET_CLOSED';
-  else if (/net::ERR/i.test(msg)) {
-    const m = msg.match(/net::(ERR_[A-Z_]+)/i);
+  // Categorize original errors locally; persist only sanitized details.
+  if (/ERR_CONNECTION_CLOSED/i.test(rawMessage)) errorType = 'ERR_CONNECTION_CLOSED';
+  else if (/ERR_CONNECTION_RESET/i.test(rawMessage)) errorType = 'ERR_CONNECTION_RESET';
+  else if (/ERR_CONNECTION_REFUSED/i.test(rawMessage)) errorType = 'ERR_CONNECTION_REFUSED';
+  else if (/ERR_CONNECTION_TIMED_OUT|ERR_TIMED_OUT/i.test(rawMessage)) errorType = 'ERR_CONNECTION_TIMED_OUT';
+  else if (/ERR_NAME_NOT_RESOLVED/i.test(rawMessage)) errorType = 'ERR_NAME_NOT_RESOLVED';
+  else if (/ERR_PROXY_CONNECTION_FAILED/i.test(rawMessage)) errorType = 'ERR_PROXY_CONNECTION_FAILED';
+  else if (/ERR_TUNNEL_CONNECTION_FAILED/i.test(rawMessage)) errorType = 'ERR_TUNNEL_CONNECTION_FAILED';
+  else if (/ERR_INTERNET_DISCONNECTED/i.test(rawMessage)) errorType = 'ERR_INTERNET_DISCONNECTED';
+  else if (/ERR_BLOCKED_BY_CLIENT/i.test(rawMessage)) errorType = 'ERR_BLOCKED_BY_CLIENT';
+  else if (/ERR_CERT/i.test(rawMessage)) errorType = 'ERR_CERT';
+  else if (/chrome-error/i.test(rawMessage)) errorType = 'CHROME_ERROR_PAGE';
+  else if (/Timeout \d+ms exceeded/i.test(rawMessage)) errorType = 'NAV_TIMEOUT';
+  else if (/Target closed|Target page.*closed/i.test(rawMessage)) errorType = 'TARGET_CLOSED';
+  else if (!require('./browser-proxy').configuredProxyUrl(getCONFIG()) && /net::ERR/i.test(rawMessage)) {
+    const m = rawMessage.match(/net::(ERR_[A-Z_]+)/i);
     if (m) errorType = m[1];
   }
 
   const rec: NetworkErrorRecord = {
     timestamp: Date.now(),
     errorType,
-    url: context?.url,
-    proxy: getCurrentProxy(),
+    url: require('./browser-proxy').configuredProxyUrl(getCONFIG()) ? undefined : context?.url,
+    proxy: require('./browser-proxy').configuredProxyUrl(getCONFIG()) ? null : getCurrentProxy(),
     message: msg.substring(0, 300),
     cycleCount: context?.cycleCount,
   };
   _recordNetworkError(rec);
-  log(`[IP] Network error recorded: ${errorType}${context?.url ? ' @ ' + context.url : ''}${rec.proxy ? ' (via ' + rec.proxy + ')' : ''}`, 'WARN');
+  log(`[IP] Network error recorded: ${errorType}${rec.url ? ' @ ' + rec.url : ''}${rec.proxy ? ' (via ' + rec.proxy + ')' : ''}`, 'WARN');
 }
 
 /**
@@ -840,25 +799,8 @@ async function start(): Promise<void> {
   // If bypassed, this will use the direct connection.
   await checkIp();
 
-  // BUGFIX: After the IP check completes, if a proxy was activated just for
-  // the check, clear the env vars again so the browser (launched later)
-  // doesn't inherit them. The proxy should only be active during explicit
-  // IP checks, not during normal browser navigation — UNLESS the bypass
-  // flag is unset AND the bot is configured to use the proxy for browsing.
-  // On Render, bypass is always set, so we always clear here.
-  if (isBypassed) {
-    // Already cleared by bypassProxy() — but re-clear defensively in case
-    // any code path re-set them during the IP check.
-    if (process.env.HTTP_PROXY) {
-      delete process.env.HTTP_PROXY;
-      log('[IP] Re-cleared process.env.HTTP_PROXY after IP check (bypass active)', 'DEBUG');
-    }
-    if (process.env.HTTPS_PROXY) {
-      delete process.env.HTTPS_PROXY;
-      log('[IP] Re-cleared process.env.HTTPS_PROXY after IP check (bypass active)', 'DEBUG');
-    }
-    _currentProxyIndex = -1;
-  }
+  // Preserve independently configured HTTP client proxy variables.
+  if (isBypassed) _currentProxyIndex = -1;
 
   // Set up periodic proxy list refresh (every 10 min)
   _proxyRefreshTimer = setInterval(async () => {

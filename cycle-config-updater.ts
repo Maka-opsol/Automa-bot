@@ -7,6 +7,7 @@ const { getProviderConfig, updateProviderConfig } = require('./providers-config-
 const { log, safeLog, logError } = require('./logger');
 const CONFIG = require('./get-config');
 const { retryWithBackoff } = require('./providers-base');
+const { proxyContextOptions, safeBrowserError } = require('./browser-proxy');
 
 const PROVIDER_DOCS = {
   'Groq': 'https://console.groq.com/docs/models',
@@ -36,7 +37,7 @@ async function discoverAndUpdateProvider(providerName: any) {
   try {
     const browser = getBrowser();
     if (!browser || !browser.isConnected()) { log('Browser not available for config update, skipping.', 'WARN', 'config-updater'); return; }
-    context = await browser.newContext();
+    context = await browser.newContext(proxyContextOptions(CONFIG));
     const page = await context.newPage();
     await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
@@ -51,7 +52,7 @@ async function discoverAndUpdateProvider(providerName: any) {
     const newConfig = { endpoint: result.result.endpoint || getProviderConfig(providerName)?.endpoint, model: result.result.model };
     updateProviderConfig(providerName, newConfig, true);
     log(`✅ Updated ${providerName} to model ${newConfig.model}`, 'INFO', 'config-updater');
-  } catch (err: any) { logError(`Updater error for ${providerName}`, err); } finally { if (context) { try { await context.close(); } catch (e: any) { /* context may already be closed */ } } }
+  } catch (err: any) { logError(`Updater error for ${providerName}`, new Error(safeBrowserError(err, CONFIG))); } finally { if (context) { try { await context.close(); } catch (e: any) { /* context may already be closed */ } } }
 }
 
 async function runConfigUpdater() { 
@@ -63,4 +64,4 @@ async function runConfigUpdater() {
   log(`✅ Config updater finished (${Object.keys(PROVIDER_DOCS).length} providers updated).`, 'INFO', 'config-updater');
 }
 
-module.exports = { runConfigUpdater };
+module.exports = { runConfigUpdater, discoverAndUpdateProvider };

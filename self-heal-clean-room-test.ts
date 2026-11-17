@@ -36,33 +36,33 @@ class CleanRoomTest {
 'use strict';
 
 const path = require('path');
-const { PROJECT_ROOT } = require('./project-root');
+const { createRequire } = require('module');
+const projectRequire = createRequire(${JSON.stringify(path.join(PROJECT_ROOT, 'package.json'))});
+projectRequire('tsx/cjs/api').register();
 const fs = require('fs');
 const os = require('os');
 
-// Create isolated database in /tmp
-const tmpDir = path.join(os.tmpdir(), 'clean-room-test-' + process.pid);
-fs.mkdirSync(tmpDir, { recursive: true });
-
-// Minimal in-memory config override
-process.env.CLEAN_ROOM_TEST = '1';
-process.env.DB_PATH = path.join(tmpDir, 'test.db');
-process.env.NO_PERSIST = 'true';
-
-const APP_URL = ${JSON.stringify(CONFIG.APP_URL || 'https://app.mathu.co.za')};
-
 async function runTest() { 
   const startTime = Date.now();
-  let browser: any = null;
+  let page = null;
+  let closeBrowser = null;
+  let tmpDir = null;
 
   try {
+    // Nested inside the parent's private runner directory, so the parent can
+    // remove it even when the child is killed before its own cleanup runs.
+    tmpDir = fs.mkdtempSync(path.join(process.env.CLEAN_ROOM_BASE_DIR || os.tmpdir(), 'clean-room-test-'));
+    process.env.CLEAN_ROOM_TEST = '1';
+    process.env.DB_PATH = path.join(tmpDir, 'test.db');
+    process.env.NO_PERSIST = 'true';
+
     // Step 1: Load config (should work without cached state)
-    const CONFIG = require(${JSON.stringify(path.join(PROJECT_ROOT, 'config'))});
-    const testUrl = CONFIG.APP_URL || APP_URL;
-    console.log('[clean-room] Config loaded, APP_URL:', testUrl);
+    const CONFIG = projectRequire('./config');
+    const testUrl = CONFIG.APP_URL || process.env.APP_URL || 'https://app.mathu.co.za';
+    console.log('[clean-room] Config loaded');
 
     // Step 2: Load database (creates fresh in /tmp)
-    const Database = require('better-sqlite3');
+    const Database = projectRequire('better-sqlite3');
     const testDb = new Database(path.join(tmpDir, 'test.db'));
     testDb.prepare('CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, val TEXT)').run();
     testDb.prepare('INSERT INTO test (val) VALUES (?)').run('clean-room');
@@ -70,38 +70,36 @@ async function runTest() {
     testDb.close();
     if (!row || row.val !== 'clean-room') {
       console.error('[clean-room] Database test failed');
-      process.exit(1);
+      throw new Error('Clean-room check failed');
     }
     console.log('[clean-room] Database: OK');
 
     // Step 3: Load logger
-    const { log } = require(${JSON.stringify(path.join(PROJECT_ROOT, 'logger'))});
+    const { log } = projectRequire('./logger');
     log('Clean-room test logger initialized', 'INFO', 'clean-room');
     console.log('[clean-room] Logger: OK');
 
     // Step 4: Launch browser (most critical test)
     console.log('[clean-room] Launching browser...');
-    const { launchBrowser, closeBrowser } = require(${JSON.stringify(path.join(PROJECT_ROOT, 'browser'))});
-    browser = await launchBrowser();
-
-    if (!browser) {
-      console.error('[clean-room] Browser launch returned null');
-      process.exit(1);
+    const browserModule = projectRequire('./browser');
+    browserModule._injectDependencies({ config: CONFIG });
+    closeBrowser = browserModule.closeBrowser;
+    page = await browserModule.launchBrowser();
+    // launchBrowser returns the already configured Page, not a Browser.
+    if (!page || typeof page.goto !== 'function') {
+      throw new Error('Browser launch did not return a Page');
     }
 
-    const pages = browser.pages ? browser.pages() : [];
-    const page = pages.length > 0 ? pages[0] : await browser.newPage();
-
     // Step 5: Navigate to APP_URL
-    console.log('[clean-room] Navigating to:', testUrl);
+    console.log('[clean-room] Navigating to app');
     await page.goto(testUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    console.log('[clean-room] Navigation complete, URL:', page.url());
+    console.log('[clean-room] Navigation complete');
 
     // Step 6: Take screenshot (proves rendering works)
     const screenshot = await page.screenshot({ type: 'jpeg', quality: 30 });
     if (!screenshot || screenshot.length < 100) {
       console.error('[clean-room] Screenshot too small or empty');
-      process.exit(1);
+      throw new Error('Clean-room check failed');
     }
     console.log('[clean-room] Screenshot: OK (' + screenshot.length + ' bytes)');
 
@@ -114,36 +112,22 @@ async function runTest() {
 
     if (interactiveElements === 0) {
       console.error('[clean-room] No interactive elements found on page');
-      process.exit(1);
-    }
-
-    // Cleanup
-    await closeBrowser();
-
-    // Cleanup tmp dir
-    try {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    } catch (e: any) {
-      // Non-critical
+      throw new Error('Clean-room check failed');
     }
 
     const duration = Date.now() - startTime;
     console.log('[clean-room] SUCCESS in ' + duration + 'ms');
-    process.exit(0);
-  } catch (err: any) {
-    console.error('[clean-room] FAILED:', err.message);
-    console.error(err.stack);
-
-    if (browser) {
-      try { await browser.close(); } catch (e: any) { /* ignore */ }
+  } catch (err) {
+    // Browser and configuration errors can contain the complete app URL.
+    console.error('[clean-room] FAILED (details withheld)');
+    process.exitCode = 1;
+  } finally {
+    if (closeBrowser) {
+      try { await closeBrowser(); } catch (e) { /* ignore */ }
     }
-
-    // Cleanup tmp dir
-    try {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    } catch (e: any) { /* ignore */ }
-
-    process.exit(1);
+    if (tmpDir) {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+    }
   }
 }
 
@@ -182,64 +166,46 @@ runTest();
       return result;
     }
 
-    // Write script to temp file (NOT source directory)
+    // Keep the runner in a fresh private directory; never follow a pre-existing
+    // shared temporary pathname when creating it.
     const os = require('os');
-    const scriptPath = path.join(os.tmpdir(), `_clean_room_runner-${Date.now()}.js`);
+    let scriptDir: string | null = null;
+    let scriptPath: string;
     try {
-      fs.writeFileSync(scriptPath, scriptContent, 'utf-8');
+      scriptDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clean-room-runner-'));
+      scriptPath = path.join(scriptDir, 'runner.js');
+      fs.writeFileSync(scriptPath, scriptContent, { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
     } catch (err: any) {
-      logError('Failed to write clean-room test script', err);
+      if (scriptDir) { try { fs.rmSync(scriptDir, { recursive: true, force: true }); } catch (e) { /* ignore */ } }
+      log('Failed to write clean-room test script (details withheld)', 'ERROR', 'clean-room');
 // @ts-expect-error
-      result.error = 'Failed to write test script: ' + err.message;
+      result.error = 'Failed to write test script';
       _lastResult = result;
       this._logEvent('clean_room_test', JSON.stringify(result));
       return result;
     }
 
+    try {
     // Run the test in a forked process
     let firstRunPassed = false;
     try {
 // @ts-expect-error
       firstRunPassed = await this._forkTest(scriptPath);
     } catch (err: any) {
-      logError('Clean-room test fork error', err);
+      log('Clean-room test fork error (details withheld)', 'ERROR', 'clean-room');
 // @ts-expect-error
-      result.error = 'Fork error: ' + err.message;
+      result.error = 'Fork error';
     }
 
     result.duration = Date.now() - startTime;
     result.passed = firstRunPassed;
 
     if (!firstRunPassed) {
-      // Check if main bot is working (i.e., bot is addicted to stale state)
-      const mainBotWorking = await this._checkMainBotWorking();
-
-      if (mainBotWorking) {
-        log('Bot is addicted to stale state: clean-room test failed but main bot works', 'ERROR', 'clean-room');
-        result.addictionDetected = true;
-        try { getSendAlert()('Clean-room test failed while main bot works. Bot may be addicted to stale cached state.', 2); } catch (e: any) {}
-
-        // Attempt cache clear and session purge
-        log('Triggering cache clear and session purge', 'WARN', 'clean-room');
-        await this._clearCacheAndSessions();
-
-        // Re-test
-        log('Re-running clean-room test after cache clear', 'INFO', 'clean-room');
-        try {
-// @ts-expect-error
-          result.retestPassed = await this._forkTest(scriptPath);
-          if (result.retestPassed) {
-            log('Clean-room re-test PASSED after cache clear', 'INFO', 'clean-room');
-          } else {
-            log('Clean-room re-test STILL FAILED after cache clear', 'ERROR', 'clean-room');
-            try { getSendAlert()('Clean-room test still fails after cache clear. Possible fundamental breakage.', 1); } catch (e: any) {}
-          }
-        } catch (retestErr: any) {
-          logError('Clean-room re-test error', retestErr);
-        }
-      } else {
-        log('Clean-room test failed and main bot also not working (not state addiction)', 'WARN', 'clean-room');
-      }
+      // A failed isolated run cannot distinguish stale state from unavailable
+      // infrastructure, browser/proxy failures, timeouts, or child crashes.
+      // Never purge based on this ambiguous signal, even if the main bot works.
+      log('Clean-room test failed; cause is ambiguous, cache and sessions preserved', 'WARN', 'clean-room');
+      try { getSendAlert()('Clean-room test failed; cache and sessions were preserved. Investigate infrastructure and browser health.', 2); } catch (e: any) {}
     } else {
       log('Clean-room test PASSED', 'INFO', 'clean-room');
     }
@@ -253,52 +219,46 @@ runTest();
       retestPassed: result.retestPassed
     }));
 
-    // Clean up temp script
-    try { fs.unlinkSync(scriptPath); } catch (e: any) { /* ignore */ }
-
     return result;
+    } finally {
+      try { fs.rmSync(scriptDir, { recursive: true, force: true }); } catch (e: any) { /* ignore */ }
+    }
   }
 
   _forkTest(scriptPath: any) { 
     return new Promise((resolve) => {
       try {
         const child = fork(scriptPath, [], {
-          timeout: 120000,
           cwd: PROJECT_ROOT,
-          stdio: 'pipe',
+          // Child diagnostics can contain credentials or URL query parameters.
+          stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
           env: {
             ...process.env,
+            APP_URL: CONFIG.APP_URL || 'https://app.mathu.co.za',
+            CLEAN_ROOM_BASE_DIR: path.dirname(scriptPath),
             CLEAN_ROOM_TEST: '1',
             NO_PERSIST: 'true'
           }
         });
 
-        let output = '';
-        child.stdout.on('data', (data: any) => { output += data.toString(); });
-        child.stderr.on('data', (data: any) => { output += data.toString(); });
-
-        child.on('exit', (code: any) => {
-          const cleanOutput = output.split('\n').filter(l => l.includes('[clean-room]')).join('\n');
-          if (cleanOutput) {
-            log(`Clean-room output:\n${cleanOutput}`, code === 0 ? 'DEBUG' : 'WARN', 'clean-room');
-          }
-          resolve(code === 0);
+        let failed = false;
+        child.on('error', () => {
+          failed = true;
+          log('Clean-room test process error (details withheld)', 'ERROR', 'clean-room');
         });
 
-        child.on('error', (err: any) => {
-          logError('Clean-room test process error', err);
-          resolve(false);
-        });
-
-        // Hard timeout safety net
-        const _timeoutHandle = setTimeout(() => {
+        const timeoutHandle = setTimeout(() => {
+          failed = true;
           try { child.kill('SIGKILL'); } catch (e: any) { /* already dead */ }
           log('Clean-room test timed out (120s)', 'ERROR', 'clean-room');
-          resolve(false);
-        }, 125000);
-        child.on('exit', () => { clearTimeout(_timeoutHandle); });
+        }, 120000);
+        // Wait for close before the parent removes the runner directory.
+        child.on('close', (code: any) => {
+          clearTimeout(timeoutHandle);
+          resolve(!failed && code === 0);
+        });
       } catch (err: any) {
-        logError('Error forking clean-room test', err);
+        log('Error forking clean-room test (details withheld)', 'ERROR', 'clean-room');
         resolve(false);
       }
     });

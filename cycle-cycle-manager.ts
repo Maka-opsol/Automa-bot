@@ -1411,10 +1411,11 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
       for (let _navAttempt = 1; _navAttempt <= MAX_NAV_ATTEMPTS && !_initialNavOk; _navAttempt++) {
         // TASK 140 (2026-10-24): If proxy is already disabled (e.g., by bypassProxy
         // on startup), skip directly to direct mode. Don't waste time trying proxy.
+        const _explicitProxy = !!require('./browser-proxy').configuredProxyUrl(CONFIG);
         const _proxyAlreadyDisabled = (globalThis as any).__proxyDisabled === true;
-        const _mode = (_proxyAlreadyDisabled || _navAttempt === 3) ? 'direct' : _navAttempt === 1 ? 'proxy' : 'rotated';
+        const _mode = _explicitProxy ? 'configured proxy' : (_proxyAlreadyDisabled || _navAttempt === 3) ? 'direct' : _navAttempt === 1 ? 'proxy' : 'rotated';
         try {
-          if (_navAttempt > 1 && !_proxyAlreadyDisabled) {
+          if (_navAttempt > 1 && !_proxyAlreadyDisabled && !_explicitProxy) {
             // Before retrying: relaunch browser with fresh context.
             // Attempt 2: rotate to a different validated proxy.
             // Attempt 3: bypass proxy entirely (direct connection).
@@ -1479,7 +1480,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           // naturalness. Best-effort — never blocks navigation.
           try { getDep('normalcy')?.recordPageVisit?.(targetUrl); } catch { /* normalcy unavailable */ }
         } catch (navErr: any) {
-          const _errMsg = navErr?.message || String(navErr);
+          const _errMsg = require('./browser-proxy').safeBrowserError(navErr, CONFIG);
           // Categorize the error for dashboard + decision-making
           let _errorType = 'UNKNOWN';
           try {
@@ -1498,8 +1499,9 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           // If this is a connection-closed / tunnel-failed / proxy error,
           // we know the proxy is bad — don't bother retrying with the same
           // proxy, skip straight to rotation (attempt 2) or bypass (attempt 3).
-          const _isProxyError = /ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_PROXY_CONNECTION_FAILED|ERR_TUNNEL_CONNECTION_FAILED|ERR_NAME_NOT_RESOLVED|ERR_INTERNET_DISCONNECTED|chrome-error|CHROME_ERROR_PAGE/i.test(_errMsg);
-          const _isTimeout = /Timeout \d+ms exceeded/i.test(_errMsg);
+          const _rawErrorMessage = String(navErr?.message || navErr);
+          const _isProxyError = /ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_PROXY_CONNECTION_FAILED|ERR_TUNNEL_CONNECTION_FAILED|ERR_NAME_NOT_RESOLVED|ERR_INTERNET_DISCONNECTED|chrome-error|CHROME_ERROR_PAGE/i.test(_rawErrorMessage);
+          const _isTimeout = /Timeout \d+ms exceeded/i.test(_rawErrorMessage);
 
           if (_isProxyError && _navAttempt === 1) {
             log('Proxy error detected — skipping rotation, going straight to attempt 2 (rotate).', 'WARN', 'cycle');
@@ -1630,7 +1632,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
           try {
             const ipRotator = require('./network-ip-rotator');
             const currentProxy = ipRotator.getCurrentProxy?.();
-            if (currentProxy && !(globalThis as any).__proxyDisabled) {
+            if (currentProxy && !require('./browser-proxy').configuredProxyUrl(CONFIG) && !(globalThis as any).__proxyDisabled) {
               if (typeof ipRotator.bypassProxy === 'function') {
                 ipRotator.bypassProxy('persistent blank screenshot after navigation (proxy may be delivering empty response)');
               } else {
@@ -2202,7 +2204,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             try {
               const ipRotator = require('./network-ip-rotator');
               const currentProxy = ipRotator.getCurrentProxy?.();
-              if (currentProxy && !(globalThis as any).__proxyDisabled) {
+              if (currentProxy && !require('./browser-proxy').configuredProxyUrl(CONFIG) && !(globalThis as any).__proxyDisabled) {
                 log(`Blank-page escalation ${blankPageCounter}: proxy was active (${currentProxy}) — DISABLING PROXY before reload.`, 'ERROR', 'cycle');
                 try {
                   const alerting = getDep('alerting');
