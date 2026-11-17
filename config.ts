@@ -310,7 +310,12 @@ function sanitizeUrl(url: unknown): string {
   try {
     const parsed = new URL(url);
     if (!['http:', 'https:'].includes(parsed.protocol)) return '';
-    return parsed.toString();
+    // FIX (2026-11-17): Strip trailing slash so callers that do
+    // APP_URL + '/assignments' don't produce a double slash (//assignments).
+    // new URL('https://app.mathu.co.za/').toString() preserves the trailing
+    // slash, which caused https://app.mathu.co.za//assignments in navigation.
+    const str = parsed.toString();
+    return str.endsWith('/') && str.length > 1 ? str.slice(0, -1) : str;
   } catch { return ''; }
 }
 
@@ -651,6 +656,9 @@ const env = envalid.cleanEnv(process.env, {
   CRITICAL_CONSENSUS_COOLING_OFF_MS: num({ default: 5 * 60 * 1000 }),
   CRITICAL_CONSENSUS_VERIFY_WINDOW_MS: num({ default: 10 * 60 * 1000 }),
   // Cloudinary screenshot storage
+  // CLOUDINARY_URL is the recommended single-secret approach (Cloudinary quickstart).
+  // Format: cloudinary://API_KEY:API_SECRET@CLOUD_NAME
+  CLOUDINARY_URL: str({ default: '' }),
   CLOUDINARY_CLOUD_NAME: str({ default: 'xlhumi67' }),
   CLOUDINARY_API_KEY: str({ default: '' }),
   CLOUDINARY_API_SECRET: str({ default: '' }),
@@ -915,6 +923,7 @@ const _configStore: Record<string, any> = {
   CRITICAL_CONSENSUS_COOLING_OFF_MS: env.CRITICAL_CONSENSUS_COOLING_OFF_MS,
   CRITICAL_CONSENSUS_VERIFY_WINDOW_MS: env.CRITICAL_CONSENSUS_VERIFY_WINDOW_MS,
   // Cloudinary screenshot storage
+  CLOUDINARY_URL: env.CLOUDINARY_URL || '',
   CLOUDINARY_CLOUD_NAME: env.CLOUDINARY_CLOUD_NAME || 'xlhumi67',
   CLOUDINARY_API_KEY: env.CLOUDINARY_API_KEY || '',
   CLOUDINARY_API_SECRET: env.CLOUDINARY_API_SECRET || '',
