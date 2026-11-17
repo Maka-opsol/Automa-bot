@@ -1,6 +1,8 @@
 // Resilience R8: Crash-Resistant Browser — mathu-bot-resilience-worklog.md
 'use strict';
 
+const { proxyLaunchOptions, proxyContextOptions, safeBrowserError } = require('./browser-proxy');
+
 // ═══════════════════════════════════════════════════════════════
 // browser-phoenix.ts — P1 Crash-Resistant Browser
 // ═══════════════════════════════════════════════════════════════
@@ -204,6 +206,7 @@ function _getTier3Flags(): string[] {
  * @returns {Promise<{browser, context, page} | null>} Browser instance or null if unrecoverable
  */
 async function phoenixBrowserLaunch(): Promise<any | null> {
+  proxyContextOptions(getCONFIG());
   if (_isUnrecoverable) {
     log('[PHOENIX] Browser declared unrecoverable. Refusing launch.', 'ERROR');
     return null;
@@ -276,10 +279,10 @@ async function phoenixBrowserLaunch(): Promise<any | null> {
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       log(
-        `[PHOENIX] Tier ${tier} (${name}) launch failed: ${error.message}`,
+        `[PHOENIX] Tier ${tier} (${name}) launch failed: ${safeBrowserError(error, getCONFIG())}`,
         'WARN'
       );
-      _lastError = error.message;
+      _lastError = safeBrowserError(error, getCONFIG());
     }
   }
 
@@ -335,6 +338,8 @@ async function _launchWithFlags(browserModule: any, flags: string[], tier: numbe
       headless: true,
       args: flags,
       timeout: 30000,  // 30s launch timeout
+      ...proxyLaunchOptions(getCONFIG()),
+      ...(getCONFIG().CHROMIUM_EXECUTABLE_PATH ? { executablePath: getCONFIG().CHROMIUM_EXECUTABLE_PATH } : {}),
     };
 
     // Set user data dir to /tmp
@@ -345,7 +350,9 @@ async function _launchWithFlags(browserModule: any, flags: string[], tier: numbe
     } catch { /* ignore */ }
 
     const browser = await chromium.launch(launchOptions);
-    const context = await browser.newContext({
+    try {
+      const context = await browser.newContext({
+        ...proxyContextOptions(getCONFIG()),
       viewport: { width: 1280, height: 720 },
       userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       ignoreHTTPSErrors: true,
@@ -373,6 +380,7 @@ async function _launchWithFlags(browserModule: any, flags: string[], tier: numbe
     }
 
     return { browser, context, page, tier };
+    } catch (err) { await browser.close().catch(() => {}); throw err; }
   } catch (err) {
     throw err;
   }
@@ -587,6 +595,7 @@ async function phoenixBrowserRetry(action: (page: any) => Promise<any>, maxRetri
 
 module.exports = {
   _injectDependencies,
+  _launchWithFlags, // exposed for deterministic recovery-path tests
   phoenixBrowserLaunch,
   phoenixBrowserRetry,
   resetFailures,

@@ -12,6 +12,7 @@ const crypto = require('crypto');
 // converted to full DI in later phases. Kept as direct requires for now.
 const { getRealisticBrowserContext } = require('./utils-user-agent');
 const { getChromeFlags, addProxyFlags, addWindowSizeFlags } = require('./browser-chrome-flags');
+const { proxyLaunchOptions, proxyContextOptions, safeBrowserError, configuredProxyUrl } = require('./browser-proxy');
 
 // v5-fix H3: Lazy-load metrics to avoid requiring it before DI injection.
 // Previously this was a top-level require('./metrics') which triggered metrics
@@ -38,6 +39,9 @@ function _injectDependencies(deps: Deps) {
 
 // ─── Lazy accessors with fallbacks ───
 function getCONFIG(): any { return _deps.config || {}; }
+function safeLoggedError(err: any): Error {
+  return configuredProxyUrl(getCONFIG()) ? new Error(safeBrowserError(err, getCONFIG())) : err;
+}
 function getLog(): (msg: string, level?: string, _module?: string) => void {
   return _deps.logger?.log || console.log;
 }
@@ -90,6 +94,7 @@ class BrowserManager {
   _intentionalClose: boolean;
   _fpFonts: string[] | null;
   _configInitialized: boolean;
+  _browserProxyFingerprint: string | null;
 
   constructor() {
     this.browserInstance = null;
@@ -113,6 +118,7 @@ class BrowserManager {
     this._intentionalClose = false;
     this._fpFonts = null;
     this._configInitialized = false;
+    this._browserProxyFingerprint = null;
   }
 
   /** Lazy-init CONFIG-dependent fields on first access */
@@ -158,7 +164,7 @@ class BrowserManager {
 
   _initGANTelemetry() { 
     const log = getLog();
-    try { this.telemetryGAN = require('./telemetry-gan'); this.telemetryGAN.init().catch((e: Error) => log(`GAN init failed: ${e.message}`, 'WARN', 'browser')); } catch (e: any) { log(`GAN module not loaded: ${e.message}`, 'WARN', 'browser'); this.telemetryGAN = null; }
+    try { this.telemetryGAN = require('./telemetry-gan'); this.telemetryGAN.init().catch((e: Error) => log(`GAN init failed: ${safeBrowserError(e, getCONFIG())}`, 'WARN', 'browser')); } catch (e: any) { log(`GAN module not loaded: ${safeBrowserError(e, getCONFIG())}`, 'WARN', 'browser'); this.telemetryGAN = null; }
   }
 
   getBrowserDisconnected() {  return this.browserDisconnected; }
@@ -174,6 +180,8 @@ class BrowserManager {
 
   async launch() {
     this._ensureConfig();
+    const proxyOptions = proxyContextOptions(getCONFIG());
+    const proxyFingerprint = crypto.createHash('sha256').update(JSON.stringify(proxyOptions)).digest('hex');
     const log = getLog();
     if (this.launching) {
       log('Browser launch already in progress, waiting...', 'DEBUG', 'browser');
@@ -183,7 +191,7 @@ class BrowserManager {
           if (!this.launching) {
             clearTimeout(timeout);
             clearInterval(interval);
-            if (this.pageInstance) { resolve(this.pageInstance); } else { reject(new Error('Browser launch failed')); }
+            if (this.pageInstance && this._browserProxyFingerprint === proxyFingerprint) { resolve(this.pageInstance); } else { reject(new Error('Browser launch failed or proxy configuration changed')); }
           }
         }, 100);
       });
@@ -196,16 +204,16 @@ class BrowserManager {
     // Now we check if the browser is still connected and the page is valid
     // — if so, return the existing page WITHOUT relaunching.
     try {
-      if (this.browserInstance && this.browserInstance.isConnected() && this.pageInstance) {
+      if (this._browserProxyFingerprint === proxyFingerprint && this.browserInstance && this.browserInstance.isConnected() && this.pageInstance) {
         // Verify the page is still functional (not closed/disconnected)
         const pageUrl = this.pageInstance.url();
         if (pageUrl && !pageUrl.includes('chrome-error')) {
-          log(`Reusing existing browser (page at ${pageUrl.substring(0, 60)}) — skipping relaunch (Task 87: protect browser)`, 'DEBUG', 'browser');
+          log(`Reusing existing browser (page at ${safeBrowserError(pageUrl.substring(0, 60), getCONFIG())}) — skipping relaunch (Task 87: protect browser)`, 'DEBUG', 'browser');
           return this.pageInstance;
         }
       }
     } catch (e: any) {
-      log(`Reuse check failed: ${e.message} — proceeding with fresh launch`, 'DEBUG', 'browser');
+      log(`Reuse check failed: ${safeBrowserError(e, getCONFIG())} — proceeding with fresh launch`, 'DEBUG', 'browser');
     }
     this.launching = true;
     this._intentionalClose = false;
@@ -234,11 +242,12 @@ class BrowserManager {
         await this.setupContext();
         await this.configurePage();
         log(`Browser launched successfully with ${strategyName} strategy`, 'INFO', 'browser');
+        this._browserProxyFingerprint = proxyFingerprint;
         this.launching = false;
         return this.pageInstance;
       } catch (err: any) {
-        lastError = err as Error;
-        log(`Launch strategy ${strategyName} failed: ${(err as Error).message}`, 'WARN', 'browser');
+        lastError = safeLoggedError(err);
+        log(`Launch strategy ${strategyName} failed: ${lastError.message}`, 'WARN', 'browser');
         await this.cleanup();
       }
     }
@@ -299,9 +308,7 @@ class BrowserManager {
     // created without a proxy override, Chromium tries to connect to this
     // bogus proxy → ERR_PROXY_CONNECTION_FAILED. This was causing the bot
     // to fail even after the proxy was disabled.
-    if (!(globalThis as any).__proxyDisabled) {
-      options.proxy = { server: 'per-context' };
-    }
+    Object.assign(options, proxyLaunchOptions(CONFIG));
     if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
     return options;
   }
@@ -319,9 +326,7 @@ class BrowserManager {
     const flags = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-extensions', '--disable-background-networking', '--disable-http2', `--window-size=${_w},${_h}`];
     const options: any = { headless: true, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000 };
     // BUG FIX (2026-09-08): Only set per-context proxy when proxy is active.
-    if (!(globalThis as any).__proxyDisabled) {
-      options.proxy = { server: 'per-context' };
-    }
+    Object.assign(options, proxyLaunchOptions(CONFIG));
     if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
     return options;
   }
@@ -330,9 +335,7 @@ class BrowserManager {
     const CONFIG = getCONFIG();
     const options: any = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-zygote', '--single-process', '--disable-http2'], timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 30000 };
     // BUG FIX (2026-09-08): Only set per-context proxy when proxy is active.
-    if (!(globalThis as any).__proxyDisabled) {
-      options.proxy = { server: 'per-context' };
-    }
+    Object.assign(options, proxyLaunchOptions(CONFIG));
     if (CONFIG.CHROMIUM_EXECUTABLE_PATH) { options.executablePath = CONFIG.CHROMIUM_EXECUTABLE_PATH; }
     return options;
   }
@@ -342,7 +345,7 @@ class BrowserManager {
     const logError = getLogError();
     if (!this.browserInstance) return;
     this.browserInstance.on('disconnected', () => { if (!this._intentionalClose && !this.launching) { log('Browser process disconnected unexpectedly', 'ERROR', 'browser'); } this.browserDisconnected = true; this.emit('disconnected'); });
-    this.browserInstance.on('error', (err: Error) => { logError('Browser process error', err); this.browserDisconnected = true; });
+    this.browserInstance.on('error', (err: Error) => { logError('Browser process error', safeLoggedError(err)); this.browserDisconnected = true; });
   }
 
   async setupContext() {
@@ -353,58 +356,7 @@ class BrowserManager {
     const sessionData = loadSession();
     const contextOptions: any = await getRealisticBrowserContext();
     if (sessionData) { contextOptions.storageState = sessionData; }
-    // BUG FIX (2026-09-07): Pass proxy at the context level, not the launch level.
-    // Also implement auto-disable: if the browser has had proxy issues (chrome-error,
-    // repeated blank pages, navigation timeouts), disable the proxy for this context
-    // to allow the bot to continue working without the proxy.
-    //
-    // BUG FIX (2026-09-08): Before assigning a proxy, validate it against
-    // app.mathu.co.za. If validation fails, try rotating to a new validated
-    // proxy. If all proxies fail, fall back to direct connection. This prevents
-    // the bot from wasting 30s navigation timeouts on a dead peer.
-    try {
-      const ipRotator = require('./network-ip-rotator');
-
-      // If proxies were disabled by a previous error path (chrome-error,
-      // blank-page escalation), honor that decision and use direct.
-      const _proxyDisabled = (globalThis as any).__proxyDisabled || false;
-
-      let proxyMode: 'current' | 'rotated' | 'bypassed' | 'direct' = 'direct';
-      if (!_proxyDisabled && typeof ipRotator.ensureValidProxy === 'function') {
-        proxyMode = await ipRotator.ensureValidProxy();
-      }
-
-      // After ensureValidProxy, re-read the current proxy (it may have rotated)
-      const currentProxy = ipRotator.getCurrentProxy?.();
-
-      if (currentProxy && proxyMode !== 'bypassed' && proxyMode !== 'direct' && !_proxyDisabled) {
-        // Parse the proxy URL to separate credentials (if any) from the server URL.
-        // Playwright requires credentials as separate username/password properties,
-        // not inline in the URL string.
-        try {
-          const proxyUrl = new URL(currentProxy);
-          const proxyConfig: any = { server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyUrl.port}` };
-          if (proxyUrl.username) {
-            proxyConfig.username = decodeURIComponent(proxyUrl.username);
-          }
-          if (proxyUrl.password) {
-            proxyConfig.password = decodeURIComponent(proxyUrl.password);
-          }
-          contextOptions.proxy = proxyConfig;
-          log(`Context proxy set to: ${proxyConfig.server}${proxyConfig.username ? ' (with auth)' : ''} [mode=${proxyMode}]`, 'INFO', 'browser');
-        } catch {
-          // If URL parsing fails, pass the raw proxy string
-          contextOptions.proxy = { server: currentProxy };
-          log(`Context proxy set to (raw): ${currentProxy} [mode=${proxyMode}]`, 'INFO', 'browser');
-        }
-      } else if (_proxyDisabled || proxyMode === 'bypassed') {
-        log(`Proxy DISABLED (mode=${proxyMode}) — using direct connection`, 'WARN', 'browser');
-      } else {
-        log('No proxy available — using direct connection', 'DEBUG', 'browser');
-      }
-    } catch (e: any) {
-      log(`Failed to validate/get proxy for context: ${e.message}`, 'WARN', 'browser');
-    }
+    Object.assign(contextOptions, proxyContextOptions(getCONFIG()));
     this.contextInstance = await Promise.race([
       this.browserInstance.newContext(contextOptions),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Context creation timeout')), getCONFIG().BROWSER_CONTEXT_TIMEOUT_MS || 30000))
@@ -435,7 +387,7 @@ class BrowserManager {
         return;
       }
       log('Closing unexpected new page/popup', 'WARN', 'browser');
-      try { await Promise.race([newPage.close(), new Promise((_, reject) => setTimeout(() => reject(new Error('Page close timeout')), getCONFIG().BROWSER_CLOSE_TIMEOUT_MS || 5000))]); } catch (err: any) { logError('Failed to close popup', err as Error); }
+      try { await Promise.race([newPage.close(), new Promise((_, reject) => setTimeout(() => reject(new Error('Page close timeout')), getCONFIG().BROWSER_CLOSE_TIMEOUT_MS || 5000))]); } catch (err: any) { logError('Failed to close popup', safeLoggedError(err)); }
     });
   }
 
@@ -452,7 +404,7 @@ class BrowserManager {
     this.pageInstance.setDefaultNavigationTimeout(getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000);
     await this.pageInstance.addInitScript(this.getFingerprintSpoofScript());
     this.pageInstance.on('crash', () => { log('Page crashed', 'ERROR', 'browser'); this.browserDisconnected = true; this.emit('crashed'); });
-    this.pageInstance.on('error', (err: Error) => { logError('Page error', err); });
+    this.pageInstance.on('error', (err: Error) => { logError('Page error', safeLoggedError(err)); });
     const selectCalibration = getSelectCalibration();
     if (selectCalibration) {
       const savedScale = selectCalibration.get('scaleFactor');
@@ -480,7 +432,7 @@ class BrowserManager {
     if (this._memoryMonitorInterval) { clearInterval(this._memoryMonitorInterval); this._memoryMonitorInterval = null; }
     // Skip session save if browser already disconnected (avoids Protocol error)
     if (this.contextInstance && !this.browserDisconnected && this.browserInstance?.isConnected()) {
-      try { const storage = await this.contextInstance.storageState(); if (storage) { saveSession(storage); } } catch (err: any) { log(`Failed to save session on close: ${(err as Error).message}`, 'WARN', 'browser'); }
+      try { const storage = await this.contextInstance.storageState(); if (storage) { saveSession(storage); } } catch (err: any) { log(`Failed to save session on close: ${safeBrowserError(err, getCONFIG())}`, 'WARN', 'browser'); }
     }
     const closeOperations = [
       { resource: this.cdpSession, name: 'CDP session', closeMethod: 'detach' },
@@ -493,7 +445,7 @@ class BrowserManager {
         try {
           const closeFn = closeMethod ? resource[closeMethod].bind(resource) : resource.close.bind(resource);
           await Promise.race([closeFn(), new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000))]); log(`Closed ${name}`, 'DEBUG', 'browser');
-        } catch (err: any) { log(`Failed to close ${name}: ${(err as Error).message}`, 'WARN', 'browser'); }
+        } catch (err: any) { log(`Failed to close ${name}: ${safeBrowserError(err, getCONFIG())}`, 'WARN', 'browser'); }
       }
     }
     this.cdpSession = null; this.pageInstance = null; this.contextInstance = null; this.browserInstance = null;
@@ -699,13 +651,13 @@ class BrowserManager {
       const result = await this.pageInstance.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio, screenWidth: window.screen.width, screenHeight: window.screen.height }));
       log(`Viewport calibrated: ${result.width}x${result.height}, DPR: ${result.devicePixelRatio}`, 'DEBUG', 'browser');
       return result;
-    } catch (err: any) { log(`Viewport calibration failed: ${(err as Error).message}`, 'WARN', 'browser'); return null; }
+    } catch (err: any) { log(`Viewport calibration failed: ${safeBrowserError(err, getCONFIG())}`, 'WARN', 'browser'); return null; }
   }
 
   async calibrateDpr() { 
     const log = getLog();
     if (!this.pageInstance) return;
-    try { this.dprScale = await this.pageInstance.evaluate(() => window.devicePixelRatio) || 1.0; log(`DPR calibrated: ${this.dprScale}`, 'DEBUG', 'browser'); } catch (err: any) { log(`DPR calibration failed: ${(err as Error).message}`, 'WARN', 'browser'); this.dprScale = 1.0; }
+    try { this.dprScale = await this.pageInstance.evaluate(() => window.devicePixelRatio) || 1.0; log(`DPR calibrated: ${this.dprScale}`, 'DEBUG', 'browser'); } catch (err: any) { log(`DPR calibration failed: ${safeBrowserError(err, getCONFIG())}`, 'WARN', 'browser'); this.dprScale = 1.0; }
   }
 
   // TASK 89 (2026-09-25): Lowered defaults from 640px/q15 to 512px/q10.
@@ -733,7 +685,7 @@ class BrowserManager {
         success = true;
         break;
       } catch (err: any) {
-        log(`Click retry ${i+1}/${maxRetries} failed: ${(err as Error).message}`, 'DEBUG', 'browser');
+        log(`Click retry ${i+1}/${maxRetries} failed: ${safeBrowserError(err, getCONFIG())}`, 'DEBUG', 'browser');
         await this._humanDelay(400, 200);
       }
     }
@@ -780,7 +732,7 @@ class BrowserManager {
         await page.mouse.wheel(jitterX, jitterY);
         await this._humanDelay(30, 20);
       }
-    } catch (err: any) { logError('Scroll failed', err as Error); }
+    } catch (err: any) { logError('Scroll failed', safeLoggedError(err)); }
   }
 
   async getCDPSession(page: any) { 
@@ -790,7 +742,7 @@ class BrowserManager {
     try {
       this.cdpSession = await page.createCDPSession();
       return this.cdpSession;
-    } catch (err: any) { logError('Failed to create CDP session', err as Error); return null; }
+    } catch (err: any) { logError('Failed to create CDP session', safeLoggedError(err)); return null; }
   }
 
   performClickWithStyle(page: any, x: number, y: number, style = 'human') { 
@@ -807,7 +759,7 @@ class BrowserManager {
         const el = document.elementFromPoint(px, py);
         return el ? el.textContent?.substring(0, 200) || '' : '';
       }, { px: x, py: y });
-    } catch (err: any) { logError('getElementTextAt failed', err as Error); return ''; }
+    } catch (err: any) { logError('getElementTextAt failed', safeLoggedError(err)); return ''; }
   }
 
   async withBrowserRetry(action: (page: any) => Promise<any>, maxRetries = 3) { 
@@ -819,7 +771,7 @@ class BrowserManager {
         const result = await action(page);
         return result;
       } catch (err: any) {
-        lastError = err as Error;
+        lastError = safeLoggedError(err);
         log(`Browser retry ${i + 1}/${maxRetries}: ${lastError.message}`, 'WARN', 'browser');
         await this.cleanup();
       }

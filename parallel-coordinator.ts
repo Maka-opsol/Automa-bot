@@ -49,6 +49,8 @@
 
 'use strict';
 
+const { proxyContextOptions, safeBrowserError } = require('./browser-proxy');
+
 let _deps: any = {};
 function _injectDependencies(deps: any) { _deps = deps; }
 function getCONFIG(): any { return _deps.config || require('./config'); }
@@ -94,7 +96,12 @@ class ParallelCoordinator {
       try {
         await this._createWorker(i);
       } catch (err: any) {
-        log(`[PARALLEL] Failed to create worker ${i}: ${err.message}`, 'ERROR', 'parallel');
+        log(`[PARALLEL] Failed to create worker ${i}: ${safeBrowserError(err, getCONFIG())}`, 'ERROR', 'parallel');
+        if (require('./browser-proxy').configuredProxyUrl(getCONFIG())) {
+          for (const worker of this.workers.values()) await worker.context.close().catch(() => {});
+          this.workers.clear();
+          throw new Error(safeBrowserError(err, getCONFIG()));
+        }
       }
     }
 
@@ -105,7 +112,7 @@ class ParallelCoordinator {
     // Start worker loops
     for (const [id, _] of this.workers) {
       this._runWorkerLoop(id).catch((err: any) => {
-        log(`[PARALLEL] Worker ${id} loop crashed: ${err.message}`, 'ERROR', 'parallel');
+        log(`[PARALLEL] Worker ${id} loop crashed: ${safeBrowserError(err, getCONFIG())}`, 'ERROR', 'parallel');
       });
     }
 
@@ -116,23 +123,29 @@ class ParallelCoordinator {
     const log = getLog();
     log(`[PARALLEL] Creating worker ${id} (context + page)...`, 'INFO', 'parallel');
 
-    const context = await this.browser.newContext({
+    const contextOptions = {
+      ...proxyContextOptions(getCONFIG()),
       viewport: { width: 1280, height: 800 },
       userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    });
+    };
+    let context: any;
+    try { context = await this.browser.newContext(contextOptions); }
+    catch (err) { throw new Error(safeBrowserError(err, getCONFIG())); }
 
-    const page = await context.newPage();
+    let page: any;
+    try { page = await context.newPage(); }
+    catch (err) { await context.close().catch(() => {}); throw new Error(safeBrowserError(err, getCONFIG())); }
     page.setDefaultTimeout(30000);
     page.setDefaultNavigationTimeout(120000);
 
     page.on('console', (msg: any) => {
       const text = msg.text();
       if (text.includes('error') || text.includes('Error') || text.includes('TASK')) {
-        log(`[WORKER-${id}] [page-console] ${msg.type()}: ${text.substring(0, 200)}`, 'DEBUG', 'parallel');
+        log(`[WORKER-${id}] [page-console] ${msg.type()}: ${safeBrowserError(text, getCONFIG()).substring(0, 200)}`, 'DEBUG', 'parallel');
       }
     });
     page.on('pageerror', (err: Error) => {
-      log(`[WORKER-${id}] [page-error] ${err.message}`, 'ERROR', 'parallel');
+      log(`[WORKER-${id}] [page-error] ${safeBrowserError(err, getCONFIG())}`, 'ERROR', 'parallel');
     });
 
     this.workers.set(id, {
@@ -233,7 +246,7 @@ class ParallelCoordinator {
       } catch (err: any) {
         worker.errors++;
         worker.status = 'error';
-        log(`[WORKER-${id}] Error: ${err.message}`, 'ERROR', 'parallel');
+        log(`[WORKER-${id}] Error: ${safeBrowserError(err, getCONFIG())}`, 'ERROR', 'parallel');
         if (worker.currentModule) {
           await this._markModuleFailed(worker.currentModule.name, id);
           worker.currentModule = null;
@@ -283,7 +296,7 @@ class ParallelCoordinator {
       }
       return true;
     } catch (err: any) {
-      log(`[WORKER-${id}] Login check failed: ${err.message}`, 'WARN', 'parallel');
+      log(`[WORKER-${id}] Login check failed: ${safeBrowserError(err, getCONFIG())}`, 'WARN', 'parallel');
       return false;
     }
   }
@@ -352,7 +365,7 @@ class ParallelCoordinator {
 
       return null; // All modules are done or claimed
     } catch (err: any) {
-      log(`[WORKER-${workerId}] Claim failed: ${err.message}`, 'DEBUG', 'parallel');
+      log(`[WORKER-${workerId}] Claim failed: ${safeBrowserError(err, getCONFIG())}`, 'DEBUG', 'parallel');
       return null;
     }
   }
@@ -418,7 +431,7 @@ class ParallelCoordinator {
       await this._sleep(3000); // Wait for navigation
       return true;
     } catch (err: any) {
-      log(`[WORKER-${workerId}] Click card failed: ${err.message}`, 'ERROR', 'parallel');
+      log(`[WORKER-${workerId}] Click card failed: ${safeBrowserError(err, getCONFIG())}`, 'ERROR', 'parallel');
       return false;
     }
   }
