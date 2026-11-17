@@ -39,7 +39,14 @@ function createContainer(): DIContainerType {
     if (typeof mod._injectDependencies === 'function') {
       mod._injectDependencies(deps);
     } else {
-      _log(`[DI] WARNING: ${modPath} does not export _injectDependencies — skipping DI`, 'WARN', 'container-modules');
+      // FIX (2026-11-17): Use _logger() (lazy) not _log (undefined) —
+      // previous version threw "_log is not defined" which propagated up
+      // as "[DI] Non-critical module failed: _log is not defined".
+      try {
+        _logger().log(`[DI] ${modPath} does not export _injectDependencies — skipping DI`, 'WARN', 'container-modules');
+      } catch {
+        console.warn(`[container-modules] ${modPath} does not export _injectDependencies — skipping DI`);
+      }
     }
     return mod;
   }
