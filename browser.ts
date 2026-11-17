@@ -603,15 +603,29 @@ class BrowserManager {
         };
       }
 
-      // ── Plugins spoofing (Chrome-like) ──
+      // ── Plugins spoofing (Chrome-like, but WITHOUT PDF plugins) ──
+      // FIX (2026-11-17): Removed 'Chrome PDF Plugin' and 'Chrome PDF Viewer'.
+      // The site (app.mathu.co.za) checks navigator.plugins for 'Chrome PDF
+      // Plugin' / 'internal-pdf-viewer' and, finding it, SKIPS loading pdf.js
+      // (expecting Chrome's native viewer to handle PDFs). This left
+      // window.pdfjsLib undefined → "pdfjsLib is not defined" error on every
+      // page load (40+ errors per run). By NOT claiming PDF plugin support,
+      // the site loads pdf.js normally and pdfjsLib gets defined.
+      // Also added item()/namedItem()/refresh() to mimic a real PluginArray.
       Object.defineProperty(navigator, 'plugins', {
         get: () => {
           const plugins = [
-            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
             { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
           ];
-          plugins.length = 3;
+          plugins.length = 1;
+          (plugins as any).item = function(i: number) { return plugins[i] || null; };
+          (plugins as any).namedItem = function(name: string) {
+            for (let i = 0; i < plugins.length; i++) {
+              if (plugins[i] && plugins[i].name === name) return plugins[i];
+            }
+            return null;
+          };
+          (plugins as any).refresh = function() {};
           return plugins;
         }
       });
