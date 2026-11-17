@@ -1,8 +1,30 @@
+
 'use strict';
 
 const { DIContainer } = require('./container-container');
 type ContainerSummary = ReturnType<InstanceType<typeof DIContainer>['getSummary']>;
 const { spawnAll, getWorkerStatuses, shutdownAll } = require('./workers');
+const fs = require('fs');
+
+// ─── Heartbeat writer (FIX 2026-11-17) ───
+// In parallel-entry mode, agent.ts is NOT loaded, so its heartbeat setInterval
+// (agent.ts:705) never starts. The .heartbeat file is never written, and the
+// survival-hang-watchdog kills the bot after the 10-min boot grace (ENOENT).
+// This module IS loaded in parallel mode (it starts all subsystems), so we
+// replicate the heartbeat interval here. Uses .unref() so it doesn't block
+// graceful shutdown, same as agent.ts.
+try {
+  const _cfg = require('./config');
+  const _hbConfig = _cfg.CONFIG || _cfg;
+  if (_hbConfig.HEARTBEAT_FILE) {
+    const _hbInterval = _hbConfig.HEARTBEAT_INTERVAL_MS || 60000;
+    setInterval(() => {
+      try { fs.writeFileSync(_hbConfig.HEARTBEAT_FILE, String(Date.now())); } catch (_e: any) { /* best-effort */ }
+    }, _hbInterval).unref();
+    // Write one immediately so the file exists before the watchdog's first check
+    try { fs.writeFileSync(_hbConfig.HEARTBEAT_FILE, String(Date.now())); } catch (_e: any) { /* best-effort */ }
+  }
+} catch (_e: any) { /* config not loaded yet — skip */ }
 
 // Lazy logger with fallback for test environments
 let _logCache: { log: (msg: string, level?: string, mod?: string) => void; logError: (msg: string, err: Error) => void } | null = null;
