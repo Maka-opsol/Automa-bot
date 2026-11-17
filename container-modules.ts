@@ -662,8 +662,13 @@ function createContainer(): DIContainerType {
     const [modPath, name, deps, optionalDeps] = tuple;
     c.register(name, {
       factory: (deps: any) => {
-        const mod = require(`./${modPath}`);
-        mod._injectDependencies(deps);
+        // FIX (2026-11-17): Use the safe injectDeps helper instead of calling
+        // mod._injectDependencies(deps) directly. pixel-explorer.ts and
+        // last-resort-mode.ts don't export _injectDependencies, which caused
+        // "mod._injectDependencies is not a function" errors and prevented
+        // those modules from loading. injectDeps checks typeof and skips DI
+        // gracefully if the method is missing.
+        const mod = injectDeps(`./${modPath}`, deps);
         return mod;
       },
       deps,
@@ -1285,8 +1290,13 @@ function createContainer(): DIContainerType {
     const [modPath, name, deps, optionalDeps] = tuple;
     c.register(name, {
       factory: (deps: any) => {
-        const mod = require(`./${modPath}`);
-        mod._injectDependencies(deps);
+        // FIX (2026-11-17): Use the safe injectDeps helper instead of calling
+        // mod._injectDependencies(deps) directly. pixel-explorer.ts and
+        // last-resort-mode.ts don't export _injectDependencies, which caused
+        // "mod._injectDependencies is not a function" errors and prevented
+        // those modules from loading. injectDeps checks typeof and skips DI
+        // gracefully if the method is missing.
+        const mod = injectDeps(`./${modPath}`, deps);
         return mod;
       },
       deps,
