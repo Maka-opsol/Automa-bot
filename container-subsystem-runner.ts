@@ -91,6 +91,17 @@ function startSelfHealV2Subsystems(
   container: any,
   CONFIG: Record<string, unknown>,
 ): SubsystemStartResult {
+  // FIX (2026-11-17): Guard against CONFIG being undefined/null. Some entry
+  // points (e.g. parallel-entry.ts) call this without passing a valid CONFIG
+  // object, which caused "Cannot read properties of undefined (reading
+  // 'PREDICTIVE_HEAL_ENABLED')" at the CONFIG[config.flag] access below.
+  // When CONFIG is missing, skip all flag-gated subsystems gracefully rather
+  // than crashing — the subsystems that don't require a flag will still run.
+  if (!CONFIG || typeof CONFIG !== 'object') {
+    _logger()?.log('Self-heal v2: CONFIG is undefined — skipping flag-gated subsystems', 'WARN', 'subsystem-runner');
+    return { started: [], failed: [] };
+  }
+
   const selfHealV2 = container.getByTag('self-heal-v2');
   const started: string[] = [];
   const failed: Array<{ name: string; error: string }> = [];
