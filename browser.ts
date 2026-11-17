@@ -532,16 +532,32 @@ class BrowserManager {
       }
 
       // ── Canvas fingerprint noise ──
+      // FIX (2026-11-17): The old wrapper called getImageData() on EVERY
+      // canvas unconditionally. pdf.js creates canvases during its init
+      // capability check, and getImageData() throws a SecurityError on
+      // tainted/cross-origin canvases. That exception aborted pdf.js script
+      // execution → window.pdfjsLib was never defined → every page reference
+      // threw "pdfjsLib is not defined" (40+ errors per run). Now we:
+      //   1. Only noise SMALL canvases (≤ 256×256 = 65536 px) — fingerprinting
+      //      canvases are small; pdf.js render canvases are large and skipped.
+      //   2. Wrap in try/catch so a SecurityError on tainted canvases is
+      //      swallowed instead of aborting the calling script.
       const toDataURL = HTMLCanvasElement.prototype.toDataURL;
       HTMLCanvasElement.prototype.toDataURL = function(type) {
-        if (type === 'image/png') {
-          const context = this.getContext('2d');
-          if (context) {
-            const imageData = context.getImageData(0, 0, this.width, this.height);
-            for (let i = 0; i < imageData.data.length; i += 4) {
-              imageData.data[i] = imageData.data[i] ^ (Math.random() > 0.5 ? 1 : 0);
+        if (type === 'image/png' && this.width > 0 && this.height > 0
+            && (this.width * this.height) <= 65536) {
+          try {
+            const context = this.getContext('2d');
+            if (context) {
+              const imageData = context.getImageData(0, 0, this.width, this.height);
+              for (let i = 0; i < imageData.data.length; i += 4) {
+                imageData.data[i] = imageData.data[i] ^ (Math.random() > 0.5 ? 1 : 0);
+              }
+              context.putImageData(imageData, 0, 0);
             }
-            context.putImageData(imageData, 0, 0);
+          } catch (e) {
+            // SecurityError (tainted canvas) or other — swallow to avoid
+            // aborting the caller (e.g. pdf.js initialization).
           }
         }
         return toDataURL.apply(this, arguments);
