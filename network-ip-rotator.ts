@@ -213,10 +213,68 @@ async function _loadProxyUrls(): Promise<void> {
  * So `validateProxy` is a fast pre-filter: "is this proxy's port open?"
  * The full routing validation happens during `page.goto`.
  */
+/**
+ * Validate a proxy by making an actual HTTP request through it via curl.
+ * This tests the FULL stack: proxy → CONNECT/TLS → HTTP → response.
+ * Much more accurate than TCP/CONNECT alone — catches proxies that tunnel
+ * quickly but transfer data too slowly for real page loads.
+ * Works for both HTTP and SOCKS5 proxies (curl -x handles both natively).
+ * Returns null if curl is not available (caller falls back to TCP/CONNECT).
+ */
+async function validateProxyViaCurl(
+  proxyUrl: string,
+  testUrl: string,
+  timeoutMs: number,
+): Promise<{ ok: boolean; latencyMs?: number; reason?: string; statusCode?: number } | null> {
+  const { execFile } = require('child_process');
+  const start = Date.now();
+  const timeoutSec = Math.ceil(timeoutMs / 1000);
+
+  return new Promise((resolve) => {
+    execFile(
+      'curl',
+      [
+        '-x', proxyUrl,           // use proxy
+        '-I',                     // HEAD request (headers only — lighter than GET)
+        '--max-time', String(timeoutSec),  // overall timeout
+        '--connect-timeout', String(Math.min(timeoutSec, 5)),  // connection timeout
+        '--silent',               // don't show progress
+        '--show-error',           // but DO show errors on stderr
+        '--insecure',             // don't fail on cert issues (proxy may intercept)
+        '-o', '/dev/null',        // discard body
+        '-w', '%{http_code}',     // output just the status code
+        testUrl,
+      ],
+      { encoding: 'utf8', timeout: (timeoutSec + 2) * 1000 },
+      (err: any, stdout: string, stderr: string) => {
+        const latencyMs = Date.now() - start;
+        if (err) {
+          // If curl binary is not found (ENOENT), return null so the caller
+          // falls back to the TCP+CONNECT test instead of failing the proxy.
+          if (err.code === 'ENOENT' || /spawn curl ENOENT/i.test(err.message)) {
+            resolve(null);
+            return;
+          }
+          // curl exited non-zero — proxy failed (timeout, connection refused, etc.)
+          const reason = stderr?.trim() || err.message || 'curl failed';
+          resolve({ ok: false, latencyMs, reason: reason.substring(0, 120) });
+          return;
+        }
+        const statusCode = parseInt(stdout.trim(), 10);
+        if (statusCode > 0) {
+          resolve({ ok: true, latencyMs, statusCode });
+        } else {
+          resolve({ ok: false, latencyMs, reason: `curl returned status ${stdout.trim()}` });
+        }
+      },
+    );
+  });
+}
+
 async function validateProxy(
   proxyUrl: string,
   testUrl?: string,
-  timeoutMs: number = 5000
+  timeoutMs: number = 8000
 ): Promise<{ ok: boolean; latencyMs?: number; reason?: string; statusCode?: number }> {
   const start = Date.now();
   let host: string | null = null;
@@ -232,6 +290,19 @@ async function validateProxy(
     }
   } catch (e: any) {
     return { ok: false, latencyMs: 0, reason: `URL parse failed: ${e.message}` };
+  }
+
+  // FIX (2026-11-17): If testUrl is provided, use curl for a FULL-STACK
+  // validation (proxy → TLS → HTTP response). The previous CONNECT-only test
+  // was insufficient — proxy 20.33.10.79:443 passed CONNECT (can tunnel) but
+  // every page load through it timed out at 60s (too slow for data transfer).
+  // curl tests actual response time, catching slow proxies CONNECT misses.
+  // If curl isn't available, falls through to TCP+CONNECT below.
+  if (testUrl) {
+    const curlResult = await validateProxyViaCurl(proxyUrl, testUrl, timeoutMs);
+    if (curlResult !== null) {
+      return curlResult;
+    }
   }
 
   // Use Node's built-in `net` module to open a TCP socket
@@ -474,7 +545,7 @@ async function ensureValidProxy(): Promise<'current' | 'rotated' | 'bypassed' | 
       testUrl: getCONFIG().APP_URL || 'https://app.mathu.co.za',
       latencyMs: result.latencyMs,
     });
-    log(`[IP] Pre-launch validation: current proxy OK (${currentProxy}, ${result.latencyMs}ms, HTTP ${result.statusCode})`, 'DEBUG');
+    log(`[IP] Pre-launch validation: current proxy OK (${currentProxy}, ${result.latencyMs}ms, HTTP ${result.statusCode})`, 'INFO');
     return 'current';
   }
 
