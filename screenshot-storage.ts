@@ -9,9 +9,13 @@
 // Replaces the old S3/R2/GCS implementation.
 //
 // Environment Variables:
-//   CLOUDINARY_CLOUD_NAME   — Cloud name (default: xlhumi67)
-//   CLOUDINARY_API_KEY      — API key
-//   CLOUDINARY_API_SECRET   — API secret
+//   CLOUDINARY_URL          — RECOMMENDED. Single URL containing all creds.
+//                             Format: cloudinary://API_KEY:API_SECRET@CLOUD_NAME
+//                             (Cloudinary quickstart approach — one secret
+//                             instead of three. Copy from Console → API Keys.)
+//   CLOUDINARY_CLOUD_NAME   — Cloud name (fallback if CLOUDINARY_URL not set)
+//   CLOUDINARY_API_KEY      — API key (fallback)
+//   CLOUDINARY_API_SECRET   — API secret (fallback)
 //   CLOUDINARY_FOLDER       — Folder prefix (default: 'mathu-bot/screenshots')
 //   SCREENSHOT_STORAGE_ENABLED — Enable/disable (default: true)
 // ═══════════════════════════════════════════════════════════════════════
@@ -104,14 +108,39 @@ function init(): { enabled: boolean; backend: string } {
     return { enabled: false, backend: 'none' };
   }
 
-  // Read config from env (same keys as config.ts envalid)
-  const cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'xlhumi67';
-  const apiKey = process.env.CLOUDINARY_API_KEY || '';
-  const apiSecret = process.env.CLOUDINARY_API_SECRET || '';
+  // FIX (2026-11-17): Support CLOUDINARY_URL (Cloudinary quickstart recommended
+  // approach). Format: cloudinary://API_KEY:API_SECRET@CLOUD_NAME
+  // This lets users set ONE secret instead of 3 separate ones, and solves the
+  // "CLOUDINARY_CLOUD_NAME EMPTY" issue — the cloud name is embedded in the URL.
+  const cloudinaryUrl = process.env.CLOUDINARY_URL || '';
 
-  if (!apiKey || !apiSecret) {
-    _log('CLOUDINARY_API_KEY and/or CLOUDINARY_API_SECRET not set. Screenshots will NOT be uploaded.', 'WARN');
-    _log('Set CLOUDINARY_API_SECRET in Render dashboard (sensitive).', 'WARN');
+  let cloudName: string;
+  let apiKey: string;
+  let apiSecret: string;
+
+  if (cloudinaryUrl) {
+    // Parse CLOUDINARY_URL: cloudinary://API_KEY:API_SECRET@CLOUD_NAME
+    const match = cloudinaryUrl.match(/^cloudinary:\/\/([^:]+):([^@]+)@(.+)$/);
+    if (match) {
+      apiKey = match[1];
+      apiSecret = match[2];
+      cloudName = match[3];
+    } else {
+      // URL set but malformed — fall back to individual env vars
+      _log(`CLOUDINARY_URL set but malformed (expected cloudinary://KEY:SECRET@CLOUD_NAME) — falling back to individual env vars`, 'WARN');
+      cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'xlhumi67';
+      apiKey = process.env.CLOUDINARY_API_KEY || '';
+      apiSecret = process.env.CLOUDINARY_API_SECRET || '';
+    }
+  } else {
+    // No CLOUDINARY_URL — use individual env vars (legacy behavior)
+    cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'xlhumi67';
+    apiKey = process.env.CLOUDINARY_API_KEY || '';
+    apiSecret = process.env.CLOUDINARY_API_SECRET || '';
+  }
+
+  if (!apiKey || !apiSecret || !cloudName) {
+    _log('Cloudinary credentials incomplete. Set CLOUDINARY_URL (recommended) or CLOUDINARY_CLOUD_NAME + CLOUDINARY_API_KEY + CLOUDINARY_API_SECRET. Screenshots will NOT be uploaded.', 'WARN');
     _initialized = true;
     return { enabled: false, backend: 'none' };
   }
