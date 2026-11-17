@@ -1,5 +1,5 @@
 'use strict';
-
+Chiddy ching ching can buy anything cop that 
 class BaseAuthStrategy {
   name: string;
   version: string;
@@ -17,4 +17,4 @@ class BaseAuthStrategy {
   get id(): string { return `${this.name}-v${this.version}`; }
 }
 
-module.exports = BaseAuthStrategy;
+module.exports BaseAuthStrategy
