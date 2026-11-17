@@ -253,11 +253,53 @@ async function validateProxy(
     socket.once('connect', () => {
       clearTimeout(timer);
       const latencyMs = Date.now() - start;
-      cleanup();
-      // Connection succeeded — proxy port is open and accepting connections.
-      // We return ok=true with statusCode=0 (no HTTP status — we only verified
-      // TCP connectivity). The caller treats this as "proxy is alive".
-      resolve({ ok: true, latencyMs, statusCode: 0 });
+
+      // FIX (2026-11-17): For HTTP proxies with an HTTPS testUrl, verify the
+      // proxy can actually tunnel to the target via CONNECT. The old code only
+      // checked TCP port-open — proxy 196.251.222.170:1080 passed (port open in
+      // 2350ms) but every navigation through it timed out at 60s. The proxy
+      // could accept TCP but couldn't route HTTPS to app.mathu.co.za.
+      // SOCKS5 proxies keep the TCP-only check (CONNECT handshake is complex).
+      const isHttpProxy = proxyUrl.startsWith('http://') || proxyUrl.startsWith('https://');
+      if (isHttpProxy && testUrl) {
+        try {
+          const target = new URL(testUrl);
+          const targetHost = target.hostname;
+          const targetPort = target.port || (target.protocol === 'https:' ? '443' : '80');
+
+          // Send CONNECT request to establish an HTTPS tunnel through the proxy
+          socket.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`);
+
+          const connectTimer = setTimeout(() => {
+            cleanup();
+            resolve({ ok: false, latencyMs: Date.now() - start, reason: `CONNECT tunnel timeout after ${timeoutMs}ms (proxy too slow for ${targetHost})` });
+          }, timeoutMs);
+
+          let responseData = '';
+          socket.on('data', (data: Buffer) => {
+            responseData += data.toString();
+            // Wait for the full HTTP status line + headers (ends with \r\n\r\n)
+            if (responseData.includes('\r\n\r\n') || responseData.length > 512) {
+              clearTimeout(connectTimer);
+              cleanup();
+              if (/HTTP\/1\.[01]\s+200/.test(responseData)) {
+                resolve({ ok: true, latencyMs: Date.now() - start, statusCode: 200 });
+              } else {
+                const firstLine = responseData.split('\r\n')[0] || 'unknown';
+                resolve({ ok: false, latencyMs: Date.now() - start, reason: `CONNECT rejected: ${firstLine}` });
+              }
+            }
+          });
+        } catch (e: any) {
+          cleanup();
+          resolve({ ok: false, latencyMs: Date.now() - start, reason: `CONNECT test failed: ${e.message}` });
+        }
+      } else {
+        // For SOCKS5 proxies or no testUrl: TCP check is sufficient (existing behavior)
+        cleanup();
+        // Connection succeeded — proxy port is open and accepting connections.
+        resolve({ ok: true, latencyMs, statusCode: 0 });
+      }
     });
 
     socket.once('error', (err: any) => {
@@ -301,7 +343,11 @@ async function rotateToValidatedProxy(maxToTry: number = 5): Promise<string | nu
     const candidate = _rotateProxy();
     if (!candidate || tried.includes(candidate)) continue;
     tried.push(candidate);
-    const result = await validateProxy(candidate);
+    // FIX (2026-11-17): Pass APP_URL as testUrl so validateProxy runs the
+    // CONNECT tunnel test for HTTP proxies. Without this, rotation only did
+    // a TCP port-open check — the rotated proxy passed but couldn't actually
+    // tunnel HTTPS to app.mathu.co.za, causing 60s navigation timeouts.
+    const result = await validateProxy(candidate, getCONFIG().APP_URL || 'https://app.mathu.co.za');
     if (result.ok) {
       _recordProxyOutcome({
         timestamp: Date.now(),
