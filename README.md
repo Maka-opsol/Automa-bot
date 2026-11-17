@@ -12,6 +12,10 @@ pinned: false
 
 Autonomous MathU question-solving bot running on Hugging Face Spaces (16GB RAM).
 
+## Change submission
+
+Submit bot code changes through the dashboard patch pipeline, not by editing the GitHub repository directly. Dashboard review does not itself prevent direct repository writes.
+
 ## Configuration
 
 This Space uses a **Docker SDK** (not Gradio/Streamlit). The `Dockerfile`
