@@ -2060,6 +2060,40 @@ async function handleDashboardRequest(req: any, res: any): Promise<boolean> {
                 updatePatchStatus(patchId, 'overlay_write', 'warning', 'Overlay write failed (non-critical): ' + overlayErr.message);
               }
 
+              // Stage 6.5: HOT-SWAP — apply the patch to the running process IMMEDIATELY.
+              // The overlay (Stage 6) only affects FUTURE require() calls. Hot-swap uses
+              // Module._compile to overwrite already-loaded module exports in-place, so
+              // the patch takes effect NOW without a restart. This is what makes
+              // anonymous live patching actually LIVE (not just persisted for next deploy).
+              // Non-fatal: if hot-swap fails, the overlay interceptor + git push (Stage 7)
+              // still ensure the patch lands.
+              updatePatchStatus(patchId, 'hot_swap', 'pending');
+              try {
+                const hotSwap = require('./self-heal-hot-swap');
+                const swapSummary = hotSwap.hotSwapModules([path.basename(file)]);
+                if (swapSummary.totalSwapped > 0) {
+                  const verifyResult = hotSwap.verifyRecentSwaps();
+                  let rolledBack = 0;
+                  for (const detail of (verifyResult.details || [])) {
+                    if (!detail.valid) {
+                      if (hotSwap.rollbackSwap(detail.file)) rolledBack++;
+                    }
+                  }
+                  if (rolledBack > 0) {
+                    updatePatchStatus(patchId, 'hot_swap', 'warning', `Swapped ${swapSummary.totalSwapped}; ${rolledBack} rolled back after verification failed`);
+                  } else {
+                    updatePatchStatus(patchId, 'hot_swap', 'passed', { swapped: swapSummary.totalSwapped, verified: verifyResult.valid });
+                    log(`Anonymous live patch ${patchId}: hot-swapped ${path.basename(file)} into the running process`, 'INFO', 'dashboard');
+                  }
+                } else if (swapSummary.totalFailed > 0) {
+                  updatePatchStatus(patchId, 'hot_swap', 'warning', `${swapSummary.totalFailed} module(s) failed — overlay interceptor handles future require()s`);
+                } else {
+                  updatePatchStatus(patchId, 'hot_swap', 'skipped', 'Module not loaded yet — overlay interceptor applies on next require()');
+                }
+              } catch (hsErr: any) {
+                updatePatchStatus(patchId, 'hot_swap', 'warning', 'Hot-swap failed (non-fatal, overlay interceptor is fallback): ' + hsErr.message);
+              }
+
               // Stage 7: Push to GitHub
               // ── Deploy budget check ──
               // Render's free plan caps at 500 build minutes/month. Each deploy
