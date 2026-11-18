@@ -76,3 +76,7 @@ Optional:
 ## Logs
 
 Check the "Logs" tab in HF Spaces to see the bot's output.
+
+## Current operation
+
+The bot now runs on GitHub Actions. The dashboard displays its logs.
