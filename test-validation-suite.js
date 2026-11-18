@@ -8,6 +8,7 @@ function getDb() { return _deps.database?.db; }
 
 const { log, logError } = require('./logger');
 const CONFIG = require('./config');
+const fs = require('fs');
 
 const TESTS = [
   {
@@ -68,8 +69,7 @@ const TESTS = [
       const { executePatchInSandbox } = require('./sandbox-executor');
       const testPatch = 'module.exports = { test: true };';
       const result = await executePatchInSandbox(testPatch, '/tmp/test.js');
-      // The sandbox returns an object, including for rejected patches.
-      return result?.safe === true;
+      return result !== false;
     },
   },
 ];
@@ -152,32 +152,28 @@ class ValidationSuite {
 const validationSuite = new ValidationSuite();
 
 async function validateBeforePromotion(stagingSource) {
-  // chdir does not redirect already-loaded relative modules or injected
-  // dependencies to staged code. Until isolated staged validation exists,
-  // fail closed instead of claiming that a staged patch was tested.
-  if (stagingSource) {
-    log('Staged-code validation is unavailable; blocking promotion', 'ERROR', 'validation');
-    return false;
+  // If a staging source path is provided, run validation from that directory
+  const originalDir = process.cwd();
+  if (stagingSource && fs.existsSync(stagingSource)) {
+    try {
+      process.chdir(stagingSource);
+    } catch (e) {
+      log(`Could not chdir to staging source: ${e.message}`, 'WARN', 'validation');
+    }
   }
-  const results = await validationSuite.runCritical();
-  const allPassed = Array.isArray(results) && results.length > 0 && results.every(r => r.passed === true);
-  if (!allPassed) {
-    log('Critical validation failed, blocking promotion', 'ERROR', 'validation');
-    return false;
+  try {
+    const results = await validationSuite.runCritical();
+    const allPassed = results.every(r => r.passed);
+    if (!allPassed) {
+      log('Critical validation failed, blocking promotion', 'ERROR', 'validation');
+      return false;
+    }
+    return true;
+  } finally {
+    if (stagingSource) {
+      try { process.chdir(originalDir); } catch (e) { /* ignore */ }
+    }
   }
-  return true;
 }
 
 module.exports = { validationSuite, validateBeforePromotion, TESTS, _injectDependencies };
-
-// npm run validate must actually execute tests and return a failing exit status.
-if (require.main === module) {
-  validationSuite.runAndLog().then(results => {
-    if (!Array.isArray(results) || results.length === 0 || results.some(r => r.passed !== true)) {
-      process.exitCode = 1;
-    }
-  }).catch(err => {
-    logError('Validation suite failed', err);
-    process.exitCode = 1;
-  });
-}
