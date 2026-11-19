@@ -28,7 +28,7 @@ test('script failure and response output only fixed coarse categories',()=>{
   f.events.requestfailed(f.request(`https://cdn.example/${secret}/pdf.min.js?token=${secret}`));
   f.events.response(f.response(f.request(`https://app.example/${secret}/flutter_bootstrap.js?token=${secret}`),503));
   f.events.response(f.response(f.request(`https://app.example/${secret}/private.js`),204));
-  assert.deepEqual(f.logs,['[WORKER-2] [render-diag] request-failed kind=pdf-script origin=external reason=blocked','[WORKER-2] [render-diag] response kind=flutter-script origin=same status=5xx']);
+  assert.deepEqual(f.logs,['[WORKER-2] [render-diag] request-failed kind=pdf-script origin=external reason=csp-block','[WORKER-2] [render-diag] response kind=flutter-script origin=same status=5xx']);
   assert.ok(!JSON.stringify(f.logs).includes(secret));
 });
 test('CSP presence and directives only, never policy text or non-main document',async()=>{
@@ -61,7 +61,7 @@ test('header rejection and non-script failures do not leak or cause unhandled re
   await new Promise(resolve=>setTimeout(resolve,0)); assert.deepEqual(f.logs,[]);
 });
 function coordinator(enabled, document) {
-  let clock=0;const logs=[]; const env=enabled?{MATHU_RENDER_DIAGNOSTICS:'1'}:{};
+  let clock=0;const logs=[]; const env=enabled?{MATHU_RENDER_DIAGNOSTICS:'1'}:{MATHU_RENDER_DIAGNOSTICS:'0'};
   class FakeDate extends Date {static now(){return clock}}
   const mod=load('parallel-coordinator.ts',{Date:FakeDate,document,process:{env},require:name=>{
     if(name==='./worker-navigation-recovery')return {};
