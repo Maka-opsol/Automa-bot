@@ -50,6 +50,7 @@
 'use strict';
 
 import { pdfErrorSource } from './pdf-error-diagnostics';
+import { navigateWorkerEntry } from './worker-navigation-recovery';
 
 let _deps: any = {};
 function _injectDependencies(deps: any) { _deps = deps; }
@@ -259,7 +260,9 @@ class ParallelCoordinator {
     const log = getLog();
     try {
       // Navigate to app root
-      await worker.page.goto(getCONFIG().APP_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await navigateWorkerEntry(worker.page, getCONFIG().APP_URL, () => {
+        log(`[WORKER-${id}] App entry loaded after navigation timeout; resuming login check`, 'INFO', 'parallel');
+      });
       await this._sleep(3000);
 
       // Check if we're on the assignments page (already logged in)
