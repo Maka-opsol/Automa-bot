@@ -285,7 +285,7 @@ function markProviderUnhealthy(provider: string): void {
   // Persist so it survives restarts
   try {
     const upsertCal = _getCalibration();
-    if (upsertCal) upsertCal.run('methodology_rotator_unhealthy_providers', JSON.stringify(Array.from(_unhealthyProviders.entries())));
+    if (upsertCal) upsertCal.run('methodology_rotator_unhealthy_providers', JSON.stringify(Array.from(_unhealthyProviders.entries())), Date.now());
   } catch {}
 }
 
@@ -374,7 +374,7 @@ function _saveState(): void {
       consecutiveZeroQuestionCycles: _consecutiveZeroQuestionCycles,
       savedAt: Date.now(),
     };
-    upsertCal.run(STATE_KEY, JSON.stringify(state));
+    upsertCal.run(STATE_KEY, JSON.stringify(state), Date.now());
   } catch (err: any) {
     _log(`Failed to persist state: ${err?.message || err}`, 'DEBUG');
   }
@@ -394,7 +394,7 @@ function _saveHistory(history: Record<string, { successes: number; attempts: num
   try {
     const upsertCal = _getCalibration();
     if (!upsertCal) return;
-    upsertCal.run(HISTORY_KEY, JSON.stringify(history));
+    upsertCal.run(HISTORY_KEY, JSON.stringify(history), Date.now());
   } catch {}
 }
 

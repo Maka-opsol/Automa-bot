@@ -59,6 +59,32 @@ function getLog(): (msg: string, level?: string, mod?: string) => void {
 }
 function getLogError() { return _deps.logger?.logError || ((msg: string, err: Error) => console.error(msg, err)); }
 
+// Diagnostic only: never emit frame URLs, paths, credentials or raw stacks.
+function pdfErrorSource(error: any, pageUrl: string): string {
+  try {
+    if (!error || error.message !== 'pdfjsLib is not defined') return '';
+    const stack = typeof error.stack === 'string' ? error.stack.slice(0, 16384) : '';
+    for (const frame of stack.split('\n').slice(1, 41)) {
+      const match = frame.match(/https?:\/\/[^\s)\]]+?:(\d{1,9}):(\d{1,9})(?:\)|\s|$)/i);
+      if (!match) continue;
+      let url: URL;
+      try { url = new URL(match[0].replace(/:\d{1,9}:\d{1,9}(?:\)|\s)?$/, '')); }
+      catch { continue; }
+      let origin = 'unknown-origin';
+      try {
+        const page = new URL(pageUrl);
+        if (page.protocol === 'http:' || page.protocol === 'https:') {
+          origin = url.origin === page.origin ? 'same-origin' : 'external-origin';
+        }
+      } catch {}
+      return ` [pdf-source ${origin}]`;
+    }
+    return ' [pdf-source unavailable]';
+  } catch {
+    return ' [pdf-source unavailable]';
+  }
+}
+
 interface WorkerState {
   id: number;
   page: any;
@@ -134,7 +160,11 @@ class ParallelCoordinator {
       }
     });
     page.on('pageerror', (err: Error) => {
-      log(`[WORKER-${id}] [page-error] ${err.message}`, 'ERROR', 'parallel');
+      let pageUrl = '';
+      if (err.message === 'pdfjsLib is not defined') {
+        try { pageUrl = page.url(); } catch {}
+      }
+      log(`[WORKER-${id}] [page-error] ${err.message}${pdfErrorSource(err, pageUrl)}`, 'ERROR', 'parallel');
     });
 
     this.workers.set(id, {
@@ -198,8 +228,13 @@ class ParallelCoordinator {
         // Step 4: Find and click the module card
         const clicked = await this._findAndClickModuleCard(worker.page, module.name, id);
         if (!clicked) {
-          log(`[WORKER-${id}] Module "${module.name}" not found on page — marking as done`, 'WARN', 'parallel');
-          await this._markModuleDone(module.name, id);
+          worker.errors++;
+          log(`[WORKER-${id}] Module "${module.name}" could not be opened — attempting to release claim for retry`, 'WARN', 'parallel');
+          await this._markModuleFailed(module.name, id);
+          worker.currentModule = null;
+          worker.status = 'idle';
+          worker.lastActivity = Date.now();
+          await this._sleep(30000);
           continue;
         }
 
@@ -306,24 +341,32 @@ class ParallelCoordinator {
       if (!page) return null;
 
       // Get all module cards on the assignments page
-      const modules = await page.evaluate(() => {
-        const cards = document.querySelectorAll('[class*="card"], [role="listitem"], .module-card');
-        const results: Array<{ name: string; completed: boolean; rect: any }> = [];
-        cards.forEach((card: any) => {
-          const name = card.textContent?.trim().substring(0, 100) || '';
-          if (name.length > 5) {
-            // Check if this card shows as completed
-            const hasCompletedBadge = card.querySelector('[class*="complete"], [class*="done"], .checkmark');
-            const rect = card.getBoundingClientRect();
-            results.push({
-              name,
-              completed: !!hasCompletedBadge,
-              rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-            });
-          }
+      let modules;
+      try {
+        modules = await page.evaluate(() => {
+          const cards = document.querySelectorAll('[class*="card"], [role="listitem"], .module-card');
+          const results: Array<{ name: string; completed: boolean; rect: any }> = [];
+          cards.forEach((card: any) => {
+            const name = card.textContent?.trim().substring(0, 100) || '';
+            if (name.length > 5) {
+              // Check if this card shows as completed
+              const hasCompletedBadge = card.querySelector('[class*="complete"], [class*="done"], .checkmark');
+              const rect = card.getBoundingClientRect();
+              results.push({
+                name,
+                completed: !!hasCompletedBadge,
+                rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+              });
+            }
+          });
+          return results;
         });
-        return results;
-      }).catch(() => []);
+      } catch {
+        // Failed inspection does not establish that the page contains no cards.
+        // Exception text may contain sensitive URLs or page content.
+        log(`[WORKER-${workerId}] Module card inspection failed; page content unknown`, 'WARN', 'parallel');
+        return null;
+      }
 
       if (!modules || modules.length === 0) {
         log(`[WORKER-${workerId}] No module cards found on page`, 'DEBUG', 'parallel');
@@ -731,13 +774,13 @@ class ParallelCoordinator {
           return canvas.width > 0 && canvas.height > 0;
         });
         if (hasContent) {
-          log(`[WORKER-${workerId}] Flutter rendered after ${Math.round((Date.now() - startTime) / 1000)}s`, 'INFO', 'parallel');
+          log(`[WORKER-${workerId}] Nonzero canvas detected after ${Math.round((Date.now() - startTime) / 1000)}s; render readiness unverified`, 'INFO', 'parallel');
           return;
         }
       } catch {}
       await this._sleep(1000);
     }
-    log(`[WORKER-${workerId}] Flutter render timeout — proceeding anyway`, 'WARN', 'parallel');
+    log(`[WORKER-${workerId}] No nonzero canvas detected within 60s; render status unknown — proceeding anyway`, 'WARN', 'parallel');
   }
 
   /**

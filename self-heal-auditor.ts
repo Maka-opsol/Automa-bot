@@ -704,6 +704,20 @@ async function auditPatchWithTribunal(patchText: any, signal: any, options?: { i
       .map(r => r.value);
   }
 
+  // The configured fallback chain can otherwise approve a cloud-only vote
+  // before it ever reaches Ollama. Require a separate real Ollama approval
+  // for every patch without changing the existing tribunal's quorum rules.
+  // Availability/parse failures and an explicit veto all fail closed.
+  let requiredOllama: any;
+  try {
+    const config = _resolveAuditorConfig('ollama');
+    if (config) requiredOllama = await auditPatchWithAI(patchText, signal, config, isNonCodegen, originalContent);
+  } catch { /* fail closed below */ }
+  if (!requiredOllama || requiredOllama.provider !== 'ollama' ||
+      requiredOllama.skipped || requiredOllama.is_safe !== true) {
+    return { safe: false, is_safe: false, reason: 'Required Ollama audit rejected or unavailable', votes: [], skipped: [] };
+  }
+
   // Walk through the fallback tiers in order. Stop at the first tier that
   // yields at least one real safety verdict (not skipped).
   // For non-codegen patches, we keep the original strict-tier behavior:
