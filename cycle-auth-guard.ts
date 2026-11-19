@@ -459,7 +459,7 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
   // For the very first cycle (no last-known-good URL yet), the helper falls
   // back to the preset _isSpaDomain() check as a one-time bootstrap.
   if (!_isOnKnownAppOrigin(url)) {
-    log(`SPA check: URL ${url} is not on the last-known-good origin — session invalid`, 'DEBUG', 'auth-guard');
+    log(`SPA check: page is not on the last-known-good origin — session invalid`, 'DEBUG', 'auth-guard');
     return false;
   }
 
@@ -499,7 +499,7 @@ async function _isSpaSessionValid(page: any): Promise<boolean> {
     notifyLastKnownGoodUrl(url);
     return true;
   } catch (err: any) {
-    log(`SPA check: evaluate failed (${err.message}) — treating as NOT valid (was: assume valid)`, 'WARN', 'auth-guard');
+    log(`SPA check: evaluate failed — treating as NOT valid (was: assume valid)`, 'WARN', 'auth-guard');
     return false;
   }
 }
@@ -634,11 +634,11 @@ async function ensureAuthenticated(page: any) {
     // reach a Microsoft login page — the proxy is working.
     (globalThis as any).__chromeErrorCount = 0;
     if (isLoginInProgress()) {
-      log(`Login flow in progress — Microsoft login URL is expected destination. Returning page to tribunal. url=${url}`, 'INFO', 'auth-guard');
+      log(`Login flow in progress — Microsoft login URL is expected destination. Returning page to tribunal.`, 'INFO', 'auth-guard');
       // DO NOT clear the flag here — the login is NOT complete.
       // The flag will be cleared when we return to the app origin (Rule 2).
     } else {
-      log(`On Microsoft login page — returning page to tribunal for visual handling (NOT navigating away, NOT closing browser). url=${url}`, 'INFO', 'auth-guard');
+      log(`On Microsoft login page — returning page to tribunal for visual handling (NOT navigating away, NOT closing browser).`, 'INFO', 'auth-guard');
     }
     authAttempts = 0;
     // Clear any stale blank-page flag — the Microsoft page has content.
@@ -752,7 +752,7 @@ async function ensureAuthenticated(page: any) {
             }
           }
         } catch (reloadErr: any) {
-          log(`SPA session check: reload failed: ${reloadErr.message}`, 'WARN', 'auth-guard');
+          log(`SPA session check: reload failed`, 'WARN', 'auth-guard');
         }
         if (!rendered) {
           log('SPA session check: page still blank after 60s + reload — proceeding with re-auth', 'WARN', 'auth-guard');
@@ -833,7 +833,7 @@ async function ensureAuthenticated(page: any) {
         const ipRotator = require('./network-ip-rotator');
         const currentProxy = ipRotator.getCurrentProxy?.();
         if (currentProxy) {
-          log(`Chrome error page detected (occurrence #${errorCount}, proxy=${currentProxy}) — DISABLING PROXY immediately. Browser will use direct connection on next launch.`, 'ERROR', 'auth-guard');
+          log(`Chrome error page detected (occurrence #${errorCount}, proxy=active) — DISABLING PROXY immediately. Browser will use direct connection on next launch.`, 'ERROR', 'auth-guard');
           // TASK 61: Removed alert — routine event.
           // BUG FIX (2026-09-09): Use bypassProxy() to FULLY shut down the proxy
           // (clears env vars + resets ip-rotator state), not just set the flag.
@@ -866,11 +866,11 @@ async function ensureAuthenticated(page: any) {
     }
 
     const recoveryUrl = CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za';
-    log('On Chrome error page (' + url + ', occurrence #' + errorCount + ') — navigating to ' + recoveryUrl + ' (network/proxy error recovery)', 'WARN', 'auth-guard');
+    log('On Chrome error page (occurrence #' + errorCount + ') — navigating to recovery destination (network/proxy error recovery)', 'WARN', 'auth-guard');
     try {
       await page.goto(recoveryUrl, { waitUntil: 'load', timeout: 120000 });
     } catch (e: any) {
-      log('Recovery navigation to ' + recoveryUrl + ' also failed: ' + e.message, 'ERROR', 'auth-guard');
+      log('Recovery navigation failed', 'ERROR', 'auth-guard');
       // TASK 146: DON'T close and relaunch browser (defeats Task 87).
       // Just wait 10s and let the next cycle retry. The network may recover.
       log('Waiting 10s before next cycle retry (NOT closing browser per Task 87)...', 'WARN', 'auth-guard');
@@ -885,15 +885,15 @@ async function ensureAuthenticated(page: any) {
   // with a blank page — it just returns error/wait, which loops forever.
   if (url === 'about:blank') {
     const recoveryUrl = CONFIG.APP_URL || CONFIG.BASE_URL || 'https://app.mathu.co.za';
-    log(`On about:blank — navigating to ${recoveryUrl} (instead of returning blank page to tribunal)`, 'INFO', 'auth-guard');
+    log(`On about:blank — navigating to recovery destination (instead of returning blank page to tribunal)`, 'INFO', 'auth-guard');
     try {
       await page.goto(recoveryUrl, { waitUntil: 'load', timeout: 120000 });
     } catch (e: any) {
-      log(`Navigation to ${recoveryUrl} failed: ${e.message}`, 'WARN', 'auth-guard');
+      log(`Recovery navigation failed`, 'WARN', 'auth-guard');
     }
     return page;
   }
-  log(`On unknown URL — returning page to tribunal for visual handling (no URL change). url=${url}`, 'INFO', 'auth-guard');
+  log(`On unknown URL — returning page to tribunal for visual handling (no URL change).`, 'INFO', 'auth-guard');
   return page;
 }
 

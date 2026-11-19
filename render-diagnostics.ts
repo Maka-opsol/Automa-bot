@@ -2,11 +2,12 @@
 // All output values are from fixed allowlists; no page content is collected.
 export function attachRenderDiagnostics(page: any, workerId: number, log: any): void {
   let emitted = 0;
+  const safeId = Number.isSafeInteger(workerId) && workerId >= 0 && workerId <= 999 ? workerId : 0;
   const maxEvents = 20;
   function emit(message: string): void {
     if (emitted >= maxEvents) return;
     emitted++;
-    try { log(`[WORKER-${workerId}] [render-diag] ${message}`, 'DEBUG', 'parallel'); } catch {}
+    try { log(`[WORKER-${safeId}] [render-diag] ${message}`, 'DEBUG', 'parallel'); } catch {}
   }
   function kind(url: string, resourceType: string): string | null {
     try {
@@ -36,8 +37,8 @@ export function attachRenderDiagnostics(page: any, workerId: number, log: any): 
   function failureGroup(text: any): string {
     // Exact, fixed error names only. Never emit the input, even on malformed data.
     const codes: Record<string, string> = {
-      'net::ERR_ABORTED': 'aborted', 'net::ERR_BLOCKED_BY_CLIENT': 'blocked',
-      'net::ERR_BLOCKED_BY_RESPONSE': 'blocked', 'net::ERR_BLOCKED_BY_CSP': 'blocked',
+      'net::ERR_ABORTED': 'aborted', 'net::ERR_BLOCKED_BY_CLIENT': 'client-block',
+      'net::ERR_BLOCKED_BY_RESPONSE': 'response-block', 'net::ERR_BLOCKED_BY_CSP': 'csp-block',
       'net::ERR_NAME_NOT_RESOLVED': 'dns', 'net::ERR_TIMED_OUT': 'timeout',
       'net::ERR_CONNECTION_TIMED_OUT': 'timeout', 'net::ERR_CONNECTION_REFUSED': 'connection',
       'net::ERR_CONNECTION_RESET': 'connection', 'net::ERR_CONNECTION_CLOSED': 'connection',
@@ -47,10 +48,20 @@ export function attachRenderDiagnostics(page: any, workerId: number, log: any): 
   }
   function cspFlags(value: any): string {
     if (typeof value !== 'string' || !value) return 'absent';
-    const names = new Set(value.split(';').slice(0, 100).map(v => v.trim().split(/\s+/, 1)[0].toLowerCase()));
+    const names = new Set(value.slice(0, 16384).split(';').slice(0, 100).map(v => v.trim().split(/\s+/, 1)[0].toLowerCase()));
     return `present,script-src=${names.has('script-src') ? 1 : 0},script-src-elem=${names.has('script-src-elem') ? 1 : 0},default-src=${names.has('default-src') ? 1 : 0}`;
   }
   try {
+    // A browser-console CSP violation is a hint, not proof: page code can forge console text.
+    // Inspect only a bounded prefix and emit neither the text nor any policy values.
+    page.on('console', (msg: any) => {
+      try {
+        if (msg.type() !== 'error') return;
+        const text = msg.text().slice(0, 4096);
+        if (text.includes('violates the following Content Security Policy directive'))
+          emit(`csp-violation hint=console kind=${text.includes('script-src') ? 'script' : 'other'}`);
+      } catch {}
+    });
     page.on('requestfailed', (request: any) => {
       try {
         const type = request.resourceType();

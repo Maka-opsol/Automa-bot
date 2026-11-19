@@ -52,38 +52,14 @@
 import { navigateWorkerEntry } from './worker-navigation-recovery';
 
 let _deps: any = {};
+const renderSignals = new WeakMap<object, any>();
+const renderPollReports = new WeakMap<object, number>();
 function _injectDependencies(deps: any) { _deps = deps; }
 function getCONFIG(): any { return _deps.config || require('./config'); }
 function getLog(): (msg: string, level?: string, mod?: string) => void {
   return _deps.logger?.log || ((msg: string, level?: string) => console.log(`[${level || 'INFO'}] [parallel] ${msg}`));
 }
 function getLogError() { return _deps.logger?.logError || ((msg: string, err: Error) => console.error(msg, err)); }
-
-// Diagnostic only: never emit frame URLs, paths, credentials or raw stacks.
-function pdfErrorSource(error: any, pageUrl: string): string {
-  try {
-    if (!error || error.message !== 'pdfjsLib is not defined') return '';
-    const stack = typeof error.stack === 'string' ? error.stack.slice(0, 16384) : '';
-    for (const frame of stack.split('\n').slice(1, 41)) {
-      const match = frame.match(/https?:\/\/[^\s)\]]+?:(\d{1,9}):(\d{1,9})(?:\)|\s|$)/i);
-      if (!match) continue;
-      let url: URL;
-      try { url = new URL(match[0].replace(/:\d{1,9}:\d{1,9}(?:\)|\s)?$/, '')); }
-      catch { continue; }
-      let origin = 'unknown-origin';
-      try {
-        const page = new URL(pageUrl);
-        if (page.protocol === 'http:' || page.protocol === 'https:') {
-          origin = url.origin === page.origin ? 'same-origin' : 'external-origin';
-        }
-      } catch {}
-      return ` [pdf-source ${origin}]`;
-    }
-    return ' [pdf-source unavailable]';
-  } catch {
-    return ' [pdf-source unavailable]';
-  }
-}
 
 interface WorkerState {
   id: number;
@@ -94,6 +70,7 @@ interface WorkerState {
   modulesCompleted: number;
   errors: number;
   lastActivity: number;
+  authNetDiag?: any;
 }
 
 class ParallelCoordinator {
@@ -122,7 +99,7 @@ class ParallelCoordinator {
       try {
         await this._createWorker(i);
       } catch (err: any) {
-        log(`[PARALLEL] Failed to create worker ${i}: ${err.message}`, 'ERROR', 'parallel');
+        log(`[PARALLEL] Failed to create worker ${i}`, 'ERROR', 'parallel');
       }
     }
 
@@ -133,7 +110,7 @@ class ParallelCoordinator {
     // Start worker loops
     for (const [id, _] of this.workers) {
       this._runWorkerLoop(id).catch((err: any) => {
-        log(`[PARALLEL] Worker ${id} loop crashed: ${err.message}`, 'ERROR', 'parallel');
+        log(`[PARALLEL] Worker ${id} loop crashed`, 'ERROR', 'parallel');
       });
     }
 
@@ -150,25 +127,36 @@ class ParallelCoordinator {
     });
 
     const page = await context.newPage();
-    // Opt-in only: passive metadata with allowlisted values, no page content.
+    // Opt-in pending a broader auth and proxy logging privacy review.
+    let authNetDiag: any = null;
+    if (process.env.MATHU_AUTHNET_DIAGNOSTICS === '1') {
+      try {
+        authNetDiag = require('./authnet-diagnostics').attachAuthNetDiagnostics(
+          page, id, getCONFIG().APP_URL, !!(globalThis as any).__proxyDisabled, log);
+      } catch {}
+    }
+    // Opt-in pending a broader auth and proxy logging privacy review.
     if (process.env.MATHU_RENDER_DIAGNOSTICS === '1') {
       try { require('./render-diagnostics').attachRenderDiagnostics(page, id, log); } catch {}
+      try { renderSignals.set(page, require('./render-observability').attachRenderSignals(page, id, log, getCONFIG().APP_URL)); } catch {}
     }
     page.setDefaultTimeout(30000);
     page.setDefaultNavigationTimeout(120000);
 
+    // Raw console and exception text may contain sensitive or academic content.
+    let genericConsoleEvents = 0;
+    let genericPageErrors = 0;
     page.on('console', (msg: any) => {
-      const text = msg.text();
-      if (text.includes('error') || text.includes('Error') || text.includes('TASK')) {
-        log(`[WORKER-${id}] [page-console] ${msg.type()}: ${text.substring(0, 200)}`, 'DEBUG', 'parallel');
-      }
+      try {
+        if (msg.type() === 'error' && genericConsoleEvents++ < 4)
+          log(`[WORKER-${id}] [page-console] kind=error`, 'DEBUG', 'parallel');
+      } catch {}
     });
     page.on('pageerror', (err: Error) => {
-      let pageUrl = '';
-      if (err.message === 'pdfjsLib is not defined') {
-        try { pageUrl = page.url(); } catch {}
-      }
-      log(`[WORKER-${id}] [page-error] ${err.message}${pdfErrorSource(err, pageUrl)}`, 'ERROR', 'parallel');
+      try {
+        if (genericPageErrors++ < 4)
+          log(`[WORKER-${id}] [page-error] kind=${err.message === 'pdfjsLib is not defined' ? 'pdf-reference' : 'other'}`, 'ERROR', 'parallel');
+      } catch {}
     });
 
     this.workers.set(id, {
@@ -180,6 +168,7 @@ class ParallelCoordinator {
       modulesCompleted: 0,
       errors: 0,
       lastActivity: Date.now(),
+      authNetDiag,
     });
 
     log(`[PARALLEL] Worker ${id} ready`, 'INFO', 'parallel');
@@ -214,8 +203,9 @@ class ParallelCoordinator {
 
         // Step 2: Navigate to assignments page
         worker.status = 'browsing_assignments';
-        await worker.page.goto(getCONFIG().APP_URL + '/assignments', { waitUntil: 'load', timeout: 120000 });
+        await this._navigateAssignments(worker, false);
         await this._waitForFlutterRender(worker.page, id);
+        try { renderSignals.get(worker.page)?.sample('render'); } catch {}
         log(`[WORKER-${id}] On assignments page`, 'INFO', 'parallel');
 
         // Step 3: Claim a module from Turso
@@ -227,13 +217,13 @@ class ParallelCoordinator {
         }
 
         worker.currentModule = { name: module.name, type: module.type, claimedAt: Date.now() };
-        log(`[WORKER-${id}] Claimed module: "${module.name}" (type: ${module.type})`, 'INFO', 'parallel');
+        log(`[WORKER-${id}] Claimed module (type: ${module.type})`, 'INFO', 'parallel');
 
         // Step 4: Find and click the module card
         const clicked = await this._findAndClickModuleCard(worker.page, module.name, id);
         if (!clicked) {
           worker.errors++;
-          log(`[WORKER-${id}] Module "${module.name}" could not be opened — attempting to release claim for retry`, 'WARN', 'parallel');
+          log(`[WORKER-${id}] Module could not be opened — attempting to release claim for retry`, 'WARN', 'parallel');
           await this._markModuleFailed(module.name, id);
           worker.currentModule = null;
           worker.status = 'idle';
@@ -256,11 +246,11 @@ class ParallelCoordinator {
 
         if (completed) {
           worker.modulesCompleted++;
-          log(`[WORKER-${id}] ✅ Module "${module.name}" completed`, 'INFO', 'parallel');
+          log(`[WORKER-${id}] ✅ Module completed`, 'INFO', 'parallel');
           await this._markModuleDone(module.name, id);
         } else {
           worker.errors++;
-          log(`[WORKER-${id}] ❌ Module "${module.name}" failed — will retry later`, 'WARN', 'parallel');
+          log(`[WORKER-${id}] ❌ Module failed — will retry later`, 'WARN', 'parallel');
           await this._markModuleFailed(module.name, id);
         }
 
@@ -269,12 +259,12 @@ class ParallelCoordinator {
         worker.lastActivity = Date.now();
 
         // Navigate back to assignments for next module
-        await worker.page.goto(getCONFIG().APP_URL + '/assignments', { waitUntil: 'load', timeout: 120000 }).catch(() => {});
+        await this._navigateAssignments(worker, true).catch(() => {});
 
       } catch (err: any) {
         worker.errors++;
         worker.status = 'error';
-        log(`[WORKER-${id}] Error: ${err.message}`, 'ERROR', 'parallel');
+        log(`[WORKER-${id}] Worker loop error`, 'ERROR', 'parallel');
         if (worker.currentModule) {
           await this._markModuleFailed(worker.currentModule.name, id);
           worker.currentModule = null;
@@ -292,15 +282,22 @@ class ParallelCoordinator {
    */
   private async _ensureLoggedIn(worker: WorkerState, id: number): Promise<boolean> {
     const log = getLog();
+    const diag = worker.authNetDiag;
+    let outcome = 'exception';
+    let failure = null;
+    diag?.begin('login_check');
     try {
       // Navigate to app root
+      diag?.step('entry_domcontentloaded');
       await navigateWorkerEntry(worker.page, getCONFIG().APP_URL, () => {
         log(`[WORKER-${id}] App entry loaded after navigation timeout; resuming login check`, 'INFO', 'parallel');
-      });
+      }, () => { diag?.step('entry_late_load_wait'); });
+      diag?.step('post_entry_wait');
       await this._sleep(3000);
 
       // Check if we're on the assignments page (already logged in)
       const url = worker.page.url();
+      diag?.step('login_decision');
       if (url.includes('/assignments') || url.includes('app.mathu.co.za')) {
         // Check for Microsoft login redirect
         if (url.includes('login.microsoftonline.com') || url.includes('login.live.com')) {
@@ -308,26 +305,50 @@ class ParallelCoordinator {
           // Use the auth guard to handle login
           const authGuard = _deps.authGuard;
           if (authGuard && typeof authGuard.ensureAuthenticated === 'function') {
+            diag?.step('guard_handoff');
             const result = await authGuard.ensureAuthenticated(worker.page);
+            outcome = result === false ? 'guard_returned_false' : 'guard_returned_nonfalse_unverified';
             return result !== false;
           }
           // Fallback: try to use the auth manager
           const auth = _deps.auth;
           if (auth && typeof auth.authenticate === 'function') {
+            diag?.step('auth_handoff');
             await auth.authenticate(worker.page);
+            outcome = 'auth_returned_unverified';
             return true;
           }
           log(`[WORKER-${id}] No auth module — cannot log in`, 'ERROR', 'parallel');
+          outcome = 'no_auth_module';
           return false;
         }
         // Already logged in
         log(`[WORKER-${id}] Already logged in`, 'INFO', 'parallel');
+        outcome = diag?.classify() === 'app_origin' ? 'legacy_true_app_unverified' : 'legacy_true_external_unverified';
         return true;
       }
+      outcome = diag?.classify() === 'app_origin' ? 'legacy_true_app_unverified' : 'legacy_true_other_unverified';
       return true;
     } catch (err: any) {
-      log(`[WORKER-${id}] Login check failed: ${err.message}`, 'WARN', 'parallel');
+      failure = err;
+      log(`[WORKER-${id}] Login check failed`, 'WARN', 'parallel');
       return false;
+    } finally {
+      diag?.finish(outcome, failure);
+    }
+  }
+
+  /** Navigate as before, with optional passive timing and outcome metadata. */
+  private async _navigateAssignments(worker: WorkerState, isReturn: boolean): Promise<any> {
+    const diag = worker.authNetDiag;
+    diag?.begin(isReturn ? 'assignments_return_load' : 'assignments_load');
+    try {
+      const result = await worker.page.goto(getCONFIG().APP_URL + '/assignments', { waitUntil: 'load', timeout: 120000 });
+      diag?.finish('completed');
+      return result;
+    } catch (err: any) {
+      diag?.finish('failed', err);
+      throw err;
     }
   }
 
@@ -369,10 +390,12 @@ class ParallelCoordinator {
         // Failed inspection does not establish that the page contains no cards.
         // Exception text may contain sensitive URLs or page content.
         log(`[WORKER-${workerId}] Module card inspection failed; page content unknown`, 'WARN', 'parallel');
+        try { renderSignals.get(page)?.sample('card-inspection-failed'); } catch {}
         return null;
       }
 
       if (!modules || modules.length === 0) {
+        try { renderSignals.get(page)?.sample('cards-empty'); } catch {}
         log(`[WORKER-${workerId}] No module cards found on page`, 'DEBUG', 'parallel');
         return null;
       }
@@ -403,7 +426,7 @@ class ParallelCoordinator {
 
       return null; // All modules are done or claimed
     } catch (err: any) {
-      log(`[WORKER-${workerId}] Claim failed: ${err.message}`, 'DEBUG', 'parallel');
+      log(`[WORKER-${workerId}] Claim failed`, 'DEBUG', 'parallel');
       return null;
     }
   }
@@ -460,7 +483,7 @@ class ParallelCoordinator {
       }, moduleName);
 
       if (!card.found) {
-        log(`[WORKER-${workerId}] Card "${moduleName}" not found on page`, 'WARN', 'parallel');
+        log(`[WORKER-${workerId}] Card not found on page`, 'WARN', 'parallel');
         return false;
       }
 
@@ -469,7 +492,7 @@ class ParallelCoordinator {
       await this._sleep(3000); // Wait for navigation
       return true;
     } catch (err: any) {
-      log(`[WORKER-${workerId}] Click card failed: ${err.message}`, 'ERROR', 'parallel');
+      log(`[WORKER-${workerId}] Click card failed`, 'ERROR', 'parallel');
       return false;
     }
   }
@@ -587,7 +610,7 @@ class ParallelCoordinator {
       return document.body.innerText.substring(0, 2000);
     }).catch(() => '');
 
-    log(`[WORKER-${id}] Memo prompt: ${prompt.substring(0, 200)}...`, 'INFO', 'parallel');
+    log(`[WORKER-${id}] Memo prompt extracted`, 'INFO', 'parallel');
 
     // Use the AI tribunal to generate the memo
     const screenshot = await worker.page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => Buffer.from(''));
@@ -772,7 +795,8 @@ class ParallelCoordinator {
     const diagnostic = process.env.MATHU_RENDER_DIAGNOSTICS === '1';
     const polls = { absent: 0, zero: 0, errors: 0 };
     const reportPolls = () => {
-      if (diagnostic) {
+      if (diagnostic && (renderPollReports.get(page) || 0) < 3) {
+        renderPollReports.set(page, (renderPollReports.get(page) || 0) + 1);
         try { log(`[WORKER-${workerId}] [render-diag] first-canvas polls absent=${polls.absent} zero=${polls.zero} eval-error=${polls.errors}`, 'DEBUG', 'parallel'); } catch {}
       }
     };
@@ -845,7 +869,7 @@ class ParallelCoordinator {
       const totalErrors = workers.reduce((sum: number, w: any) => sum + w.errors, 0);
       log(`[PARALLEL] 📊 Uptime: ${uptime}s | Workers: ${this.workers.size} | Modules completed: ${totalCompleted} | Errors: ${totalErrors}`, 'INFO', 'parallel');
       for (const w of workers) {
-        log(`[PARALLEL]   Worker ${w.id}: ${w.status} | ${w.module || 'idle'} | ✅${w.completed} ❌${w.errors}`, 'INFO', 'parallel');
+        log(`[PARALLEL]   Worker ${w.id}: ${w.status} | module=${w.module ? 'active' : 'idle'} | ✅${w.completed} ❌${w.errors}`, 'INFO', 'parallel');
       }
     }, 60000).unref?.();
   }

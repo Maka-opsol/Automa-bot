@@ -4,7 +4,7 @@
 // Never re-navigate: allow one bounded readiness wait only after observing a
 // single main-frame entry request, its successful response, and its commit.
 // This establishes document readiness, not authentication.
-async function navigateWorkerEntry(page, appUrl, onLateLoad = () => {}) {
+async function navigateWorkerEntry(page, appUrl, onLateLoad = () => {}, onLateLoadWait = () => {}) {
   let expected;
   try {
     expected = new URL(appUrl);
@@ -65,6 +65,8 @@ async function navigateWorkerEntry(page, appUrl, onLateLoad = () => {}) {
         (error?.constructor?.name === 'TimeoutError' &&
          /^page\.goto: Timeout \d+ms exceeded\./.test(error?.message || ''));
       if (!isNavigationTimeout || !canRecover()) throw error;
+      // Diagnostic hook is best effort and must not alter recovery.
+      try { onLateLoadWait(); } catch {}
       try {
         await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
       } catch {
