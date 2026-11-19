@@ -1,0 +1,129 @@
+name: Dashboard Auditor
+# Version 2: consumers MUST verify all bindings, all three explicit votes,
+# trusted run/job identity, and current base at commit time. See auditor/README.md.
+on:
+  workflow_dispatch:
+    inputs:
+      nonce:
+        description: 64 lowercase hex characters
+        required: true
+        type: string
+      path:
+        description: Existing source file path
+        required: true
+        type: string
+      base_blob:
+        description: Git SHA-1 blob of that path at dispatched main revision
+        required: true
+        type: string
+      candidate_b64:
+        description: Canonical base64 full replacement; max 4096 decoded bytes
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      OLLAMA_HOST: 127.0.0.1:11434
+      OLLAMA_NO_CLOUD: '1'
+    steps:
+      - name: Require intended dispatch
+        env:
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          EVENT: ${{ github.event_name }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test "$REPO" = 'Maka-opsol/Automa-bot'
+          test "$REF" = 'refs/heads/main'
+          test "$EVENT" = 'workflow_dispatch'
+          test "$ATTEMPT" = '1'
+      # This is an explicit trusted code pin, NOT the mutable dispatched branch.
+      # Review-only template. See auditor/README.md before any use.
+      - name: Check out pinned evaluator
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: cc4e2fef214bebe2e1dd7496e94d4540c7239108
+          path: evaluator
+          persist-credentials: false
+          fetch-depth: 1
+      # Never execute from this checkout; the evaluator reads Git objects only.
+      - name: Check out dispatched baseline
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: baseline
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+      - name: Validate candidate and baseline
+        env:
+          NONCE: ${{ inputs.nonce }}
+          PATCH_PATH: ${{ inputs.path }}
+          BASE_BLOB: ${{ inputs.base_blob }}
+          CANDIDATE_B64: ${{ inputs.candidate_b64 }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          BASE_REPO: ${{ github.workspace }}/baseline
+        run: python3 evaluator/auditor/audit.py --validate
+      - name: Install pinned prompt tokenizer
+        run: |
+          set -euo pipefail
+          tokenizer="$RUNNER_TEMP/qwen-tokenizer.json"
+          wheel="$RUNNER_TEMP/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+          curl --proto '=https' --tlsv1.2 -fsSL --max-time 120 -o "$tokenizer" 'https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct/resolve/2e1fd397ee46e1388853d2af2c993145b0f1098a/tokenizer.json'
+          printf '%s  %s\n' 'c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539' "$tokenizer" | sha256sum -c -
+          curl --proto '=https' --tlsv1.2 -fsSL --max-time 120 -o "$wheel" 'https://files.pythonhosted.org/packages/2e/76/932be4b50ef6ccedf9d3c6639b056a967a86258c6d9200643f01269211ca/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl'
+          printf '%s  %s\n' '369cc9fc8cc10cb24143873a0d95438bb8ee257bb80c71989e3ee290e8d72c67' "$wheel" | sha256sum -c -
+          python3 -m venv "$RUNNER_TEMP/tokenizer-venv"
+          "$RUNNER_TEMP/tokenizer-venv/bin/pip" install --no-index --no-deps "$wheel"
+          printf '%s\n' "$RUNNER_TEMP/tokenizer-venv/bin" >> "$GITHUB_PATH"
+          printf 'TOKENIZER_PATH=%s\n' "$tokenizer" >> "$GITHUB_ENV"
+      # Official release is pinned by a reviewed SHA-256; never execute install.sh.
+      - name: Install pinned Ollama and pull model
+        env:
+          OLLAMA_MODELS: ${{ runner.temp }}/audit-models
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/ollama-linux-amd64.tgz"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 2 --max-time 600 -o "$archive" \
+            'https://github.com/ollama/ollama/releases/download/v0.13.5/ollama-linux-amd64.tgz'
+          printf '%s  %s\n' '41fb93ff8be35e4d2d22bafd1c42b487efb15b766076d976766bd1ee4db3f8e2' "$archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/ollama"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/ollama"
+          "$RUNNER_TEMP/ollama/bin/ollama" serve > "$RUNNER_TEMP/ollama-audit.log" 2>&1 &
+          for n in $(seq 1 60); do
+            if curl --noproxy '*' -fsS --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --noproxy '*' -fsS --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null
+          timeout 600 "$RUNNER_TEMP/ollama/bin/ollama" pull qwen2.5-coder:1.5b
+      - name: Review with Ollama
+        env:
+          NONCE: ${{ inputs.nonce }}
+          PATCH_PATH: ${{ inputs.path }}
+          BASE_BLOB: ${{ inputs.base_blob }}
+          CANDIDATE_B64: ${{ inputs.candidate_b64 }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          BASE_REPO: ${{ github.workspace }}/baseline
+          VERDICT_FILE: ${{ runner.temp }}/dashboard-audit-verdict.json
+        run: python3 evaluator/auditor/audit.py
+      - name: Upload bound verdict
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: audit-${{ inputs.nonce }}
+          path: ${{ runner.temp }}/dashboard-audit-verdict.json
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: false
