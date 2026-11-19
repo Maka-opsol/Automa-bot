@@ -46,7 +46,7 @@ class AuditTests(unittest.TestCase):
     def prepare(self, **changes): return audit.prepare(self.inputs | changes, str(self.repo))
     def transport(self, votes=None, digest=audit.MODEL_DIGEST):
         calls = []
-        votes = iter(votes if votes is not None else ['{"safe":true,"reason":"none"}'] * 3)
+        votes = iter(votes if votes is not None else ['{"safe":true}'] * 3)
         def send(path, payload=None):
             calls.append((path,payload))
             if path == '/api/version': return {'version':audit.RUNTIME_VERSION}
@@ -84,10 +84,10 @@ class AuditTests(unittest.TestCase):
         with self.assertRaises(Exception): self.prepare(path='second.ts')
     def test_model_failure_modes_fail_closed(self):
         p=self.prepare()
-        responses=['{"safe":false,"reason":"concern"}', '{}','{"safe":1,"reason":"x"}',
-                   '{"safe":true,"safe":true,"reason":"x"}',
-                   'prefix {"safe":true,"reason":"x"}', '{"safe":true,"reason":"x","extra":0}',
-                   '{"safe":true,"reason":null}', '{"safe":true,"reason":"x"} trailing']
+        responses=['{"safe":false}', '{}','{"safe":1}',
+                   '{"safe":true,"safe":true}',
+                   'prefix {"safe":true}', '{"safe":true,"reason":"unsafe"}',
+                   '{"safe":true,"extra":0}', '{"safe":true} trailing']
         for response in responses:
             with self.subTest(response=response):
                 send,_=self.transport([response]*3)
@@ -101,6 +101,17 @@ class AuditTests(unittest.TestCase):
         p=self.prepare(); v={'provider':audit.PROVIDERS[0],'is_safe':True}
         for votes in ([],[v],[v,v,v], [{'provider':n,'is_safe':1} for n in audit.PROVIDERS]):
             self.assertFalse(audit.verdict(p,votes)['safe'])
+    def test_conflicting_or_unknown_envelope_fails_closed(self):
+        p=self.prepare()
+        for field, value in (('unsafe', True), ('is_safe', False), ('error', 'bad'),
+                             ('tool_calls', []), ('refusal', 'no'), ('unknown', {})):
+            send,_=self.transport()
+            def amended(path, payload=None):
+                r=send(path,payload)
+                if path == '/api/generate': r[field]=value
+                return r
+            with self.subTest(field=field):
+                self.assertFalse(audit.verdict(p,audit.review(p,amended))['safe'])
     def test_truncated_response_fails(self):
         p=self.prepare(); send,_=self.transport()
         def transport(path,payload=None):
@@ -170,7 +181,7 @@ class AuditTests(unittest.TestCase):
                 body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 requests.append(('POST',self.path,body))
                 self.reply({'model':audit.MODEL,'done':True,'done_reason':'stop',
-                            'prompt_eval_count':len(AuditTests.tokenizer.encode(body['prompt'],add_special_tokens=False).ids),'response':'{"safe":true,"reason":"none"}'})
+                            'prompt_eval_count':len(AuditTests.tokenizer.encode(body['prompt'],add_special_tokens=False).ids),'response':'{"safe":true}'})
             def reply(self, obj):
                 b=json.dumps(obj).encode(); self.send_response(200); self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b)
         server=http.server.HTTPServer(('127.0.0.1',11434),Handler)
