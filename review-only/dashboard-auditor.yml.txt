@@ -50,7 +50,7 @@ jobs:
       - name: Check out pinned evaluator
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: cc4e2fef214bebe2e1dd7496e94d4540c7239108
+          ref: 4db104e72722e448d394b64ecb94787f8af33686
           path: evaluator
           persist-credentials: false
           fetch-depth: 1
