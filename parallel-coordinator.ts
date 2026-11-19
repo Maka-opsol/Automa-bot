@@ -49,6 +49,7 @@
 
 'use strict';
 
+import { pdfErrorSource } from './pdf-error-diagnostics';
 import { navigateWorkerEntry } from './worker-navigation-recovery';
 
 let _deps: any = {};
@@ -134,7 +135,11 @@ class ParallelCoordinator {
       }
     });
     page.on('pageerror', (err: Error) => {
-      log(`[WORKER-${id}] [page-error] ${err.message}`, 'ERROR', 'parallel');
+      let pageUrl = '';
+      if (err.message === 'pdfjsLib is not defined') {
+        try { pageUrl = page.url(); } catch {}
+      }
+      log(`[WORKER-${id}] [page-error] ${err.message}${pdfErrorSource(err, pageUrl)}`, 'ERROR', 'parallel');
     });
 
     this.workers.set(id, {
@@ -731,13 +736,13 @@ class ParallelCoordinator {
           return canvas.width > 0 && canvas.height > 0;
         });
         if (hasContent) {
-          log(`[WORKER-${workerId}] Flutter rendered after ${Math.round((Date.now() - startTime) / 1000)}s`, 'INFO', 'parallel');
+          log(`[WORKER-${workerId}] Nonzero canvas detected after ${Math.round((Date.now() - startTime) / 1000)}s; render readiness unverified`, 'INFO', 'parallel');
           return;
         }
       } catch {}
       await this._sleep(1000);
     }
-    log(`[WORKER-${workerId}] Flutter render timeout — proceeding anyway`, 'WARN', 'parallel');
+    log(`[WORKER-${workerId}] No nonzero canvas detected within 60s; render status unknown — proceeding anyway`, 'WARN', 'parallel');
   }
 
   /**

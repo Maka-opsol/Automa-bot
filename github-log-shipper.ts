@@ -157,6 +157,8 @@ interface FilePushResult {
 
 let _started = false;
 let _timer: any = null;
+let _initialTimer: any = null;
+let _generation = 0;
 let _config: ShipperConfig | null = null;
 let _lastPushAt: number | null = null;
 let _lastPushOk: boolean | null = null;
@@ -475,10 +477,9 @@ async function _tick(): Promise<void> {
 function start(): void {
   if (_started) return;
 
-  _config = _resolveConfig();
-  if (!_config) {
   const cfg = _resolveConfig();
   if (!cfg) {
+    _config = null;
     _skippedNoConfig = true;
     if (!_firstStartLogged) {
       _firstStartLogged = true;
@@ -493,18 +494,25 @@ function start(): void {
   _config = cfg;
   _started = true;
   _skippedNoConfig = false;
+  const generation = ++_generation;
   log(
-    `Started — pushing to github.com/${_config.owner}/${_config.repo}/tree/${_config.branch}/${_config.pathPrefix} every ${Math.round(_config.intervalMs / 1000)}s`,
     `Started — pushing to github.com/${cfg.owner}/${cfg.repo}/tree/${cfg.branch}/${cfg.pathPrefix} every ${Math.round(cfg.intervalMs / 1000)}s`,
     'INFO'
   );
 
+  // A logger may synchronously stop or restart the shipper.
+  if (!_started || generation !== _generation) return;
+
   // First push after 30s (don't block startup)
-  setTimeout(() => {
+  _initialTimer = setTimeout(() => {
+    if (!_started || generation !== _generation) return;
+    _initialTimer = null;
     _tick().catch(() => {});
+    if (!_started || generation !== _generation) return;
     // Then on the regular interval
-    _timer = setInterval(() => { _tick().catch(() => {}); }, _config.intervalMs);
-    _timer = setInterval(() => { _tick().catch(() => {}); }, cfg.intervalMs);
+    _timer = setInterval(() => {
+      if (_started && generation === _generation) _tick().catch(() => {});
+    }, cfg.intervalMs);
     if (_timer.unref) _timer.unref();
   }, 30 * 1000);
 }
@@ -512,7 +520,10 @@ function start(): void {
 function stop(): void {
   if (!_started) return;
   _started = false;
+  ++_generation;
+  if (_initialTimer) { clearTimeout(_initialTimer); _initialTimer = null; }
   if (_timer) { clearInterval(_timer); _timer = null; }
+  _config = null;
   log('Stopped', 'INFO');
 }
 
