@@ -150,6 +150,10 @@ class ParallelCoordinator {
     });
 
     const page = await context.newPage();
+    // Opt-in only: passive metadata with allowlisted values, no page content.
+    if (process.env.MATHU_RENDER_DIAGNOSTICS === '1') {
+      try { require('./render-diagnostics').attachRenderDiagnostics(page, id, log); } catch {}
+    }
     page.setDefaultTimeout(30000);
     page.setDefaultNavigationTimeout(120000);
 
@@ -765,21 +769,37 @@ class ParallelCoordinator {
     const log = getLog();
     const maxWaitMs = 60000;
     const startTime = Date.now();
+    const diagnostic = process.env.MATHU_RENDER_DIAGNOSTICS === '1';
+    const polls = { absent: 0, zero: 0, errors: 0 };
+    const reportPolls = () => {
+      if (diagnostic) {
+        try { log(`[WORKER-${workerId}] [render-diag] first-canvas polls absent=${polls.absent} zero=${polls.zero} eval-error=${polls.errors}`, 'DEBUG', 'parallel'); } catch {}
+      }
+    };
 
     while (Date.now() - startTime < maxWaitMs) {
       try {
-        const hasContent = await page.evaluate(() => {
+        // Exactly the same first-canvas predicate; optional mode adds only a coarse result.
+        const result = diagnostic ? await page.evaluate(() => {
+          const canvas = document.querySelector('canvas');
+          if (!canvas) return 'absent';
+          return canvas.width > 0 && canvas.height > 0 ? 'nonzero' : 'zero';
+        }) : await page.evaluate(() => {
           const canvas = document.querySelector('canvas');
           if (!canvas) return false;
           return canvas.width > 0 && canvas.height > 0;
         });
-        if (hasContent) {
+        if (diagnostic && result === 'absent') polls.absent++;
+        if (diagnostic && result === 'zero') polls.zero++;
+        if (diagnostic ? result === 'nonzero' : result) {
+          reportPolls();
           log(`[WORKER-${workerId}] Nonzero canvas detected after ${Math.round((Date.now() - startTime) / 1000)}s; render readiness unverified`, 'INFO', 'parallel');
           return;
         }
-      } catch {}
+      } catch { if (diagnostic) polls.errors++; }
       await this._sleep(1000);
     }
+    reportPolls();
     log(`[WORKER-${workerId}] No nonzero canvas detected within 60s; render status unknown — proceeding anyway`, 'WARN', 'parallel');
   }
 
