@@ -26,5 +26,12 @@ for (const file of files) {
     fail++;
   }
 }
+// This JS helper is imported by compiled TypeScript and must accompany it.
+try {
+  fs.copyFileSync('pdf-error-diagnostics.js', path.join('dist', 'pdf-error-diagnostics.js'));
+} catch (e) {
+  console.error('FAIL: pdf-error-diagnostics.js - ' + e.message.slice(0, 120));
+  fail++;
+}
 console.log('Compiled: ' + ok + ' files, ' + fail + ' failures');
 if (fail > 0) process.exit(1);
