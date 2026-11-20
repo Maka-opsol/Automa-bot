@@ -50,7 +50,7 @@ jobs:
       - name: Check out pinned evaluator
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: 8b85f313d0f921c341ce4ee2a8851427d171906a
+          ref: 36414530844a00eb0df5ff1e91299ee57dfe62e6
           path: evaluator
           persist-credentials: false
           fetch-depth: 1
@@ -59,8 +59,8 @@ jobs:
       - name: Verify evaluator commit and file
         run: |
           set -euo pipefail
-          test "$(git -C evaluator rev-parse HEAD)" = '8b85f313d0f921c341ce4ee2a8851427d171906a'
-          test "$(git -C evaluator hash-object --no-filters auditor/audit.py)" = '48c65176b9943b42f8693f3791394a5e5b9ffba9'
+          test "$(git -C evaluator rev-parse HEAD)" = '36414530844a00eb0df5ff1e91299ee57dfe62e6'
+          test "$(git -C evaluator hash-object --no-filters auditor/audit.py)" = '5189f8d83debf8b7b78f3bb1cf03db9255a97d63'
       # Never execute from this checkout; the evaluator reads Git objects only.
       - name: Check out dispatched baseline
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
