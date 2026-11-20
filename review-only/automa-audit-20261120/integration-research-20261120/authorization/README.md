@@ -1,0 +1,16 @@
+# Standalone dashboard writer authorization contract (review model only)
+
+**NOT DEPLOYABLE.** Independently written generic model; no private dashboard source, production adapters, integration or actual write. The unit-test adapters are fakes, not security controls. This model describes a boundary; caller-supplied booleans (including `authorized: true`) are not authentication or authorization.
+
+Run offline with a recent Node.js: `node --test contract.test.js`. No dependencies or network needed.
+
+## Contract
+
+`createContract` requires five trusted configuration inputs: `verifyReceipt`, `authenticateCaller`, `evaluatePolicy`, `atomicConsume`, and `requiredPolicy`. The returned async function returns `null` on denial/error, or a frozen binding after one successful consume. It hashes a snapshot of the actual supplied candidate bytes, and matches authenticated receipt claims against the exact requested repository, branch, expected base commit and expected base blob, candidate SHA-256, authenticated caller, and trusted required policy. The receipt must also carry a valid expiration and nonce. Receipt strings are hashed for identity; no unsigned receipt claims or request flag grant access.
+
+- `verifyReceipt(raw)`: authenticate **that exact serialized receipt** using a trusted issuer/key and validation scheme and return its verified claims, or reject. Receipt parsing, canonical format, issuer/key trust, revocation and protocol/domain separation are adapter responsibilities.
+- `authenticateCaller(context)`: return the verified actual caller identity; the context must be authenticated by a trusted boundary, not accepted as a caller declaration.
+- `evaluatePolicy({claims,target,caller,candidateSha256,policy})`: enforce trusted policy and return literal `true` only when allowed, including whether that caller may target that repo and branch. `requiredPolicy` is trusted server configuration, not selected by the requester.
+- `atomicConsume({nonce,expiresAtMs,receiptSha256})`: in one atomic operation, using authoritative time, check `now < expiresAtMs`, check nonce has never been consumed in the receipt issuer/security domain, and durably record its consumption and receipt digest. Return literal `true` only for the unique winning call. No check-then-insert across processes. Namespace nonces by trusted issuer/security domain and retain replay records as long as a receipt could be accepted, accounting for key rotation, clock behavior and retry/recovery. A failure/uncertain response must not authorize; a failure after committing may burn the receipt. The in-memory fake is only for single-process tests.
+
+The writer must bind its subsequent operation to the **same bytes** whose digest was authorized and enforce expected commit and blob through an atomic compare-and-swap or equivalent server-side conditional write. Recheck applicable expiry/policy and address the consume-to-write gap, concurrent updates, crash recovery, and ambiguous outcomes in a separately designed trusted transaction/protocol. A returned binding is not itself a portable credential, proof of an actual write, or a complete transaction. This model does not provide cryptographic verification, distributed persistence, a secure writer, secret handling, or production operational controls.
