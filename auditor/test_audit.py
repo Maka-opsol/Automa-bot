@@ -60,9 +60,9 @@ class AuditTests(unittest.TestCase):
         self.assertIn('-export const value = 1;',p['diff']); self.assertIn('+export const value = 2;',p['diff'])
         self.assertEqual(p['candidate_sha256'],hashlib.sha256(p['candidate'].encode()).hexdigest())
         send,calls=self.transport(); result=audit.verdict(p,audit.review(p,send))
-        self.assertTrue(result['safe']); self.assertEqual(result['version'],2)
+        self.assertTrue(result['safe']); self.assertEqual(result['version'],1)
         self.assertEqual(result['workflow_sha'],self.sha); self.assertEqual(result['run_id'],'123')
-        self.assertEqual(len(result['votes']),3)
+        self.assertEqual(result['providers'],list(audit.PROVIDERS))
         for _, body in calls[2:]:
             for key in ('baseline','candidate','diff','base_blob','candidate_sha256'):
                 self.assertIn(key,body['prompt'])
@@ -169,6 +169,14 @@ class AuditTests(unittest.TestCase):
         with patch.dict(os.environ,{'TOKENIZER_PATH':str(path)}):
             with self.assertRaises(Exception): audit.load_tokenizer()
             send,_=self.transport(); self.assertEqual(audit.review(self.prepare(),send),[])
+    def test_pinned_evaluator_is_ancestor_of_checked_out_branch(self):
+        # A local object or another branch is not enough: a squash/rebase can
+        # leave the pinned SHA unavailable after the review branch is deleted.
+        workflow=(HERE.parent/'.github/workflows/dashboard-auditor.yml').read_text()
+        checkout=workflow.split('      - name: Check out pinned evaluator\n',1)[1].split('      - name:',1)[0]
+        pin=re.search(r'^          ref: ([0-9a-f]{40})$',checkout,re.M).group(1)
+        result=subprocess.run(['git','-C',str(HERE.parent),'merge-base','--is-ancestor',pin,'HEAD'])
+        self.assertEqual(result.returncode,0,'Pinned evaluator must be retained in branch history; do not squash or rebase')
     def test_cli_http_integration_and_private_logs(self):
         requests=[]
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -193,14 +201,22 @@ class AuditTests(unittest.TestCase):
                 'WORKFLOW_SHA':self.sha,'RUN_ID':'123','RUN_ATTEMPT':'1','BASE_REPO':str(self.repo),'VERDICT_FILE':str(output)})
             # Execute the exact validation and review commands from the workflow,
             # against a temporary workspace and mocked local Ollama HTTP server.
-            workflow=(HERE.parent/'review-only/dashboard-auditor.yml.txt').read_text()
+            workflow=(HERE.parent/'.github/workflows/dashboard-auditor.yml').read_text()
             commands=re.findall(r'^        run: (python3 evaluator/auditor/audit.py(?: --validate)?)$', workflow, re.M)
             self.assertEqual(commands,['python3 evaluator/auditor/audit.py --validate','python3 evaluator/auditor/audit.py'])
-            evaluator=self.root/'evaluator/auditor'; evaluator.mkdir(parents=True)
-            shutil.copyfile(HERE/'audit.py',evaluator/'audit.py')
+            checkout=workflow.split('      - name: Check out pinned evaluator\n',1)[1].split('      - name:',1)[0]
+            pin=re.search(r'^          ref: ([0-9a-f]{40})$',checkout,re.M).group(1)
+            subprocess.run(['git','clone','-q','--no-hardlinks','--no-checkout',str(HERE.parent),str(self.root/'evaluator')],check=True)
+            subprocess.run(['git','-C',str(self.root/'evaluator'),'checkout','-q','--detach',pin],check=True)
+            verify=workflow.split('      - name: Verify evaluator commit and file\n        run: |\n',1)[1].split('      # Never execute',1)[0]
+            import textwrap
+            verify=textwrap.dedent(verify)
+            self.assertEqual(subprocess.run(['bash','-c',verify],cwd=self.root).returncode,0)
+            evaluator=self.root/'evaluator/auditor/audit.py'
+            self.assertEqual(evaluator.read_bytes(),(HERE/'audit.py').read_bytes())
             for command in commands:
                 p=subprocess.run(command,shell=True,cwd=self.root,env=env,capture_output=True,text=True,timeout=20)
-                self.assertEqual(p.returncode,0,p.stderr)
+                self.assertEqual(p.returncode,0,command + ': ' + p.stdout + p.stderr)
             result=json.loads(output.read_text())
             self.assertTrue(result['safe']); self.assertEqual(len(requests),5)
             self.assertNotIn('export const',p.stdout+p.stderr+output.read_text())
