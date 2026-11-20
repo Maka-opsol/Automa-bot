@@ -1,7 +1,7 @@
 name: Dashboard Auditor
 # REVIEW CANDIDATE ONLY. The unconditional review stop has been removed.
 # Do not deploy until the documented timing, privacy, isolation and verifier
-# blockers are independently resolved. v2 requires all identity bindings and votes.
+# blockers are independently resolved. v1 safe requires all three bound votes.
 on:
   workflow_dispatch:
     inputs:
@@ -50,7 +50,7 @@ jobs:
       - name: Check out pinned evaluator
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: 1b0955d70e559de2df705a2a5b9170da6e7bccaa
+          ref: 8b85f313d0f921c341ce4ee2a8851427d171906a
           path: evaluator
           persist-credentials: false
           fetch-depth: 1
@@ -59,8 +59,8 @@ jobs:
       - name: Verify evaluator commit and file
         run: |
           set -euo pipefail
-          test "$(git -C evaluator rev-parse HEAD)" = '1b0955d70e559de2df705a2a5b9170da6e7bccaa'
-          test "$(git -C evaluator hash-object --no-filters auditor/audit.py)" = 'c9eb4e5cbb6cff9c8608860c4311c4341e1f1643'
+          test "$(git -C evaluator rev-parse HEAD)" = '8b85f313d0f921c341ce4ee2a8851427d171906a'
+          test "$(git -C evaluator hash-object --no-filters auditor/audit.py)" = '48c65176b9943b42f8693f3791394a5e5b9ffba9'
       # Never execute from this checkout; the evaluator reads Git objects only.
       - name: Check out dispatched baseline
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
