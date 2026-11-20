@@ -68,9 +68,10 @@ def git(repo, *args):
 
 def prepare(inputs, repo):
     nonce, path, blob = (inputs.get(k, '') for k in ('nonce', 'path', 'base_blob'))
-    sha, run, attempt = (inputs.get(k, '') for k in ('workflow_sha', 'run_id', 'run_attempt'))
+    sha, base_commit, run, attempt = (inputs.get(k, '') for k in ('workflow_sha', 'base_commit', 'run_id', 'run_attempt'))
     require(re.fullmatch(r'[0-9a-f]{64}', nonce) is not None)
-    require(re.fullmatch(r'[0-9a-f]{40}', blob) is not None and re.fullmatch(r'[0-9a-f]{40}', sha) is not None)
+    require(all(re.fullmatch(r'[0-9a-f]{40}', value) is not None and value != '0' * 40
+                for value in (blob, sha, base_commit)))
     require(re.fullmatch(r'[1-9][0-9]{0,19}', run) is not None and attempt == '1')
     require(len(path) <= 160 and (PATH.fullmatch(path) or path == 'README.md') and not DENY.search(path))
     require(not path.startswith(('auditor/', '.github/')))
@@ -80,8 +81,9 @@ def prepare(inputs, repo):
     except Exception as e: raise AuditError('invalid base64') from e
     require(base64.b64encode(candidate).decode('ascii') == encoded)
     candidate_text = valid_source(candidate)
-    require(git(repo, 'rev-parse', 'HEAD').strip().decode('ascii') == sha)
-    tree = git(repo, 'ls-tree', '-z', sha, '--', path)
+    require(git(repo, 'rev-parse', 'HEAD').strip().decode('ascii') == base_commit)
+    require(git(repo, 'cat-file', '-t', base_commit).strip() == b'commit')
+    tree = git(repo, 'ls-tree', '-z', base_commit, '--', path)
     require(tree.endswith(b'\0') and tree.count(b'\0') == 1)
     metadata, actual_path = tree[:-1].split(b'\t', 1)
     mode, kind, found = metadata.split(b' ')
@@ -98,7 +100,7 @@ def prepare(inputs, repo):
         require(re.fullmatch(rb'[A-Za-z0-9 ,.?!\n-]+', added) is not None and re.search(rb'[A-Za-z0-9]', added) is not None)
     diff = ''.join(difflib.unified_diff(baseline_text.splitlines(keepends=True), candidate_text.splitlines(keepends=True), fromfile='baseline/'+path, tofile='candidate/'+path, n=3))
     require(len(diff.encode('utf-8')) <= MAX_DIFF)
-    return {'nonce': nonce, 'path': path, 'base_blob': blob, 'workflow_sha': sha,
+    return {'nonce': nonce, 'path': path, 'base_blob': blob, 'base_commit': base_commit, 'workflow_sha': sha,
             'run_id': run, 'run_attempt': 1, 'candidate_sha256': hashlib.sha256(candidate).hexdigest(),
             'baseline': baseline_text, 'candidate': candidate_text, 'diff': diff}
 
@@ -165,7 +167,7 @@ def verdict(prepared, votes):
     expected = set(PROVIDERS)
     approved = (len(votes) == 3 and {v.get('provider') for v in votes} == expected and
                 all(set(v) == {'provider','is_safe'} and v['is_safe'] is True for v in votes))
-    return {k:prepared[k] for k in ('base_blob','candidate_sha256','nonce','path','run_attempt','run_id','workflow_sha')} | {
+    return {k:prepared[k] for k in ('base_blob','base_commit','candidate_sha256','nonce','path','run_attempt','run_id','workflow_sha')} | {
         'job':'audit', 'version':2, 'baseline_verified':True, 'safe':approved, 'votes':votes}
 
 def run(inputs, repo, output, transport=http_json):
@@ -177,7 +179,7 @@ def run(inputs, repo, output, transport=http_json):
 
 def main():
     keys = {'nonce':'NONCE','path':'PATCH_PATH','base_blob':'BASE_BLOB','candidate_b64':'CANDIDATE_B64',
-            'workflow_sha':'WORKFLOW_SHA','run_id':'RUN_ID','run_attempt':'RUN_ATTEMPT'}
+            'workflow_sha':'WORKFLOW_SHA','base_commit':'BASE_COMMIT','run_id':'RUN_ID','run_attempt':'RUN_ATTEMPT'}
     try:
         inputs = {k:os.environ.get(v,'') for k,v in keys.items()}
         if sys.argv[1:] == ['--validate']:
