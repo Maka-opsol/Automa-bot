@@ -7,6 +7,7 @@ import importlib.metadata
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import urllib.error
@@ -21,6 +22,7 @@ TOKENIZER_VERSION = '0.22.2'
 URL = 'http://127.0.0.1:11434'
 MAX_SOURCE = 4096
 MAX_DIFF = 12000
+HTTP_DEADLINE_SECONDS = 300
 PROVIDERS = ('ollama#security', 'ollama#correctness', 'ollama#intent')
 PATH = re.compile(r'[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\.(?:js|mjs|cjs|ts|tsx|jsx)\Z')
 DENY = re.compile(r'private[ _-]?key|-----begin|password|passwd|secret|api[_-]?key|bearer\s+[a-z0-9]|github_pat_|gh[pousr]_|sk-[a-z0-9]|student|learner|pupil|homework|worksheet|exam(?:ination)?|assessment|answer(?:s|ing)?|question(?:s)?|lesson|curriculum|math(?:ematics)?\s+(?:problem|task)|ignore\s+(?:all\s+)?(?:previous|prior)|system\s+prompt|(?:https?://|@)[^\s]+', re.I)
@@ -66,6 +68,19 @@ def git(repo, *args):
     require(p.returncode == 0 and len(p.stdout) <= 65536)
     return p.stdout
 
+def unified_source_diff(baseline, candidate, path):
+    # Git text lines are LF-delimited; splitlines() also splits on bare CR.
+    def lines(text):
+        parts = text.split('\n')
+        return [part + '\n' for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+    result = []
+    for line in difflib.unified_diff(lines(baseline), lines(candidate),
+                                     fromfile='baseline/' + path, tofile='candidate/' + path, n=3):
+        result.append(line)
+        if not line.endswith('\n'):
+            result.append('\n\\ No newline at end of file\n')
+    return ''.join(result)
+
 def prepare(inputs, repo):
     nonce, path, blob = (inputs.get(k, '') for k in ('nonce', 'path', 'base_blob'))
     sha, run, attempt = (inputs.get(k, '') for k in ('workflow_sha', 'run_id', 'run_attempt'))
@@ -96,21 +111,34 @@ def prepare(inputs, repo):
         added = candidate[len(baseline):]
         require(bool(added) and len(added) <= 1024 and len(added.split(b'\n')) - int(added.endswith(b'\n')) <= 20)
         require(re.fullmatch(rb'[A-Za-z0-9 ,.?!\n-]+', added) is not None and re.search(rb'[A-Za-z0-9]', added) is not None)
-    diff = ''.join(difflib.unified_diff(baseline_text.splitlines(keepends=True), candidate_text.splitlines(keepends=True), fromfile='baseline/'+path, tofile='candidate/'+path, n=3))
+    diff = unified_source_diff(baseline_text, candidate_text, path)
     require(len(diff.encode('utf-8')) <= MAX_DIFF)
     return {'nonce': nonce, 'path': path, 'base_blob': blob, 'workflow_sha': sha,
             'run_id': run, 'run_attempt': 1, 'candidate_sha256': hashlib.sha256(candidate).hexdigest(),
             'baseline': baseline_text, 'candidate': candidate_text, 'diff': diff}
 
 def http_json(path, payload=None):
-    data = None if payload is None else json.dumps(payload, ensure_ascii=True, separators=(',', ':')).encode()
-    req = urllib.request.Request(URL + path, data=data, headers={'Content-Type':'application/json'}, method='GET' if data is None else 'POST')
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-    with opener.open(req, timeout=240) as response:
-        require(response.status == 200)
-        raw = response.read(65537)
-    require(len(raw) <= 65536)
-    return strict_json(raw.decode('utf-8'))
+    # Socket timeouts alone are inactivity timeouts; a byte trickle can keep a
+    # call alive indefinitely. The workflow runs this on Linux's main thread.
+    # Fail closed rather than disturb another caller's real-time timer.
+    require(signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0))
+    previous = signal.getsignal(signal.SIGALRM)
+    def expired(signum, frame):
+        raise AuditError('HTTP deadline exceeded')
+    signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, HTTP_DEADLINE_SECONDS)
+        data = None if payload is None else json.dumps(payload, ensure_ascii=True, separators=(',', ':')).encode()
+        req = urllib.request.Request(URL + path, data=data, headers={'Content-Type':'application/json'}, method='GET' if data is None else 'POST')
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        with opener.open(req, timeout=HTTP_DEADLINE_SECONDS) as response:
+            require(response.status == 200)
+            raw = response.read(65537)
+        require(len(raw) <= 65536)
+        return strict_json(raw.decode('utf-8'))
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
