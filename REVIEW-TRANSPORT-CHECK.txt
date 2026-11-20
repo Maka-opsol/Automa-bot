@@ -1,2 +1,0 @@
-line one
-'single' and "double" quotes
