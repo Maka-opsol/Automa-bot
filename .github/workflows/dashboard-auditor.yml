@@ -1,31 +1,24 @@
 name: Dashboard Auditor
-# Keyless AI advisory for anonymous dashboard patches. The dashboard
-# (actions-auditor.js) dispatches this run with a per-patch nonce + base64-encoded
-# candidate. The run executes three INDEPENDENT Ollama reviews (security /
-# correctness / intent — different prompts + temperatures, mirroring the dashboard's
-# _aiProviders OLLAMA_VARIANTS), aggregates the verdicts, and uploads
-# dashboard-audit-verdict.json as an artifact named audit-<nonce>.
-#
-# The dashboard never holds an AI API key: Ollama runs here, in GitHub Actions,
-# using the runner's own CPU. Swap OLLAMA_MODEL below for a larger model if your
-# runner has the budget (a GPU runner + qwen2.5-coder:7b improves review quality).
+# LOCAL REVIEW CANDIDATE ONLY. Deliberately blocked before checkout or inference.
+# Do not deploy until the documented timing, privacy, isolation and verifier
+# blockers are independently resolved. v2 requires all identity bindings and votes.
 on:
   workflow_dispatch:
     inputs:
       nonce:
-        description: 'Per-patch nonce (64 hex chars, from the dashboard)'
+        description: 64 lowercase hex characters
         required: true
         type: string
       path:
-        description: 'Patch file path (e.g. src/utils-sleep.ts)'
+        description: Existing source file path
         required: true
         type: string
       base_blob:
-        description: 'Baseline git blob SHA-1 (the reviewedSha the dashboard pinned)'
+        description: Git SHA-1 blob of that path at dispatched main revision
         required: true
         type: string
       candidate_b64:
-        description: 'Candidate file content, base64-encoded'
+        description: Canonical base64 full replacement; max 4096 decoded bytes
         required: true
         type: string
 
@@ -35,111 +28,115 @@ permissions:
 jobs:
   audit:
     name: audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     env:
-      OLLAMA_MODEL: qwen2.5-coder:1.5b
+      OLLAMA_HOST: 127.0.0.1:11434
+      OLLAMA_NO_CLOUD: '1'
     steps:
-      - name: Decode candidate + compute candidate_sha256
+      # Intentionally not configurable: unresolved blockers must not be bypassed
+      # by an environment variable or workflow dispatch input.
+      - name: Stop pending independent security and timing review
+        run: |
+          echo 'Audit integration is disabled pending review.' >&2
+          exit 1
+      - name: Require intended dispatch
         env:
-          CANDIDATE_B64: ${{ inputs.candidate_b64 }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          EVENT: ${{ github.event_name }}
+          ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          printf '%s' "$CANDIDATE_B64" | base64 -d > /tmp/candidate
-          sha256sum /tmp/candidate | awk '{print $1}' > /tmp/candidate.sha256
-          echo "candidate bytes: $(wc -c < /tmp/candidate)"
-
-      - name: Install Ollama
-        run: curl -fsSL https://ollama.com/install.sh | sh
-
-      - name: Start Ollama server + wait for readiness
+          test "$REPO" = 'Maka-opsol/Automa-bot'
+          test "$REF" = 'refs/heads/main'
+          test "$EVENT" = 'workflow_dispatch'
+          test "$ATTEMPT" = '1'
+      # Trusted evaluator commit, never the mutable dispatched branch.
+      - name: Check out pinned evaluator
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 1b0955d70e559de2df705a2a5b9170da6e7bccaa
+          path: evaluator
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+      - name: Verify evaluator commit and file
         run: |
-          ollama serve > /tmp/ollama.log 2>&1 &
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then echo "ollama ready"; exit 0; fi
-            sleep 1
-          done
-          echo "ollama did not become ready"; cat /tmp/ollama.log; exit 1
-
-      - name: Pull review model
-        run: ollama pull "$OLLAMA_MODEL"
-
-      - name: Run three independent Ollama reviews + build verdict
+          set -euo pipefail
+          test "$(git -C evaluator rev-parse HEAD)" = '1b0955d70e559de2df705a2a5b9170da6e7bccaa'
+          test "$(git -C evaluator hash-object --no-filters auditor/audit.py)" = 'c9eb4e5cbb6cff9c8608860c4311c4341e1f1643'
+      # Never execute from this checkout; the evaluator reads Git objects only.
+      - name: Check out dispatched baseline
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: baseline
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+      - name: Validate candidate and baseline
         env:
           NONCE: ${{ inputs.nonce }}
-          PATH_IN: ${{ inputs.path }}
+          PATCH_PATH: ${{ inputs.path }}
           BASE_BLOB: ${{ inputs.base_blob }}
+          CANDIDATE_B64: ${{ inputs.candidate_b64 }}
+          WORKFLOW_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
-          WORKFLOW_SHA: ${{ github.sha }}
+          BASE_REPO: ${{ github.workspace }}/baseline
+        run: python3 evaluator/auditor/audit.py --validate
+      - name: Install pinned prompt tokenizer
         run: |
           set -euo pipefail
-          python3 <<'PY'
-          import json, os, urllib.request, time
-          model = os.environ["OLLAMA_MODEL"]
-          with open("/tmp/candidate") as f: code = f.read()
-          with open("/tmp/candidate.sha256") as f: candidate_sha256 = f.read().strip()
-          # Three genuinely independent reviews — different system prompts + temperatures.
-          # The provider names MUST match what the dashboard reports in its votes; the
-          # dashboard only requires >=2 uniquely-named providers (no hard-coded list).
-          variants = [
-            ("ollama#security", 0.1,
-             "You are auditing this code for SECURITY threats only: backdoors, data exfiltration, credential theft, hardcoded secrets, command injection, path traversal. Be strict but precise."),
-            ("ollama#correctness", 0.3,
-             "You are auditing this code for CORRECTNESS only: syntax errors, undefined references, broken logic, missing awaits, unhandled exceptions. Be thorough."),
-            ("ollama#intent", 0.5,
-             "You are auditing this code for DISGUISED MALICIOUS INTENT: obfuscation, time-bombs, conditional backdoors, safety-check weakening, social engineering in names/comments. Be skeptical."),
-          ]
-          providers = []
-          all_safe = True
-          for name, temp, system in variants:
-            prompt = ("Review the following code patch for your assigned concern. "
-                      "If you find NO issues, reply with exactly this JSON and nothing else: "
-                      "{\"safe\": true}. If you find an issue, reply with exactly: "
-                      "{\"safe\": false, \"reason\": \"<one short line>\"}. "
-                      "Output ONLY the JSON object.\n\n```\n" + code + "\n```")
-            body = json.dumps({"model": model, "prompt": prompt, "system": system,
-                               "stream": False, "options": {"temperature": temp}}).encode()
-            req = urllib.request.Request("http://localhost:11434/api/generate", data=body,
-                                         headers={"Content-Type": "application/json"})
-            parsed = None
-            for attempt in range(3):
-              try:
-                with urllib.request.urlopen(req, timeout=180) as r:
-                  resp = json.loads(r.read().decode())
-                text = (resp.get("response") or "").strip()
-                s, e = text.find("{"), text.rfind("}")
-                if s >= 0 and e > s:
-                  parsed = json.loads(text[s:e+1])
-                break
-              except Exception:
-                time.sleep(3)
-            if not isinstance(parsed, dict) or parsed.get("safe") is not True:
-              all_safe = False
-            providers.append(name)
-          # Exact 13-key structure the dashboard's verdict validator expects.
-          verdict = {
-            "base_blob": os.environ["BASE_BLOB"],
-            "candidate_sha256": candidate_sha256,
-            "job": "audit",
-            "nonce": os.environ["NONCE"],
-            "path": os.environ["PATH_IN"],
-            "providers": providers,
-            "run_attempt": int(os.environ["RUN_ATTEMPT"]),
-            "run_id": os.environ["RUN_ID"],
-            "safe": bool(all_safe),
-            "version": 1,
-            "workflow_sha": os.environ["WORKFLOW_SHA"],
-          }
-          with open("dashboard-audit-verdict.json", "w") as f:
-            json.dump(verdict, f, separators=(",", ":"))
-          print(json.dumps(verdict, indent=2))
-          PY
-
-      - name: Upload verdict artifact (audit-<nonce>)
-        uses: actions/upload-artifact@v4
+          tokenizer="$RUNNER_TEMP/qwen-tokenizer.json"
+          wheel="$RUNNER_TEMP/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+          curl --proto '=https' --tlsv1.2 -fsSL --max-time 120 -o "$tokenizer" 'https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct/resolve/2e1fd397ee46e1388853d2af2c993145b0f1098a/tokenizer.json'
+          printf '%s  %s\n' 'c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539' "$tokenizer" | sha256sum -c -
+          curl --proto '=https' --tlsv1.2 -fsSL --max-time 120 -o "$wheel" 'https://files.pythonhosted.org/packages/2e/76/932be4b50ef6ccedf9d3c6639b056a967a86258c6d9200643f01269211ca/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl'
+          printf '%s  %s\n' '369cc9fc8cc10cb24143873a0d95438bb8ee257bb80c71989e3ee290e8d72c67' "$wheel" | sha256sum -c -
+          python3 -m venv "$RUNNER_TEMP/tokenizer-venv"
+          "$RUNNER_TEMP/tokenizer-venv/bin/pip" install --no-index --no-deps "$wheel"
+          printf '%s\n' "$RUNNER_TEMP/tokenizer-venv/bin" >> "$GITHUB_PATH"
+          printf 'TOKENIZER_PATH=%s\n' "$tokenizer" >> "$GITHUB_ENV"
+      # Official release is pinned by a reviewed SHA-256; never execute install.sh.
+      - name: Install pinned Ollama and pull model
+        env:
+          OLLAMA_MODELS: ${{ runner.temp }}/audit-models
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/ollama-linux-amd64.tgz"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 2 --max-time 600 -o "$archive" \
+            'https://github.com/ollama/ollama/releases/download/v0.13.5/ollama-linux-amd64.tgz'
+          printf '%s  %s\n' '41fb93ff8be35e4d2d22bafd1c42b487efb15b766076d976766bd1ee4db3f8e2' "$archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/ollama"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/ollama"
+          "$RUNNER_TEMP/ollama/bin/ollama" serve > "$RUNNER_TEMP/ollama-audit.log" 2>&1 &
+          for n in $(seq 1 60); do
+            if curl --noproxy '*' -fsS --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --noproxy '*' -fsS --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null
+          timeout 600 "$RUNNER_TEMP/ollama/bin/ollama" pull qwen2.5-coder:1.5b
+      - name: Review with Ollama
+        env:
+          NONCE: ${{ inputs.nonce }}
+          PATCH_PATH: ${{ inputs.path }}
+          BASE_BLOB: ${{ inputs.base_blob }}
+          CANDIDATE_B64: ${{ inputs.candidate_b64 }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          BASE_REPO: ${{ github.workspace }}/baseline
+          VERDICT_FILE: ${{ runner.temp }}/dashboard-audit-verdict.json
+        run: python3 evaluator/auditor/audit.py
+      - name: Upload bound verdict
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: audit-${{ inputs.nonce }}
-          path: dashboard-audit-verdict.json
+          path: ${{ runner.temp }}/dashboard-audit-verdict.json
+          if-no-files-found: error
           retention-days: 1
-          overwrite: true
+          overwrite: false
