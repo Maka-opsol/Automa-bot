@@ -1,0 +1,58 @@
+diff --git a/.github/workflows/mathu-bot-loop.yml b/.github/workflows/mathu-bot-loop.yml
+index df1c842..67f907e 100644
+--- a/.github/workflows/mathu-bot-loop.yml
++++ b/.github/workflows/mathu-bot-loop.yml
+@@ -79,6 +79,12 @@ jobs:
+       - name: Checkout code
+         uses: actions/checkout@v4
+ 
++      # Review-only aggregate baseline: no credentials or file contents.
++      - name: Runner disk baseline
++        run: |
++          env -i PATH=/usr/bin:/bin GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
++            bash ./scripts/runner-disk-diagnostics.sh --once || true
++
+       # ─── Step 2: Set up Node.js 22 ───
+       # v3: Upgraded from 20 to 22 to silence deprecation warning
+       - name: Setup Node.js
+@@ -156,6 +162,14 @@ jobs:
+           echo "Available models:"
+           ollama list || true
+ 
++      - name: Runner disk after setup
++        if: always()
++        run: |
++          if [ -f ./scripts/runner-disk-diagnostics.sh ]; then
++            env -i PATH=/usr/bin:/bin GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
++              bash ./scripts/runner-disk-diagnostics.sh --once || true
++          fi
++
+       # ─── Step 5.6: Write .env from BOT_ENV_FILE secret ───
+       # Restores the mechanism from the old bot-runner.yml workflow: the user
+       # stores the ENTIRE .env file (all API keys, Microsoft creds, Turso, etc.)
+@@ -301,8 +315,25 @@ jobs:
+           echo "=== End secret presence check ==="
+           echo ""
+           chmod +x ./scripts/run-bot.sh
++          # No bot credentials are inherited; diagnostics failure is non-fatal.
++          env -i PATH=/usr/bin:/bin GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
++            bash ./scripts/runner-disk-diagnostics.sh --monitor 2>/dev/null &
++          disk_monitor_pid=$!
++          cleanup_disk_monitor() {
++            kill "$disk_monitor_pid" 2>/dev/null || :
++            wait "$disk_monitor_pid" 2>/dev/null || :
++          }
++          trap cleanup_disk_monitor EXIT
+           ./scripts/run-bot.sh
+ 
++      - name: Runner disk after bot
++        if: always()
++        run: |
++          if [ -f ./scripts/runner-disk-diagnostics.sh ]; then
++            env -i PATH=/usr/bin:/bin GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
++              bash ./scripts/runner-disk-diagnostics.sh --once || true
++          fi
++
+       # ─── Step 7: Trigger the next iteration ───
+       # v3: Uses the built-in GITHUB_TOKEN (no PAT needed!) to trigger a new
+       # workflow_dispatch run of this same workflow via the GitHub CLI.
