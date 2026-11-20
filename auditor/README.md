@@ -1,6 +1,6 @@
 # NON-DEPLOYABLE — Dashboard Actions Ollama auditor review candidate
 
-**Local review candidate only: do not merge, deploy, dispatch, enable writes, or treat this as a completed integration.** The candidate replaces `.github/workflows/dashboard-auditor.yml` in the local tree based on bot main `1b0955d70e559de2df705a2a5b9170da6e7bccaa`. Its first step is an unconditional hard stop: every run fails before checkout and no artifact is produced. Removing that stop requires independent review and resolution of the blockers below. The inherited file in `review-only/` is not the active candidate.
+**Review candidate only: do not merge, deploy, dispatch, enable writes, or treat this as a completed integration.** The candidate replaces `.github/workflows/dashboard-auditor.yml` based on bot main `1b0955d70e559de2df705a2a5b9170da6e7bccaa`. At the owner’s request, its unconditional hard stop has been removed, but the intended-dispatch and all fail-closed validation checks remain. Removal does not resolve the blockers below. The inherited file in `review-only/` is not the active candidate.
 
 ## Purpose and limits
 
