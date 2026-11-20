@@ -166,7 +166,8 @@ def verdict(prepared, votes):
     approved = (len(votes) == 3 and {v.get('provider') for v in votes} == expected and
                 all(set(v) == {'provider','is_safe'} and v['is_safe'] is True for v in votes))
     return {k:prepared[k] for k in ('base_blob','candidate_sha256','nonce','path','run_attempt','run_id','workflow_sha')} | {
-        'job':'audit', 'version':2, 'baseline_verified':True, 'safe':approved, 'votes':votes}
+        'job':'audit', 'version':1, 'safe':approved,
+        'providers':[v['provider'] for v in votes]}
 
 def run(inputs, repo, output, transport=http_json):
     prepared = prepare(inputs, repo)
@@ -186,7 +187,7 @@ def main():
             return 0
         require(not sys.argv[1:])
         result = run(inputs, os.environ['BASE_REPO'], os.environ['VERDICT_FILE'])
-        print('Audit completed; approved:', result['safe'], 'valid votes:', len(result['votes']))
+        print('Audit completed; approved:', result['safe'], 'valid votes:', len(result['providers']))
     except Exception:
         print('Audit validation failed; no verdict emitted', file=sys.stderr)
         return 1
