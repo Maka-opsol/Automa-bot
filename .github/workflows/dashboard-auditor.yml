@@ -103,6 +103,7 @@ jobs:
             req = urllib.request.Request("http://localhost:11434/api/generate", data=body,
                                          headers={"Content-Type": "application/json"})
             parsed = None
+            text = ""
             for attempt in range(3):
               try:
                 with urllib.request.urlopen(req, timeout=180) as r:
@@ -116,8 +117,15 @@ jobs:
                 time.sleep(3)
             if not isinstance(parsed, dict) or parsed.get("safe") is not True:
               all_safe = False
+              if parsed is None:
+                print(f"[{name}] FAILED to parse a JSON verdict from the model response (treating as unsafe — fail-closed); raw response was: {text!r}")
+              else:
+                print(f"[{name}] NOT safe: {parsed!r}")
+            else:
+              print(f"[{name}] safe")
             providers.append(name)
-          # Exact 13-key structure the dashboard's verdict validator expects.
+          # Exact 11-key structure the dashboard's verdict validator expects
+          # (base_blob,candidate_sha256,job,nonce,path,providers,run_attempt,run_id,safe,version,workflow_sha).
           verdict = {
             "base_blob": os.environ["BASE_BLOB"],
             "candidate_sha256": candidate_sha256,
