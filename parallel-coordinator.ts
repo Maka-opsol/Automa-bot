@@ -76,6 +76,7 @@ interface WorkerState {
 class ParallelCoordinator {
   private workers: Map<number, WorkerState> = new Map();
   private browser: any = null;
+  private browserManager: any = null;
   private running: boolean = false;
   private startTime: number = 0;
 
@@ -92,6 +93,7 @@ class ParallelCoordinator {
     log('[PARALLEL] Launching shared Chrome instance...', 'INFO', 'parallel');
     await browserManager.launch();
     this.browser = browserManager.browserInstance;
+    this.browserManager = browserManager;
     if (!this.browser) throw new Error('Browser launch failed');
 
     // Create N worker contexts
@@ -127,6 +129,17 @@ class ParallelCoordinator {
     });
 
     const page = await context.newPage();
+    // Apply the same fingerprint / pdf.js-mitigation init script the singleton page
+    // gets via browser.ts configurePage(). Without it, headless Chromium advertises
+    // the Chrome PDF Plugin, the site skips loading pdf.js, and the app throws
+    // "pdfjsLib is not defined" on bootstrap — crashing before the Flutter <canvas>
+    // is created (the "No nonzero canvas" / "No module cards" loop).
+    try {
+      const spoof = this.browserManager?.getFingerprintSpoofScript?.();
+      if (spoof) await page.addInitScript(spoof);
+    } catch (err: any) {
+      log(`[WORKER-${id}] Failed to apply fingerprint spoof init script`, 'WARN', 'parallel');
+    }
     // Opt-in pending a broader auth and proxy logging privacy review.
     let authNetDiag: any = null;
     if (process.env.MATHU_AUTHNET_DIAGNOSTICS === '1') {
