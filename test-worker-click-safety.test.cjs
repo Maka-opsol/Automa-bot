@@ -35,7 +35,8 @@ function create({ card, clickError, evaluateError, dbError, completion = true })
   const c = new Coordinator();
   c.workers = new Map([[1, worker]]); c.running = true;
   c._ensureLoggedIn = async () => true;
-  c._waitForFlutterRender = async () => {};
+  c._navigateAssignments = async () => { await page.goto(); };  // stubbed: loop calls this before the render gate; mimics the real method's page.goto so steps=['goto']
+  c._waitForFlutterRender = async () => true;        // render succeeded → proceed to claim/click (exercises click-safety, not render-failure)
   c._claimNextModule = async () => ({ name: 'Mock lesson', type: 'exercise' });
   c._detectModuleType = async () => { steps.push('detect'); return 'exercise'; };
   c._completeModule = async () => { steps.push('complete'); return completion; };
