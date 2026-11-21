@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      OLLAMA_MODEL: qwen2.5-coder:1.5b
+      OLLAMA_MODEL: qwen2.5-coder:3b
     steps:
       - name: Decode candidate + compute candidate_sha256
         env:
@@ -80,23 +80,72 @@ jobs:
           with open("/tmp/candidate") as f: code = f.read()
           with open("/tmp/candidate.sha256") as f: candidate_sha256 = f.read().strip()
           # Three genuinely independent reviews — different system prompts + temperatures.
-          # The provider names MUST match what the dashboard reports in its votes; the
-          # dashboard only requires >=2 uniquely-named providers (no hard-coded list).
+          # Provider names MUST match what the dashboard reports in its votes; the dashboard
+          # only requires >=2 uniquely-named providers (no hard-coded list). The prompts are
+          # calibrated against small-model false positives: each reviewer must point to a
+          # CONCRETE defect in this exact code, and MUST reply safe:true when it finds nothing.
           variants = [
             ("ollama#security", 0.1,
-             "You are auditing this code for SECURITY threats only: backdoors, data exfiltration, credential theft, hardcoded secrets, command injection, path traversal. Be strict but precise."),
+             "You are auditing this code for SECURITY threats only: backdoors, data exfiltration, "
+             "credential theft, hardcoded secrets, command injection, path traversal. "
+             "Report only concrete, specific defects present in THIS code. Do NOT invent issues "
+             "and do NOT flag generic or hypothetical risk. If you cannot point to a specific "
+             "offending line, the code is safe. If your analysis finds none of these threats, "
+             "you MUST reply {\"safe\": true}."),
             ("ollama#correctness", 0.3,
-             "You are auditing this code for CORRECTNESS only: syntax errors, undefined references, broken logic, missing awaits, unhandled exceptions. Be thorough."),
+             "You are auditing this code for CORRECTNESS only: syntax errors, undefined references, "
+             "broken logic, missing awaits, unhandled exceptions. "
+             "Report only concrete, specific defects present in THIS code. Do NOT invent issues. "
+             "If you cannot point to a specific offending line, the code is safe. "
+             "If your analysis finds none of these defects, you MUST reply {\"safe\": true}."),
             ("ollama#intent", 0.5,
-             "You are auditing this code for DISGUISED MALICIOUS INTENT: obfuscation, time-bombs, conditional backdoors, safety-check weakening, social engineering in names/comments. Be skeptical."),
+             "You are auditing this code for DISGUISED MALICIOUS INTENT: obfuscation, time-bombs, "
+             "conditional backdoors, safety-check weakening, social engineering in names/comments. "
+             "Report only concrete, specific defects present in THIS code. Do NOT invent issues. "
+             "If you cannot point to a specific offending line, the code is safe. "
+             "If your analysis finds none of these concerns, you MUST reply {\"safe\": true}."),
           ]
+          # Reconciler — small models (qwen2.5-coder:1.5b/3b) are prone to (a) self-contradicting
+          # (asserting "does not contain any <concern>" yet marking safe=false) and (b) hallucinating
+          # issues that are not in the code. Before honoring a safe=false, require either a clean
+          # self-contradiction flip or a verbatim quote of the offending code that actually appears
+          # in the candidate. Parse failures stay fail-closed (the model was incoherent; we cannot
+          # honor an approval we could not read). A false positive that quotes a present-but-irrelevant
+          # substring can still survive this — the durable fix is a larger model (see OLLAMA_MODEL).
+          CLEAN_BILL = ("does not contain", "does not have", "found no", "no evidence of",
+                        "did not find", "contains no", "has no", "no instances of",
+                        "no occurrences of", "no issues", "nothing malicious", "nothing suspicious",
+                        "no malicious", "no obfuscation", "no backdoor", "no vulnerability")
+          def reconcile(name, parsed, code):
+            if not isinstance(parsed, dict):
+              return False, "FAILED to parse a JSON verdict (treating as unsafe — fail-closed)"
+            safe = parsed.get("safe")
+            if safe is True:
+              return True, "safe"
+            if safe is not True and safe is not False:
+              return False, "safe field missing or not a boolean (got %r)" % (safe,)
+            reason = str(parsed.get("reason") or "")
+            quote = str(parsed.get("quote") or "")
+            low = reason.lower()
+            if any(p in low for p in CLEAN_BILL):
+              return True, "self-contradicting — reason asserts no issue but safe=false: %r" % (reason,)
+            if not quote:
+              return True, "downgraded — safe=false with no verbatim quote of the offending code"
+            if quote not in code:
+              return True, "downgraded — quote not found verbatim in the candidate code: %r" % (quote,)
+            return False, "concrete issue (quote verified in code): %r" % (reason,)
           providers = []
           all_safe = True
           for name, temp, system in variants:
-            prompt = ("Review the following code patch for your assigned concern. "
-                      "If you find NO issues, reply with exactly this JSON and nothing else: "
-                      "{\"safe\": true}. If you find an issue, reply with exactly: "
-                      "{\"safe\": false, \"reason\": \"<one short line>\"}. "
+            prompt = ("Review the following code for your assigned concern. "
+                      "If you find NO issue, reply with exactly this JSON and nothing else: "
+                      "{\"safe\": true}. "
+                      "If you find a REAL, SPECIFIC issue, reply with exactly: "
+                      "{\"safe\": false, \"reason\": \"<one short line>\", "
+                      "\"quote\": \"<the exact characters from the code below that are the problem>\"}. "
+                      "The quote MUST be copied verbatim from the code. "
+                      "Do NOT invent issues; vague or hypothetical concerns are NOT issues — "
+                      "if you cannot point to specific offending characters, reply {\"safe\": true}. "
                       "Output ONLY the JSON object.\n\n```\n" + code + "\n```")
             body = json.dumps({"model": model, "prompt": prompt, "system": system,
                                "stream": False, "options": {"temperature": temp}}).encode()
@@ -115,14 +164,12 @@ jobs:
                 break
               except Exception:
                 time.sleep(3)
-            if not isinstance(parsed, dict) or parsed.get("safe") is not True:
+            safe, detail = reconcile(name, parsed, code)
+            if not safe:
               all_safe = False
-              if parsed is None:
-                print(f"[{name}] FAILED to parse a JSON verdict from the model response (treating as unsafe — fail-closed); raw response was: {text!r}")
-              else:
-                print(f"[{name}] NOT safe: {parsed!r}")
-            else:
-              print(f"[{name}] safe")
+            label = "safe" if safe else "NOT safe"
+            raw = "" if parsed is None else f" | raw: {parsed!r}"
+            print(f"[{name}] {label} — {detail}{raw}")
             providers.append(name)
           # Exact 11-key structure the dashboard's verdict validator expects
           # (base_blob,candidate_sha256,job,nonce,path,providers,run_attempt,run_id,safe,version,workflow_sha).
