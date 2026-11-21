@@ -282,16 +282,35 @@ class ParallelCoordinator {
       await this._sleep(1000);
     }
 
-        // Step 3: Claim a module from Turso
+       // Even if canvas/DOM stability checks time out, don't block AI vision —
+        // capture a screenshot and let the vision tribunal inspect the page.
+        if (!rendered) {
+          log(`[WORKER-${id}] Render check timed out (no nonzero canvas within 60s) — falling back to AI vision screenshot`, 'WARN', 'parallel');
+        }
+
+        // Step 3: Claim a module from Turso (DOM card path first, then AI vision screenshot fallback)
         const module = await this._claimNextModule(id);
         if (!module) {
+          const providers = _deps.providers;
+          const actionExecutor = _deps.actionExecutor;
+          if (providers && typeof providers.determineNextAction === 'function') {
+            log(`[WORKER-${id}] No DOM module cards found — capturing screenshot for AI vision`, 'INFO', 'parallel');
+            const screenshot = await worker.page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => Buffer.from(''));
+            const base64 = screenshot.toString('base64');
+            if (base64) {
+              const aiAction = await providers.determineNextAction(base64, worker.page.url?.() || null, null).catch(() => null);
+              if (aiAction && actionExecutor && typeof actionExecutor.executeAction === 'function') {
+                await actionExecutor.executeAction(worker.page, aiAction).catch(() => {});
+                worker.lastActivity = Date.now();
+                await this._sleep(2000);
+                continue;
+              }
+            }
+          }
           log(`[WORKER-${id}] No modules available — waiting 30s`, 'INFO', 'parallel');
           await this._sleep(30000);
           continue;
         }
-
-        worker.currentModule = { name: module.name, type: module.type, claimedAt: Date.now() };
-        log(`[WORKER-${id}] Claimed module (type: ${module.type})`, 'INFO', 'parallel');
 
         // Step 4: Find and click the module card
         const clicked = await this._findAndClickModuleCard(worker.page, module.name, id);
