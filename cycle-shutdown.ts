@@ -19,14 +19,16 @@ const HOOK_TIMEOUT_MS = 10_000;
 async function gracefulShutdown(signal: any) { 
   log(`Received ${signal}, starting graceful shutdown...`, 'WARN', 'shutdown');
   for (const { hook, priority } of shutdownHooks) {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
         Promise.resolve(hook()),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error(`Shutdown hook (priority ${priority}) timed out after ${HOOK_TIMEOUT_MS}ms`)), HOOK_TIMEOUT_MS)
-        ),
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(`Shutdown hook (priority ${priority}) timed out after ${HOOK_TIMEOUT_MS}ms`)), HOOK_TIMEOUT_MS);
+        }),
       ]);
     } catch (err: any) { const msg = err instanceof Error ? err.message : String(err); log(`Shutdown hook failed: ${msg}`, 'ERROR', 'shutdown'); }
+    finally { if (timeout !== undefined) clearTimeout(timeout); }
   }
 }
 
