@@ -204,9 +204,20 @@ class ParallelCoordinator {
         // Step 2: Navigate to assignments page
         worker.status = 'browsing_assignments';
         await this._navigateAssignments(worker, false);
-        await this._waitForFlutterRender(worker.page, id);
+        const rendered = await this._waitForFlutterRender(worker.page, id);
         try { renderSignals.get(worker.page)?.sample('render'); } catch {}
         log(`[WORKER-${id}] On assignments page`, 'INFO', 'parallel');
+
+        // If the Flutter canvas never rendered, the assignments page did not load —
+        // most often the session is invalid and /assignments redirected to a
+        // non-Flutter login/home page. Running the module-card query now would
+        // always return zero and mislabel the failure as "No modules available".
+        // Back off and re-check login instead of querying an unrendered page.
+        if (!rendered) {
+          log(`[WORKER-${id}] Assignments page did not render (no canvas within 60s) — re-checking login in 30s`, 'WARN', 'parallel');
+          await this._sleep(30000);
+          continue;
+        }
 
         // Step 3: Claim a module from Turso
         const module = await this._claimNextModule(id);
@@ -788,7 +799,7 @@ class ParallelCoordinator {
   /**
    * Wait for Flutter's CanvasKit to finish rendering.
    */
-  private async _waitForFlutterRender(page: any, workerId: number): Promise<void> {
+  private async _waitForFlutterRender(page: any, workerId: number): Promise<boolean> {
     const log = getLog();
     const maxWaitMs = 60000;
     const startTime = Date.now();
@@ -818,13 +829,14 @@ class ParallelCoordinator {
         if (diagnostic ? result === 'nonzero' : result) {
           reportPolls();
           log(`[WORKER-${workerId}] Nonzero canvas detected after ${Math.round((Date.now() - startTime) / 1000)}s; render readiness unverified`, 'INFO', 'parallel');
-          return;
+          return true;
         }
       } catch { if (diagnostic) polls.errors++; }
       await this._sleep(1000);
     }
     reportPolls();
     log(`[WORKER-${workerId}] No nonzero canvas detected within 60s; render status unknown — proceeding anyway`, 'WARN', 'parallel');
+    return false;
   }
 
   /**
