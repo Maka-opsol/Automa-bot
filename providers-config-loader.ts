@@ -106,6 +106,8 @@ const DEFAULTS: Record<string, ProviderDefault> = {
     model: 'meta/llama-4-scout-17b-16e-instruct',
     envKeys: ['NVIDIA_API_KEY'],
     visionCapable: true,
+    disabled: true,
+    disabledReason: 'NVIDIA NIM vision models return HTTP 404 / model_not_found (decommissioned 2026-11-22). Re-enable only after confirming a working vision model on integrate.api.nvidia.com.',
     fallbackModels: [
       'meta/llama-4-maverick-17b-128e-instruct',
     ],
