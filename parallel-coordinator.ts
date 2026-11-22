@@ -827,28 +827,30 @@ class ParallelCoordinator {
 
     while (Date.now() - startTime < maxWaitMs) {
       try {
-        // Exactly the same first-canvas predicate; optional mode adds only a coarse result.
-        const result = diagnostic ? await page.evaluate(() => {
+        // Always use the coarse string predicate so absent/zero can be counted even with
+        // diagnostics off. No page text, attributes or pixels are read — only whether a
+        // <canvas> exists and its width/height (drawing-buffer size).
+        const result = await page.evaluate(() => {
           const canvas = document.querySelector('canvas');
           if (!canvas) return 'absent';
           return canvas.width > 0 && canvas.height > 0 ? 'nonzero' : 'zero';
-        }) : await page.evaluate(() => {
-          const canvas = document.querySelector('canvas');
-          if (!canvas) return false;
-          return canvas.width > 0 && canvas.height > 0;
         });
-        if (diagnostic && result === 'absent') polls.absent++;
-        if (diagnostic && result === 'zero') polls.zero++;
-        if (diagnostic ? result === 'nonzero' : result) {
+        if (result === 'absent') polls.absent++;
+        else if (result === 'zero') polls.zero++;
+        if (result === 'nonzero') {
           reportPolls();
           log(`[WORKER-${workerId}] Nonzero canvas detected after ${Math.round((Date.now() - startTime) / 1000)}s; render readiness unverified`, 'INFO', 'parallel');
           return true;
         }
-      } catch { if (diagnostic) polls.errors++; }
+      } catch { polls.errors++; }
       await this._sleep(1000);
     }
     reportPolls();
-    log(`[WORKER-${workerId}] No nonzero canvas detected within 60s; render status unknown — proceeding anyway`, 'WARN', 'parallel');
+    // Always report the absent/zero/eval-error breakdown on failure (NOT gated behind
+    // MATHU_RENDER_DIAGNOSTICS): absent = no <canvas> at all (Flutter bundle not loading
+    // through the proxy), zero = canvas exists but unsized (slow engine bootstrap),
+    // eval-error = context detached/closed. Only coarse counts — no page content.
+    log(`[WORKER-${workerId}] No nonzero canvas detected within 60s (polls absent=${polls.absent} zero=${polls.zero} eval-error=${polls.errors}); render status unknown — proceeding anyway`, 'WARN', 'parallel');
     return false;
   }
 
