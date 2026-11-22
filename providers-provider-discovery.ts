@@ -43,8 +43,8 @@ const PROVIDER_DEFAULTS: Record<string, string> = {
   'GitHub GPT': 'gpt-4o-mini',
   'z.ai': 'GLM-4.6V-Flash',
   'Agnes': 'agnes-2.5-flash', // TASK 130: was agnes-2.0-flash (decommissioned)
-  'NVIDIA': 'meta/llama-3.2-11b-vision-instruct', // TASK 130: was llama-3.1-8b-instruct (EOL)
-  'Cloudflare': '@cf/meta/llama-4-scout-17b-16e-instruct',
+  'NVIDIA': 'meta/llama-4-scout-17b-16e-instruct', // TASK (2026-11-22): llama-3.2-11b-vision-instruct EOL 410 (2026-11-05)
+  'Cloudflare': '@cf/meta/llama-3.2-11b-vision-instruct', // TASK (2026-11-22): llama-4-scout returned empty on Cloudflare; lead with confirmed-valid vision model
   'Cerebras': 'gemma-4-31b',
   'Gemini': 'gemini-2.5-flash',
 };
