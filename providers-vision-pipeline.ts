@@ -184,6 +184,7 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
   const getAvailableProviders = providersRegistry.getAvailableProviders;
   const recordProviderResult = providersRegistry.recordProviderResult;
   const safeCall = providersBase.safeCall;
+  const extractJSON = providersBase.extractJSON;
 
   // Check cache
   const cached = getCachedVisionResponse(prompt, base64Image);
@@ -255,20 +256,32 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
     const start = Date.now();
     try {
       const raw = await safeCall(
-        (sig: any) => provider.fn(compressedBase64, prompt, sig, { validate: false }),
+        (sig: any) => provider.fn(compressedBase64, prompt, sig, { validate: false, maxRetries: 2 }),
         `Vision ${provider.name}`,
-        { timeoutMs, url: provider.name, maxRetries: 0, signal }
+        // Ollama is a local model that must NEVER be timed out by the dashboard's own
+        // timer (explicit requirement). Other providers keep the pipeline timeout.
+        { timeoutMs: provider.name === 'Ollama' ? 0 : timeoutMs, url: provider.name, maxRetries: 0, signal }
       );
       const latency = Date.now() - start;
 
       // Parse response
       let parsed: any;
-      let rawClean = (raw || '').trim();
-      if (rawClean.startsWith('```')) rawClean = rawClean.replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '').trim();
       try {
-        parsed = JSON.parse(rawClean);
+        // Use the tolerant extractor (scans for {...}, strips markdown fences, prose
+        // preamble and refusals) instead of a raw JSON.parse. Many small / prose-prone
+        // models prefix the JSON with "I cannot..." / "The button..." / "This image..."
+        // text, which a raw JSON.parse rejects as "Unexpected token 'I'...".
+        parsed = extractJSON(raw, provider.name);
       } catch (e: any) {
         log(`Provider ${provider.name} returned invalid JSON: ${e.message}`, 'DEBUG', 'vision');
+        recordProviderResult(provider.name, false, latency);
+        return null;
+      }
+      // extractJSON returns null (not a throw) when no action object is found — e.g. a
+      // pure refusal ("I cannot fulfill this request.") with no JSON at all. Treat that
+      // as a failure, not a success carrying a null result.
+      if (!parsed || typeof parsed !== 'object') {
+        log(`Provider ${provider.name} returned non-JSON/prose response (no extractable action object)`, 'DEBUG', 'vision');
         recordProviderResult(provider.name, false, latency);
         return null;
       }
@@ -295,22 +308,36 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
     }
   });
 
-  const results = await Promise.allSettled(promises);
-
-  // Return first successful result (providers are ordered by health + Groq priority)
-  const failedCount = results.filter(r => r.status === 'rejected' || r.value === null).length;
-  for (const r of results) {
-    if (r.status === 'fulfilled' && r.value !== null) {
-      if (failedCount > 0) {
-        log(`Vision pipeline: ${failedCount}/${results.length} providers failed, using ${r.value.provider}`, 'INFO', 'vision');
-      }
-      setCachedVisionResponse(prompt, base64Image, r.value);
-      return r.value;
+  // First-success race: return as soon as ANY provider yields a valid result, WITHOUT
+  // waiting for the rest to settle. This lets a slow / no-timeout provider (e.g. Ollama,
+  // which by design has no internal timeout) keep running without blocking the pipeline
+  // once another provider has succeeded. Each provider promise above resolves to
+  // { result, provider } or null (it never rejects — the inner catch returns null).
+  let failedSoFar = 0;
+  let firstSuccessResolve: ((v: any) => void) | null = null;
+  const firstSuccess = new Promise<any>(res => { firstSuccessResolve = res; });
+  let pending = promises.length;
+  const allSettledNoSuccess = new Promise<void>(res => {
+    if (pending === 0) res();
+    for (const p of promises) {
+      p.then(v => {
+        if (v === null) failedSoFar++;
+        else if (firstSuccessResolve) firstSuccessResolve(v);
+        if (--pending === 0) res();
+      });
     }
+  });
+  const winner = await Promise.race([firstSuccess, allSettledNoSuccess]);
+  if (winner) {
+    if (failedSoFar > 0) {
+      log(`Vision pipeline: ${failedSoFar}/${promises.length} providers failed, using ${winner.provider}`, 'INFO', 'vision');
+    }
+    setCachedVisionResponse(prompt, base64Image, winner);
+    return winner;
   }
 
   // ─── All cloud providers failed → local VLM fallback ───
-  log(`All ${results.length} cloud vision providers failed, attempting fallback chain`, 'WARN', 'vision');
+  log(`All ${promises.length} cloud vision providers failed, attempting fallback chain`, 'WARN', 'vision');
 
   // Fallback 1: Pix2Tex OCR (free, local math OCR via Python)
   try {
