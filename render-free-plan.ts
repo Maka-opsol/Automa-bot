@@ -1,5 +1,32 @@
-
 'use strict';
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLATFORM DETECTION (2026-11-22): the bot runs on GitHub Actions, not Render.
+// ═══════════════════════════════════════════════════════════════════════════════
+// Boot logs show path=/home/runner/work/Automa-bot/Automa-bot/ — a GitHub Actions
+// runner (16GB RAM, ephemeral job, no 15-min spin-down). This file and several
+// modules (memory-mode, local-vlm-failover, db-backup, survival-ephemeral-shield,
+// flutter-stability-waiter) were written for Render's 512MB free plan. A leftover
+// RENDER env var would make them force MINIMUM mode, disable the local VLM, and
+// treat the disk as ephemeral Render storage — all wrong on Actions.
+// GitHub Actions takes precedence: detect it FIRST (before any module loads or
+// threshold is set), clear any misleading RENDER env vars, and expose
+// IS_GITHUB_ACTIONS / IS_RENDER / PLATFORM for the rest of the file.
+const _PLATFORM_CWD = (typeof process.cwd === 'function' ? process.cwd() : '');
+const IS_GITHUB_ACTIONS = !!(
+  process.env.GITHUB_ACTIONS === 'true' ||
+  process.env.RUNNER_OS ||
+  process.env.CI === 'true' ||
+  /\/runner\/work\//.test(_PLATFORM_CWD) ||
+  /\\runner\\work\\/.test(_PLATFORM_CWD)
+);
+if (IS_GITHUB_ACTIONS) {
+  for (const _k of ['RENDER', 'RENDER_SERVICE_ID', 'RENDER_INSTANCE_ID', 'RENDER_SERVICE_TYPE', 'RENDER_DISCORD_TOKEN', 'RENDER_EXTERNAL_URL']) {
+    if (process.env[_k] !== undefined) {
+      console.log(`[platform] GitHub Actions detected — clearing leftover ${_k} env var (the bot is NOT on Render).`);
+      delete process.env[_k];
+    }
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BUG FIX (2026-09-04): EARLY MEMORY GUARD — runs BEFORE any module loading.
@@ -32,7 +59,11 @@
 // load — that's normal, not a crisis. 300MB was too low and killed the
 // process during normal browser launch.
 // 350MB / 384MB V8 = 34MB headroom — enough for V8 to GC before hitting limit.
-const EARLY_OOM_THRESHOLD_MB = 350;
+// GitHub Actions runners have 16GB RAM; Render free plan has 512MB. The OOM
+// guard thresholds must match the platform or the bot kills itself on Actions
+// during normal Flutter CanvasKit load (~400MB heap, ~600MB RSS with 3 workers).
+const EARLY_OOM_THRESHOLD_MB = IS_GITHUB_ACTIONS ? 1024 : 350;
+const EARLY_OOM_RSS_THRESHOLD_MB = IS_GITHUB_ACTIONS ? 2048 : 485;
 const EARLY_OOM_CHECK_INTERVAL_MS = 2000; // every 2s — fast enough to catch boot spikes
 let _earlyOomTriggered = false;
 const _earlyOomInterval = setInterval(() => {
@@ -50,9 +81,9 @@ const _earlyOomInterval = setInterval(() => {
     // The old 450MB threshold fired during normal Flutter load (RSS 455MB).
     // 485MB / 512MB container = 27MB headroom — tight but enough for the
     // memory shed to free ~20-40MB before the kernel OOM killer fires.
-    if (rssMB >= 485 && !_earlyOomTriggered) {
+    if (rssMB >= EARLY_OOM_RSS_THRESHOLD_MB && !_earlyOomTriggered) {
       _earlyOomTriggered = true;
-      console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= 485MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
+      console.error(`[FATAL] [early-oom] RSS ${rssMB.toFixed(0)}MB >= ${EARLY_OOM_RSS_THRESHOLD_MB}MB threshold. Kernel OOM imminent. Exiting immediately (heap=${heapMB.toFixed(0)}MB).`);
       clearInterval(_earlyOomInterval);
       process.exit(137);
     }
@@ -117,8 +148,10 @@ const os = require('os');
 const { PROJECT_ROOT } = require('./project-root');
 
 // ═══════════════════════════════════════════════════════════════════════
-// RENDER DETECTION
+// RENDER / PLATFORM DETECTION
 // ═══════════════════════════════════════════════════════════════════════
+// IS_GITHUB_ACTIONS was resolved at the top of the file, where any misleading
+// RENDER env vars were already cleared. On GitHub Actions, IS_RENDER is false.
 if (!process.env.RENDER_SERVICE_ID) {
   if (process.env.RENDER) {
     process.env.RENDER_SERVICE_ID = 'detected-free-plan';
@@ -126,6 +159,8 @@ if (!process.env.RENDER_SERVICE_ID) {
 }
 
 const IS_RENDER = !!(process.env.RENDER_SERVICE_ID || process.env.RENDER);
+const PLATFORM = IS_GITHUB_ACTIONS ? 'github-actions' : (IS_RENDER ? 'render-free-plan' : 'local');
+console.log(`[platform] Detected platform: ${PLATFORM}${IS_GITHUB_ACTIONS ? ' (16GB runner, no Render spin-down)' : IS_RENDER ? ' (512MB free plan)' : ''}.`);
 
 // ═══════════════════════════════════════════════════════════════════════
 // PRE-STARTUP: Set Render-friendly defaults BEFORE any module loads
@@ -156,11 +191,13 @@ if (!process.env.DISPLAY_WIDTH)  process.env.DISPLAY_WIDTH  = '800';
 if (!process.env.DISPLAY_HEIGHT) process.env.DISPLAY_HEIGHT = '600';
 
 // Memory — only set MAX_MEMORY_MB if not already set.
-// Render free plan = 512 MB total. Aggressive threshold to prevent OOM kills.
-if (!process.env.MAX_MEMORY_MB) process.env.MAX_MEMORY_MB = '400';
-// Override warning and restart thresholds to be aggressive
-if (!process.env.MEMORY_WARNING_THRESHOLD_MB) process.env.MEMORY_WARNING_THRESHOLD_MB = '280';
-if (!process.env.MEMORY_RESTART_THRESHOLD_MB) process.env.MEMORY_RESTART_THRESHOLD_MB = '320';
+// Render free plan = 512 MB total (aggressive thresholds). GitHub Actions
+// runners have 16GB — use generous thresholds so the bot doesn't shed/OOM
+// during normal Flutter CanvasKit load + 3 parallel workers.
+if (!process.env.MAX_MEMORY_MB) process.env.MAX_MEMORY_MB = IS_GITHUB_ACTIONS ? '2048' : '400';
+// Override warning and restart thresholds to be aggressive (Render) or roomy (Actions)
+if (!process.env.MEMORY_WARNING_THRESHOLD_MB) process.env.MEMORY_WARNING_THRESHOLD_MB = IS_GITHUB_ACTIONS ? '1536' : '280';
+if (!process.env.MEMORY_RESTART_THRESHOLD_MB) process.env.MEMORY_RESTART_THRESHOLD_MB = IS_GITHUB_ACTIONS ? '1792' : '320';
 
 // Post-set consistency guard
 (function ensureMemoryThresholdConsistency() {
@@ -223,12 +260,12 @@ const { container, startSubsystemGroup, startSelfHealV2Subsystems, startResilien
   const _mem = process.memoryUsage();
   const _postContainerHeapMB = _mem.heapUsed / 1024 / 1024;
   const _postContainerRSSMB = _mem.rss / 1024 / 1024;
-  if (_postContainerRSSMB >= 485) {
-    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= 485MB after container init. Kernel OOM imminent. Exiting immediately.`);
+  if (_postContainerRSSMB >= EARLY_OOM_RSS_THRESHOLD_MB) {
+    console.error(`[FATAL] [boot-oom] RSS ${_postContainerRSSMB.toFixed(0)}MB >= ${EARLY_OOM_RSS_THRESHOLD_MB}MB after container init. Kernel OOM imminent. Exiting immediately.`);
     clearInterval(_earlyOomInterval);
     process.exit(137);
   }
-  if (_postContainerHeapMB >= 350) {
+  if (_postContainerHeapMB >= EARLY_OOM_THRESHOLD_MB) {
     console.error(`[FATAL] [boot-oom] Heap ${_postContainerHeapMB.toFixed(0)}MB >= 350MB after container init. Exiting immediately.`);
     clearInterval(_earlyOomInterval);
     process.exit(137);
@@ -437,7 +474,7 @@ try {
 // ═══════════════════════════════════════════════════════════════════════
 // WORKER FALLBACK: Start rewardTracker in-process
 // ═══════════════════════════════════════════════════════════════════════
-log('Render: Running all subsystems in-process (no worker threads, saves ~90-150 MB)', 'INFO', 'render-free-plan');
+log(`${PLATFORM}: Running all subsystems in-process (no worker threads, saves ~90-150 MB)`, 'INFO', 'render-free-plan');
 try {
   const rtMod = container.get('rewardTracker', { required: false });
   if (rtMod && typeof rtMod.start === 'function') {
@@ -486,6 +523,9 @@ function externalPing() {
 }
 
 const _selfPingWrapped = function() {
+  // Render spins down after 15min inactivity; GitHub Actions jobs don't. Skip the
+  // self-ping off Render to avoid noisy keepalive logs on Actions/local.
+  if (!IS_RENDER) return;
   const port = process.env.PORT || '10000';
   const req = http.get(`http://localhost:${port}/health`, (res: any) => {
     res.resume();
@@ -493,7 +533,7 @@ const _selfPingWrapped = function() {
       _keepaliveFailCount = 0;
       if (!_firstKeepaliveLogged) {
         _firstKeepaliveLogged = true;
-        log('First keepalive ping succeeded — Render spin-down prevented', 'INFO', 'keepalive');
+        log(`First keepalive ping succeeded — ${PLATFORM} spin-down prevented`, 'INFO', 'keepalive');
       }
     });
   });
@@ -711,10 +751,11 @@ function _startMemoryMonitor(): void {
     // still having room for the full stack.
     //   - HARD_RESTART_HEAP_MB = 280 (gives 104MB headroom below 384MB V8 limit)
     //   - HARD_RSS_LIMIT_MB = 440 (gives 72MB headroom in 512MB container)
-    const HARD_RESTART_HEAP_MB = 280; // fire if heap > 280MB (out of 384MB V8 limit)
-    //
-    // 440MB gives 72MB of headroom in the 512MB container.
-    const HARD_RSS_LIMIT_MB = 440;   // fire if RSS > 440MB (out of 512MB container)
+    // Render: 280MB heap / 440MB RSS (out of 384MB V8 / 512MB container).
+    // GitHub Actions (16GB runner): 1536MB heap / 3584MB RSS — room for 3 parallel
+    // workers + Flutter CanvasKit without needless shedding.
+    const HARD_RESTART_HEAP_MB = IS_GITHUB_ACTIONS ? 1536 : 280;
+    const HARD_RSS_LIMIT_MB = IS_GITHUB_ACTIONS ? 3584 : 440;
     if (used > HARD_RESTART_HEAP_MB || rss > HARD_RSS_LIMIT_MB) {
       log(`Memory CRITICAL (hard threshold): heap=${used.toFixed(0)}MB rss=${rss.toFixed(0)}MB — full memory shed (midQuiz=${memoryMode.isMidQuiz?.() ?? false})`, 'ERROR', 'render-free-plan');
       // BUG FIX (2026-09-06): Cap maxLevel at L2 to prevent closing the browser.
@@ -925,7 +966,7 @@ a{color:#818cf8}a:hover{color:#a5b4fc}
 <div class="stat"><span class="stat-label">RSS</span><span class="stat-value">${memInfo.rss} (${memInfo.rssPercent})</span></div>
 <div class="stat"><span class="stat-label">Node.js</span><span class="stat-value">${process.version}</span></div>
 <div class="stat"><span class="stat-label">Workers</span><span class="stat-value">0 (in-process)</span></div>
-<div class="stat"><span class="stat-label">Platform</span><span class="stat-value">render-free-plan${IS_RENDER ? '' : ' (local)'}</span></div>
+<div class="stat"><span class="stat-label">Platform</span><span class="stat-value">${PLATFORM}</span></div>
 <h2>Links</h2>
 <div class="stat"><span class="stat-label">Dashboard</span><span class="stat-value"><a href="${getDashboardLink(port)}">Open Dashboard</a></span></div>
 <h2>API Endpoints</h2>
@@ -958,8 +999,9 @@ a{color:#818cf8}a:hover{color:#a5b4fc}
         stats: { questionsCompleted: stats.questionsCompleted || 0, cycleCount: stats.cycleCount || 0 },
         memory: { ...memInfo, mode: memoryMode.getMode() },
         state: { current: stateMachine?.stateMachine?.getCurrentState?.() || null },
-        platform: 'render-free-plan',
+        platform: PLATFORM,
         isRender: IS_RENDER,
+        isGitHubActions: IS_GITHUB_ACTIONS,
         features: 'all-enabled',
         workers: 'in-process',
       };
@@ -1074,7 +1116,7 @@ a{color:#818cf8}a:hover{color:#a5b4fc}
 // ── Start HTTP server FIRST (Render requirement) ──
 const PORT = parseInt(process.env.PORT || '10000', 10);
 server.listen(PORT, '0.0.0.0', () => {
-  log(`MathU Bot v6 — Render Free Plan listening on port ${PORT}`, 'INFO', 'render-free-plan');
+  log(`MathU Bot v6 — ${PLATFORM} listening on port ${PORT}`, 'INFO', 'render-free-plan');
   log(`Dashboard available at http://localhost:${PORT}/dashboard`, 'INFO', 'render-free-plan');
   const t = memoryMode.getThresholds();
   log(`Mode: ${memoryMode.getMode()} | Memory: warn=${t.warnHeapMB}MB restart=${t.restartHeapMB}MB rss_hard=${t.rssHardLimitMB}MB gc=${t.gcIntervalMs / 1000}s`, 'INFO', 'render-free-plan');
@@ -1338,5 +1380,5 @@ try {
     log('Daemon crashed — will restart on next cycle iteration', 'ERROR', 'render-free-plan');
   });
 
-  log('MathU Bot v6 — Render Free Plan fully started (all features, no workers)', 'INFO', 'render-free-plan');
+  log(`MathU Bot v6 — ${PLATFORM} fully started (all features, no workers)`, 'INFO', 'render-free-plan');
 })();
