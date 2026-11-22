@@ -171,6 +171,25 @@ class ParallelCoordinator {
           log(`[WORKER-${id}] [page-error] kind=${err.message === 'pdfjsLib is not defined' ? 'pdf-reference' : 'other'}`, 'ERROR', 'parallel');
       } catch {}
     });
+    // Log network request failures that matter for app boot (document/script/xhr/fetch).
+    // Skips images/media/fonts/stylesheets so the 10-log cap is spent on meaningful
+    // failures. Emits only resource type + host + error reason — no URLs, paths, or page
+    // content. Decisive for "absent" canvas: if the Flutter bundle / pdf.js fail to load,
+    // this shows which host failed and why (e.g. net::ERR_CONNECTION_TIMED_OUT).
+    let failedReqs = 0;
+    page.on('requestfailed', (req: any) => {
+      try {
+        if (failedReqs >= 10) return;
+        let type = 'unknown';
+        try { type = req.resourceType(); } catch {}
+        if (['image', 'media', 'font', 'stylesheet'].includes(type)) return;
+        failedReqs++;
+        let host = 'unknown';
+        try { host = new URL(req.url()).host; } catch {}
+        const reason = (req.failure() && req.failure().errorText) || 'unknown';
+        log(`[WORKER-${id}] [request-failed] type=${type} host=${host} reason=${reason}`, 'WARN', 'parallel');
+      } catch {}
+    });
 
     this.workers.set(id, {
       id,
