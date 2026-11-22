@@ -16,7 +16,7 @@ const http = require('http');
 const https = require('https');
 
 const DASHBOARD_URL = process.env.DASHBOARD_URL || '';
-const API_KEY = process.env.DASHBOARD_KEY || 'mathu-dashboard-key';
+const API_KEY = process.env.DASHBOARD_KEY || '';
 
 const FLUSH_INTERVAL_MS = 3000;
 const MAX_BATCH_SIZE = 50;
@@ -26,6 +26,18 @@ let flushTimer = null;
 let totalShipped = 0;
 let shipErrors = 0;
 let lastHeartbeat = 0;
+let lastRejectionLog = 0;
+let rejectionCount = 0;
+
+// Loud startup diagnostics. A missing DASHBOARD_URL silently disabled shipping,
+// and a missing DASHBOARD_KEY used to make the bot send a wrong hardcoded
+// fallback ('mathu-dashboard-key') that the dashboard 401-rejected — both
+// produced "no logs on the dashboard" with zero visibility. Surface them at boot.
+if (!DASHBOARD_URL) {
+  console.warn('[dashboard-shipper] DASHBOARD_URL is not set — log shipping DISABLED. Set DASHBOARD_URL (and a matching DASHBOARD_KEY) in the bot environment.');
+} else if (!API_KEY) {
+  console.warn('[dashboard-shipper] DASHBOARD_KEY is not set — the dashboard will REJECT every POST /api/logs with 503 ("Ingestion authorization is not configured"). Set DASHBOARD_KEY to match the dashboard\'s DASHBOARD_KEY.');
+}
 
 function _post(pathname, data) {
   if (!DASHBOARD_URL) return;
@@ -41,7 +53,22 @@ function _post(pathname, data) {
       path: url.pathname,
       headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY, 'Content-Length': Buffer.byteLength(body) },
       timeout: 10000,
-    }, () => {});
+    }, (res) => {
+      // Old callback was () => {} — it silently swallowed 401/403/404/500/503 and
+      // made "no logs" impossible to diagnose. The dashboard 503s every POST when
+      // its DASHBOARD_KEY is unset, 401s on a key mismatch, 404s on a wrong
+      // DASHBOARD_URL. Surface those (throttled) instead of failing silently.
+      if (res.statusCode >= 400) {
+        shipErrors++;
+        rejectionCount++;
+        const now = Date.now();
+        if (now - lastRejectionLog > 60000) {
+          lastRejectionLog = now;
+          console.error('[dashboard-shipper] dashboard rejected ' + pathname + ' (HTTP ' + res.statusCode + '); ' + rejectionCount + ' rejections so far. 503=DASHBOARD_KEY unset on dashboard; 401=key mismatch; 404=wrong DASHBOARD_URL.');
+        }
+      }
+      res.resume();
+    });
     req.on('error', () => { shipErrors++; });
     req.on('timeout', () => req.destroy());
     req.write(body);
