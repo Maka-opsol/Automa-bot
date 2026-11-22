@@ -428,12 +428,12 @@ class CircuitBreaker {
  */
   private _getCooldownMs(): number {
     switch (this.lastFailureCategory) {
-      case 'rate_limited': return 45000;
+      case 'rate_limited': return 300000; // 5 min — rate limits last minutes; 45s re-probed every 45s and flooded logs with half-open/re-opened noise
       case 'timeout': return 30000;
       case 'connection': return 15000;
       case 'server_error': return 60000;
       case 'auth_failure': return 300000;  // 5 min
-      default: return 60000;
+      default: return 180000; // 3 min — uncategorized errors re-probed every 60s, flooding logs with transitions
     }
   }
 
@@ -484,7 +484,7 @@ class CooldownManager {
     }
     const providerCooldowns = this.cooldowns.get(providerName)!;
     providerCooldowns.set(category, until);
-    _log(`${providerName} cooldown set: ${category} for ${Math.round(durationMs / 1000)}s`, 'DEBUG', 'health');
+    if (durationMs >= 120000) _log(`${providerName} cooldown set: ${category} for ${Math.round(durationMs / 1000)}s`, 'DEBUG', 'health'); // suppress noisy <120s cooldown logs
   }
 
   /**
