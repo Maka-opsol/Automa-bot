@@ -100,27 +100,29 @@ const DEFAULTS: Record<string, ProviderDefault> = {
   },
   'NVIDIA': {
     endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions',
-    // TASK 111 (2026-10-08): meta/llama-3.1-8b-instruct is ALSO EOL (410 Gone).
-    // Available models confirmed from NVIDIA API (Oct 2026):
-    //   meta/llama-3.2-11b-vision-instruct (vision-capable!)
-    //   meta/llama-3.2-90b-vision-instruct (vision-capable, larger)
-    // Using llama-3.2-11b-vision-instruct — it's vision-capable and available.
-    model: 'meta/llama-3.2-11b-vision-instruct',
+    // TASK (2026-11-22): meta/llama-3.2-11b-vision-instruct reached end-of-life
+    // (HTTP 410, EOL 2026-11-05). Switched to current Llama 4 vision NIM models,
+    // confirmed available on integrate.api.nvidia.com per NVIDIA NIM vision-language docs.
+    model: 'meta/llama-4-scout-17b-16e-instruct',
     envKeys: ['NVIDIA_API_KEY'],
     visionCapable: true,
     fallbackModels: [
-      'meta/llama-3.2-90b-vision-instruct',
+      'meta/llama-4-maverick-17b-128e-instruct',
     ],
   },
   'Cloudflare': {
     endpoint: null,  // built dynamically from CF_ACCOUNT_ID
-    model: '@cf/meta/llama-4-scout-17b-16e-instruct',
+    // TASK (2026-11-22): @cf/meta/llama-4-scout-17b-16e-instruct returned empty responses
+    // on Cloudflare Workers AI, and @cf/google/gemma-4-26b-a4b-it is not a real Cloudflare
+    // model ID (Gemma 4 doesn't exist) — also empty. Lead with the confirmed valid +
+    // responding vision model; demote llama-4-scout to a fallback.
+    model: '@cf/meta/llama-3.2-11b-vision-instruct',
     envKeys: ['CF_API_KEY', 'CF_ACCOUNT_ID'],
     visionCapable: true,
     fallbackModels: [
-      '@cf/google/gemma-4-26b-a4b-it',
-      '@cf/meta/llama-3.2-11b-vision-instruct',
+      '@cf/meta/llama-4-scout-17b-16e-instruct',
       // TASK 67: Removed @cf/moonshotai/kimi-k2.5 — returns 403 forbidden.
+      // TASK (2026-11-22): Removed @cf/google/gemma-4-26b-a4b-it — fake model ID, empty responses.
     ],
   },
   'Cerebras': {
@@ -522,7 +524,9 @@ function _getDb() {
 // Stale models that should NEVER be used (even if the DB has them)
 const STALE_MODEL_PREFIXES = [
   'meta/llama-3.1-8b-instruct',     // EOL 410
+  'meta/llama-3.2-11b-vision-instruct',  // TASK (2026-11-22): NVIDIA EOL 410 (2026-11-05). The Cloudflare @cf/meta/llama-3.2-11b-vision-instruct variant starts with '@cf/' so is NOT matched here.
   'meta-llama/llama-4-scout-17b',   // TASK 138: 404 on Groq (no access)
+  '@cf/google/gemma-4-26b-a4b-it',  // TASK (2026-11-22): not a real Cloudflare model ID — empty responses
   'agnes-2.0-flash',                 // decommissioned 500
   'gemini-1.5-flash',                // deprecated 404
   'gemini-2.0-flash',                // deprecated
