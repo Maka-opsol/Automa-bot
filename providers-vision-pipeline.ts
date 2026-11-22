@@ -356,8 +356,8 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
     log(`Pix2Tex OCR fallback failed: ${e.message || e}`, 'DEBUG', 'vision');
   }
 
-  // Fallback 2: Local VLM (disabled on Render free plan)
-  log(`Local VLM is ${getCONFIG().ENABLE_LOCAL_VLM ? 'enabled' : 'DISABLED (Render free plan limitation)'}`, 'INFO', 'vision');
+  // Fallback 2: Local VLM (disabled by default; on Render free plan it's forced off)
+  log(`Local VLM is ${getCONFIG().ENABLE_LOCAL_VLM ? 'enabled' : 'DISABLED (' + ((process.env.RENDER || process.env.RENDER_SERVICE_ID) ? 'Render free plan limitation' : 'set ENABLE_LOCAL_VLM=true to enable') + ')'}`, 'INFO', 'vision');
   const localResult = await tryLocalVLM(compressedBase64, prompt, validator, setCachedVisionResponse, base64Image);
   if (localResult) return localResult;
 
