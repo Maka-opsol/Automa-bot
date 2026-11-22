@@ -347,115 +347,90 @@ function extractJSON(rawContent: string, providerName?: string): any {
     return null;
   }
 
+  // Collect every parsed JSON value we can find, split by whether it looks like
+  // an action object. Action callers (validateActionResponse) need actionType;
+  // vision/coordinate callers expect bare {x,y} objects or arrays of them.
+  // Return the best action object if any exists, otherwise the first valid
+  // object/array — so vision coordinate responses are accepted (they have no
+  // actionType). Action callers' validator (validateActionResponse) rejects
+  // non-action objects, so returning them is safe for action callers too.
+  const actionCandidates: any[] = [];
+  const otherCandidates: any[] = [];
+
+  const consider = (val: any) => {
+    if (val === null || val === undefined) return;
+    if (val && typeof val === 'object' && !Array.isArray(val) && val.actionType) {
+      actionCandidates.push(val); return;
+    }
+    if (val && typeof val === 'object' && !Array.isArray(val) && val.action && typeof val.action === 'object' && val.action.actionType) {
+      actionCandidates.push(val.action); return;
+    }
+    if (Array.isArray(val)) {
+      const actionItem = val.find((it: any) => it && typeof it === 'object' && it.actionType);
+      if (actionItem) { actionCandidates.push(actionItem); return; }
+      const nestedActionItem = val.find((it: any) => it && it.action && it.action.actionType);
+      if (nestedActionItem) { actionCandidates.push(nestedActionItem.action); return; }
+      // coordinate array (or other array) — accept as-is
+      otherCandidates.push(val); return;
+    }
+    if (val && typeof val === 'object') {
+      // bare object, e.g. {x,y} coordinate — accept as-is
+      otherCandidates.push(val); return;
+    }
+  };
+
   // 1. Try parsing the entire response as JSON first
-  const fullParse = _tryParseJSON(rawContent);
-  if (fullParse) {
-    // If it has actionType, it's directly an action object
-    if (fullParse.actionType) return fullParse;
-    // If it has a nested action, unwrap it
-    if (fullParse.action && fullParse.action.actionType) return fullParse.action;
+  consider(_tryParseJSON(rawContent));
+
+  // 2. Markdown code fences: ```json ... ``` or ``` ... ```
+  const fenceRe = /```(?:json)?\s*([\s\S]*?)```/g;
+  let m;
+  while ((m = fenceRe.exec(rawContent)) !== null) {
+    consider(_tryParseJSON(m[1].trim()));
   }
 
-  // 2. Extract all top-level { ... } blocks by brace depth tracking
-  const candidates: { start: number; end: number; json: string }[] = [];
-  let depth = 0;
-  let blockStart = -1;
-  let inString = false;
-  let stringChar = '';
-
-  for (let i = 0; i < rawContent.length; i++) {
-    const ch = rawContent[i];
-
-    // Handle string literals (skip braces inside strings)
-    if (inString) {
-      if (ch === '\\') { i++; continue; } // Skip escaped char
-      if (ch === stringChar) inString = false;
-      continue;
-    }
-    if (ch === '"' || ch === "'" || ch === '`') {
-      inString = true;
-      stringChar = ch;
-      continue;
-    }
-
-    if (ch === '{') {
-      if (depth === 0) blockStart = i;
-      depth++;
-    } else if (ch === '}') {
-      depth--;
-      if (depth === 0 && blockStart >= 0) {
-        const jsonStr = rawContent.substring(blockStart, i + 1);
-        candidates.push({ start: blockStart, end: i + 1, json: jsonStr });
-        blockStart = -1;
-      }
+  // 3. Top-level { ... } object blocks via brace-depth tracking (skips braces inside strings)
+  const objBlocks: string[] = [];
+  {
+    let depth2 = 0, blockStart = -1, inString = false, stringChar = '';
+    for (let i2 = 0; i2 < rawContent.length; i2++) {
+      const ch = rawContent[i2];
+      if (inString) { if (ch === '\\') { i2++; continue; } if (ch === stringChar) inString = false; continue; }
+      if (ch === '"' || ch === "'" || ch === '`') { inString = true; stringChar = ch; continue; }
+      if (ch === '{') { if (depth2 === 0) blockStart = i2; depth2++; }
+      else if (ch === '}') { depth2--; if (depth2 === 0 && blockStart >= 0) { objBlocks.push(rawContent.substring(blockStart, i2 + 1)); blockStart = -1; } }
     }
   }
+  for (const blk of objBlocks) consider(_tryParseJSON(blk));
 
-  // 3. Try each candidate (prefer first valid action object)
-  for (const candidate of candidates) {
-    const parsed = _tryParseJSON(candidate.json);
-    if (!parsed) continue;
-
-    // Direct action object
-    if (parsed.actionType) return parsed;
-
-    // Nested action in a wrapper (e.g., { "action": { "actionType": "click", ... } })
-    if (parsed.action && typeof parsed.action === 'object' && parsed.action.actionType) {
-      return parsed.action;
-    }
-
-    // Array of actions — return the first valid one
-    if (Array.isArray(parsed)) {
-      for (const item of parsed) {
-        if (item && item.actionType) return item;
-        if (item && item.action && item.action.actionType) return item.action;
-      }
+  // 4. Top-level [ ... ] array blocks via bracket-depth tracking (NEW — arrays
+  //    like [] or [{"x":0.5,"y":0.6}] were never extracted by the brace tracker)
+  const arrBlocks: string[] = [];
+  {
+    let depth3 = 0, blockStart = -1, inString = false, stringChar = '';
+    for (let i3 = 0; i3 < rawContent.length; i3++) {
+      const ch = rawContent[i3];
+      if (inString) { if (ch === '\\') { i3++; continue; } if (ch === stringChar) inString = false; continue; }
+      if (ch === '"' || ch === "'" || ch === '`') { inString = true; stringChar = ch; continue; }
+      if (ch === '[') { if (depth3 === 0) blockStart = i3; depth3++; }
+      else if (ch === ']') { depth3--; if (depth3 === 0 && blockStart >= 0) { arrBlocks.push(rawContent.substring(blockStart, i3 + 1)); blockStart = -1; } }
     }
   }
+  for (const blk of arrBlocks) consider(_tryParseJSON(blk));
 
-  // 4. Try markdown code block extraction (```json ... ```)
-  const codeBlockRegex = /```(?:json)?\s*([\s\S]*?)```/g;
-  let match;
-  while ((match = codeBlockRegex.exec(rawContent)) !== null) {
-    const codeContent = match[1].trim();
-    const parsed = _tryParseJSON(codeContent);
-    if (!parsed) continue;
+  // 5. Last-resort: greedy regex for all {...} and [...] blocks (including nested).
+  //    Try from LAST to FIRST for objects — chain-of-thought models put the real
+  //    action JSON at the end.
+  const allObj = rawContent.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g) || [];
+  for (let k = allObj.length - 1; k >= 0; k--) consider(_tryParseJSON(allObj[k]));
+  const allArr = rawContent.match(/\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\]/g) || [];
+  for (const s of allArr) consider(_tryParseJSON(s));
 
-    if (parsed.actionType) return parsed;
-    if (parsed.action && typeof parsed.action === 'object' && parsed.action.actionType) {
-      return parsed.action;
-    }
-    if (Array.isArray(parsed)) {
-      for (const item of parsed) {
-        if (item && item.actionType) return item;
-        if (item && item.action && item.action.actionType) return item.action;
-      }
-    }
-  }
+  // 6. Prefer action objects (action callers); otherwise the first valid object/array (vision callers)
+  if (actionCandidates.length > 0) return actionCandidates[0];
+  if (otherCandidates.length > 0) return otherCandidates[0];
 
-  // 5. TASK 127 (2026-10-22): Last-resort — find ALL { ... } blocks (including
-  // nested) and try each one. Some small models (NVIDIA llama-3.2-11b-vision)
-  // write chain-of-thought reasoning ("**Step 1:** ... **Step 2:** ...")
-  // BEFORE finally outputting the JSON action. The brace-depth tracker above
-  // only finds TOP-LEVEL blocks — but if the reasoning contains inline JSON-like
-  // fragments, we miss the actual action JSON at the end.
-  // This step uses a greedy regex to find ALL potential JSON objects and tries
-  // each one, preferring those with actionType.
-  const allJsonLike = rawContent.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g);
-  if (allJsonLike && allJsonLike.length > 0) {
-    // Try from LAST to FIRST — the actual action JSON is usually at the end
-    // (after the reasoning steps)
-    for (let i = allJsonLike.length - 1; i >= 0; i--) {
-      const candidate = _tryParseJSON(allJsonLike[i]);
-      if (!candidate) continue;
-      if (candidate.actionType) return candidate;
-      if (candidate.action && typeof candidate.action === 'object' && candidate.action.actionType) {
-        return candidate.action;
-      }
-    }
-  }
-
-  // 6. Nothing found — log the full response for debugging
+  // 7. Nothing found — log for debugging
   const preview = rawContent.length > 500
     ? rawContent.substring(0, 500) + `... [truncated, total ${rawContent.length} chars]`
     : rawContent;
@@ -464,7 +439,6 @@ function extractJSON(rawContent: string, providerName?: string): any {
     'WARN',
     'base'
   );
-
   return null;
 }
 
