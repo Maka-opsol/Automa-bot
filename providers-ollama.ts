@@ -141,10 +141,14 @@ function OllamaProvider() {
     // Pass the SAME prompt that every cloud provider receives — the tribunal
     // has already flattened system prompt + URL + UI map + math context into
     // this single string. No reduced context, no special handling.
+    // format:json — Ollama maps response_format {type:'json_object'} to
+    // format:json, forcing valid JSON output instead of prose (the vision prompts
+    // already contain the word JSON which Ollama requires). If the model rejects
+    // it, callChatCompletionWithRollback 422 handler retries without it — no regression.
     const rawContent = await retryWithBackoff(
       () => callChatCompletionWithRollback(
         config.endpoint, apiKey, model, base64Image, prompt, 'Ollama',
-        { signal, maxTokens: options.maxTokens, temperature: options.temperature ?? 0.1, timeoutMs: 0 }
+        { signal, maxTokens: options.maxTokens, temperature: options.temperature ?? 0.1, timeoutMs: 0, responseFormat: { type: 'json_object' } }
       ),
       { providerName: 'Ollama', signal, maxRetries: options.maxRetries ?? 2, baseDelay: 2000 }
     );
