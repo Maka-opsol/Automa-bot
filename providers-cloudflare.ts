@@ -41,7 +41,7 @@ const _modelCooldowns: Record<string, { expiresAt: number; consecutive429s: numb
  */
 function _getModelChain(): string[] {
   const config = getProviderConfig('Cloudflare');
-  const primary = config?.model || '@cf/meta/llama-4-scout-17b-16e-instruct';
+  const primary = config?.model || '@cf/meta/llama-3.2-11b-vision-instruct';
   const fallbacks = getFallbackModels('Cloudflare');
   // Deduplicate while preserving order
   const seen = new Set<string>();
