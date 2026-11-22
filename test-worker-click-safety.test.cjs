@@ -27,6 +27,7 @@ function create({ card, clickError, evaluateError, dbError, completion = true })
   const deps = { database: { db } };
   const build = new Function('_deps', 'getLog', 'getCONFIG', `return class {
     ${method('_runWorkerLoop')}
+    ${method('_findAndClickModuleViaVision')}
     ${method('_findAndClickModuleCard')}
     ${method('_markModuleDone')}
     ${method('_markModuleFailed')}
