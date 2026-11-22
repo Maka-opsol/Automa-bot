@@ -200,6 +200,12 @@ class ParallelCoordinator {
     try {
       await page.route(/^https?:\/\/[^/]*\.atlassian\.net\//, (r: any) => r.abort());
     } catch {}
+    // Block Google Fonts / gstatic assets — purely cosmetic, and on the flaky
+    // ZA proxy these time out (net::ERR_TIMED_OUT) and waste bandwidth the main
+    // Flutter bundle needs. The bot vision login does not depend on fonts.
+    try {
+      await page.route(/^https?:\/\/[^/]*(?:fonts\.gstatic\.com|www\.gstatic\.com|fonts\.googleapis\.com)\//, (r: any) => r.abort());
+    } catch {}
 
     this.workers.set(id, {
       id,
@@ -426,6 +432,9 @@ class ParallelCoordinator {
     const email: string = (typeof cfg.getMicrosoftEmail === 'function' ? cfg.getMicrosoftEmail() : '') || cfg.MICROSOFT_EMAIL || '';
     const password: string = (typeof cfg.getMicrosoftPassword === 'function' ? cfg.getMicrosoftPassword() : '') || cfg.MICROSOFT_PASSWORD || '';
     const maxSteps = 8;
+    // Track repeated sign-in clicks: if the page does not advance after the click,
+    // escalate to a DOM text-selector click, then give up (hand back to worker loop).
+    let signInAttempts = 0;
 
     for (let step = 0; step < maxSteps; step++) {
       let b64 = '';
@@ -445,12 +454,45 @@ class ParallelCoordinator {
         return true;
       }
 
-      // MathU landing: "Sign in with Microsoft" button
+      // MathU landing: "Sign in with Microsoft" button.
+      // The click triggers an OAuth redirect OFF the Flutter SPA to
+      // login.microsoftonline.com (different origin), so a URL change is the
+      // reliable signal the click registered. The old 3s flat sleep was too short
+      // for the slow-proxy redirect, so the next screenshot still showed the
+      // button and the bot spam-clicked every ~15s without ever advancing.
       try {
         const signIn = await providers.findSignInButtonCoordinates(b64);
         if (signIn && typeof signIn.x === 'number' && typeof signIn.y === 'number') {
-          await this._visionClick(worker, id, signIn, '"Sign in with Microsoft"');
-          await this._sleep(3000);
+          const urlBefore = worker.page.url();
+          // After 2 vision clicks that did not advance, fall back to a DOM
+          // text-selector click — if the button is a real <a>/<button> (not a
+          // canvas pixel), this fires the nav handler reliably. If it is a Flutter
+          // canvas widget, this throws silently and we retry vision coords.
+          if (signInAttempts >= 2) {
+            let domOk = false;
+            try { await worker.page.click('text=/Sign in with Microsoft/i', { timeout: 5000 }); domOk = true; }
+            catch { domOk = false; }
+            log(`[WORKER-${id}] Vision login: DOM sign-in click ${domOk ? 'succeeded' : 'failed'} (vision coords were not advancing)`, 'INFO', 'parallel');
+          } else {
+            await this._visionClick(worker, id, signIn, '"Sign in with Microsoft"');
+          }
+          signInAttempts++;
+          // Poll for the OAuth redirect (URL change) for up to 15s — slow proxy.
+          let navigated = false;
+          for (let w = 0; w < 15; w++) {
+            await this._sleep(1000);
+            try { if (worker.page.url() !== urlBefore) { navigated = true; break; } } catch {}
+          }
+          if (navigated) {
+            log(`[WORKER-${id}] Vision login: sign-in redirected to ${worker.page.url()}`, 'INFO', 'parallel');
+            signInAttempts = 0;
+          } else {
+            log(`[WORKER-${id}] Vision login: sign-in click did not navigate (attempt ${signInAttempts})`, 'WARN', 'parallel');
+            if (signInAttempts >= 4) {
+              log(`[WORKER-${id}] Vision login: sign-in stuck after ${signInAttempts} attempts — handing back to worker loop`, 'WARN', 'parallel');
+              return false;
+            }
+          }
           continue;
         }
       } catch {}
@@ -460,11 +502,12 @@ class ParallelCoordinator {
         try {
           const ef = await providers.findElementCoordinates(b64, 'the email input field');
           if (ef && typeof ef.x === 'number' && typeof ef.y === 'number') {
+            signInAttempts = 0; // advanced past the sign-in step
             await this._visionClick(worker, id, ef, 'email field');
             await worker.page.keyboard.type(email).catch(() => {});
             await worker.page.keyboard.press('Enter').catch(() => {});
             log(`[WORKER-${id}] Vision login: typed email + pressed Enter`, 'INFO', 'parallel');
-            await this._sleep(3000);
+            await this._sleep(5000);
             continue;
           }
         } catch {}
@@ -475,11 +518,12 @@ class ParallelCoordinator {
         try {
           const pf = await providers.findElementCoordinates(b64, 'the password input field');
           if (pf && typeof pf.x === 'number' && typeof pf.y === 'number') {
+            signInAttempts = 0; // advanced past the sign-in step
             await this._visionClick(worker, id, pf, 'password field');
             await worker.page.keyboard.type(password).catch(() => {});
             await worker.page.keyboard.press('Enter').catch(() => {});
             log(`[WORKER-${id}] Vision login: typed password + pressed Enter`, 'INFO', 'parallel');
-            await this._sleep(5000);
+            await this._sleep(7000);
             continue;
           }
         } catch {}
