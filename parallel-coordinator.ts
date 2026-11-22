@@ -205,112 +205,43 @@ class ParallelCoordinator {
 
     while (this.running) {
       try {
-        // 1. In _ensureLoggedIn(worker, id): verify the page isn't showing a login prompt
-//    or empty content before returning "Already logged in".
-      const pageState = await worker.page.evaluate(() => {
-        const text = (document.body?.innerText || '').trim().toLowerCase();
-        const interactiveCount = document.querySelectorAll('button, [role="button"], input, a[href], canvas').length;
-        const looksLikeLogin =
-          text.includes('sign in with microsoft') ||
-          text.includes('sign in with apple') ||
-          text.includes('sign in with phone') ||
-          (text.includes('sign in') && text.length < 500);
-        return { textLen: text.length, interactiveCount, looksLikeLogin };
-      }).catch(() => ({ textLen: 0, interactiveCount: 0, looksLikeLogin: false }));
-
-      if (pageState.looksLikeLogin) {
-        log(`[WORKER-${id}] App page shows login prompt — attempting auth handoff`, 'INFO', 'parallel');
-        const authGuard = _deps.authGuard;
-        if (authGuard && typeof authGuard.ensureAuthenticated === 'function') {
-          diag?.step('guard_handoff');
-          const result = await authGuard.ensureAuthenticated(worker.page);
-          outcome = result === false ? 'guard_returned_false' : 'guard_returned_nonfalse_unverified';
-          return result !== false;
-        }
-        const auth = _deps.auth;
-        if (auth && typeof auth.authenticate === 'function') {
-          diag?.step('auth_handoff');
-          const authed = await auth.authenticate(worker.page);
-          outcome = authed === false ? 'auth_returned_false' : 'auth_returned_unverified';
-          return authed !== false;
-        }
-        return false;
-      }
-
-      // Already logged in (not on Microsoft login and not showing login prompt)
-      log(`[WORKER-${id}] Already logged in`, 'INFO', 'parallel');
-      outcome = diag?.classify() === 'app_origin' ? 'legacy_true_app_unverified' : 'legacy_true_external_unverified';
-      return true;
-
-        // 2. In _waitForFlutterRender(page, workerId): check ALL canvases on the page
-//    and fall back to rendered DOM/text/semantics signals rather than relying
-//    solely on document.querySelector('canvas').
-    while (Date.now() - startTime < maxWaitMs) {
-      try {
-        const check = await page.evaluate(() => {
-          const canvases = Array.from(document.querySelectorAll('canvas'));
-          const hasNonzeroCanvas = canvases.some((c: any) => c.width > 0 && c.height > 0);
-          const hasAnyCanvas = canvases.length > 0;
-          const flEng = (window as any).flutter?.web?.engine;
-          const semanticsCount = flEng?.semantics?._semantics ? Object.keys(flEng.semantics._semantics).length : 0;
-          const interactiveCount = document.querySelectorAll('button, [role="button"], input, a[href], [class*="card"]').length;
-          const bodyTextLen = (document.body?.innerText || '').trim().length;
-          const hasRenderedContent = semanticsCount > 0 || interactiveCount > 0 || bodyTextLen > 20;
-          return {
-            hasNonzeroCanvas,
-            hasAnyCanvas,
-            hasRenderedContent,
-            state: hasNonzeroCanvas ? 'nonzero' : (hasRenderedContent ? 'content' : (hasAnyCanvas ? 'zero' : 'absent')),
-          };
-        });
-
-        if (diagnostic) {
-          if (check.state === 'absent') polls.absent++;
-          if (check.state === 'zero') polls.zero++;
+        // Step 1: Ensure logged in
+        worker.status = 'logging_in';
+        const loggedIn = await this._ensureLoggedIn(worker, id);
+        if (!loggedIn) {
+          log(`[WORKER-${id}] Login failed — retrying in 30s`, 'WARN', 'parallel');
+          await this._sleep(30000);
+          continue;
         }
 
-        if (check.hasNonzeroCanvas || check.hasRenderedContent) {
-          reportPolls();
-          log(
-            `[WORKER-${workerId}] Render detected after ${Math.round((Date.now() - startTime) / 1000)}s (mode=${check.state})`,
-            'INFO',
-            'parallel'
-          );
-          return true;
-        }
-      } catch { if (diagnostic) polls.errors++; }
-      await this._sleep(1000);
-    }
+        // Step 2: Navigate to assignments page
+        worker.status = 'browsing_assignments';
+        await this._navigateAssignments(worker, false);
+        const rendered = await this._waitForFlutterRender(worker.page, id);
+        try { renderSignals.get(worker.page)?.sample('render'); } catch {}
+        log(`[WORKER-${id}] On assignments page`, 'INFO', 'parallel');
 
-       // Even if canvas/DOM stability checks time out, don't block AI vision —
-        // capture a screenshot and let the vision tribunal inspect the page.
+        // If the Flutter canvas never rendered, the assignments page did not load —
+        // most often the session is invalid and /assignments redirected to a
+        // non-Flutter login/home page. Running the module-card query now would
+        // always return zero and mislabel the failure as "No modules available".
+        // Back off and re-check login instead of querying an unrendered page.
         if (!rendered) {
-          log(`[WORKER-${id}] Render check timed out (no nonzero canvas within 60s) — falling back to AI vision screenshot`, 'WARN', 'parallel');
+          log(`[WORKER-${id}] Assignments page did not render (no canvas within 60s) — re-checking login in 30s`, 'WARN', 'parallel');
+          await this._sleep(30000);
+          continue;
         }
 
-        // Step 3: Claim a module from Turso (DOM card path first, then AI vision screenshot fallback)
+        // Step 3: Claim a module from Turso
         const module = await this._claimNextModule(id);
         if (!module) {
-          const providers = _deps.providers;
-          const actionExecutor = _deps.actionExecutor;
-          if (providers && typeof providers.determineNextAction === 'function') {
-            log(`[WORKER-${id}] No DOM module cards found — capturing screenshot for AI vision`, 'INFO', 'parallel');
-            const screenshot = await worker.page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => Buffer.from(''));
-            const base64 = screenshot.toString('base64');
-            if (base64) {
-              const aiAction = await providers.determineNextAction(base64, worker.page.url?.() || null, null).catch(() => null);
-              if (aiAction && actionExecutor && typeof actionExecutor.executeAction === 'function') {
-                await actionExecutor.executeAction(worker.page, aiAction).catch(() => {});
-                worker.lastActivity = Date.now();
-                await this._sleep(2000);
-                continue;
-              }
-            }
-          }
           log(`[WORKER-${id}] No modules available — waiting 30s`, 'INFO', 'parallel');
           await this._sleep(30000);
           continue;
         }
+
+        worker.currentModule = { name: module.name, type: module.type, claimedAt: Date.now() };
+        log(`[WORKER-${id}] Claimed module (type: ${module.type})`, 'INFO', 'parallel');
 
         // Step 4: Find and click the module card
         const clicked = await this._findAndClickModuleCard(worker.page, module.name, id);
