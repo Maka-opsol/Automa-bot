@@ -97,7 +97,7 @@ function classifyError(err: unknown): ClassifiedError {
   }
 
   // Unknown — allow limited retry (max 1) since we can't classify
-  return { category: 'unknown', retryable: true, disableProvider: false, retireProvider: false, retryAfterMs: 1000, description: `Unknown error: ${truncateMsg(msg)}` };
+  return { category: 'unknown', retryable: true, disableProvider: false, retireProvider: false, retryAfterMs: 60000, description: `Unknown error: ${truncateMsg(msg)}` };
 }
 
 function extractStatus(err: unknown): number {
