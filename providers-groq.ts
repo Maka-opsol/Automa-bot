@@ -287,7 +287,7 @@ function GroqProvider() {
       const body: any = {
         model,
         messages: [{ role: 'user', content: modelSupportsVision ? userContent : prompt }],
-        max_tokens: 4096,
+        max_tokens: 512,
         temperature: 0.1,
       };
       const requestOptions: any = signal ? { signal } : undefined;
@@ -341,7 +341,7 @@ function GroqProvider() {
           const retryBody: any = {
             model: body.model,
             messages: [{ role: 'user', content: smallerContent }],
-            max_tokens: 2048, // reduced from 4096
+            max_tokens: 512, // reduced from 4096
             temperature: 0.1,
           };
           const response = await client.chat.completions.create(retryBody, requestOptions);
@@ -362,7 +362,7 @@ function GroqProvider() {
           const textOnlyBody: any = {
             model: body.model,
             messages: [{ role: 'user', content: prompt }], // string, not array
-            max_tokens: 4096,
+            max_tokens: 512,
             temperature: 0.1,
           };
           const response = await client.chat.completions.create(textOnlyBody, requestOptions);
