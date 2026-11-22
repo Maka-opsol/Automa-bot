@@ -86,6 +86,14 @@ test('disabled polling keeps original behavior and emits no diagnostic output',a
   const {c,logs,clock}=coordinator(false);await c._waitForFlutterRender({evaluate:async()=>false},1);
   assert.equal(clock(),60000);assert.equal(logs.length,1);assert.ok(!logs[0].includes('render-diag'));
 });
+test('diagnostics-off failure still reports absent/zero/eval-error breakdown on the WARN line',async()=>{
+  const {c,logs,clock}=coordinator(false);
+  await c._waitForFlutterRender({evaluate:async()=>'absent'},1);
+  assert.equal(clock(),60000);
+  assert.equal(logs.length,1); // only the WARN; no [render-diag] line when diagnostics off
+  assert.match(logs[0],/No nonzero canvas detected within 60s \(polls absent=60 zero=0 eval-error=0 cardsMax=0\); render status unknown — proceeding anyway/);
+  assert.ok(!logs[0].includes('render-diag'));
+});
 test('enabled and disabled modes run the same real first-canvas predicate',async()=>{
   for (const canvas of [null,{width:0,height:20},{width:2,height:3}]) {
     const outcomes=[];
@@ -99,11 +107,12 @@ test('enabled and disabled modes run the same real first-canvas predicate',async
     assert.equal(outcomes[0],canvas&&canvas.width>0&&canvas.height>0?0:60000);
   }
 });
-test('actual worker attaches extra listeners only when enabled',async()=>{
+test('render-diagnostics listeners are opt-in; requestfailed is always-on',async()=>{
   for (const enabled of [false,true]) {const {c}=coordinator(enabled);const events=[];
     const page={on:n=>events.push(n),setDefaultTimeout(){},setDefaultNavigationTimeout(){}};
     c.browser={newContext:async()=>({newPage:async()=>page})};await c._createWorker(0);
-    assert.equal(events.includes('requestfailed'),enabled);assert.equal(events.includes('response'),enabled);
+    assert.ok(events.includes('requestfailed')); // always-on coarse network-failure diagnostic
+    assert.equal(events.includes('response'),enabled); // opt-in render-diagnostics only
     assert.ok(events.includes('pageerror'));assert.ok(events.includes('console'));
   }
 });
