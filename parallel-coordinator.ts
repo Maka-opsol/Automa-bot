@@ -436,11 +436,24 @@ class ParallelCoordinator {
     // escalate to a DOM text-selector click, then give up (hand back to worker loop).
     let signInAttempts = 0;
 
+    // Give the page a moment to reach DOMContentLoaded before the first
+    // screenshot. The 'no recognizable login state at step 0' warnings happen
+    // when the Flutter app has not rendered yet — the bot screenshots a blank
+    // canvas. Cheap: returns immediately if the page is already loaded, waits
+    // at most 8s if not.
+    try { await worker.page.waitForLoadState('domcontentloaded', { timeout: 8000 }); } catch {}
+
     for (let step = 0; step < maxSteps; step++) {
       let b64 = '';
       try {
         const shot = await worker.page.screenshot({ type: 'jpeg', quality: 80 });
         b64 = shot.toString('base64');
+        // Pipe every vision-login screenshot to the dashboard cache so the
+        // dashboard Screenshot panel actually shows what the bot sees. The
+        // dashboard /api/screenshot reads (globalThis).__getLatestScreenshot;
+        // without this write it always returned null (nobody called
+        // __setLatestScreenshot) and the panel showed 'No screenshot available'.
+        try { const _setShot = (globalThis as any).__setLatestScreenshot; if (typeof _setShot === 'function') _setShot(b64, { actionType: 'vision_login', currentState: 'worker-' + id + '-step-' + step }); } catch {}
       } catch {
         log(`[WORKER-${id}] Vision login: screenshot failed at step ${step} — retrying next cycle`, 'WARN', 'parallel');
         return false;
@@ -548,6 +561,7 @@ class ParallelCoordinator {
     // Final check: did we reach the assignments page?
     try {
       const shot = await worker.page.screenshot({ type: 'jpeg', quality: 80 });
+      try { const _setShot = (globalThis as any).__setLatestScreenshot; if (typeof _setShot === 'function' && shot && shot.length) _setShot(shot.toString('base64'), { actionType: 'screenshot', currentState: 'worker-' + id }); } catch {}
       const cards = await providers.findCollapsedCardsCoordinates(shot.toString('base64')) || [];
       if (Array.isArray(cards) && cards.length > 0) {
         log(`[WORKER-${id}] Vision login: assignments page reached on final check`, 'INFO', 'parallel');
@@ -592,6 +606,7 @@ class ParallelCoordinator {
       if (providers && typeof providers.findCollapsedCardsCoordinates === 'function') {
         try {
           const shot = await worker.page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => Buffer.from(''));
+          try { const _setShot = (globalThis as any).__setLatestScreenshot; if (typeof _setShot === 'function' && shot && shot.length) _setShot(shot.toString('base64'), { actionType: 'screenshot', currentState: 'worker-' + id }); } catch {}
           const b64 = shot.toString('base64');
           const cards = await providers.findCollapsedCardsCoordinates(b64).catch(() => []);
           if (Array.isArray(cards) && cards.length > 0) {
@@ -756,6 +771,7 @@ class ParallelCoordinator {
     if (!providers || typeof providers.findCollapsedCardsCoordinates !== 'function') return false;
     try {
       const screenshot = await worker.page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => Buffer.from(''));
+      try { const _setShot = (globalThis as any).__setLatestScreenshot; if (typeof _setShot === 'function' && screenshot && screenshot.length) _setShot(screenshot.toString('base64'), { actionType: 'screenshot', currentState: 'worker-' + id }); } catch {}
       const base64 = screenshot.toString('base64');
       const cards = await providers.findCollapsedCardsCoordinates(base64).catch(() => []);
       if (!Array.isArray(cards) || cards.length === 0) {
@@ -931,6 +947,7 @@ class ParallelCoordinator {
 
     // Use the AI tribunal to generate the memo
     const screenshot = await worker.page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => Buffer.from(''));
+    try { const _setShot = (globalThis as any).__setLatestScreenshot; if (typeof _setShot === 'function' && screenshot && screenshot.length) _setShot(screenshot.toString('base64'), { actionType: 'screenshot', currentState: 'worker-' + id }); } catch {}
     const base64 = screenshot.toString('base64');
 
     const providers = _deps.providers;
@@ -991,6 +1008,7 @@ class ParallelCoordinator {
     while (questionsAnswered < maxQuestions) {
       // Take a screenshot
       const screenshot = await worker.page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => Buffer.from(''));
+      try { const _setShot = (globalThis as any).__setLatestScreenshot; if (typeof _setShot === 'function' && screenshot && screenshot.length) _setShot(screenshot.toString('base64'), { actionType: 'screenshot', currentState: 'worker-' + id }); } catch {}
       const base64 = screenshot.toString('base64');
 
       // Check if we're on the score screen (exercise complete)
@@ -1043,6 +1061,7 @@ class ParallelCoordinator {
     // Take screenshots and let AI decide what to do for up to 20 actions
     for (let i = 0; i < 20; i++) {
       const screenshot = await worker.page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => Buffer.from(''));
+      try { const _setShot = (globalThis as any).__setLatestScreenshot; if (typeof _setShot === 'function' && screenshot && screenshot.length) _setShot(screenshot.toString('base64'), { actionType: 'screenshot', currentState: 'worker-' + id }); } catch {}
       const base64 = screenshot.toString('base64');
 
       const providers = _deps.providers;
