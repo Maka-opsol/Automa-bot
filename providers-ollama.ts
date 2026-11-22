@@ -144,7 +144,7 @@ function OllamaProvider() {
     const rawContent = await retryWithBackoff(
       () => callChatCompletionWithRollback(
         config.endpoint, apiKey, model, base64Image, prompt, 'Ollama',
-        { signal, maxTokens: options.maxTokens, temperature: options.temperature ?? 0.1 }
+        { signal, maxTokens: options.maxTokens, temperature: options.temperature ?? 0.1, timeoutMs: 0 }
       ),
       { providerName: 'Ollama', signal, maxRetries: options.maxRetries ?? 2, baseDelay: 2000 }
     );
