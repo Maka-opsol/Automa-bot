@@ -131,7 +131,7 @@ async function callChatCompletionWithRollback(
   base64Image: any,
   prompt: any,
   providerName: string,
-  options: { signal?: any; maxTokens?: number; temperature?: number; responseFormat?: any; systemMessage?: string } = {}
+  options: { signal?: any; maxTokens?: number; temperature?: number; responseFormat?: any; systemMessage?: string; timeoutMs?: number } = {}
 ): Promise<string> {
   const log = _getLog().log;
 
@@ -185,7 +185,7 @@ async function callChatCompletionWithRollback(
     headers,
     body: JSON.stringify(payload),
     signal: options.signal,
-  });
+  }, options.timeoutMs);
 
   // Handle 422 — protocol chameleon: try without response_format
   if (response.status === 422 && payload.response_format) {
@@ -196,7 +196,7 @@ async function callChatCompletionWithRollback(
       headers,
       body: JSON.stringify(payload),
       signal: options.signal,
-    });
+    }, options.timeoutMs);
     if (retryResponse.ok) {
       const data = await retryResponse.json();
       const content = data.choices?.[0]?.message?.content || '';
