@@ -18,6 +18,34 @@
 
 'use strict';
 
+// ═══════════════════════════════════════════════════════════════════════
+// PLATFORM DETECTION (2026-11-22): GitHub Actions, not Render.
+// ═══════════════════════════════════════════════════════════════════════
+// Must run BEFORE any require() — the container loads memory-mode,
+// local-vlm-failover, db-backup, survival-ephemeral-shield, flutter-stability-waiter,
+// all of which check process.env.RENDER / RENDER_SERVICE_ID. A leftover RENDER env
+// var (from a prior Render deploy) makes them force MINIMUM mode, disable the
+// local VLM, and treat the disk as ephemeral Render storage. On GitHub Actions
+// (/home/runner/work/, GITHUB_ACTIONS=true, 16GB runner) clear those vars first.
+(function _detectPlatform() {
+  const cwd = (typeof process.cwd === 'function' ? process.cwd() : '');
+  const isGitHubActions = !!(
+    process.env.GITHUB_ACTIONS === 'true' ||
+    process.env.RUNNER_OS ||
+    process.env.CI === 'true' ||
+    /\/runner\/work\//.test(cwd) ||
+    /\\runner\\work\\/.test(cwd)
+  );
+  if (isGitHubActions) {
+    for (const k of ['RENDER', 'RENDER_SERVICE_ID', 'RENDER_INSTANCE_ID', 'RENDER_SERVICE_TYPE', 'RENDER_DISCORD_TOKEN', 'RENDER_EXTERNAL_URL']) {
+      if (process.env[k] !== undefined) {
+        console.log(`[platform] GitHub Actions detected — clearing leftover ${k} env var (the bot is NOT on Render).`);
+        delete process.env[k];
+      }
+    }
+  }
+})();
+
 require('./error-handler');
 const http = require('http');
 const { PROJECT_ROOT } = require('./project-root');
