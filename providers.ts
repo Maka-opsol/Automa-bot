@@ -10,6 +10,7 @@ const { extractMicrosoftCaptchaText } = require('./providers-detection-captcha-t
 const { checkModuleCompletionViaVision } = require('./providers-detection-module-completion');
 const { findSignInButtonCoordinates } = require('./providers-detection-signin-button');
 const { findCollapsedCardsCoordinates } = require('./providers-detection-collapsed-cards');
+const { findElementCoordinates } = require('./providers-detection-element');
 const { safeCall, coalescer } = require('./providers-base');
 
 const fs = require('fs');
@@ -72,4 +73,4 @@ async function determineNextAction(base64Image: string, pageUrl: string | null =
   return action;
 }
 
-module.exports = { determineNextAction, detectNewWork, resetCycleProviderState, getAvailableProviders, solveCaptchaWithVision, extractMicrosoftCaptchaText, checkModuleCompletionViaVision, findSignInButtonCoordinates, findCollapsedCardsCoordinates, getStats, updateStats, registerDynamicProvider, _injectDependencies };
+module.exports = { determineNextAction, detectNewWork, resetCycleProviderState, getAvailableProviders, solveCaptchaWithVision, extractMicrosoftCaptchaText, checkModuleCompletionViaVision, findSignInButtonCoordinates, findCollapsedCardsCoordinates, findElementCoordinates, getStats, updateStats, registerDynamicProvider, _injectDependencies };
