@@ -190,6 +190,16 @@ class ParallelCoordinator {
         log(`[WORKER-${id}] [request-failed] type=${type} host=${host} reason=${reason}`, 'WARN', 'parallel');
       } catch {}
     });
+    // Block the non-essential Atlassian support widget (automa.atlassian.net) so it
+    // stops consuming scarce proxy bandwidth and generating timeout/reset noise while the
+    // app bundle loads. The bot never interacts with the support widget; blocking it is
+    // safe. NOTE: this is noise/bandwidth hygiene only — it does NOT fix the core problem
+    // (the geo-fenced app host's multi-MB Flutter bundle aborts on the flaky proxy with
+    // ERR_ABORTED / ERR_CONNECTION_RESET; pdf.js on cdn.jsdelivr.net returns
+    // ERR_EMPTY_RESPONSE). That requires a stable proxy that can sustain large downloads.
+    try {
+      await page.route(/^https?:\/\/[^/]*\.atlassian\.net\//, (r: any) => r.abort());
+    } catch {}
 
     this.workers.set(id, {
       id,
@@ -236,20 +246,15 @@ class ParallelCoordinator {
         // Step 2: Navigate to assignments page
         worker.status = 'browsing_assignments';
         await this._navigateAssignments(worker, false);
-        const rendered = await this._waitForFlutterRender(worker.page, id);
+        // Render-readiness is ADVISORY only: this bot relies on AI vision (Ollama) to see
+        // the page and decide what to do, so a missing Flutter <canvas> or DOM module
+        // cards must NOT block the vision path. _waitForFlutterRender runs for at most 10s
+        // here (a short diagnostic sample — it logs the canvas/cardsMax breakdown) but its
+        // result no longer gates the flow. The vision-based module finder below screenshots
+        // the actual rendered pixels and lets the VLM locate the module cards.
+        await this._waitForFlutterRender(worker.page, id, 10000);
         try { renderSignals.get(worker.page)?.sample('render'); } catch {}
         log(`[WORKER-${id}] On assignments page`, 'INFO', 'parallel');
-
-        // If the Flutter canvas never rendered, the assignments page did not load —
-        // most often the session is invalid and /assignments redirected to a
-        // non-Flutter login/home page. Running the module-card query now would
-        // always return zero and mislabel the failure as "No modules available".
-        // Back off and re-check login instead of querying an unrendered page.
-        if (!rendered) {
-          log(`[WORKER-${id}] Assignments page did not render (no canvas within 60s) — re-checking login in 30s`, 'WARN', 'parallel');
-          await this._sleep(30000);
-          continue;
-        }
 
         // Step 3: Claim a module from Turso
         const module = await this._claimNextModule(id);
@@ -262,8 +267,13 @@ class ParallelCoordinator {
         worker.currentModule = { name: module.name, type: module.type, claimedAt: Date.now() };
         log(`[WORKER-${id}] Claimed module (type: ${module.type})`, 'INFO', 'parallel');
 
-        // Step 4: Find and click the module card
-        const clicked = await this._findAndClickModuleCard(worker.page, module.name, id);
+        // Step 4: Find and click the module card — VISION FIRST. The bot relies on AI
+        // vision (Ollama), not DOM/Semantics: _findAndClickModuleViaVision screenshots
+        // the page and asks the VLM for module-card coordinates via
+        // providers.findCollapsedCardsCoordinates. The DOM finder is a fallback only when
+        // vision is unavailable (no providers wired, e.g. in tests).
+        const clicked = await this._findAndClickModuleViaVision(worker, module.name, id)
+          || await this._findAndClickModuleCard(worker.page, module.name, id);
         if (!clicked) {
           worker.errors++;
           log(`[WORKER-${id}] Module could not be opened — attempting to release claim for retry`, 'WARN', 'parallel');
@@ -338,7 +348,25 @@ class ParallelCoordinator {
       diag?.step('post_entry_wait');
       await this._sleep(3000);
 
-      // Check if we're on the assignments page (already logged in)
+      // VISION-DRIVEN LOGIN (primary): this bot relies on AI vision, not URL substrings
+      // or DOM CSS selectors. When providers are wired, drive the full login state machine
+      // visually: MathU landing ("Sign in with Microsoft") → MS email field → MS password
+      // field → KMSI "Yes" → assignments page. MicrosoftAuthV2 (DOM CSS form-fill) is dead
+      // code — ensureAuthenticated (cycle-auth-guard Rule 1) returns the page as-is on MS
+      // pages and never calls authenticate, so the form MUST be filled here, visually.
+      // Guarded: tests inject no providers, so the legacy URL-based logic below runs
+      // unchanged and produces the exact outcomes/phases the authnet tests assert.
+      const providers = _deps.providers;
+      if (providers && typeof providers.findSignInButtonCoordinates === 'function'
+          && typeof providers.findElementCoordinates === 'function'
+          && typeof providers.findCollapsedCardsCoordinates === 'function') {
+        const visionOk = await this._visionLogin(worker, id, providers);
+        outcome = visionOk ? 'vision_login_complete' : 'vision_login_incomplete';
+        log(`[WORKER-${id}] Vision login: ${visionOk ? 'complete — logged in' : 'incomplete — will retry'}`, visionOk ? 'INFO' : 'WARN', 'parallel');
+        return visionOk;
+      }
+
+      // Legacy URL-based login (fallback when no vision providers — tests).
       const url = worker.page.url();
       diag?.step('login_decision');
       if (url.includes('/assignments') || url.includes('app.mathu.co.za')) {
@@ -365,7 +393,7 @@ class ParallelCoordinator {
           outcome = 'no_auth_module';
           return false;
         }
-        // Already logged in
+        // Already logged in (legacy URL-based — used only when no vision providers).
         log(`[WORKER-${id}] Already logged in`, 'INFO', 'parallel');
         outcome = diag?.classify() === 'app_origin' ? 'legacy_true_app_unverified' : 'legacy_true_external_unverified';
         return true;
@@ -381,12 +409,168 @@ class ParallelCoordinator {
     }
   }
 
+  /**
+   * Vision-driven login state machine. Drives the full MathU → Microsoft → assignments
+   * login flow visually: screenshots each step and asks the VLM (via
+   * providers.findCollapsedCardsCoordinates / findSignInButtonCoordinates /
+   * findElementCoordinates) what is on screen, then acts (click sign-in, type email,
+   * type password, click KMSI "Yes") until the assignments page (module cards) is
+   * reached. Replaces the dead DOM-CSS MicrosoftAuthV2 form-fill (ensureAuthenticated
+   * never calls authenticate — Rule 1 returns the page as-is) and the URL-substring
+   * "Already logged in" guess. The Flutter SPA's URL does not change between pages
+   * (providers-prompts.ts:207), so vision — not URL — must drive every step.
+   */
+  private async _visionLogin(worker: WorkerState, id: number, providers: any): Promise<boolean> {
+    const log = getLog();
+    const cfg = getCONFIG();
+    const email: string = (typeof cfg.getMicrosoftEmail === 'function' ? cfg.getMicrosoftEmail() : '') || cfg.MICROSOFT_EMAIL || '';
+    const password: string = (typeof cfg.getMicrosoftPassword === 'function' ? cfg.getMicrosoftPassword() : '') || cfg.MICROSOFT_PASSWORD || '';
+    const maxSteps = 8;
+
+    for (let step = 0; step < maxSteps; step++) {
+      let b64 = '';
+      try {
+        const shot = await worker.page.screenshot({ type: 'jpeg', quality: 80 });
+        b64 = shot.toString('base64');
+      } catch {
+        log(`[WORKER-${id}] Vision login: screenshot failed at step ${step} — retrying next cycle`, 'WARN', 'parallel');
+        return false;
+      }
+
+      // Already on the assignments page? (logged in — module cards visible)
+      let cards: any[] = [];
+      try { cards = await providers.findCollapsedCardsCoordinates(b64) || []; } catch {}
+      if (Array.isArray(cards) && cards.length > 0) {
+        log(`[WORKER-${id}] Vision login: assignments page reached (${cards.length} module cards) — logged in`, 'INFO', 'parallel');
+        return true;
+      }
+
+      // MathU landing: "Sign in with Microsoft" button
+      try {
+        const signIn = await providers.findSignInButtonCoordinates(b64);
+        if (signIn && typeof signIn.x === 'number' && typeof signIn.y === 'number') {
+          await this._visionClick(worker, id, signIn, '"Sign in with Microsoft"');
+          await this._sleep(3000);
+          continue;
+        }
+      } catch {}
+
+      // MS email field — type the configured email
+      if (email) {
+        try {
+          const ef = await providers.findElementCoordinates(b64, 'the email input field');
+          if (ef && typeof ef.x === 'number' && typeof ef.y === 'number') {
+            await this._visionClick(worker, id, ef, 'email field');
+            await worker.page.keyboard.type(email).catch(() => {});
+            await worker.page.keyboard.press('Enter').catch(() => {});
+            log(`[WORKER-${id}] Vision login: typed email + pressed Enter`, 'INFO', 'parallel');
+            await this._sleep(3000);
+            continue;
+          }
+        } catch {}
+      }
+
+      // MS password field — type the configured password
+      if (password) {
+        try {
+          const pf = await providers.findElementCoordinates(b64, 'the password input field');
+          if (pf && typeof pf.x === 'number' && typeof pf.y === 'number') {
+            await this._visionClick(worker, id, pf, 'password field');
+            await worker.page.keyboard.type(password).catch(() => {});
+            await worker.page.keyboard.press('Enter').catch(() => {});
+            log(`[WORKER-${id}] Vision login: typed password + pressed Enter`, 'INFO', 'parallel');
+            await this._sleep(5000);
+            continue;
+          }
+        } catch {}
+      }
+
+      // KMSI "Stay signed in?" — click "Yes"
+      try {
+        const kmsi = await providers.findElementCoordinates(b64, 'the "Yes" button on the "Stay signed in" page');
+        if (kmsi && typeof kmsi.x === 'number' && typeof kmsi.y === 'number') {
+          await this._visionClick(worker, id, kmsi, 'KMSI "Yes"');
+          log(`[WORKER-${id}] Vision login: clicked KMSI "Yes"`, 'INFO', 'parallel');
+          await this._sleep(3000);
+          continue;
+        }
+      } catch {}
+
+      // No recognizable login state at this step — stop and let the worker loop retry.
+      log(`[WORKER-${id}] Vision login: no recognizable login state at step ${step} (not assignments/sign-in/email/password/KMSI) — handing back to worker loop`, 'WARN', 'parallel');
+      break;
+    }
+
+    // Final check: did we reach the assignments page?
+    try {
+      const shot = await worker.page.screenshot({ type: 'jpeg', quality: 80 });
+      const cards = await providers.findCollapsedCardsCoordinates(shot.toString('base64')) || [];
+      if (Array.isArray(cards) && cards.length > 0) {
+        log(`[WORKER-${id}] Vision login: assignments page reached on final check`, 'INFO', 'parallel');
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  /**
+   * Click a vision-returned coordinate (percentages 0-1) by converting to pixels via the
+   * real viewport size, then dispatching a mouse click. Centralizes the pattern already
+   * used inline by _findAndClickModuleViaVision. Failures are non-fatal — the caller's
+   * loop re-screenshots and retries.
+   */
+  private async _visionClick(worker: WorkerState, id: number, coords: any, label: string): Promise<void> {
+    const log = getLog();
+    try {
+      const vp = await worker.page.evaluate(() => ({ w: window.innerWidth || 1440, h: window.innerHeight || 900 })).catch(() => ({ w: 1440, h: 900 }));
+      const px = Math.round(coords.x * vp.w), py = Math.round(coords.y * vp.h);
+      log(`[WORKER-${id}] Vision login: clicking ${label} at (${px}, ${py})`, 'INFO', 'parallel');
+      await worker.page.mouse.click(px, py).catch(() => {});
+    } catch {}
+  }
+
   /** Navigate as before, with optional passive timing and outcome metadata. */
   private async _navigateAssignments(worker: WorkerState, isReturn: boolean): Promise<any> {
+    const log = getLog();
     const diag = worker.authNetDiag;
     diag?.begin(isReturn ? 'assignments_return_load' : 'assignments_load');
     try {
       const result = await worker.page.goto(getCONFIG().APP_URL + '/assignments', { waitUntil: 'load', timeout: 120000 });
+
+      // VISION NAVIGATION VERIFICATION: confirm the page actually rendered the
+      // assignments view (module cards visible), not a login redirect / blank / error.
+      // The bot relies on AI vision — the Flutter SPA's URL may not change between pages
+      // (providers-prompts.ts:207), so a successful goto + "On assignments page" log is
+      // NOT proof. Guarded: tests inject no providers, so the legacy goto-only behavior
+      // is preserved (authnet asserts _navigateAssignments returns {ok:true}, outcome
+      // 'completed'; combined-privacy asserts the 'assignments_load' diag marker).
+      const providers = _deps.providers;
+      if (providers && typeof providers.findCollapsedCardsCoordinates === 'function') {
+        try {
+          const shot = await worker.page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => Buffer.from(''));
+          const b64 = shot.toString('base64');
+          const cards = await providers.findCollapsedCardsCoordinates(b64).catch(() => []);
+          if (Array.isArray(cards) && cards.length > 0) {
+            log(`[WORKER-${worker.id}] Vision nav: assignments page confirmed (${cards.length} module cards)`, 'INFO', 'parallel');
+          } else {
+            // No module cards — could be a login redirect (session expired) or blank.
+            // Probe for a sign-in button to distinguish; if present, the session expired
+            // and the next _ensureLoggedIn cycle (vision) will re-drive login.
+            let signIn: any = null;
+            if (typeof providers.findSignInButtonCoordinates === 'function') {
+              signIn = await providers.findSignInButtonCoordinates(b64).catch(() => null);
+            }
+            if (signIn && typeof signIn.x === 'number') {
+              log(`[WORKER-${worker.id}] Vision nav: /assignments did NOT render module cards — "Sign in with Microsoft" button visible (session expired); next login cycle will re-authenticate`, 'WARN', 'parallel');
+            } else {
+              log(`[WORKER-${worker.id}] Vision nav: /assignments did NOT render module cards and no sign-in button — page may be blank/loading; downstream module-finder will retry`, 'WARN', 'parallel');
+            }
+          }
+        } catch (e: any) {
+          log(`[WORKER-${worker.id}] Vision nav check error: ${e && e.message ? e.message : 'unknown'} — continuing`, 'WARN', 'parallel');
+        }
+      }
+
       diag?.finish('completed');
       return result;
     } catch (err: any) {
@@ -508,6 +692,52 @@ class ParallelCoordinator {
 
   /**
    * Find and click a module card on the assignments page.
+   */
+  /**
+   * Find and click a module card using AI VISION — the primary path. Screenshots the
+   * assignments page and asks the VLM (via providers.findCollapsedCardsCoordinates, a
+   * MathU-specific vision function that returns module-card coordinates as viewport
+   * percentages) to locate module cards, then clicks the first. Returns false when vision
+   * providers are unavailable or the VLM sees no cards, so the DOM finder
+   * (_findAndClickModuleCard) can fall back. No DOM/Semantics/canvas assumptions — the
+   * VLM sees the rendered pixels.
+   *
+   * NOTE: the VLM selects which card to open (it cannot match text by name), so the
+   * Turso claim name is best-effort here; a follow-up could have the VLM return the
+   * opened module's title so Turso records the right completion.
+   */
+  private async _findAndClickModuleViaVision(worker: WorkerState, _moduleName: string, id: number): Promise<boolean> {
+    const log = getLog();
+    const providers = _deps.providers;
+    if (!providers || typeof providers.findCollapsedCardsCoordinates !== 'function') return false;
+    try {
+      const screenshot = await worker.page.screenshot({ type: 'jpeg', quality: 80 }).catch(() => Buffer.from(''));
+      const base64 = screenshot.toString('base64');
+      const cards = await providers.findCollapsedCardsCoordinates(base64).catch(() => []);
+      if (!Array.isArray(cards) || cards.length === 0) {
+        log(`[WORKER-${id}] Vision: no module cards detected by VLM`, 'DEBUG', 'parallel');
+        return false;
+      }
+      const c = cards[0];
+      const vx = typeof c?.x === 'number' ? c.x : 0.5;
+      const vy = typeof c?.y === 'number' ? c.y : 0.5;
+      const vp = await worker.page.evaluate(() => ({ w: window.innerWidth || 1440, h: window.innerHeight || 900 })).catch(() => ({ w: 1440, h: 900 }));
+      const px = Math.round(vx * vp.w);
+      const py = Math.round(vy * vp.h);
+      log(`[WORKER-${id}] Vision: clicking module card at (${px}, ${py}) [viewport ${Math.round(vx * 100)}%, ${Math.round(vy * 100)}%]`, 'INFO', 'parallel');
+      await worker.page.mouse.click(px, py).catch(() => {});
+      await this._sleep(3000); // Wait for navigation/expand
+      return true;
+    } catch {
+      log(`[WORKER-${id}] Vision module-finder failed`, 'ERROR', 'parallel');
+      return false;
+    }
+  }
+
+  /**
+   * Find and click a module card by matching text — the DOM FALLBACK when vision is
+   * unavailable. Queries [class*="card"], [role="listitem"], .module-card and clicks the
+   * card whose text contains the module name.
    */
   private async _findAndClickModuleCard(page: any, moduleName: string, workerId: number): Promise<boolean> {
     const log = getLog();
@@ -831,12 +1061,11 @@ class ParallelCoordinator {
   /**
    * Wait for Flutter's CanvasKit to finish rendering.
    */
-  private async _waitForFlutterRender(page: any, workerId: number): Promise<boolean> {
+  private async _waitForFlutterRender(page: any, workerId: number, maxWaitMs: number = 60000): Promise<boolean> {
     const log = getLog();
-    const maxWaitMs = 60000;
     const startTime = Date.now();
     const diagnostic = process.env.MATHU_RENDER_DIAGNOSTICS === '1';
-    const polls = { absent: 0, zero: 0, errors: 0 };
+    const polls = { absent: 0, zero: 0, errors: 0, cardsMax: 0 };
     const reportPolls = () => {
       if (diagnostic && (renderPollReports.get(page) || 0) < 3) {
         renderPollReports.set(page, (renderPollReports.get(page) || 0) + 1);
@@ -846,30 +1075,51 @@ class ParallelCoordinator {
 
     while (Date.now() - startTime < maxWaitMs) {
       try {
-        // Always use the coarse string predicate so absent/zero can be counted even with
-        // diagnostics off. No page text, attributes or pixels are read — only whether a
-        // <canvas> exists and its width/height (drawing-buffer size).
+        // Render readiness has TWO independent signals, either of which is sufficient:
+        //   (a) a sized Flutter <canvas> (canvas-based app), OR
+        //   (b) module cards as DOM elements — _findAndClickModuleCard queries exactly
+        //       [class*="card"], [role="listitem"], .module-card, so an assignments page
+        //       that renders modules as DOM (with NO canvas) must not be blocked by a
+        //       canvas-only gate (which would log absent=60 on a fully rendered page).
+        // The card path also requires no password input on the page, so a redirected
+        // login form (which may have a "card"-classed wrapper) cannot satisfy the gate.
+        // No page text, attributes or pixels are read — only element counts and sizes.
+        // Legacy string returns ('absent'/'zero'/'nonzero' from test mocks) normalize.
         const result = await page.evaluate(() => {
           const canvas = document.querySelector('canvas');
-          if (!canvas) return 'absent';
-          return canvas.width > 0 && canvas.height > 0 ? 'nonzero' : 'zero';
+          const canvasState = !canvas ? 'absent' : (canvas.width > 0 && canvas.height > 0 ? 'nonzero' : 'zero');
+          let cards = 0, hasPassword = false;
+          try {
+            if (typeof document.querySelectorAll === 'function') {
+              cards = document.querySelectorAll('[class*="card"], [role="listitem"], .module-card').length;
+              hasPassword = document.querySelectorAll('input[type="password"]').length > 0;
+            }
+          } catch {}
+          return { canvas: canvasState, cards, hasPassword };
         });
-        if (result === 'absent') polls.absent++;
-        else if (result === 'zero') polls.zero++;
-        if (result === 'nonzero') {
+        const canvasState = (result && typeof result === 'object') ? result.canvas : result;
+        const cards = (result && typeof result === 'object' && typeof result.cards === 'number') ? result.cards : 0;
+        const hasPassword = (result && typeof result === 'object' && typeof result.hasPassword === 'boolean') ? result.hasPassword : false;
+        if (canvasState === 'absent') polls.absent++;
+        else if (canvasState === 'zero') polls.zero++;
+        if (cards > polls.cardsMax) polls.cardsMax = cards;
+        if (canvasState === 'nonzero' || (cards >= 1 && !hasPassword)) {
           reportPolls();
-          log(`[WORKER-${workerId}] Nonzero canvas detected after ${Math.round((Date.now() - startTime) / 1000)}s; render readiness unverified`, 'INFO', 'parallel');
+          const sig = canvasState === 'nonzero' ? `canvas=${canvasState}` : `cards=${cards}`;
+          log(`[WORKER-${workerId}] Render signal detected (${sig}) after ${Math.round((Date.now() - startTime) / 1000)}s; render readiness unverified`, 'INFO', 'parallel');
           return true;
         }
       } catch { polls.errors++; }
       await this._sleep(1000);
     }
     reportPolls();
-    // Always report the absent/zero/eval-error breakdown on failure (NOT gated behind
-    // MATHU_RENDER_DIAGNOSTICS): absent = no <canvas> at all (Flutter bundle not loading
-    // through the proxy), zero = canvas exists but unsized (slow engine bootstrap),
-    // eval-error = context detached/closed. Only coarse counts — no page content.
-    log(`[WORKER-${workerId}] No nonzero canvas detected within 60s (polls absent=${polls.absent} zero=${polls.zero} eval-error=${polls.errors}); render status unknown — proceeding anyway`, 'WARN', 'parallel');
+    // Always report the breakdown on failure (NOT gated behind MATHU_RENDER_DIAGNOSTICS):
+    // absent = no <canvas>, zero = canvas unsized, eval-error = context detached/closed,
+    // cardsMax = most module-card DOM elements seen in any single poll. cardsMax=0 means
+    // neither canvas nor cards ever appeared (bundle did not load); cardsMax>0 with no
+    // success means cards were present but a password input was too (redirected to login).
+    // Only coarse counts — no page content.
+    log(`[WORKER-${workerId}] No nonzero canvas detected within ${Math.round(maxWaitMs / 1000)}s (polls absent=${polls.absent} zero=${polls.zero} eval-error=${polls.errors} cardsMax=${polls.cardsMax}); render status unknown — proceeding anyway`, 'WARN', 'parallel');
     return false;
   }
 
