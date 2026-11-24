@@ -58,6 +58,22 @@ function getLogError(): (msg: string, err: Error, ctx?: any) => void {
   try { return require('./logger').logError; } catch { return (msg: string, err: Error) => console.error(msg, err); }
 }
 
+// Throttle per-provider validation-failure DEBUG logs. These fire every vision
+// call when a provider fails validation (Ollama 'Not an array', Cloudflare
+// 'no JSON object found', etc.) — ~12-18/min with 3 workers, all DEBUG, all
+// shipped to the dashboard. The first failure per provider per 5 min still
+// logs; repeats are suppressed. recordProviderResult (called by the caller
+// right after) still records every failure for stats.
+const _validationFailLog = new Map<string, number>();
+function _throttledValidationLog(providerName: string, msg: string): void {
+  const now = Date.now();
+  const last = _validationFailLog.get(providerName) || 0;
+  if (now - last > 300000) {
+    _validationFailLog.set(providerName, now);
+    getLog()(msg, 'DEBUG', 'vision');
+  }
+}
+
 let localVLM: any = null;
 let onnxSession: any = null;
 
@@ -281,7 +297,7 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
       // pure refusal ("I cannot fulfill this request.") with no JSON at all. Treat that
       // as a failure, not a success carrying a null result.
       if (!parsed || typeof parsed !== 'object') {
-        log(`Provider ${provider.name} returned non-JSON/prose response (no extractable action object)`, 'DEBUG', 'vision');
+        _throttledValidationLog(provider.name, `Provider ${provider.name} returned non-JSON/prose response (no extractable action object)`);
         recordProviderResult(provider.name, false, latency);
         return null;
       }
@@ -291,7 +307,7 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
       if (validator) {
         try { result = validator(parsed); }
         catch (e: any) {
-          log(`Provider ${provider.name} validation failed: ${e.message}`, 'DEBUG', 'vision');
+          _throttledValidationLog(provider.name, `Provider ${provider.name} validation failed: ${e.message}`);
           recordProviderResult(provider.name, false, latency);
           return null;
         }
