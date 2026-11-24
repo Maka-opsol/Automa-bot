@@ -424,11 +424,15 @@ async function runHealthCheck(): Promise<HealthState> {
       const cycleMgr = require('./cycle-cycle-manager');
       if (cycleMgr.isOrParked?.() && level === 'degraded') {
         if (Math.random() < 0.05) log(`Health ${level.toUpperCase()} (OR-parked, expected): ${score}/12`, 'DEBUG');
-      } else {
+      } else if (level !== prevLevel) {
+        // Only log the full state on LEVEL TRANSITION (not every 60s) — the
+        // every-minute DEGRADED log with the same score flooded the dashboard.
         log(`Health ${level.toUpperCase()}: ${score}/12 [${Object.entries(checks).map(([k, v]) => `${k}=${v.points}`).join(', ')}]`, level === 'fatal' ? 'ERROR' : 'WARN');
       }
     } catch {
-      log(`Health ${level.toUpperCase()}: ${score}/12 [${Object.entries(checks).map(([k, v]) => `${k}=${v.points}`).join(', ')}]`, level === 'fatal' ? 'ERROR' : 'WARN');
+      if (level !== prevLevel) {
+        log(`Health ${level.toUpperCase()}: ${score}/12 [${Object.entries(checks).map(([k, v]) => `${k}=${v.points}`).join(', ')}]`, level === 'fatal' ? 'ERROR' : 'WARN');
+      }
     }
   }
 
