@@ -482,13 +482,34 @@ class ParallelCoordinator {
           // canvas pixel), this fires the nav handler reliably. If it is a Flutter
           // canvas widget, this throws silently and we retry vision coords.
           if (signInAttempts >= 2) {
+            // After 2 vision clicks that did not advance, also try a DOM
+            // text-selector click — if the button is a real <a>/<button> (not a
+            // canvas pixel), this fires the nav handler reliably.
             let domOk = false;
             try { await worker.page.click('text=/Sign in with Microsoft/i', { timeout: 5000 }); domOk = true; }
             catch { domOk = false; }
             log(`[WORKER-${id}] Vision login: DOM sign-in click ${domOk ? 'succeeded' : 'failed'} (vision coords were not advancing)`, 'INFO', 'parallel');
-          } else {
-            await this._visionClick(worker, id, signIn, '"Sign in with Microsoft"');
           }
+          // ALWAYS multi-click the sign-in button: the vision Y varies +/-0.1
+          // across attempts (clicks logged at 320/400/440 for a button near
+          // viewport center ~400 on a 1280x800 context), so a single click at
+          // the vision coords often misses the Flutter canvas button. Click the
+          // vision Y + the viewport center +/- a strip; the OAuth redirect
+          // starts on the first hit, later clicks land on the redirecting page
+          // (harmless). mouse.click + touchscreen.tap cover both pointer +
+          // touch gesture paths.
+          try {
+            const vp = await worker.page.evaluate(() => ({ w: window.innerWidth || 1440, h: window.innerHeight || 900 })).catch(() => ({ w: 1440, h: 900 }));
+            const cx = Math.round(signIn.x * vp.w), cy = Math.round(signIn.y * vp.h);
+            const mid = Math.round(vp.h / 2);
+            const ys = [cy, mid, mid - 40, mid + 40];
+            log(`[WORKER-${id}] Vision login: clicking "Sign in with Microsoft" at x=${cx} ys=[${ys.join(',')}] (vision ${cy} + center strip)`, 'INFO', 'parallel');
+            for (const py of ys) {
+              await worker.page.mouse.click(cx, py).catch(() => {});
+              await worker.page.touchscreen.tap(cx, py).catch(() => {});
+              await this._sleep(250);
+            }
+          } catch {}
           signInAttempts++;
           // Poll for the OAuth redirect (URL change) for up to 15s — slow proxy.
           let navigated = false;
