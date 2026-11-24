@@ -416,9 +416,14 @@ class CircuitBreaker {
     } else {
       this.consecutiveFailures++;
       if (this.consecutiveFailures >= this._config.failureThreshold) {
+        const wasAlreadyOpen = this.state === 'open';
         this.state = 'open';
         this.openedAt = Date.now();
-        _log(`${this.providerName} circuit → open (${this.consecutiveFailures} consecutive failures, category=${category}, cooldown=${this._getCooldownMs() / 1000}s)`, 'ERROR', 'health');
+        // Only log the open transition ONCE (closed → open). Re-logging every
+        // consecutive failure (5, 6, ... 152, 153 ...) flooded the dashboard.
+        if (!wasAlreadyOpen) {
+          _log(`${this.providerName} circuit → open (${this.consecutiveFailures} consecutive failures, category=${category}, cooldown=${this._getCooldownMs() / 1000}s)`, 'ERROR', 'health');
+        }
       }
     }
   }
