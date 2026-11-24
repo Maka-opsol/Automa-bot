@@ -184,9 +184,15 @@ class ParallelCoordinator {
         let type = 'unknown';
         try { type = req.resourceType(); } catch {}
         if (['image', 'media', 'font', 'stylesheet'].includes(type)) return;
-        failedReqs++;
         let host = 'unknown';
         try { host = new URL(req.url()).host; } catch {}
+        // Suppress logs for hosts the bot intentionally blocks (atlassian
+        // support widget, google fonts) — page.route(..., r => r.abort())
+        // triggers requestfailed, which would otherwise log a self-inflicted
+        // WARN per block AND consume the 10-log cap before real failures
+        // (cdn.jsdelivr.net pdf.js, the Flutter bundle host) get logged.
+        if (host.endsWith('atlassian.net') || host.endsWith('gstatic.com') || host.endsWith('googleapis.com')) return;
+        failedReqs++;
         const reason = (req.failure() && req.failure().errorText) || 'unknown';
         log(`[WORKER-${id}] [request-failed] type=${type} host=${host} reason=${reason}`, 'WARN', 'parallel');
       } catch {}
@@ -443,6 +449,25 @@ class ParallelCoordinator {
     // canvas. Cheap: returns immediately if the page is already loaded, waits
     // at most 8s if not.
     try { await worker.page.waitForLoadState('domcontentloaded', { timeout: 8000 }); } catch {}
+    // Wait for the Flutter CanvasKit to render (nonzero <canvas> or module-card
+    // DOM) before screenshotting, retrying the page load once if the bundle /
+    // pdf.js abort on the flaky proxy (cdn.jsdelivr.net ERR_ABORTED /
+    // ERR_EMPTY_RESPONSE). domcontentloaded fires when the HTML is parsed, but
+    // the multi-MB Flutter bundle + pdf.js can still be loading/aborting —
+    // without this the first screenshot is a blank white page (the dashboard
+    // showed white boxes), the vision hallucinates sign-in button coords, and
+    // the click never navigates. _waitForFlutterRender polls up to 60s; if no
+    // canvas appears, reload + retry once (the proxy often succeeds on a second
+    // load). After the retries, proceed anyway (best effort).
+    for (let renderAttempt = 0; renderAttempt < 2; renderAttempt++) {
+      try {
+        if (await this._waitForFlutterRender(worker.page, id, 60000)) break;
+        if (renderAttempt === 0) {
+          log(`[WORKER-${id}] Vision login: canvas not rendered after 60s — reloading page (retry 1/2)`, 'WARN', 'parallel');
+          try { await worker.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+        }
+      } catch {}
+    }
 
     for (let step = 0; step < maxSteps; step++) {
       let b64 = '';
