@@ -157,6 +157,19 @@ function getChromeFlags(options: any = {}) {
   if (extraFlags) {
     const envFlagList = extraFlags.split(/\s+/).filter(Boolean);
     for (const flag of envFlagList) {
+      // Round 5e: --disable-gpu kills WebGL → Flutter CanvasKit can't init →
+      // blank white canvas (the code's own comments at line 15 + 45 say so).
+      // The 2026-10-27 bugfix at line 142 refused to strip it, claiming
+      // "Chromium NEEDS --disable-gpu to enable SwiftShader" — that is
+      // BACKWARDS: --disable-gpu DISABLES the GPU process and KILLS WebGL;
+      // SwiftShader is enabled by KEEPING the GPU + --use-gl=angle
+      // --use-angle=swiftshader. Strip --disable-gpu on non-Render platforms
+      // (GitHub Actions 16GB has no OOM risk); keep it on Render free tier
+      // (512MB, where blank-canvas is the accepted tradeoff vs OOM).
+      if (flag === '--disable-gpu' && !isRenderFree) {
+        envSkipped++;
+        continue;
+      }
       if (dedupEnvFlags && _matchesCommonPrefix(flag) && addedPrefixes.has(flag)) {
         envSkipped++;
         continue;
