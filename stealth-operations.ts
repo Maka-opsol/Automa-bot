@@ -375,12 +375,13 @@ function _resolveDecoy(): typeof DEFAULT_DECOY {
  * timer and inline before any risk computation.
  */
 function _pruneExpiredSignals(): void {
+  // Prune silently — the "Pruned N expired signal(s)" DEBUG log fired on every
+  // reportSignal() call (which calls reevaluate() → _computeRiskAssessment() →
+  // here), producing dozens of redundant lines per cycle. The signal queue is
+  // internal state; level transitions (the actionable event) are logged
+  // separately in _applyLevelTransition().
   const now = _now();
-  const before = _signals.length;
   _signals = _signals.filter(s => (now - s.timestamp) < s.ttlMs);
-  if (_signals.length !== before) {
-    log(`Pruned ${before - _signals.length} expired signal(s); ${_signals.length} remain`, 'DEBUG');
-  }
 }
 
 /**
@@ -513,7 +514,10 @@ function reportSignal(
     _signals.splice(0, _signals.length - MAX_SIGNAL_QUEUE);
     log(`Signal queue overflowed ${MAX_SIGNAL_QUEUE}; dropped oldest`, 'WARN');
   }
-  log(`Signal +1: kind=${kind} weight=${signal.weight} source=${source}${detail ? ` detail="${detail.slice(0, 80)}"` : ''}`, 'DEBUG');
+  // Don't log every signal at DEBUG — provider 429s are now dropped from the
+  // signal path (see providers-base.ts), so the remaining target-site signals
+  // are low-volume; level transitions (NORMAL→ELEVATED→MAXIMUM, the actionable
+  // event) are logged in _applyLevelTransition().
   // Immediately re-evaluate — a single big signal can flip us to MAXIMUM
   // and we want that to happen now, not on the next 30s tick.
   reevaluate();
