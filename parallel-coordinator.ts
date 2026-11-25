@@ -495,6 +495,28 @@ class ParallelCoordinator {
       let cards: any[] = [];
       try { cards = await providers.findCollapsedCardsCoordinates(b64) || []; } catch {}
       if (Array.isArray(cards) && cards.length > 0) {
+        // Render-gate (2026-11-25): the VLM hallucinates "module cards" on a
+        // blank page (bodyLen=1478, no flutter-view) → false "logged in" → the
+        // logging_in → browsing_assignments → "No module cards" → logging_in
+        // loop. Verify the Flutter app actually mounted before trusting the
+        // vision. Cheap presence check (flutter-view + flt-glass-pane) + a
+        // body-size threshold that cleanly separates the raw shell (1478B) from
+        // a mounted app (4890B+). If not mounted, this was a hallucination —
+        // return false so the outer login cycle retries instead of declaring a
+        // false logged-in.
+        let mounted = false;
+        try {
+          mounted = await worker.page.evaluate(() => {
+            const fv = !!document.querySelector('flutter-view');
+            const gp = !!document.querySelector('flt-glass-pane');
+            const bodyLen = document.body ? document.body.innerHTML.length : 0;
+            return (fv && gp) || bodyLen > 3000;
+          });
+        } catch {}
+        if (!mounted) {
+          log(`[WORKER-${id}] Vision login: VLM saw ${cards.length} cards but Flutter app not mounted (blank page) — hallucination; retrying login cycle`, 'WARN', 'parallel');
+          return false;
+        }
         log(`[WORKER-${id}] Vision login: assignments page reached (${cards.length} module cards) — logged in`, 'INFO', 'parallel');
         return true;
       }
@@ -1294,10 +1316,33 @@ class ParallelCoordinator {
           // bundle-load/CSP/JS-error, not WebGL.
           webgl2: (() => { try { return !!document.createElement('canvas').getContext('webgl2'); } catch (e) { return 'err'; } })(),
           webgl1: (() => { try { return !!document.createElement('canvas').getContext('webgl'); } catch (e) { return 'err'; } })(),
+          // Round 5f (2026-11-25): Flutter-load probe — distinguishes WHY the app
+          // didn't mount when bodyLen is stuck at the raw shell (~1478):
+          //   flutterLoaded = did main.dart.js / canvaskit.js / flutter.js get
+          //     FETCHED (PerformanceResourceTiming)? false → network/CDN blocked
+          //     the bundle, or the site served a degraded page to detected
+          //     automation (navigator.webdriver was true because the spoof had a
+          //     SyntaxError + never applied — fixed separately).
+          //   flutterBootstrap = did the Flutter engine START? window._flutter /
+          //     flutterConfiguration / _flutter_build_config. false → flutter.js
+          //     loaded but threw (JS error) or never ran.
+          flutterLoaded: (() => {
+            try {
+              const entries = (performance && typeof performance.getEntriesByType === 'function')
+                ? performance.getEntriesByType('resource') : [];
+              return entries.some((e: any) => /main\.dart|canvaskit|flutter\.js/i.test(e.name || ''));
+            } catch { return 'err'; }
+          })(),
+          flutterBootstrap: (() => {
+            try {
+              const w: any = window;
+              return !!(w._flutter || w.flutterConfiguration || w._flutter_build_config || w.flutter);
+            } catch { return 'err'; }
+          })(),
         };
       });
       if (_d && typeof _d === 'object') {
-        _renderDiag = ` ready=${(_d as any).ready} scripts=${(_d as any).scriptCount} flutterScripts=${(_d as any).flutterScripts} bodyLen=${(_d as any).bodyLen} webgl2=${(_d as any).webgl2} webgl1=${(_d as any).webgl1}`;
+        _renderDiag = ` ready=${(_d as any).ready} scripts=${(_d as any).scriptCount} flutterScripts=${(_d as any).flutterScripts} bodyLen=${(_d as any).bodyLen} webgl2=${(_d as any).webgl2} webgl1=${(_d as any).webgl1} flutterLoaded=${(_d as any).flutterLoaded} flutterBootstrap=${(_d as any).flutterBootstrap}`;
       }
     } catch {}
     log(`[WORKER-${workerId}] No render signal detected within ${Math.round(maxWaitMs / 1000)}s (polls absent=${polls.absent} zero=${polls.zero} eval-error=${polls.errors} htmlRendered=${polls.htmlRendered} cardsMax=${polls.cardsMax}); render status unknown — proceeding anyway${_renderDiag}`, 'WARN', 'parallel');
