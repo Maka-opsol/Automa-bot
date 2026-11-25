@@ -459,11 +459,18 @@ class ParallelCoordinator {
     // the click never navigates. _waitForFlutterRender polls up to 60s; if no
     // canvas appears, reload + retry once (the proxy often succeeds on a second
     // load). After the retries, proceed anyway (best effort).
-    for (let renderAttempt = 0; renderAttempt < 2; renderAttempt++) {
+    // Wait for the Flutter CanvasKit to render before screenshotting. The
+    // multi-MB Flutter bundle can take >60s to download + execute on a slow or
+    // throttled connection, so wait up to 120s per attempt (was 60s — the poll
+    // timed out before the bundle finished, producing "absent=60" + blank
+    // screenshots). If no canvas appears, reload + retry: the bundle host often
+    // succeeds on a second load. Three attempts total (initial + 2 reloads);
+    // the old loop only reloaded once ("retry 1/2" — retry 2/2 was a no-op).
+    for (let renderAttempt = 0; renderAttempt < 3; renderAttempt++) {
       try {
-        if (await this._waitForFlutterRender(worker.page, id, 60000)) break;
-        if (renderAttempt === 0) {
-          log(`[WORKER-${id}] Vision login: canvas not rendered after 60s — reloading page (retry 1/2)`, 'WARN', 'parallel');
+        if (await this._waitForFlutterRender(worker.page, id, 120000)) break;
+        if (renderAttempt < 2) {
+          log(`[WORKER-${id}] Vision login: canvas not rendered after 120s — reloading page (retry ${renderAttempt + 1}/2)`, 'WARN', 'parallel');
           try { await worker.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
         }
       } catch {}
@@ -1234,7 +1241,30 @@ class ParallelCoordinator {
     // neither canvas nor cards ever appeared (bundle did not load); cardsMax>0 with no
     // success means cards were present but a password input was too (redirected to login).
     // Only coarse counts — no page content.
-    log(`[WORKER-${workerId}] No nonzero canvas detected within ${Math.round(maxWaitMs / 1000)}s (polls absent=${polls.absent} zero=${polls.zero} eval-error=${polls.errors} cardsMax=${polls.cardsMax}); render status unknown — proceeding anyway`, 'WARN', 'parallel');
+    // On timeout, gather a coarse diagnostic (no page content/URLs — only
+    // counts + readyState + whether the Flutter bundle script tag is present)
+    // so the next log shows WHY the canvas is absent: bundle-not-loaded (no
+    // script tag), bundle-loaded-but-app-not-initialized (script tag present,
+    // body empty), or page-not-navigated (readyState still loading).
+    let _renderDiag = '';
+    try {
+      const _d = await page.evaluate(() => {
+        const scripts = typeof document.querySelectorAll === 'function' ? document.querySelectorAll('script') : [];
+        const flutterScripts = typeof document.querySelectorAll === 'function'
+          ? document.querySelectorAll('script[src*="main.dart"], script[src*="flutter"], script[src*="canvaskit"]').length
+          : 0;
+        return {
+          ready: document.readyState,
+          scriptCount: scripts.length,
+          flutterScripts,
+          bodyLen: document.body ? document.body.innerHTML.length : 0,
+        };
+      });
+      if (_d && typeof _d === 'object') {
+        _renderDiag = ` ready=${(_d as any).ready} scripts=${(_d as any).scriptCount} flutterScripts=${(_d as any).flutterScripts} bodyLen=${(_d as any).bodyLen}`;
+      }
+    } catch {}
+    log(`[WORKER-${workerId}] No nonzero canvas detected within ${Math.round(maxWaitMs / 1000)}s (polls absent=${polls.absent} zero=${polls.zero} eval-error=${polls.errors} cardsMax=${polls.cardsMax}); render status unknown — proceeding anyway${_renderDiag}`, 'WARN', 'parallel');
     return false;
   }
 
