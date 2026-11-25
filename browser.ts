@@ -277,6 +277,15 @@ class BrowserManager {
     const _w = Number(CONFIG.DISPLAY_WIDTH) || 1280;
     const _h = Number(CONFIG.DISPLAY_HEIGHT) || 800;
     addWindowSizeFlags(flags, _w, _h);
+    // Round 5e: FORCE SwiftShader WebGL flags so Flutter CanvasKit can render.
+    // CanvasKit requires WebGL2; headless Chromium needs explicit software-GL
+    // flags or WebGL is unavailable → CanvasKit fails to init → no <canvas>
+    // → blank white page (the "absent=60" symptom; browser-chrome-flags.ts:15
+    // calls it "permanently blank white canvas"). The workflow env CHROMIUM_FLAGS
+    // also sets these, but force them here so WebGL is guaranteed regardless of
+    // env/config/.env overrides or launch-strategy cascade. Idempotent.
+    const _swiftshaderFlags = ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'];
+    for (const _ssf of _swiftshaderFlags) { if (!flags.includes(_ssf)) flags.push(_ssf); }
     // BUG FIX (2026-09-08): headless MUST default to true.
     // The old code `!!getCONFIG().HEADLESS` evaluates to `false` when CONFIG is
     // empty (during cold start or after self-heal rollback), which causes
@@ -317,6 +326,9 @@ class BrowserManager {
     const _w = Number(CONFIG.DISPLAY_WIDTH) || 1280;
     const _h = Number(CONFIG.DISPLAY_HEIGHT) || 800;
     const flags = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-extensions', '--disable-background-networking', '--disable-http2', `--window-size=${_w},${_h}`];
+    // Round 5e: SwiftShader WebGL flags (see getFullLaunchOptions) — CanvasKit
+    // needs WebGL even in the reduced fallback strategy.
+    for (const _ssf of ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist']) { if (!flags.includes(_ssf)) flags.push(_ssf); }
     const options: any = { headless: true, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000 };
     // BUG FIX (2026-09-08): Only set per-context proxy when proxy is active.
     if (!(globalThis as any).__proxyDisabled) {
@@ -328,7 +340,11 @@ class BrowserManager {
 
   getMinimalLaunchOptions() { 
     const CONFIG = getCONFIG();
-    const options: any = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-zygote', '--single-process', '--disable-http2'], timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 30000 };
+    // Round 5e: SwiftShader WebGL flags (see getFullLaunchOptions) — CanvasKit
+    // needs WebGL even in the minimal fallback strategy.
+    const _minArgs = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-zygote', '--single-process', '--disable-http2'];
+    for (const _ssf of ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist']) { if (!_minArgs.includes(_ssf)) _minArgs.push(_ssf); }
+    const options: any = { headless: true, args: _minArgs, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 30000 };
     // BUG FIX (2026-09-08): Only set per-context proxy when proxy is active.
     if (!(globalThis as any).__proxyDisabled) {
       options.proxy = { server: 'per-context' };
