@@ -1,4 +1,3 @@
-
 # ═══════════════════════════════════════════════════════════════════════
 # MathU Bot — Perpetual Loop GitHub Actions Workflow (v4)
 # ═══════════════════════════════════════════════════════════════════════
@@ -232,6 +231,11 @@ jobs:
           CLOUDINARY_FOLDER: ${{ secrets.CLOUDINARY_FOLDER || vars.CLOUDINARY_FOLDER }}
           # Chrome flags — full WebGL support (16GB RAM, no limits needed)
           CHROMIUM_FLAGS: "--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-default-apps --disable-sync --disable-translate --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader --window-size=1280,800"
+          # Round 5e: turn on Flutter-script load / CSP / request-failure logging
+          # so the next run shows WHY the canvas is absent (bundle-not-loaded vs
+          # CSP-block vs WebGL-missing). Gated behind this flag in
+          # parallel-coordinator.ts:153 + render-diagnostics.ts.
+          MATHU_RENDER_DIAGNOSTICS: "1"
           DISPLAY: ":99"
           NODE_ENV: production
           PORT: 10000
