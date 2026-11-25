@@ -732,14 +732,37 @@ async function executePatchInSandbox(patchText: string, filePath: string, source
       }
     }
   }
-  const jsForValidation: string = transpiledJs ?? patchText;
-  try {
-    new vm.Script(jsForValidation, { filename: path.basename(filePath), timeout: 3000 });
-  } catch (e: any) {
-    _log(`Sandbox: Syntax validation failed for ${filePath}: ${e.message}`, 'ERROR', 'sandbox-executor');
-    return { safe: false, error: `Patch syntax validation failed: ${e.message}` };
+  // Layer 4: Syntax validation using vm.Script (does NOT execute)
+  // For .ts files, vm.Script alone will reject TypeScript type annotations
+  // (e.g. `let _deps: Record<string, any> = {}` → "Unexpected token ':'").
+  // Transpile to JS first using esbuild (preferred) or typescript, then
+  // validate the JS output with vm.Script. The transpiled JS is reused in
+  // Layer 6 so the isolated worker (which lives in /tmp/ and has no access
+  // to node_modules) doesn't need to re-transpile.
+  //
+  // FIX (2026-11-25): If NO transpiler is available (both esbuild + typescript
+  // missing from node_modules — the current state of this repo), vm.Script on
+  // raw TS rejects EVERY .ts patch with "Unexpected token ':'" → the dashboard
+  // reports `source_syntax: rejected — Syntax validation failed or parser
+  // unavailable` + the patch never applies. The old comment claimed "Layer 6's
+  // tsc --noEmit will catch real TS errors" but vm.Script rejected BEFORE
+  // Layer 6 ran, so that fallback never worked. Now: when a .ts patch can't be
+  // transpiled, SKIP vm.Script (we cannot validate TS syntax without a parser)
+  // and defer to Layer 6's isolated-process validation. This unblocks valid TS
+  // patches while still catching genuinely malformed JS patches (which vm.Script
+  // still validates below).
+  if (isTypeScript && !transpiledJs) {
+    _log(`Sandbox: No transpiler available for TS patch ${filePath} (esbuild + typescript both missing) — skipping vm.Script syntax check; deferring to Layer 6 isolated validation`, 'WARN', 'sandbox-executor');
+  } else {
+    const jsForValidation: string = transpiledJs ?? patchText;
+    try {
+      new vm.Script(jsForValidation, { filename: path.basename(filePath), timeout: 3000 });
+    } catch (e: any) {
+      _log(`Sandbox: Syntax validation failed for ${filePath}: ${e.message}`, 'ERROR', 'sandbox-executor');
+      return { safe: false, error: `Patch syntax validation failed: ${e.message}` };
+    }
+    _log(`Sandbox: Syntax validation passed for ${filePath}${transpiledJs ? ' (after TS transpile)' : ''}`, 'INFO', 'sandbox-executor');
   }
-  _log(`Sandbox: Syntax validation passed for ${filePath}${transpiledJs ? ' (after TS transpile)' : ''}`, 'INFO', 'sandbox-executor');
 
   // Layer 5: Size limit (prevent oversized patches)
   const MAX_PATCH_SIZE_BYTES = 500 * 1024; // 500KB
