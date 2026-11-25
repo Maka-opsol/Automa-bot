@@ -650,14 +650,14 @@ class BrowserManager {
             { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
           ];
           plugins.length = 1;
-          (plugins as any).item = function(i: number) { return plugins[i] || null; };
-          (plugins as any).namedItem = function(name: string) {
+          plugins.item = function(i) { return plugins[i] || null; };
+          plugins.namedItem = function(name) {
             for (let i = 0; i < plugins.length; i++) {
               if (plugins[i] && plugins[i].name === name) return plugins[i];
             }
             return null;
           };
-          (plugins as any).refresh = function() {};
+          plugins.refresh = function() {};
           return plugins;
         }
       });
