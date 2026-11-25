@@ -9,6 +9,15 @@ export function attachRenderDiagnostics(page: any, workerId: number, log: any): 
     emitted++;
     try { log(`[WORKER-${safeId}] [render-diag] ${message}`, 'DEBUG', 'parallel'); } catch {}
   }
+  // WARN-level emitter (visible in INFO/WARN log views; emit() is DEBUG-filtered
+  // so its lines never reach the dashboard). Used for pageerror + flutter-script
+  // load failures — the bot's mounting failure (bodyLen=1478 stuck, scripts=8)
+  // is an uncaught JS error during _flutter.loader.loadEntrypoint / main.dart.js
+  // execution, which was previously invisible (no pageerror capture + DEBUG
+  // events filtered). Uncapped: pageerrors are rare + critical.
+  function emitWarn(message: string): void {
+    try { log(`[WORKER-${safeId}] [render-diag] ${message}`, 'WARN', 'parallel'); } catch {}
+  }
   function kind(url: string, resourceType: string): string | null {
     try {
       const path = new URL(url).pathname.toLowerCase();
@@ -67,7 +76,7 @@ export function attachRenderDiagnostics(page: any, workerId: number, log: any): 
         const type = request.resourceType();
         const label = kind(request.url(), type);
         if (!label) return;
-        emit(`request-failed kind=${label} origin=${origin(request)} reason=${failureGroup(request.failure()?.errorText)}`);
+        emitWarn(`request-failed kind=${label} origin=${origin(request)} reason=${failureGroup(request.failure()?.errorText)}`);
       } catch {}
     });
     page.on('response', (response: any) => {
@@ -85,7 +94,35 @@ export function attachRenderDiagnostics(page: any, workerId: number, log: any): 
         const status = Number(response.status());
         // Successes for generic scripts are noise; preserve PDF/Flutter status.
         if (label === 'other-script' && status < 400) return;
-        emit(`response kind=${label} origin=${origin(request)} status=${statusGroup(status)}`);
+        // Elevate non-2xx flutter/pdf responses to WARN (visible) — a 4xx/5xx on
+        // main.dart.js / canvaskit / flutter.js / pdf.min.mjs explains a
+        // non-mounting app (the bundle loaded-but-failed).
+        if (status >= 400) emitWarn(`response kind=${label} origin=${origin(request)} status=${statusGroup(status)}`);
+        else emit(`response kind=${label} origin=${origin(request)} status=${statusGroup(status)}`);
+      } catch {}
+    });
+    // pageerror (2026-11-25): uncaught JS errors. The bot's mounting failure
+    // (flutterLoaded=true, flutterBootstrap=true, scripts=8, bodyLen=1478) means
+    // flutter.js ran + _flutter was set, but _flutter.loader.loadEntrypoint never
+    // loaded main.dart.js — most likely because loadEntrypoint or main.dart.js
+    // THREW an uncaught error. This was previously invisible (no pageerror
+    // capture). Emit a CLASSIFIED summary only (type + token hints) — never the
+    // raw message, which may contain URLs/page content.
+    page.on('pageerror', (err: any) => {
+      try {
+        const msg = String((err && err.message) || err || '').slice(0, 4096);
+        const type = err instanceof Error ? err.constructor.name : 'Error';
+        const lower = msg.toLowerCase();
+        const hints: string[] = [];
+        if (/pdfjslib/.test(lower)) hints.push('pdfjsLib');
+        if (/loadentrypoint/.test(lower)) hints.push('loadEntrypoint');
+        if (/_flutter/.test(lower)) hints.push('_flutter');
+        if (/canvaskit/.test(lower)) hints.push('canvaskit');
+        if (/main\.dart/.test(lower)) hints.push('main.dart');
+        if (/is not defined/.test(lower)) hints.push('not-defined');
+        if (/unexpected token/.test(lower)) hints.push('syntax');
+        if (/failed to fetch/.test(lower)) hints.push('fetch-failed');
+        emitWarn(`pageerror type=${type}${hints.length ? ' hints=' + hints.join(',') : ''}`);
       } catch {}
     });
   } catch {}
