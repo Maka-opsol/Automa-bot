@@ -317,8 +317,13 @@ async function runVisionPipeline(base64Image: string, prompt: string, { validato
       return { result, provider: provider.name };
     } catch (err: any) {
       const latency = Date.now() - start;
-      // Only log at DEBUG - the safeCall already logged at WARN with structured details
-      log(`Provider ${provider.name} vision failed: ${err.message || err}`, 'DEBUG', 'vision');
+      // Suppress the DEBUG log for known rate-limit / cooldown outcomes —
+      // retryWithBackoff + safeCall already logged the cause. Keep it for
+      // unexpected errors (genuine provider failures worth diagnosing).
+      const _emsg = String(err.message || err);
+      if (!/PROVIDER_COOLDOWN|HTTP_ERROR_429|rate_limit|rate-limited|OPENROUTER_DAILY_LIMIT|DAILY_LIMIT|429/.test(_emsg)) {
+        log(`Provider ${provider.name} vision failed: ${_emsg}`, 'DEBUG', 'vision');
+      }
       recordProviderResult(provider.name, false, latency);
       return null;
     }
