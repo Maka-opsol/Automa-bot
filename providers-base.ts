@@ -272,9 +272,13 @@ async function callChatCompletionWithRollback(
       if (stealth?.reportSignal) {
         const _status = response.status;
         const _detail = `${providerName} HTTP ${_status}: ${errorText.slice(0, 120)}`;
-        if (_status === 429) {
-          stealth.reportSignal('rate_limited', `providers:${providerName}`, _detail, 40);
-        } else if (_status === 403 || _status === 401) {
+        // Provider 429s are API-key rate limits (keyed on the API key, not our
+        // egress IP) — rotating IP/UA via stealth-ops cannot fix them, and a
+        // weight-40 signal flips stealth to ELEVATED/MAXIMUM on every 429,
+        // triggering pointless IP/UA rotation + log spam. Drop the signal for
+        // provider 429s; keep http_block for 403/401/5xx (those may be target-site
+        // IP blocks where rotation actually helps).
+        if (_status === 403 || _status === 401) {
           stealth.reportSignal('http_block', `providers:${providerName}`, _detail, 60);
         } else if (_status >= 500) {
           stealth.reportSignal('http_block', `providers:${providerName}`, _detail, 20);
@@ -595,9 +599,17 @@ async function retryWithBackoff(
       const classified = classifyError(err);
 
       // FIX: On 429, register provider-level cooldown so future calls
-      // (even from different code paths) won't hammer the same provider
+      // (even from different code paths) won't hammer the same provider, AND
+      // short-circuit the retry loop immediately. Without the bail, a 2-retry
+      // call logs "Retry 1/2 → Retry 2/2 → Retry exhausted" (3 lines) for a
+      // provider we JUST marked rate-limited — pure noise. The cooldown gate at
+      // the top of this function catches the next call.
       if (classified.category === 'rate_limited' && providerName) {
         setProviderCooldown(providerName, classified.retryAfterMs);
+        if (attempt < maxRetries) {
+          log(`Provider ${providerName} rate-limited — short-circuiting retries (cooldown ${Math.round(classified.retryAfterMs / 1000)}s)`, 'WARN', 'base');
+          throw err;
+        }
       }
 
       // FIX: Check if the caller (e.g. tribunal) has already aborted.
@@ -682,7 +694,14 @@ async function safeCall(
     ]);
     return result;
   } catch (err: any) {
-    log(`${label} failed: ${err.message || err}`, 'WARN', 'base');
+    // Suppress the redundant WARN for known rate-limit / cooldown outcomes —
+    // retryWithBackoff already logged the specific cause. Logging it again here
+    // at WARN (plus the vision-pipeline DEBUG) was 2+ extra lines per provider
+    // per cycle for a condition we already know about. Keep WARN for unexpected
+    // errors; downgrade rate-limit/cooldown to DEBUG.
+    const _msg = String(err.message || err);
+    const _isRateLimit = /PROVIDER_COOLDOWN|HTTP_ERROR_429|rate_limit|rate-limited|OPENROUTER_DAILY_LIMIT|DAILY_LIMIT|429/.test(_msg);
+    log(`${label} failed: ${_msg}`, _isRateLimit ? 'DEBUG' : 'WARN', 'base');
     fnPromise.catch(() => {});
     throw err;
   } finally {
