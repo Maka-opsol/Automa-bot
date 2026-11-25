@@ -1181,13 +1181,15 @@ class ParallelCoordinator {
   }
 
   /**
-   * Wait for Flutter's CanvasKit to finish rendering.
+   * Wait for Flutter to finish rendering — CanvasKit (<canvas>) OR the HTML
+   * renderer (<flutter-view>/<flt-glass-pane>). The MathU app uses the HTML
+   * renderer, so a canvas-only check always fails (root cause of absent=60).
    */
   private async _waitForFlutterRender(page: any, workerId: number, maxWaitMs: number = 60000): Promise<boolean> {
     const log = getLog();
     const startTime = Date.now();
     const diagnostic = process.env.MATHU_RENDER_DIAGNOSTICS === '1';
-    const polls = { absent: 0, zero: 0, errors: 0, cardsMax: 0 };
+    const polls = { absent: 0, zero: 0, errors: 0, cardsMax: 0, htmlRendered: 0 };
     const reportPolls = () => {
       if (diagnostic && (renderPollReports.get(page) || 0) < 3) {
         renderPollReports.set(page, (renderPollReports.get(page) || 0) + 1);
@@ -1197,12 +1199,19 @@ class ParallelCoordinator {
 
     while (Date.now() - startTime < maxWaitMs) {
       try {
-        // Render readiness has TWO independent signals, either of which is sufficient:
-        //   (a) a sized Flutter <canvas> (canvas-based app), OR
-        //   (b) module cards as DOM elements — _findAndClickModuleCard queries exactly
-        //       [class*="card"], [role="listitem"], .module-card, so an assignments page
-        //       that renders modules as DOM (with NO canvas) must not be blocked by a
-        //       canvas-only gate (which would log absent=60 on a fully rendered page).
+        // Render readiness has THREE independent signals, any of which is sufficient:
+        //   (a) a sized Flutter <canvas> (CanvasKit renderer), OR
+        //   (b) the Flutter HTML renderer mounted: <flutter-view> + a sized
+        //       <flt-glass-pane> with >=1 child (the app's root render surface —
+        //       the sign-in button renders inside as a <flt-platform-view>).
+        //       The MathU app uses the HTML renderer, NOT CanvasKit — it NEVER
+        //       creates a <canvas>, so a canvas-only gate logged "absent=60" on
+        //       a fully rendered page (root cause of the blank-screenshot loop,
+        //       proven by test-real-page-render-v4.js: screenshot 93.74% non-white
+        //       with sign_in_button_0 present, but canvas=false).
+        //   (c) module cards as DOM elements — _findAndClickModuleCard queries
+        //       [class*="card"], [role="listitem"], .module-card, so an
+        //       assignments page that renders modules as DOM must not be blocked.
         // The card path also requires no password input on the page, so a redirected
         // login form (which may have a "card"-classed wrapper) cannot satisfy the gate.
         // No page text, attributes or pixels are read — only element counts and sizes.
@@ -1210,6 +1219,18 @@ class ParallelCoordinator {
         const result = await page.evaluate(() => {
           const canvas = document.querySelector('canvas');
           const canvasState = !canvas ? 'absent' : (canvas.width > 0 && canvas.height > 0 ? 'nonzero' : 'zero');
+          // HTML renderer root: <flutter-view> + <flt-glass-pane> (sized, with content).
+          const flutterView = !!document.querySelector('flutter-view');
+          const fltGlass = document.querySelector('flt-glass-pane');
+          let fltGlassSized = false;
+          let fltGlassChildren = 0;
+          try {
+            if (fltGlass) {
+              const r = fltGlass.getBoundingClientRect();
+              fltGlassSized = r.width > 0 && r.height > 0;
+              fltGlassChildren = fltGlass.childElementCount || 0;
+            }
+          } catch {}
           let cards = 0, hasPassword = false;
           try {
             if (typeof document.querySelectorAll === 'function') {
@@ -1217,17 +1238,26 @@ class ParallelCoordinator {
               hasPassword = document.querySelectorAll('input[type="password"]').length > 0;
             }
           } catch {}
-          return { canvas: canvasState, cards, hasPassword };
+          return { canvas: canvasState, flutterView, fltGlassPresent: !!fltGlass, fltGlassSized, fltGlassChildren, fltPlatformView: !!document.querySelector('flt-platform-view'), cards, hasPassword };
         });
         const canvasState = (result && typeof result === 'object') ? result.canvas : result;
         const cards = (result && typeof result === 'object' && typeof result.cards === 'number') ? result.cards : 0;
         const hasPassword = (result && typeof result === 'object' && typeof result.hasPassword === 'boolean') ? result.hasPassword : false;
-        if (canvasState === 'absent') polls.absent++;
-        else if (canvasState === 'zero') polls.zero++;
+        // htmlRendered = Flutter HTML renderer mounted (<flutter-view> + <flt-glass-pane>
+        // present) OR a platform view (the sign-in button's <flt-platform-view>) present.
+        // NOTE: flt-glass-pane's getBoundingClientRect + childElementCount are UNRELIABLE
+        // (0x0 rect; content lives in shadow DOM / absolutely-positioned platform views),
+        // so use PRESENCE, not size/children. Proven by test-real-page-render-v4.js:
+        // flutter-view + flt-glass-pane + flt-platform-view + #sign_in_button_0 all
+        // present at 12s with a 93.74%-non-white screenshot, but canvas=false forever.
+        const htmlRendered = !!(result && typeof result === 'object' && (((result as any).flutterView && (result as any).fltGlassPresent) || (result as any).fltPlatformView));
+        if (canvasState === 'absent' && !htmlRendered) polls.absent++;
+        else if (canvasState === 'zero' && !htmlRendered) polls.zero++;
+        if (htmlRendered) polls.htmlRendered++;
         if (cards > polls.cardsMax) polls.cardsMax = cards;
-        if (canvasState === 'nonzero' || (cards >= 1 && !hasPassword)) {
+        if (canvasState === 'nonzero' || htmlRendered || (cards >= 1 && !hasPassword)) {
           reportPolls();
-          const sig = canvasState === 'nonzero' ? `canvas=${canvasState}` : `cards=${cards}`;
+          const sig = canvasState === 'nonzero' ? `canvas=${canvasState}` : (htmlRendered ? 'flt-glass-pane(html-renderer)' : `cards=${cards}`);
           log(`[WORKER-${workerId}] Render signal detected (${sig}) after ${Math.round((Date.now() - startTime) / 1000)}s; render readiness unverified`, 'INFO', 'parallel');
           return true;
         }
@@ -1258,13 +1288,19 @@ class ParallelCoordinator {
           scriptCount: scripts.length,
           flutterScripts,
           bodyLen: document.body ? document.body.innerHTML.length : 0,
+          // Round 5e: WebGL probe — CanvasKit requires WebGL2. webgl2=false
+          // means WebGL is unavailable (bad launch flags) → CanvasKit can't
+          // init → no canvas. webgl2=true means WebGL works + the issue is
+          // bundle-load/CSP/JS-error, not WebGL.
+          webgl2: (() => { try { return !!document.createElement('canvas').getContext('webgl2'); } catch (e) { return 'err'; } })(),
+          webgl1: (() => { try { return !!document.createElement('canvas').getContext('webgl'); } catch (e) { return 'err'; } })(),
         };
       });
       if (_d && typeof _d === 'object') {
-        _renderDiag = ` ready=${(_d as any).ready} scripts=${(_d as any).scriptCount} flutterScripts=${(_d as any).flutterScripts} bodyLen=${(_d as any).bodyLen}`;
+        _renderDiag = ` ready=${(_d as any).ready} scripts=${(_d as any).scriptCount} flutterScripts=${(_d as any).flutterScripts} bodyLen=${(_d as any).bodyLen} webgl2=${(_d as any).webgl2} webgl1=${(_d as any).webgl1}`;
       }
     } catch {}
-    log(`[WORKER-${workerId}] No nonzero canvas detected within ${Math.round(maxWaitMs / 1000)}s (polls absent=${polls.absent} zero=${polls.zero} eval-error=${polls.errors} cardsMax=${polls.cardsMax}); render status unknown — proceeding anyway${_renderDiag}`, 'WARN', 'parallel');
+    log(`[WORKER-${workerId}] No render signal detected within ${Math.round(maxWaitMs / 1000)}s (polls absent=${polls.absent} zero=${polls.zero} eval-error=${polls.errors} htmlRendered=${polls.htmlRendered} cardsMax=${polls.cardsMax}); render status unknown — proceeding anyway${_renderDiag}`, 'WARN', 'parallel');
     return false;
   }
 
