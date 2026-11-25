@@ -588,7 +588,13 @@ const env = envalid.cleanEnv(process.env, {
   GAN_MODEL_PATH: str({ default: './models/mouse-gan.onnx' }),
   ENABLE_EXPLORATION_PASS: bool({ default: true }),
   EXPLORATION_CONSECUTIVE_FAILURES: num({ default: 3 }),
-  ENABLE_LOCAL_VLM: bool({ default: false }),
+  // Default ON when running on GitHub Actions (16GB runner — ~2GB model
+  // weights, CPU-only ONNX, no port, no GPU). Gives a local vision fallback
+  // when all cloud providers are rate-limited (the common failure mode).
+  // Default OFF on Render's 512MB free plan (can't fit the weights) + local
+  // dev. Explicit ENABLE_LOCAL_VLM=false still overrides; memory-mode
+  // force-disables it in minimum-memory mode regardless.
+  ENABLE_LOCAL_VLM: bool({ default: process.env.GITHUB_ACTIONS === 'true' }),
   LOCAL_VLM_MODEL: str({ default: 'onnx-community/Phi-3.5-vision-instruct-ONNX' }),
   ENABLE_PUZZLE_SANDBOX: bool({ default: false }),
   ENABLE_RUNTIME_GUARDIAN: bool({ default: true }),
