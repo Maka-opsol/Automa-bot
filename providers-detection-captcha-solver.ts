@@ -47,13 +47,23 @@ async function solveCaptchaWithVision(base64Image: any, instruction: any, signal
   try {
     const res = await runVisionPipeline(base64Image, prompt, {
       validator: (parsed: any) => {
-        if (!Array.isArray(parsed)) throw new Error('Not an array');
+        // Ollama / small models often wrap the array ({coordinates:[...]},
+        // {results:[...]}, {cards:[...]}, {data:[...]}, {items:[...]}) or return
+        // a single bare coordinate object {x,y}. Unwrap before the array check
+        // so a wrapped response isn't rejected as "Not an array".
+        let arr: any = parsed;
+        if (!Array.isArray(arr) && parsed && typeof parsed === 'object') {
+          const wrapped = Object.values(parsed).find((v: any) => Array.isArray(v));
+          if (Array.isArray(wrapped)) arr = wrapped;
+          else if (typeof parsed.x === 'number' && typeof parsed.y === 'number') arr = [parsed];
+        }
+        if (!Array.isArray(arr)) throw new Error('Not an array');
         // BUG FIX (Response 19): Validate each coordinate
-        const valid = parsed
+        const valid = (arr as any[])
           .filter((c: any) => typeof c?.x === 'number' && typeof c?.y === 'number')
           .filter((c: any) => c.x >= 0 && c.y >= 0) // Non-negative
           .slice(0, MAX_COORDS); // Cap count
-        if (valid.length === 0 && parsed.length > 0) {
+        if (valid.length === 0 && arr.length > 0) {
           throw new Error('No valid coordinates in response');
         }
         return valid;
