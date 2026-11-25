@@ -32,9 +32,18 @@ async function findCollapsedCardsCoordinates(base64Image: any, signal: any) {
   try {
     const res = await runVisionPipeline(base64Image, COLLAPSED_CARDS_PROMPT, {
       validator: (parsed: any) => {
-        if (!Array.isArray(parsed)) throw new Error('Not an array');
+        // Ollama / small models often wrap the array ({coordinates:[...]},
+        // {results:[...]}, {cards:[...]}, {data:[...]}, {items:[...]}) or return
+        // a single bare coordinate object {x,y}. Unwrap before the array check.
+        let arr: any = parsed;
+        if (!Array.isArray(arr) && parsed && typeof parsed === 'object') {
+          const wrapped = Object.values(parsed).find((v: any) => Array.isArray(v));
+          if (Array.isArray(wrapped)) arr = wrapped;
+          else if (typeof parsed.x === 'number' && typeof parsed.y === 'number') arr = [parsed];
+        }
+        if (!Array.isArray(arr)) throw new Error('Not an array');
         // BUG FIX (Response 19): Validate each coordinate and cap count
-        const valid = parsed
+        const valid = (arr as any[])
           .filter((c: any) => typeof c?.x === 'number' && typeof c?.y === 'number')
           .filter((c: any) => c.x >= 0 && c.x <= 1 && c.y >= 0 && c.y <= 1)
           .slice(0, MAX_COLLAPSED_CARDS);
