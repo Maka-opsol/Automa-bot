@@ -285,6 +285,15 @@ async function validateProxy(
     const parsed = new URL(proxyUrl);
     host = parsed.hostname;
     port = parseInt(parsed.port, 10);
+    // FIX (2026-11-25): new URL() STRIPS default ports — parsed.port is "" for
+    // "http://host:80" and "https://host:443" (the URL API omits default ports
+    // for the scheme). parseInt("") = NaN → bogus "invalid host/port: host:NaN"
+    // rejection. The logs showed exactly this: proxy http://20.33.10.79:80
+    // failed with "invalid host/port: 20.33.10.79:NaN". Infer the default port
+    // from the protocol when the URL API stripped it.
+    if (!port || isNaN(port)) {
+      port = parsed.protocol === 'https:' ? 443 : 80;
+    }
     if (!host || !port || port <= 0 || port > 65535) {
       return { ok: false, latencyMs: 0, reason: `invalid host/port: ${host}:${port}` };
     }
@@ -402,11 +411,17 @@ async function validateProxy(
  * `maxToTry` bounds the number of proxies we test (default: 5) so we don't
  * spend 30s+ testing a long proxy list.
  */
-async function rotateToValidatedProxy(maxToTry: number = 5): Promise<string | null> {
+async function rotateToValidatedProxy(maxToTry: number = 50): Promise<string | null> {
   if (_proxyUrls.length === 0) {
     log('[IP] rotateToValidatedProxy: no proxies available', 'WARN');
     return null;
   }
+  // FIX (2026-11-25): default was 5 — ProxyScrape returns 7-12 ZA proxies, so
+  // the rotation gave up after testing only 5, leaving working proxies untried.
+  // Default now 50 (effectively "test all available" since the list is <50).
+  // Each failed proxy costs ~5s (curl timeout), so testing 12 ≈ 60s worst case —
+  // acceptable vs. falling back to a direct connection that can't reach the
+  // geo-restricted site at all.
   // Start from the next proxy in the list
   const tried: string[] = [];
   const triedReasons: Array<{ proxy: string; reason: string; latencyMs?: number }> = [];
