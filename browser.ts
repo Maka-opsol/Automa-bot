@@ -286,6 +286,16 @@ class BrowserManager {
     // env/config/.env overrides or launch-strategy cascade. Idempotent.
     const _swiftshaderFlags = ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'];
     for (const _ssf of _swiftshaderFlags) { if (!flags.includes(_ssf)) flags.push(_ssf); }
+    // Round 5g (2026-11-25): Disk-space defense — the bot died at ~2h30m from
+    // disk exhaustion. Chromium's Default/Cache, Code Cache, GPUCache, ShaderCache
+    // accumulate the multi-MB Flutter bundle (main.dart.js + canvaskit.wasm) on
+    // every reload across 3 workers. --disk-cache-size=1 effectively disables
+    // the disk cache (re-fetch each load; the CDN caches server-side so the cost
+    // is small). --disable-crash-reporter stops crash dumps (can be large +
+    // accumulate). --disable-component-update stops background component
+    // downloads. Idempotent.
+    const _diskFlags = ['--disk-cache-size=1', '--disable-crash-reporter', '--disable-component-update'];
+    for (const _df of _diskFlags) { if (!flags.includes(_df)) flags.push(_df); }
     // BUG FIX (2026-09-08): headless MUST default to true.
     // The old code `!!getCONFIG().HEADLESS` evaluates to `false` when CONFIG is
     // empty (during cold start or after self-heal rollback), which causes
@@ -329,7 +339,8 @@ class BrowserManager {
     // Round 5e: SwiftShader WebGL flags (see getFullLaunchOptions) — CanvasKit
     // needs WebGL even in the reduced fallback strategy.
     for (const _ssf of ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist']) { if (!flags.includes(_ssf)) flags.push(_ssf); }
-    const options: any = { headless: true, args: flags, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 45000 };
+    // Round 5g: disk-space defense (see getFullLaunchOptions).
+    for (const _df of ['--disk-cache-size=1', '--disable-crash-reporter', '--disable-component-update']) { if (!flags.includes(_df)) flags.push(_df); }
     // BUG FIX (2026-09-08): Only set per-context proxy when proxy is active.
     if (!(globalThis as any).__proxyDisabled) {
       options.proxy = { server: 'per-context' };
@@ -344,6 +355,8 @@ class BrowserManager {
     // needs WebGL even in the minimal fallback strategy.
     const _minArgs = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-zygote', '--single-process', '--disable-http2'];
     for (const _ssf of ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist']) { if (!_minArgs.includes(_ssf)) _minArgs.push(_ssf); }
+    // Round 5g: disk-space defense (see getFullLaunchOptions).
+    for (const _df of ['--disk-cache-size=1', '--disable-crash-reporter', '--disable-component-update']) { if (!_minArgs.includes(_df)) _minArgs.push(_df); }
     const options: any = { headless: true, args: _minArgs, timeout: getCONFIG().BROWSER_LAUNCH_TIMEOUT_MS || 30000 };
     // BUG FIX (2026-09-08): Only set per-context proxy when proxy is active.
     if (!(globalThis as any).__proxyDisabled) {
@@ -538,6 +551,43 @@ class BrowserManager {
     const fontsJSON = JSON.stringify(this._fpFonts);
 
     return `
+      // ── pdfjsLib stub (2026-11-25): THE mounting fix ──
+      // The app references the global 'pdfjsLib' during init (main.dart.js),
+      // but the site loads pdf.js as an ESM module
+      // (cdn.jsdelivr.net/.../pdf.min.mjs, type="module") which (a) does NOT
+      // set a window global and (b) loads SLOW/FLAKY from the GHA runner
+      // (logs show net::ERR_CONNECTION_RESET / ERR_TIMED_OUT on pdf.min.mjs).
+      // When the app references pdfjsLib before it's defined → ReferenceError
+      // "pdfjsLib is not defined" (pageerror hints=pdfjsLib,not-defined) → the
+      // app's init THROWS → flutter-view never mounts (bodyLen stuck at 1478,
+      // scripts=8, flutterLoaded=true flutterBootstrap=true but no render).
+      // Defining a stub global HERE (before any page script runs, via
+      // addInitScript) guarantees pdfjsLib is always defined → no ReferenceError
+      // → the app mounts. If the real pdf.min.mjs loads later AND sets
+      // window.pdfjsLib, it overrides the stub (preferred). The stub's
+      // getDocument returns a dummy 0-page doc so init code that probes PDF
+      // capability doesn't crash; real PDF rendering needs the actual lib.
+      try {
+        if (typeof window.pdfjsLib === 'undefined') {
+          window.pdfjsLib = {
+            version: '4.6.82', build: 'stub',
+            GlobalWorkerOptions: { workerSrc: '', workerPort: null, isWorkerDisabled: false },
+            getDocument: function() {
+              return { promise: Promise.resolve({
+                numPages: 0, fingerprint: '',
+                getPage: function() { return Promise.resolve(null); },
+                destroy: function() {},
+                getDestination: function() { return Promise.resolve(null); },
+                getOutline: function() { return Promise.resolve([]); },
+              }) };
+            },
+            renderTextLayer: function() { return Promise.resolve(); },
+            AnnotationLayer: function() {},
+            TextLayer: function() {},
+          };
+        }
+      } catch (e) { /* never let the stub itself break page load */ }
+
       // ── WebRTC blocking ──
       const originalRTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection;
       if (originalRTCPeerConnection) {
