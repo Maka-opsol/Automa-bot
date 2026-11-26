@@ -1421,7 +1421,7 @@ async function runCycle(options?: { pixelOnly?: boolean }) {
             try {
               const ipRotator = require('./network-ip-rotator');
               if (_navAttempt === 2 && typeof ipRotator.rotateToValidatedProxy === 'function') {
-                const newProxy = await ipRotator.rotateToValidatedProxy(5);
+                const newProxy = await ipRotator.rotateToValidatedProxy(50);
                 if (!newProxy) {
                   log('Attempt 2: no validated proxy available — skipping to direct connection.', 'WARN', 'cycle');
                   if (typeof ipRotator.bypassProxy === 'function') {
