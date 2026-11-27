@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════════════
+/ ═══════════════════════════════════════════════════════════════════════
 // Parallel Browser Coordinator v2 — task-based distribution
 // ═══════════════════════════════════════════════════════════════════════
 //
@@ -1219,7 +1219,19 @@ class ParallelCoordinator {
       }
     };
 
-    while (Date.now() - startTime < maxWaitMs) {
+    // HARD cap = 2.5× maxWaitMs (300s for the 120s soft limit). FIX (2026-11-26):
+    // the old loop gave up at maxWaitMs + the caller reloaded — but the reload
+    // ABORTS the in-flight main.dart.js/CanvasKit download (multi-MB bundle on a
+    // slow proxy), so the app NEVER mounted (87× in the logs: flutterBootstrap=
+    // true, bodyLen=1478, scripts=8, no flutter-view, 0 mounts in 2000 lines).
+    // Each reload restarted the bundle download from zero. Now: at the soft
+    // limit, if the bundle is STILL LOADING (a critical resource has
+    // responseEnd===0), keep polling up to the hard cap instead of giving up.
+    // Only return false (→ caller reloads) when the bundle is NOT loading
+    // (finished or failed) AND there's no render signal.
+    const _hardCapMs = maxWaitMs * 2.5;
+    let _extended = false;
+    while (Date.now() - startTime < _hardCapMs) {
       try {
         // Render readiness has THREE independent signals, any of which is sufficient:
         //   (a) a sized Flutter <canvas> (CanvasKit renderer), OR
@@ -1284,6 +1296,26 @@ class ParallelCoordinator {
           return true;
         }
       } catch { polls.errors++; }
+      // SOFT-limit extension: at maxWaitMs, if the Flutter bundle is still
+      // in-flight, keep waiting up to the hard cap (see comment above). Only
+      // break (→ caller reloads) when the bundle is NOT loading. This is the
+      // core mounting fix — the reload was aborting the multi-MB bundle.
+      if (!_extended && Date.now() - startTime >= maxWaitMs) {
+        let _stillLoading = false;
+        try {
+          _stillLoading = await page.evaluate(() => {
+            const _crit = /main\.dart\.js|canvaskit(?:\.js|\.wasm)?|flutter\.js|flutter_bootstrap\.js/i;
+            const _entries: any[] = (performance as any).getEntriesByType ? (performance as any).getEntriesByType('resource') : [];
+            return _entries.some((e: any) => _crit.test(e.name || '') && e.responseEnd === 0);
+          });
+        } catch {}
+        if (_stillLoading) {
+          _extended = true;
+          try { log(`[WORKER-${workerId}] Render wait: bundle still in-flight at ${Math.round(maxWaitMs / 1000)}s — extending to ${Math.round(_hardCapMs / 1000)}s (a reload would abort the in-flight main.dart.js/CanvasKit download + restart from zero)`, 'WARN', 'parallel'); } catch {}
+        } else {
+          break; // bundle finished/failed + no render → give up → caller reloads
+        }
+      }
       await this._sleep(1000);
     }
     reportPolls();
