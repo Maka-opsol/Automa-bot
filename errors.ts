@@ -29,6 +29,14 @@ const ERROR_CODES: Readonly<Record<string, string>> = Object.freeze({
   PROVIDER_PERMANENT: 'E_PROVIDER_PERMANENT',
   STATE_DEADLOCK: 'E_STATE_DEADLOCK',
   PATCH_FAILED: 'E_PATCH_FAILED',
+  // Patch failure split (2026-11-25): distinguish a DENIAL (a gate REFUSED the
+  // patch — syntax/scope/consensus/approval/auditor-voted-unsafe) from a
+  // MECHANISM failure (the apply/write/compile/exec step itself errored, OR an
+  // auditor crashed/was unavailable/skipped). Callers previously collapsed both
+  // into the vague "denied or the mechanism itself failed" string; these codes
+  // let each failure path tag exactly which kind it is.
+  PATCH_DENIED: 'E_PATCH_DENIED',
+  PATCH_MECHANISM_FAILED: 'E_PATCH_MECHANISM_FAILED',
 
   // Domain-specific
   CONFIG_INVALID: 'E_CONFIG_INVALID',
@@ -219,6 +227,22 @@ class StateDeadlockError extends HealableError {
 class PatchFailedError extends HealableError {
   constructor(message = 'Self-heal patch failed', opts: MathUBotErrorOptions = {}) {
     super(message, { ...opts, code: ERROR_CODES.PATCH_FAILED });
+  }
+}
+
+// Patch failure split (2026-11-25): two distinct classes so a thrown patch
+// failure carries whether it was DENIED (a gate refused) or a MECHANISM
+// failure (the apply/exec step crashed). PatchFailedError remains the
+// catch-all for callers that don't yet distinguish.
+class PatchDeniedError extends HealableError {
+  constructor(message = 'Patch denied by a gate', opts: MathUBotErrorOptions = {}) {
+    super(message, { ...opts, code: opts.code || ERROR_CODES.PATCH_DENIED });
+  }
+}
+
+class PatchMechanismError extends HealableError {
+  constructor(message = 'Patch mechanism failure', opts: MathUBotErrorOptions = {}) {
+    super(message, { ...opts, code: opts.code || ERROR_CODES.PATCH_MECHANISM_FAILED });
   }
 }
 
