@@ -48,10 +48,21 @@ export function attachRenderDiagnostics(page: any, workerId: number, log: any): 
     const codes: Record<string, string> = {
       'net::ERR_ABORTED': 'aborted', 'net::ERR_BLOCKED_BY_CLIENT': 'client-block',
       'net::ERR_BLOCKED_BY_RESPONSE': 'response-block', 'net::ERR_BLOCKED_BY_CSP': 'csp-block',
-      'net::ERR_NAME_NOT_RESOLVED': 'dns', 'net::ERR_TIMED_OUT': 'timeout',
-      'net::ERR_CONNECTION_TIMED_OUT': 'timeout', 'net::ERR_CONNECTION_REFUSED': 'connection',
-      'net::ERR_CONNECTION_RESET': 'connection', 'net::ERR_CONNECTION_CLOSED': 'connection',
-      'net::ERR_CERT_AUTHORITY_INVALID': 'tls', 'net::ERR_CERT_DATE_INVALID': 'tls'
+      'net::ERR_NAME_NOT_RESOLVED': 'dns', 'net::ERR_NAME_RESOLUTION_FAILED': 'dns',
+      'net::ERR_TIMED_OUT': 'timeout', 'net::ERR_CONNECTION_TIMED_OUT': 'timeout',
+      'net::ERR_CONNECTION_REFUSED': 'connection', 'net::ERR_CONNECTION_RESET': 'connection',
+      'net::ERR_CONNECTION_CLOSED': 'connection', 'net::ERR_CONNECTION_FAILED': 'connection-failed',
+      'net::ERR_SOCKET_CONNECTION_FAILED': 'socket-connection',
+      'net::ERR_CERT_AUTHORITY_INVALID': 'tls', 'net::ERR_CERT_DATE_INVALID': 'tls',
+      'net::ERR_CERT_COMMON_NAME_INVALID': 'tls', 'net::ERR_CERT_WEAK_SIGNATURE_ALGORITHM': 'tls',
+      'net::ERR_FAILED': 'generic-failed', 'net::ERR_INVALID_RESPONSE': 'invalid-response',
+      'net::ERR_EMPTY_RESPONSE': 'empty-response', 'net::ERR_ADDRESS_UNREACHABLE': 'unreachable',
+      'net::ERR_NETWORK_CHANGED': 'network-changed', 'net::ERR_INTERNET_DISCONNECTED': 'disconnected',
+      'net::ERR_FILE_NOT_FOUND': 'not-found', 'net::ERR_TOO_MANY_REDIRECTS': 'redirect-loop',
+      'net::ERR_INVALID_HTTP_METHOD': 'invalid-method', 'net::ERR_CACHE_MISS': 'cache-miss',
+      'net::ERR_SSL_PROTOCOL_ERROR': 'tls', 'net::ERR_PROXY_CONNECTION_FAILED': 'proxy-connection',
+      'net::ERR_TUNNEL_CONNECTION_FAILED': 'proxy-tunnel',
+      'net::ERR_MANDATORY_PROXY_CONFIGURATION_FAILED': 'proxy-misconfigured'
     };
     return typeof text === 'string' && Object.prototype.hasOwnProperty.call(codes, text) ? codes[text] : 'other';
   }
