@@ -1,4 +1,4 @@
-/ ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 // Parallel Browser Coordinator v2 — task-based distribution
 // ═══════════════════════════════════════════════════════════════════════
 //
@@ -54,6 +54,22 @@ import { navigateWorkerEntry } from './worker-navigation-recovery';
 let _deps: any = {};
 const renderSignals = new WeakMap<object, any>();
 const renderPollReports = new WeakMap<object, number>();
+
+// v12: LOGIN-STAGNATION SELF-HEAL TRIGGER state (2026-11-26). The existing
+// self-heal triggers only fire on restarts / OOM / errors (consecutiveFailures)
+// / 20-min stagnation DURING A MODULE CYCLE (action.actionType === 'wait'). But
+// when the bot is stuck in the LOGIN phase (all workers 'logging_in', 0 modules
+// completed) it never enters a module cycle → none of those fire. The bot ran
+// 5+ hours making ZERO progress + self-heal NEVER fired. These track the
+// login-stagnation window so the health monitor can fire self-heal itself.
+let _loginStagnationStartTs = 0;
+let _lastLoginStagnationHealTs = 0;
+let _loginStagnationHealRunning = false;
+// Worker statuses that mean "actively progressing on a module" — if NO worker
+// is in one of these, the bot is stuck in login/browse/idle/error and making no
+// progress. Covers the all-'logging_in' pattern (the 5h log) AND oscillation
+// between login/browse/idle without ever entering a module.
+const _PROGRESSING_STATES = new Set(['in_module', 'answering_question', 'completing_video', 'writing_memo']);
 function _injectDependencies(deps: any) { _deps = deps; }
 function getCONFIG(): any { return _deps.config || require('./config'); }
 function getLog(): (msg: string, level?: string, mod?: string) => void {
@@ -1311,7 +1327,7 @@ class ParallelCoordinator {
         } catch {}
         if (_stillLoading) {
           _extended = true;
-          try { log(`[WORKER-${workerId}] Render wait: bundle still in-flight at ${Math.round(maxWaitMs / 1000)}s — extending to ${Math.round(_hardCapMs / 1000)}s (a reload would abort the in-flight main.dart.js/CanvasKit download + restart from zero)`, 'WARN', 'parallel'); } catch {}
+          try { log('[WORKER-' + workerId + '] Render wait: bundle still in-flight at ' + Math.round(maxWaitMs / 1000) + 's — extending to ' + Math.round(_hardCapMs / 1000) + 's (a reload would abort the in-flight main.dart.js/CanvasKit download + restart from zero)', 'WARN', 'parallel'); } catch {}
         } else {
           break; // bundle finished/failed + no render → give up → caller reloads
         }
@@ -1425,6 +1441,60 @@ class ParallelCoordinator {
       for (const w of workers) {
         log(`[PARALLEL]   Worker ${w.id}: ${w.status} | module=${w.module ? 'active' : 'idle'} | ✅${w.completed} ❌${w.errors}`, 'INFO', 'parallel');
       }
+      // v12: LOGIN-STAGNATION SELF-HEAL TRIGGER. Fire performRuntimeHeal (then
+      // performSelfHeal) when ALL workers have been stuck in 'logging_in' with
+      // 0 modules completed for 20+ min. The existing triggers miss this case
+      // (no restarts/OOM/errors — login failures are WARN — and no module cycle
+      // so the 20-min 'wait'-action stagnation gates never run). Without this,
+      // the bot ran 5+ hours making zero progress + self-heal never fired.
+      try {
+        const allStuck = workers.length > 0 && workers.every((w: any) => !_PROGRESSING_STATES.has(w.status));
+        if (allStuck && totalCompleted === 0) {
+          if (_loginStagnationStartTs === 0) {
+            _loginStagnationStartTs = Date.now();
+          } else if (uptime >= 1200 /* 20 min — skip fresh starts */
+                     && Date.now() - _loginStagnationStartTs >= 1200000 /* 20 min stuck */
+                     && Date.now() - _lastLoginStagnationHealTs >= 1800000 /* 30-min cooldown */
+                     && !_loginStagnationHealRunning) {
+            _loginStagnationHealRunning = true;
+            _lastLoginStagnationHealTs = Date.now();
+            const stagnationMin = Math.round((Date.now() - _loginStagnationStartTs) / 60000);
+            log('[PARALLEL] Login stagnation: all ' + workers.length + " workers stuck in 'logging_in' with 0 modules completed for " + stagnationMin + 'min — triggering self-heal (existing triggers miss this: no restarts/OOM/errors, never enter a module cycle)', 'WARN', 'parallel');
+            try {
+              const selfHealMod = require('./self-heal');
+              const rtHeal = typeof selfHealMod.performRuntimeHeal === 'function' ? selfHealMod.performRuntimeHeal() : Promise.resolve({ healed: false });
+              rtHeal.then((rtResult: any) => {
+                if (rtResult?.healed) {
+                  const avenues = (rtResult.results || []).filter((r: any) => r.healed).map((r: any) => r.avenue).join(', ');
+                  log('[PARALLEL] Login-stagnation runtime heal SUCCEEDED: ' + avenues + ' — workers should progress next cycle', 'INFO', 'parallel');
+                  _loginStagnationHealRunning = false;
+                } else {
+                  log('[PARALLEL] Login-stagnation runtime heal did not fix it — escalating to FULL self-heal (auditor will diagnose the login/mount failure + propose a patch)', 'WARN', 'parallel');
+                  const fullHeal = selfHealMod.performSelfHeal;
+                  if (typeof fullHeal === 'function') {
+                    Promise.resolve(fullHeal.call(selfHealMod)).then((fullResult: any) => {
+                      if (fullResult?.healed) log('[PARALLEL] Login-stagnation FULL self-heal SUCCEEDED — patch deployed', 'INFO', 'parallel');
+                      else log('[PARALLEL] Login-stagnation FULL self-heal did not heal — will retry after 30-min cooldown', 'WARN', 'parallel');
+                    }).catch((e: any) => log('[PARALLEL] Login-stagnation full self-heal error: ' + (e?.message || e), 'ERROR', 'parallel'))
+                      .finally(() => { _loginStagnationHealRunning = false; });
+                  } else {
+                    _loginStagnationHealRunning = false;
+                  }
+                }
+              }).catch((e: any) => {
+                log('[PARALLEL] Login-stagnation runtime heal error: ' + (e?.message || e), 'ERROR', 'parallel');
+                _loginStagnationHealRunning = false;
+              });
+            } catch (e: any) {
+              _loginStagnationHealRunning = false;
+              log('[PARALLEL] Login-stagnation self-heal require failed: ' + (e?.message || e), 'ERROR', 'parallel');
+            }
+          }
+        } else {
+          // A worker progressed past login OR a module completed — reset the window.
+          _loginStagnationStartTs = 0;
+        }
+      } catch {}
     }, 60000).unref?.();
   }
 
