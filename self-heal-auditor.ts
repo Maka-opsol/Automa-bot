@@ -1,4 +1,3 @@
-
 'use strict';
 
 let _deps: Record<string, any> = {};
@@ -715,7 +714,31 @@ async function auditPatchWithTribunal(patchText: any, signal: any, options?: { i
   } catch { /* fail closed below */ }
   if (!requiredOllama || requiredOllama.provider !== 'ollama' ||
       requiredOllama.skipped || requiredOllama.is_safe !== true) {
-    return { safe: false, is_safe: false, reason: 'Required Ollama audit rejected or unavailable', votes: [], skipped: [] };
+    // Split the four distinct failure modes so the caller sees EXACTLY what
+    // happened — a DENIAL (auditor ran + voted unsafe) vs a MECHANISM failure
+    // (auditor unavailable / misconfigured / skipped on infrastructure error).
+    // The old combined string 'Required Ollama audit rejected or unavailable'
+    // collapsed all four into one vague reason; the dashboard couldn't tell a
+    // real rejection from a crashed auditor.
+    let reason: string;
+    let failureKind: 'denied' | 'mechanism';
+    if (!requiredOllama) {
+      reason = 'Ollama auditor unavailable: no verdict returned (config missing, or auditPatchWithAI threw + was swallowed)';
+      failureKind = 'mechanism';
+    } else if (requiredOllama.provider !== 'ollama') {
+      reason = `Ollama auditor misconfigured: provider resolved to '${requiredOllama.provider}' (expected 'ollama')`;
+      failureKind = 'mechanism';
+    } else if (requiredOllama.skipped) {
+      reason = `Ollama auditor skipped — infrastructure failure (${requiredOllama.skip_reason || 'rate-limit / network / parse error'})`;
+      failureKind = 'mechanism';
+    } else {
+      // is_safe !== true AND not skipped AND provider is ollama → the auditor
+      // actually ran and returned a real verdict that was unsafe. This is a
+      // genuine DENIAL, not a mechanism failure.
+      reason = `Ollama auditor DENIED the patch — voted unsafe${requiredOllama.reason ? ': ' + requiredOllama.reason : ''}`;
+      failureKind = 'denied';
+    }
+    return { safe: false, is_safe: false, reason, failureKind, votes: requiredOllama?.votes || [], skipped: requiredOllama?.skipped || [] };
   }
 
   // Walk through the fallback tiers in order. Stop at the first tier that
