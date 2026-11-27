@@ -886,9 +886,15 @@ async function requestCriticalPatch(context: any) {
       reasoning: err.message,
       details: { consensusId, stack: err.stack },
     });
+    // Classify the unexpected error as DENIAL vs MECHANISM so the caller sees
+    // which happened, not a bare "Unexpected error: ..." that could be either.
+    // Denial keywords = a consensus gate REFUSED; everything else = the
+    // consensus pipeline CRASHED (mechanism).
+    const _uMsg = String((err && err.message) || err || '');
+    const _uIsDenial = /denied|reject|not unanimous|insufficient support|veto|unsafe|blocked|not allowed|quorum|consensus|critical file requires/i.test(_uMsg);
     return {
       applied: false,
-      reason: `Unexpected error: ${err.message}`,
+      reason: _uIsDenial ? `Patch DENIED by a consensus gate (denial): ${_uMsg}` : `Consensus pipeline CRASHED (mechanism failure): ${_uMsg}`,
       details: { consensusId },
     };
   } finally {
